@@ -7,7 +7,9 @@ import logging
 from typing import Any
 
 from database import get_supabase
-from mcp_loader import DEFAULT_MCP_SERVER_NAMES
+
+# 기본 MCP 서버 이름 (SafeToolLoader 기본 설정과 동일하게 유지)
+DEFAULT_MCP_SERVER_NAMES: tuple[str, str] = ("claude-skills", "computer-use")
 
 logger = logging.getLogger(__name__)
 
@@ -115,12 +117,85 @@ def _build_system_prompt(
         names = ", ".join(agent_skills)
         parts.append(f"- Assigned skills: {names}")
         parts.append(
-            "- Use read_skill_document (or find_helpful_skills) via the claude-skills MCP "
-            "server to load skill documentation when needed, then follow those procedures "
-            "when executing your tasks."
+            "- Default document path for each skill follows this template (do NOT invent paths): "
+            "\"/app/skills/{tenant_id}/{skill_name}/SKILL.md\"."
+        )
+        for s in agent_skills:
+            parts.append(
+                f"  * {s} → primary document_path: "
+                "\"/app/skills/{tenant_id}/"
+                f'{s}'
+                "/SKILL.md\""
+            )
+        parts.append(
+            "- When solving tasks, you MUST first use your assigned skills above. "
+            "For each assigned skill, call read_skill_document with all of the following "
+            "fallbacks IN ORDER (stop as soon as one returns a non-empty result):"
+        )
+        parts.append(
+            "  1) read_skill_document("
+            "skill_name=\"<name>\", "
+            "document_path=\"/app/skills/{tenant_id}/<name>/SKILL.md\", "
+            "include_base64=true)"
+        )
+        parts.append(
+            "  2) If (1) returns no documents or a not-found error, retry with a wildcard "
+            "pattern that matches the full path such as "
+            "document_path=\"*/<name>/SKILL.md\"."
+        )
+        parts.append(
+            "  3) If (2) also fails, finally retry with a simple relative path "
+            "document_path=\"SKILL.md\"."
+        )
+        parts.append(
+            "- You MUST NOT give up after a single failed call to read_skill_document for "
+            "an assigned skill. Always apply the above fallback sequence before concluding "
+            "that the skill has no readable documents."
+        )
+        parts.append(
+            "- Only when none of your assigned skills are suitable may you call "
+            "find_helpful_skills to discover additional skills."
+        )
+        parts.append(
+            "- You MUST NOT start a task by calling find_helpful_skills when you already "
+            "have assigned skills. Always attempt to use your own skills first (by reading "
+            "their SKILL.md and following their guidance); treat find_helpful_skills purely "
+            "as a fallback when your assigned skills are insufficient to complete the work."
+        )
+        parts.append(
+            "- Whenever you do call find_helpful_skills (fallback case), you MUST perform "
+            "two separate searches for the same task: first with a Korean task_description "
+            "and then with an English task_description. If the user's query is in Korean, "
+            "use it directly for the Korean call and translate it to English for the second "
+            "call. If the query is in English, translate it into natural Korean for the first "
+            "call, then reuse or refine the English version for the second call. Merge and "
+            "deduplicate the returned skill candidates from both calls before deciding which "
+            "skills to use."
+        )
+        parts.append(
+            "- When a skill's documents include Python scripts (*.py files), you MUST execute "
+            "them using the computer-use MCP tool run_shell. First read the assigned skill "
+            "(e.g. global-investment-analyzer via read_skill_document with document_path "
+            "\"SKILL.md\"); if the skill lists or references .py "
+            "files, run those scripts with run_shell—do not only return code or instructions. "
+            "Actually invoke run_shell to execute the Python file (e.g. python <path from skill>)."
         )
     else:
         parts.append("- Assigned skills: (none explicitly assigned)")
+        parts.append(
+            "- Because you have no assigned skills, you SHOULD start by calling "
+            "find_helpful_skills with an appropriate task_description and tenant_id "
+            "to discover relevant skills before attempting any complex domain work."
+        )
+        parts.append(
+            "- In all cases when you use find_helpful_skills, you MUST call it twice per "
+            "task: first with a Korean task_description and then with an English "
+            "task_description for the same task. Use Korean if the user's request is in "
+            "Korean (or translate the request into Korean), and create or refine an English "
+            "version for the second call. Combine the results from both calls so that skills "
+            "whose descriptions are written only in Korean or only in English can still be "
+            "discovered."
+        )
 
     if tools:
         parts.append(f"- Declared tools (by name/server): {', '.join(tools)}")
@@ -130,6 +205,11 @@ def _build_system_prompt(
     parts.append(
         "- If mem0 or dmn_rule tools are attached to you, use them to retrieve your "
         "own past knowledge and decision rules before making important decisions."
+    )
+    parts.append(
+        "- When you need to run a Python script (*.py), use the computer-use MCP tool "
+        "run_shell to execute it (e.g. run_shell with the appropriate command). Do not "
+        "only show or suggest the command—actually call run_shell."
     )
 
     # 섹션 5: 협업 및 보고 방식
@@ -145,18 +225,25 @@ def _build_system_prompt(
         "queries, mem0/memento, dmn_rule) before performing irreversible mutations."
     )
 
-    # 섹션 6: 자격 증명 및 placeholder 금지
-    parts.append("\n=== Section 6: Credentials and execution policy ===")
+    # 섹션 6: 자격 증명 및 사용자 개입 요청
+    parts.append("\n=== Section 6: Credentials and user intervention ===")
     parts.append(
         "- If you need an API key, token, or other credential that is not in the "
         "work-item InputData or context, do NOT respond with only placeholder code or "
-        "'insert your API key here'. The workflow will ask the user for the value and "
-        "you will receive it to continue; then perform the actual tool/API call."
+        "'insert your API key here'. Request user intervention (e.g. via request_human_input "
+        "or the tool that signals requires_human); the workflow will ask the user for the "
+        "value and you will receive it to continue; then perform the actual tool/API call."
+    )
+    parts.append(
+        "- Whenever any information required to proceed is missing (API keys, tokens, "
+        "file paths, parameters, or other inputs), you MUST request user intervention "
+        "instead of guessing or inventing values. Do not assume defaults for credentials "
+        "or sensitive data."
     )
     parts.append(
         "- Never return only code snippets or example responses when the task requires "
         "real execution (e.g. fetching KOSPI, calling an external API). Perform the "
-        "actual tool calls once the required credential is available."
+        "actual tool calls once the required credential or information is available."
     )
 
     return "\n".join(parts)
@@ -191,12 +278,17 @@ def build_subagent_configs(
         system_prompt = _build_system_prompt(row, query=query, tenant_id=tenant_id)
 
         agent_tool_names = _parse_csv(row.get("tools"))
-        if not agent_tool_names and _parse_csv(row.get("skills")):
+        has_skills = bool(_parse_csv(row.get("skills")))
+        if not agent_tool_names and has_skills:
+            # 스킬만 지정된 에이전트는 기본 MCP 서버(claude-skills, computer-use)를 우선적으로 사용하도록 한다.
             agent_tool_names = list(DEFAULT_MCP_SERVER_NAMES)
+
         # 각 서브 에이전트는 고유한 MCP 툴 인스턴스를 가져야 한다.
         # 그렇지 않으면 도구 호출 로깅 시 job_id를 서브 에이전트별로 분리할 수 없다.
         filtered_tools: list[Any] = []
         seen_ids: set[int] = set()
+
+        # 1차: 에이전트가 선언한 tools 기준으로 매핑
         for tn in agent_tool_names:
             if tn in tools_map:
                 t = tools_map[tn]
@@ -209,11 +301,49 @@ def build_subagent_configs(
                         filtered_tools.append(copy.copy(t))
                         seen_ids.add(id(t))
 
-        if agent_tool_names and not filtered_tools:
-            logger.warning(
-                "Agent '%s' requested tools %s but none matched loaded tools",
+        # 2차: 어떤 이유로든 filtered_tools 가 비어 있으면,
+        #     기본 MCP 서버(claude-skills, computer-use)의 툴을 fallback 으로 붙인다.
+        if not filtered_tools:
+            fallback_tools: list[Any] = []
+            for server_name in DEFAULT_MCP_SERVER_NAMES:
+                for t in server_to_tools.get(server_name, []):
+                    if id(t) not in seen_ids:
+                        fallback_tools.append(copy.copy(t))
+                        seen_ids.add(id(t))
+            if fallback_tools:
+                logger.warning(
+                    "Agent '%s' had no resolved tools (requested=%s); "
+                    "attaching default MCP tools from %s instead",
+                    name,
+                    agent_tool_names or "[]",
+                    ", ".join(DEFAULT_MCP_SERVER_NAMES),
+                )
+                filtered_tools.extend(fallback_tools)
+            elif agent_tool_names:
+                # fallback 도 실패한 경우에만 경고를 남긴다.
+                logger.warning(
+                    "Agent '%s' requested tools %s but none matched loaded tools or default MCP servers",
+                    name,
+                    agent_tool_names,
+                )
+
+        # 3차: 기본 MCP 서버(claude-skills, computer-use)의 툴은
+        #    "모든" 서브 에이전트에 항상 포함되도록 보장한다.
+        #    (이미 포함된 경우에는 seen_ids 체크로 중복을 방지한다.)
+        baseline_added = 0
+        for server_name in DEFAULT_MCP_SERVER_NAMES:
+            for t in server_to_tools.get(server_name, []):
+                if id(t) not in seen_ids:
+                    filtered_tools.append(copy.copy(t))
+                    seen_ids.add(id(t))
+                    baseline_added += 1
+        if baseline_added > 0:
+            logger.info(
+                "Attached default MCP tools %s to agent '%s' (added=%d, total_tools=%d)",
+                ", ".join(DEFAULT_MCP_SERVER_NAMES),
                 name,
-                agent_tool_names,
+                baseline_added,
+                len(filtered_tools),
             )
 
         subagent: dict[str, Any] = {
@@ -236,3 +366,4 @@ def build_subagent_configs(
         )
 
     return subagents
+

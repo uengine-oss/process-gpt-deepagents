@@ -8,6 +8,8 @@ from typing import Any, Mapping, Sequence
 from deepagents import create_deep_agent
 from langgraph.graph.state import CompiledStateGraph
 
+from deepagents_hitl import get_hitl_tools
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,17 +24,25 @@ def build_orchestrator(
     """Create the top-level orchestrator agent with DB-driven subagents.
 
     The main agent coordinates work by delegating to subagents via the
-    built-in ``task()`` tool.  Any *tools* passed here are available to
-    the main agent directly (e.g. shared utility tools).
-    Optional *middleware* is passed to create_deep_agent for subagent event hooks etc.
+    built-in ``task()`` tool. The orchestrator should only receive HITL
+    tools (request_human_input) and optionally shared utility tools.
+    Do NOT pass skill/MCP/API tools here — those belong to subagents;
+    giving them to the orchestrator leads to it doing work itself instead
+    of delegating. Optional *middleware* is passed to create_deep_agent
+    for subagent event hooks etc.
     """
     effective_prompt = system_prompt or default_orchestrator_prompt()
+    # DeepAgents 하네스와 동일하게 그래프 레벨 HITL 을 위해
+    # request_human_input 도구를 항상 주입한다. 오케스트레이터에는
+    # 스킬/MCP 도구를 넣지 않아 위임(task) 동작이 유지되도록 한다.
+    hitl_tools = list(get_hitl_tools())
     tools = list(tools) if tools else []
+    all_tools = hitl_tools + tools
     middleware_list = list(middleware) if middleware else []
 
     agent = create_deep_agent(
         model=model_name,
-        tools=tools,
+        tools=all_tools,
         system_prompt=effective_prompt,
         subagents=subagents or [],
         middleware=middleware_list,
@@ -59,29 +69,29 @@ def default_orchestrator_prompt() -> str:
         "- the business goal,\n"
         "- any explicit constraints and approvals required,\n"
         "- which InputData keys are important.\n\n"
-        "Your role is planning, delegation, and synthesis — not direct execution:\n"
-        "- Break the work into small atomic steps.\n"
-        "- For each step, choose the most appropriate subagent (by name/role/description).\n"
-        "- You MUST delegate domain-specific work to subagents using the task() tool and wait "
-        "for their reports before producing a final answer. Do NOT answer from your own knowledge "
-        "when a suitable subagent exists.\n"
-        "- CRITICAL: Whenever the work-item matches a subagent's domain (e.g. data analysis, "
-        "research, external API calls), you MUST call the task() tool first with that subagent. "
-        "Never respond with only text or code examples without delegating; the subagent will use "
-        "its own tools to perform the actual work.\n\n"
-        "Domain routing examples (not exhaustive):\n"
-        "- If the query clearly belongs to a specialised area (for example, financial analysis, "
-        "legal review, data engineering, customer support, etc.), call task() with the subagent "
-        "whose name or role best matches that area. That subagent will use its configured tools "
-        "to retrieve and interpret the necessary data.\n"
-        "- For other domains, call task() with the subagent whose role best matches the topic.\n\n"
+        "Your ONLY role is planning, delegation, and synthesis — you must NOT do domain work yourself:\n"
+        "- You have exactly two tools: task() (to delegate to subagents) and request_human_input() (for HITL). "
+        "You do NOT have access to skill tools, MCP tools, or API-calling tools; those belong to subagents.\n"
+        "- For any domain-specific work (data fetch, API calls, skill execution, analysis), you MUST call "
+        "task() with the appropriate subagent from Section 2 and wait for their result. Never perform "
+        "such work by yourself or reply with only text/code examples.\n"
+        "- Do NOT use a general-purpose subagent for domain work. Use the named subagents listed in "
+        "Section 2 (e.g. financial/data/research agents with assigned skills).\n"
+        "- Break the work into small atomic steps. For each step that involves tools/skills/APIs, "
+        "choose the most appropriate subagent by name/role/description and call task() with a clear "
+        "instruction. Only after you receive subagent results may you synthesize the final answer.\n\n"
+        "Domain routing (mandatory delegation):\n"
+        "- If the query involves a specialised area (e.g. financial data, external APIs, research, "
+        "analysis), you MUST call task() with the subagent whose name or role matches that area. "
+        "That subagent will use its configured tools/skills; you only assign and aggregate.\n"
+        "- You must not answer from your own knowledge when a suitable subagent exists. If in doubt, "
+        "delegate to the subagent whose skills best match the request.\n\n"
         "Tools and skills policy:\n"
-        "- Subagents own their tools and skills (including any MCP tools, vector stores, memory, "
-        "or rule engines). You should not call these directly; instead, specify in your plan "
-        "which tools they are expected to use.\n"
-        "- You may use organisation-wide context tools (for example, global knowledge or "
-        "documentation search tools) only to gather shared background information before or "
-        "between delegations.\n\n"
+        "- Subagents own all execution tools and skills (MCP, APIs, memory, rule engines). You do not "
+        "have these tools. Specify in your plan which subagent will do what; do not attempt to run "
+        "skills or tools yourself.\n"
+        "- Do not call find_helpful_skills, read_skill_document, or any API/skill tools — only "
+        "task() and request_human_input() are available to you.\n\n"
         "Human-in-the-loop (HITL):\n"
         "- If Instructions or Description indicate approvals, sensitive data, or explicit "
         "human review (e.g. terms like \"승인\", \"검토\", \"결재\", \"민감\", \"개인정보\", "
@@ -98,6 +108,9 @@ def default_orchestrator_prompt() -> str:
         "\n"
         "Planning and logging requirements:\n"
         "- First, create an explicit, step-by-step execution plan that can be logged as text.\n"
+        "- If the work-item requires any domain work (data, APIs, skills), your plan MUST include "
+        "at least one step where you call task() with a subagent; do not finish with only a text "
+        "answer when a subagent could perform the work.\n"
         "- For each step, describe which subagent will act, which tools/skills it will likely "
         "use, what inputs it will consume, and what outputs it will produce.\n"
         "\n"
@@ -130,6 +143,7 @@ def build_orchestrator_system_prompt(
     feedback: str | None,
     form_info: Mapping[str, Any] | None,
     tenant_id: str | None = None,
+    plan_text: str | None = None,
 ) -> str:
     """Compose a sectioned system_prompt for the DeepAgents orchestrator.
 
@@ -167,11 +181,12 @@ def build_orchestrator_system_prompt(
         )
     if agent_lines:
         parts.append(
-            "=== Section 2: Available agents and skills ===\n"
-            "The following subagents are available. Delegate domain-specific work to the "
-            "most appropriate agent based on role and skills. Each agent may have its own "
-            "tools and skills configured; treat these as black boxes and describe them only "
-            "at a high level in your plan (e.g. 'uses retrieval tools', 'uses analysis tools').\n"
+            "=== Section 2: Available agents and skills (you MUST delegate to these) ===\n"
+            "The following subagents are available. You MUST delegate all domain-specific work "
+            "(API calls, data fetch, skill execution, analysis) to the most appropriate agent "
+            "below using the task() tool. Do not perform such work yourself.\n"
+            "Each agent has its own tools and skills; use task() with the agent name and a clear "
+            "instruction. Describe in your plan which subagent handles which step.\n"
             + "\n".join(agent_lines)
             + "\n"
         )
@@ -213,15 +228,13 @@ def build_orchestrator_system_prompt(
     # 섹션 5: 멀티 에이전트 플랜 요구사항
     parts.append(
         "=== Section 5: Multi-agent planning requirements ===\n"
-        "- Break the task into atomic steps. For each step, specify:\n"
-        "  * which subagent (by name/role) should handle it,\n"
-        "  * which kinds of tools that subagent is expected to use "
-        "(for example, retrieval/search tools, analysis tools, memory tools, rule engines),\n"
-        "  * which parts of Description/Instruction/InputData (or previous steps) it consumes,\n"
-        "  * what concrete intermediate output it must return.\n"
-        "- Remember: some tools may be organisation-wide context tools (used at the orchestrator "
-        "level), while others are owned by individual subagents. Reflect this separation when "
-        "you describe how work is delegated.\n"
+        "- You do not have domain tools (skills, APIs, MCP). All such work MUST be done by "
+        "subagents via task(). Break the task into atomic steps and for each step that needs "
+        "tools/skills/data, assign a subagent from Section 2.\n"
+        "- For each step, specify: which subagent (by name) handles it, which tools/skills that "
+        "subagent will use, what inputs it consumes, and what output it must return.\n"
+        "- Do not use the general-purpose subagent for domain work; use the named subagents "
+        "in Section 2 (e.g. those with roles/skills that match the request).\n"
         "- Your final reply MUST include a [PLAN]...[/PLAN] block containing only the "
         "step-by-step plan (no error text or results inside that block), and optionally "
         "[SUMMARY]...[/SUMMARY] or [RESULT]...[/RESULT] for summary/outcome.\n"
@@ -231,7 +244,7 @@ def build_orchestrator_system_prompt(
     parts.append(
         "\n=== Section 6: Final output format requirements ===\n"
         "- When there is no form schema or the form_id is 'defaultform', the final business "
-        "result will be wrapped as: {\"output\": {\"status\": \"SUCCESS\" | \"Fail\", "
+        "result will be wrapped as:{\"output\": {\"status\": \"SUCCESS\" | \"Fail\", "
         "\"result\": \"plain text only\"}}. The 'result' value MUST be plain text only "
         "(no JSON strings, no list/dict literals).\n"
         "- In this case, produce a clear, human-readable narrative of the outcome for "
@@ -240,4 +253,39 @@ def build_orchestrator_system_prompt(
         "into the form fields described above while still being safely serialisable as JSON.\n"
     )
 
+    # (선택) 섹션 7: 사전 계산된 실행 플랜
+    if plan_text:
+        cleaned_plan = (str(plan_text).strip() or "")
+        if cleaned_plan:
+            parts.append(
+                "\n=== Section 7: Pre-computed execution plan (read-only) ===\n"
+                "The following plan was generated in a previous planning step. Use it as a strong "
+                "prior when delegating to subagents, but you may refine or adjust it if needed. "
+                "If you change the plan substantially, summarise the changes in your final result.\n\n"
+                f"{cleaned_plan}\n"
+            )
+
     return "\n".join(parts)
+
+
+def build_planner_agent(
+    *,
+    model_name: str,
+    system_prompt: str,
+) -> CompiledStateGraph:
+    """Create a lightweight planner agent that only generates a PLAN block.
+
+    - No subagents or domain tools are attached.
+    - This agent should only be used to produce a [PLAN]...[/PLAN] block and
+      MUST NOT execute tools or skills.
+    """
+    agent = create_deep_agent(
+        model=model_name,
+        tools=[],
+        system_prompt=system_prompt,
+        subagents=[],
+        middleware=[],
+    )
+    logger.info("Planner agent created: model=%s", model_name)
+    return agent
+

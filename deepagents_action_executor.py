@@ -1,4 +1,4 @@
-"""DeepAgents executor: create_deep_agent only; no process-gpt / a2a."""
+"""DeepAgents executor: ProcessGPT A2A 래퍼 + DeepAgents orchestrator."""
 
 from __future__ import annotations
 
@@ -9,21 +9,22 @@ import re
 import uuid
 from typing import Any
 
-from agent_execution import (
-    AgentExecutor,
-    EventQueue,
-    ExecutionContext,
-    build_event_payload,
-)
-from agent_loader import build_subagent_configs
-from database import insert_event
-from deep_agent_factory import (
+from typing_extensions import override
+from a2a.server.agent_execution import AgentExecutor, RequestContext
+from a2a.server.events import EventQueue
+from a2a.types import TaskStatusUpdateEvent, TaskState, TaskArtifactUpdateEvent
+from a2a.utils import new_agent_text_message, new_text_artifact
+
+from deepagents_hitl import extract_interrupt_payload
+from subagents import build_subagent_configs
+from deepagents_factory import (
     build_orchestrator,
     build_orchestrator_system_prompt,
     default_orchestrator_prompt,
+    build_planner_agent,
 )
-from mcp_loader import load_default_mcp_tools
 from output_utils import convert_agent_output
+from processgpt_agent_utils.tools.safe_tool_loader import SafeToolLoader
 from processgpt_agent_utils.utils.context_manager import set_context
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,226 @@ try:
 except ImportError:
     AgentMiddleware = None  # type: ignore[misc, assignment]
     ToolCallRequest = None  # type: ignore[misc, assignment]
+
+try:
+    from langchain_core.tools import BaseTool as LangChainBaseTool
+    from langchain_core.tools import StructuredTool as LangChainStructuredTool
+    from pydantic import BaseModel as PydanticBaseModel
+    _LANGCHAIN_TOOLS_AVAILABLE = True
+except ImportError:
+    LangChainBaseTool = None  # type: ignore[misc, assignment]
+    LangChainStructuredTool = None  # type: ignore[misc, assignment]
+    PydanticBaseModel = None  # type: ignore[misc, assignment]
+    _LANGCHAIN_TOOLS_AVAILABLE = False
+
+
+def _ensure_langchain_tools(tools: list[Any]) -> list[Any]:
+    """CrewAI/MCP 툴을 LangChain BaseTool로 래핑하여 tool decorator __name__ 오류를 방지합니다.
+
+    crewai_tools.MCPServerAdapter가 반환하는 CrewAIMCPTool 등은 LangChain 파이프라인에서
+    tool() 데코레이터에 전달될 때 'callable with __name__' 요구로 인해 오류가 발생합니다.
+    이 함수는 LangChain BaseTool이 아닌 툴을 LangChain StructuredTool로 감싸 반환합니다.
+    """
+    if not _LANGCHAIN_TOOLS_AVAILABLE or not tools:
+        return tools
+
+    result: list[Any] = []
+    for t in tools:
+        if isinstance(t, LangChainBaseTool):
+            result.append(t)
+            continue
+
+        # CrewAI/기타 툴: run 또는 invoke/ainvoke 위임 래퍼로 LangChain 툴 생성
+        name = getattr(t, "name", None) or getattr(t, "__class__", type(t)).__name__
+        description = getattr(t, "description", None) or str(t)
+
+        def _make_sync_wrapper(original: Any) -> Any:
+            def _run(**kwargs: Any) -> Any:
+                if hasattr(original, "run"):
+                    return original.run(**kwargs)
+                if hasattr(original, "invoke"):
+                    return original.invoke(kwargs)
+                raise RuntimeError(f"Tool {getattr(original, 'name', original)} has no run/invoke")
+
+            return _run
+
+        def _make_async_wrapper(original: Any) -> Any:
+            async def _arun(**kwargs: Any) -> Any:
+                if hasattr(original, "arun"):
+                    return await original.arun(**kwargs)
+                if hasattr(original, "ainvoke"):
+                    return await original.ainvoke(kwargs)
+                # sync fallback
+                sync_run = _make_sync_wrapper(original)
+                return sync_run(**kwargs)
+
+            return _arun
+
+        sync_func = _make_sync_wrapper(t)
+        async_func = _make_async_wrapper(t)
+        safe_name = (name or "unknown").replace(" ", "_")
+        sync_func.__name__ = safe_name  # type: ignore[attr-defined]
+        async_func.__name__ = safe_name  # type: ignore[attr-defined]
+
+        args_schema = getattr(t, "args_schema", None)
+        use_schema = (
+            args_schema is not None
+            and isinstance(args_schema, type)
+            and PydanticBaseModel is not None
+            and issubclass(args_schema, PydanticBaseModel)
+        )
+
+        try:
+            if use_schema:
+                wrapped = LangChainStructuredTool(
+                    name=name,
+                    description=description or name,
+                    func=sync_func,
+                    coroutine=async_func,
+                    args_schema=args_schema,
+                )
+            else:
+                # 스키마 없음/호환 불가 시 최소 스키마로 생성 (입력 dict 허용)
+                _DynamicSchema = type(
+                    f"_Schema_{safe_name}",
+                    (PydanticBaseModel,),
+                    {"model_config": {"extra": "allow"}, "__annotations__": {}},
+                )
+                wrapped = LangChainStructuredTool(
+                    name=name,
+                    description=description or name,
+                    func=sync_func,
+                    coroutine=async_func,
+                    args_schema=_DynamicSchema,
+                )
+        except Exception as e:
+            logger.warning(
+                "CrewAI/MCP tool wrap failed, using minimal schema: %s | tool=%s",
+                e,
+                name,
+            )
+            _FallbackSchema = type(
+                f"_Fallback_{safe_name}",
+                (PydanticBaseModel,),
+                {"model_config": {"extra": "allow"}, "__annotations__": {}},
+            )
+            wrapped = LangChainStructuredTool(
+                name=name,
+                description=description or name,
+                func=sync_func,
+                coroutine=async_func,
+                args_schema=_FallbackSchema,
+            )
+
+        if hasattr(t, "_mcp_server"):
+            setattr(wrapped, "_mcp_server", getattr(t, "_mcp_server"))
+        result.append(wrapped)
+
+    return result
+
+
+class ExecutionContext:
+    """Execution-scoped context for multi-agent runs and tracing.
+
+    DeepAgents 오케스트레이션에 공통으로 필요한 상위 메타데이터(correlation_id,
+    agent_path, task_id, proc_inst_id 등)를 담고, events.data.meta 에 직렬화하기
+    위한 최소 정보를 제공한다.
+    """
+
+    def __init__(
+        self,
+        *,
+        correlation_id: str,
+        agent_path: list[str] | None = None,
+        current_agent: str | None = None,
+        task_id: str | None = None,
+        proc_inst_id: str | None = None,
+    ) -> None:
+        self.correlation_id = correlation_id
+        self.agent_path: list[str] = list(agent_path) if agent_path else []
+        # If current_agent is not provided, derive it from the path when possible.
+        self.current_agent: str | None = current_agent or (
+            self.agent_path[-1] if self.agent_path else None
+        )
+        self.task_id = task_id
+        self.proc_inst_id = proc_inst_id
+
+    @property
+    def depth(self) -> int:
+        return len(self.agent_path)
+
+    def push_agent(self, agent_name: str) -> None:
+        self.agent_path.append(agent_name)
+        self.current_agent = agent_name
+
+    def pop_agent(self) -> str | None:
+        if not self.agent_path:
+            return None
+        popped = self.agent_path.pop()
+        self.current_agent = self.agent_path[-1] if self.agent_path else None
+        return popped
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a minimal, serialisable snapshot of execution metadata."""
+        meta: dict[str, Any] = {
+            "correlation_id": self.correlation_id,
+            "agent_path": list(self.agent_path),
+            "agent_name": self.current_agent,
+            "depth": self.depth,
+        }
+        if self.task_id is not None:
+            meta["task_id"] = self.task_id
+        if self.proc_inst_id is not None:
+            meta["proc_inst_id"] = self.proc_inst_id
+        return meta
+
+
+def build_event_payload(
+    exec_ctx: ExecutionContext | None,
+    *,
+    logical_event_type: str,
+    phase: str,
+    tool_name: str | None = None,
+    requires_human: bool | None = None,
+    input_schema: Any | None = None,
+    output_schema: Any | None = None,
+    agent_name: str | None = None,
+    extra_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """events.data 로 저장될 **평탄화(flat)** 된 JSON 페이로드를 생성한다.
+
+    - correlation_id, agent_path, phase 등 실행 메타데이터와
+      goal, plans, tool_name 같은 도메인 필드를 **동일한 깊이의 키**로 둔다.
+    """
+    merged: dict[str, Any] = {}
+
+    # 실행 컨텍스트 메타데이터 먼저 병합
+    if exec_ctx is not None:
+        merged.update(exec_ctx.as_dict())
+
+    # 호출 측에서 명시한 agent_name 이 있다면 덮어쓰기
+    if agent_name is not None:
+        merged["agent_name"] = agent_name
+
+    # 논리적 이벤트 타입 / 페이즈 정보
+    merged["logical_event_type"] = logical_event_type
+    merged["phase"] = phase
+
+    # 선택적 필드들
+    if tool_name is not None:
+        merged["tool_name"] = tool_name
+    if requires_human is not None:
+        merged["requires_human"] = requires_human
+    if input_schema is not None:
+        merged["input_schema"] = input_schema
+    if output_schema is not None:
+        merged["output_schema"] = output_schema
+
+    # 도메인 데이터(목표, 플랜, 메시지 등)를 같은 레벨에 병합
+    if extra_data:
+        merged.update(extra_data)
+
+    return merged
 
 
 def _enqueue_status(
@@ -49,13 +270,14 @@ def _enqueue_status(
     logical_event_type: str | None = None,
     phase: str | None = None,
     agent_name: str | None = None,
+    status: str | None = None,
 ) -> None:
-    """Enqueue a status event with optional execution context metadata."""
+    """Enqueue a TaskStatusUpdateEvent so that processgpt_agent_sdk handles persistence."""
     effective_job_id = job_id or str(uuid.uuid4())
-    logical = logical_event_type
-    if logical is None:
-        logical = "agent_started" if event_type == "task_started" else "agent_finished"
+    logical = logical_event_type or ("agent_started" if event_type == "task_started" else "agent_finished")
     effective_phase = phase or "reasoning"
+
+    # 1) 우리가 원하는 평탄화 payload(메타+도메인)를 먼저 만든다.
     payload = build_event_payload(
         exec_ctx,
         logical_event_type=logical,
@@ -63,14 +285,51 @@ def _enqueue_status(
         agent_name=agent_name,
         extra_data=data,
     )
-    eq.enqueue_event(
-        {
-            "event_type": event_type,
-            "job_id": effective_job_id,
-            "crew_type": crew_type,
-            "data": payload,
-        }
-    )
+
+    # 2) a2a 메시지 객체 생성 (텍스트는 payload JSON)
+    try:
+        message = new_agent_text_message(
+            json.dumps(payload, ensure_ascii=False),
+            proc_inst_id,
+            task_id,
+        )
+    except Exception:
+        logger.exception("Failed to build agent text message for status event", exc_info=True)
+        return
+
+    # 3) TaskState 매핑
+    if event_type == "human_asked":
+        state = TaskState.input_required
+        final_flag = True
+    elif event_type in ("task_completed", "tool_usage_finished"):
+        state = TaskState.completed
+        final_flag = True
+    else:
+        state = TaskState.working
+        final_flag = False
+
+    metadata = {
+        "crew_type": crew_type,
+        "event_type": event_type,
+        "status": status,
+        "job_id": effective_job_id,
+    }
+
+    try:
+        eq.enqueue_event(
+            TaskStatusUpdateEvent(
+                status={
+                    "state": state,
+                    "message": message,
+                },
+                final=final_flag,
+                contextId=proc_inst_id,
+                taskId=task_id,
+                metadata=metadata,
+            )
+        )
+    except Exception:
+        logger.exception("Failed to enqueue TaskStatusUpdateEvent", exc_info=True)
 
 
 def _enqueue_artifact(
@@ -81,46 +340,59 @@ def _enqueue_artifact(
     proc_inst_id: str,
     task_id: str,
     *,
-    exec_ctx: ExecutionContext | None = None,
+    exec_ctx: ExecutionContext | None = None,  # exec_ctx는 현재 사용하지 않지만 시그니처 호환용
 ) -> None:
-    data = build_event_payload(
-        exec_ctx,
-        logical_event_type="artifact",
-        phase="final",
-        extra_data={"name": name, "description": description, "text": text},
-    )
-    eq.enqueue_event(
-        {
-            "event_type": "task_completed",
-            "job_id": "artifact",
-            "crew_type": "result",
-            "data": data,
-            "text": text,
-            "last_chunk": True,
-        }
-    )
+    """최종 결과를 TaskArtifactUpdateEvent 로 발행한다."""
+    try:
+        if not isinstance(text, str):
+            artifact_text = json.dumps(text, ensure_ascii=False)
+        else:
+            artifact_text = text
+        artifact = new_text_artifact(
+            name=name,
+            description=description,
+            text=artifact_text,
+        )
+        eq.enqueue_event(
+            TaskArtifactUpdateEvent(
+                artifact=artifact,
+                lastChunk=True,
+                contextId=proc_inst_id,
+                taskId=task_id,
+            )
+        )
+    except Exception:
+        logger.exception("Failed to enqueue TaskArtifactUpdateEvent", exc_info=True)
 
 
 def _create_subagent_event_middleware(
-    event_queue: EventQueue,
+    event_queue: Any,
     proc_inst_id: str,
     task_id: str,
     name_to_context: dict[str, dict[str, Any]],
     subagent_tool_log: dict[str, list[str]],
-) -> Any:
+) -> tuple[Any | None, dict[str, Any]]:
     """Create middleware that emits task_started/task_completed around each subagent (task tool) run.
 
-    Only used when AgentMiddleware is available; otherwise returns None and executor falls back
-    to emitting subagent events after the run.
+    Only used when AgentMiddleware is available; otherwise returns (None, state) and executor
+    falls back to emitting subagent events after the run.
     """
+    # 미들웨어가 실제로 subagent task() 호출을 감쌌는지 추적하기 위한 상태.
+    # 도구 호출(log only)만 발생하고 task() 자체는 다른 계층에서 실행되는 경우,
+    # 이 플래그가 False 로 남아 있어 fallback 이벤트 발행 로직을 트리거한다.
+    state: dict[str, Any] = {"saw_task_call": False}
+
     if AgentMiddleware is None or ToolCallRequest is None:
-        return None
+        return None, state
 
     class SubagentEventMiddleware(AgentMiddleware):
         async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
             tool_name = getattr(getattr(request, "tool", None), "name", None)
             if tool_name != "task":
                 return await handler(request)
+
+            # 서브 에이전트 실행을 담당하는 task() 호출을 한 번이라도 감쌌음을 표시.
+            state["saw_task_call"] = True
 
             call = getattr(request, "call", None) or {}
             args = call.get("args", {}) if isinstance(call, dict) else {}
@@ -175,7 +447,7 @@ def _create_subagent_event_middleware(
                 )
                 raise
 
-    return SubagentEventMiddleware()
+    return SubagentEventMiddleware(), state
 
 
 def _parse_block(source: str, header: str, next_headers: list[str]) -> str:
@@ -237,43 +509,6 @@ def parse_workitem_query(query: str) -> dict[str, Any]:
         "input_data_raw": input_raw,
         "input_data": input_data,
     }
-
-
-def _should_trigger_human_asked(
-    description: str,
-    instruction: str,
-    input_data: dict[str, Any],
-) -> tuple[bool, str]:
-    """Safety-net heuristics to decide whether to request human-in-the-loop before running.
-
-    This runs before the DeepAgents graph. When DeepAgents graph-level HITL (e.g. interrupt_on
-    or credential nodes) is in use, that path takes precedence; this heuristic remains as a
-    fallback for approval/sensitivity/missing-InputData signals. Any human_asked event must
-    use the unified schema: data = { role, text, type, options }.
-    """
-    text = f"{description}\n{instruction}".lower()
-
-    approval_keywords = [
-        "승인",
-        "검토",
-        "결재",
-        "민감",
-        "개인정보",
-        "personal data",
-        "sensitive",
-        "approve",
-        "approval",
-    ]
-    if any(kw in text for kw in approval_keywords):
-        return True, "Instruction indicates approval / sensitive data handling."
-
-    # Very simple heuristic: no InputData at all.
-    if not input_data:
-        missing_keywords = ["추가 정보", "입력", "정보 제공", "데이터"]
-        if any(kw in text for kw in missing_keywords):
-            return True, "InputData is empty while instructions mention additional information."
-
-    return False, ""
 
 
 class HitlInterrupt(Exception):
@@ -418,6 +653,7 @@ def _instrument_tools(
     job_id_getter: callable | None = None,
     job_tool_log: dict[str, list[str]] | None = None,
     exec_ctx: ExecutionContext | None = None,
+    event_queue: Any | None = None,
 ) -> list[Any]:
     """Wrap tools in-place so that all calls are logged into the events table.
 
@@ -446,32 +682,32 @@ def _instrument_tools(
         return str(uuid.uuid4())
 
     def _log_started(base_tool: Any, job_id: str, tool_input: Any) -> None:
+        """도구 호출 시작 이벤트를 SDK EventQueue 경유로 기록."""
+        if event_queue is None:
+            return
         try:
             safe_input = _json_safe(tool_input)
             tool_name = getattr(base_tool, "name", base_tool.__class__.__name__)
-            payload = build_event_payload(
-                exec_ctx,
+            data = {
+                "tool_name": tool_name,
+                "mcp_server": getattr(base_tool, "_mcp_server", None),
+                "input": safe_input,
+            }
+            _enqueue_status(
+                event_queue,
+                "tool_usage_started",
+                data,
+                proc_inst_id or "",
+                str(todo_id) if todo_id else "",
+                crew_type,
+                job_id=job_id,
+                exec_ctx=exec_ctx,
                 logical_event_type="tool_call",
                 phase="tool_call",
-                tool_name=tool_name,
-                extra_data={
-                    "tool_name": tool_name,
-                    "mcp_server": getattr(base_tool, "_mcp_server", None),
-                    "input": safe_input,
-                },
-            )
-            insert_event(
-                id=str(uuid.uuid4()),
-                job_id=job_id,
-                todo_id=str(todo_id) if todo_id else None,
-                proc_inst_id=str(proc_inst_id) if proc_inst_id else None,
-                event_type="tool_usage_started",
-                status=None,
-                crew_type=crew_type,
-                data=payload,
+                agent_name=None,
             )
         except Exception:
-            logger.exception("Failed to insert tool_usage_started event", exc_info=True)
+            logger.exception("Failed to enqueue tool_usage_started event", exc_info=True)
 
     def _log_finished(
         base_tool: Any,
@@ -498,34 +734,30 @@ def _instrument_tools(
         if error is None and isinstance(tool_output, dict):
             decision = _extract_hitl_decision_from_output(tool_output)
         try:
-            payload = build_event_payload(
-                exec_ctx,
-                logical_event_type="tool_result",
-                phase="tool_result",
-                tool_name=tool_name,
-                extra_data=data,
-            )
-            insert_event(
-                id=str(uuid.uuid4()),
-                job_id=job_id,
-                todo_id=str(todo_id) if todo_id else None,
-                proc_inst_id=str(proc_inst_id) if proc_inst_id else None,
-                event_type="tool_usage_finished",
-                status=None,
-                crew_type=crew_type,
-                data=payload,
-            )
+            if event_queue is not None:
+                _enqueue_status(
+                    event_queue,
+                    "tool_usage_finished",
+                    data,
+                    proc_inst_id or "",
+                    str(todo_id) if todo_id else "",
+                    crew_type,
+                    job_id=job_id,
+                    exec_ctx=exec_ctx,
+                    logical_event_type="tool_result",
+                    phase="tool_result",
+                    agent_name=None,
+                )
             # 서브 에이전트 작업 요약 작성을 위해 job_id별 사용된 도구 이름을 수집한다.
             if job_tool_log is not None:
                 try:
-                    payload_body = payload.get("payload") or {}
-                    name = payload_body.get("tool_name")
+                    name = data.get("tool_name")
                     if isinstance(name, str) and name:
                         job_tool_log.setdefault(job_id, []).append(name)
                 except Exception:
                     logger.exception("Failed to collect tool usage for job summary", exc_info=True)
         except Exception:
-            logger.exception("Failed to insert tool_usage_finished event", exc_info=True)
+            logger.exception("Failed to enqueue tool_usage_finished event", exc_info=True)
         return decision
 
     for t in tools:
@@ -602,14 +834,15 @@ def _instrument_tools(
 
 
 class DeepAgentsActionExecutor(AgentExecutor):
-    """Runs todolist query via create_deep_agent(subagents); emits dict events."""
+    """Runs todolist query via create_deep_agent(subagents); emits A2A Task*Events."""
 
+    @override
     async def execute(
         self,
-        context: Any,
+        context: RequestContext,
         event_queue: EventQueue,
         exec_ctx: ExecutionContext | None = None,
-    ) -> str:
+    ) -> None:
         logger.info("DeepAgents 멀티 에이전트 실행 시작")
 
         query = context.get_user_input()
@@ -659,73 +892,28 @@ class DeepAgentsActionExecutor(AgentExecutor):
             input_data[pending_field] = human_response_answer.strip()
             parsed_query["input_data"] = input_data
 
-            # Emit a resume event for tracing.
+            # Emit a resume event for tracing via SDK EventQueue.
             try:
-                resume_payload = build_event_payload(
-                    exec_ctx,
-                    logical_event_type="resume",
-                    phase="resume",
-                    extra_data={
+                _enqueue_status(
+                    event_queue,
+                    "task_working",
+                    {
                         "resume_source": "human_response",
                         "human_answer": human_response_answer.strip(),
                         "previous_interrupt_agent_path": run_state.get("agent_path"),
                         "previous_interrupt_tool_name": run_state.get("tool_name"),
                     },
-                )
-                insert_event(
-                    id=str(uuid.uuid4()),
+                    proc_inst_id,
+                    task_id,
+                    "action",
                     job_id=job_uuid,
-                    todo_id=task_id or None,
-                    proc_inst_id=proc_inst_id or None,
-                    event_type="task_working",
-                    status=None,
-                    crew_type="action",
-                    data=resume_payload,
+                    exec_ctx=exec_ctx,
+                    logical_event_type="resume",
+                    phase="resume",
+                    agent_name=None,
                 )
             except Exception:
-                logger.exception("Failed to insert resume event", exc_info=True)
-
-        # HITL safety net: pre-run heuristic; when graph-level HITL is used it takes precedence.
-        hitl_needed, hitl_reason = _should_trigger_human_asked(description, instruction, input_data)
-        if hitl_needed:
-            try:
-                hitl_job_id = str(uuid.uuid4())
-                hitl_data = build_event_payload(
-                    exec_ctx,
-                    logical_event_type="interrupt",
-                    phase="interrupt",
-                    requires_human=True,
-                    extra_data={
-                        "role": "user",
-                        "text": hitl_reason
-                        or "Additional information or approval is required.",
-                        "type": "text",
-                        "options": [],
-                    },
-                )
-                insert_event(
-                    id=str(uuid.uuid4()),
-                    job_id=hitl_job_id,
-                    todo_id=task_id or None,
-                    proc_inst_id=proc_inst_id or None,
-                    event_type="human_asked",
-                    status="ASKED",
-                    crew_type="action",
-                    data=hitl_data,
-                )
-                return {
-                    "status": "waiting_for_human",
-                    "run_state": {
-                        "reason": hitl_reason,
-                        "pending_field": "input_data",
-                        "correlation_id": exec_ctx.correlation_id,
-                        "agent_path": list(exec_ctx.agent_path),
-                        "tool_name": None,
-                        "tool_call_context": None,
-                    },
-                }
-            except Exception:
-                logger.exception("Failed to insert human_asked event", exc_info=True)
+                logger.exception("Failed to enqueue resume event", exc_info=True)
 
         # Initialize processgpt_agent_utils context (for tools like mem0, memento, dmn_rule).
         set_context(
@@ -737,10 +925,16 @@ class DeepAgentsActionExecutor(AgentExecutor):
 
         all_tools: list[Any] = []
         try:
-            all_tools = await load_default_mcp_tools(tenant_id=tenant_id or None)
+            # SafeToolLoader 는 기본 MCP 서버(claude-skills, computer-use)를 포함한
+            # MCP 도구와 로컬 툴(mem0, memento, human_asked, dmn_rule)을 로드한다.
+            tool_loader = SafeToolLoader(tenant_id=tenant_id or None)
+            # tool_names 를 비우면 is_default=True 인 MCP 서버들을 우선 로드한다.
+            all_tools = tool_loader.create_tools_from_names(tool_names=[], agent_type=None)
+            # CrewAI/MCP 툴을 LangChain BaseTool로 래핑하여 tool() 데코레이터 __name__ 오류 방지
+            all_tools = _ensure_langchain_tools(all_tools)
         except Exception as e:
             logger.warning(
-                "MCP tools loading failed (subagent config continues with no MCP tools): %s",
+                "MCP tools loading via SafeToolLoader failed (subagent config continues with no MCP tools): %s",
                 e,
                 exc_info=False,
             )
@@ -779,7 +973,14 @@ class DeepAgentsActionExecutor(AgentExecutor):
             agent_id = row.get("id")
 
             sub_job_id = str(uuid.uuid4())
-            # 이 서브 에이전트의 도구 호출은 모두 sub_job_id로 로깅된다.
+            # 서브에이전트 도구 호출은 이 에이전트 이름으로 로깅되도록 전용 ExecutionContext 사용.
+            # (동일 exec_ctx를 쓰면 서브가 호출한 도구가 모두 root_orchestrator로 기록됨)
+            sub_exec_ctx = ExecutionContext(
+                correlation_id=exec_ctx.correlation_id,
+                agent_path=list(exec_ctx.agent_path) + [agent_name],
+                task_id=exec_ctx.task_id,
+                proc_inst_id=exec_ctx.proc_inst_id,
+            )
             if idx < len(subagents):
                 sub_tools = subagents[idx].get("tools", [])
                 _instrument_tools(
@@ -789,7 +990,8 @@ class DeepAgentsActionExecutor(AgentExecutor):
                     crew_type="action",
                     job_id_getter=lambda sj=sub_job_id: sj,
                     job_tool_log=subagent_tool_log,
-                    exec_ctx=exec_ctx,
+                    exec_ctx=sub_exec_ctx,
+                    event_queue=event_queue,
                 )
 
             subagent_contexts.append(
@@ -804,7 +1006,10 @@ class DeepAgentsActionExecutor(AgentExecutor):
             )
 
         name_to_context = {ctx["name"]: ctx for ctx in subagent_contexts}
-        subagent_event_middleware = _create_subagent_event_middleware(
+        (
+            subagent_event_middleware,
+            subagent_middleware_state,
+        ) = _create_subagent_event_middleware(
             event_queue,
             proc_inst_id,
             task_id,
@@ -815,8 +1020,7 @@ class DeepAgentsActionExecutor(AgentExecutor):
 
         model_name = extras.get("model") or "openai:gpt-4o"
 
-        # Build a sectioned, dynamic system prompt for the orchestrator,
-        # combining static base rules with the current work-item context.
+        # 1단계: Planner Agent 로 순수 플랜만 생성하고 planning 이벤트를 발행한다.
         base_rules = default_orchestrator_prompt()
         feedback_summary = extras.get("summarized_feedback") or ""
         form_fields = extras.get("form_fields")
@@ -825,7 +1029,7 @@ class DeepAgentsActionExecutor(AgentExecutor):
         if form_fields or form_html:
             form_info = {"fields": form_fields, "html": form_html}
 
-        system_prompt = build_orchestrator_system_prompt(
+        planner_system_prompt = build_orchestrator_system_prompt(
             base_rules=base_rules,
             description=description,
             instruction=instruction,
@@ -834,29 +1038,32 @@ class DeepAgentsActionExecutor(AgentExecutor):
             feedback=feedback_summary,
             form_info=form_info,
             tenant_id=tenant_id or None,
+            plan_text=None,
         )
-
-        orchestrator = build_orchestrator(
+        planner_agent = build_planner_agent(
             model_name=model_name,
-            system_prompt=system_prompt,
-            subagents=subagents,
-            middleware=extra_middleware,
+            system_prompt=planner_system_prompt,
         )
 
-        # 이 시점 이후에 발생하는 모든 도구 호출은 job_uuid와 동일한 job_id로 로깅된다.
-        current_job_id["value"] = job_uuid
-        # Task Execution Planner용 오케스트레이터 구성 이벤트
+        # Task Execution Planner용 planning 이벤트 (플랜 전용)
         planner_task_description = "\n\n".join(
             [part for part in [description, instruction] if part]
         ).strip()
+        planner_goal = (
+            "Your goal is to create an extremely detailed, step-by-step plan based on "
+            "the tasks and tools available to each agent so that they can perform the "
+            "tasks in an exemplary manner."
+        )
         _enqueue_status(
             event_queue,
             "task_started",
-        {
-            # UI용 보기 좋은 메시지 (도메인 독립)
-            "message": "루트 오케스트레이터가 작업 계획 수립을 시작했습니다.",
-            "task_description": planner_task_description,
-        },
+            {
+                "goal": planner_goal,
+                "name": "Unknown",
+                "role": "Task Execution Planner",
+                "agent_profile": "/images/chat-icon.png",
+                "task_description": planner_task_description,
+            },
             proc_inst_id,
             task_id,
             "action",
@@ -867,25 +1074,39 @@ class DeepAgentsActionExecutor(AgentExecutor):
             agent_name="root_orchestrator",
         )
 
+        plan_text: str = ""
         try:
-            result = await orchestrator.ainvoke(
+            planner_result = await planner_agent.ainvoke(
                 {"messages": [{"role": "user", "content": query or ""}]}
             )
+            planner_messages = planner_result.get("messages", [])
+            planner_raw = ""
+            if planner_messages:
+                last_msg = planner_messages[-1]
+                planner_content = (
+                    last_msg.get("content")
+                    if isinstance(last_msg, dict)
+                    else getattr(last_msg, "content", None)
+                )
+                planner_raw = _extract_plain_text(planner_content)
+            plan_text = _extract_plan_block(planner_raw) or _extract_plain_text(planner_raw).strip()
         except HitlInterrupt as hi:
             # A tool signalled that human input is required. Record a human_asked
             # interrupt event and return waiting_for_human so the caller can pause.
             decision = hi.decision or {}
             question = decision.get("question") or "이 작업을 계속 진행하려면 사람이 추가 정보를 입력해야 합니다."
             choices = decision.get("choices") or []
+            hitl_agent_name = "root_orchestrator"
+            for ctx in subagent_contexts:
+                if ctx.get("job_id") == hi.job_id:
+                    hitl_agent_name = ctx.get("name") or hitl_agent_name
+                    break
             try:
                 hitl_job_id = str(uuid.uuid4())
-                hitl_data = build_event_payload(
-                    exec_ctx,
-                    logical_event_type="interrupt",
-                    phase="interrupt",
-                    requires_human=True,
-                    tool_name=hi.tool_name,
-                    extra_data={
+                _enqueue_status(
+                    event_queue,
+                    "human_asked",
+                    {
                         "role": "user",
                         "text": question,
                         "type": "text",
@@ -896,19 +1117,18 @@ class DeepAgentsActionExecutor(AgentExecutor):
                             "tool_name": hi.tool_name,
                         },
                     },
-                )
-                insert_event(
-                    id=str(uuid.uuid4()),
+                    proc_inst_id,
+                    task_id,
+                    "action",
                     job_id=hitl_job_id,
-                    todo_id=task_id or None,
-                    proc_inst_id=proc_inst_id or None,
-                    event_type="human_asked",
+                    exec_ctx=exec_ctx,
+                    logical_event_type="interrupt",
+                    phase="interrupt",
+                    agent_name=hitl_agent_name,
                     status="ASKED",
-                    crew_type="action",
-                    data=hitl_data,
                 )
             except Exception:
-                logger.exception("Failed to insert human_asked event from tool HITL", exc_info=True)
+                logger.exception("Failed to enqueue human_asked event from tool HITL", exc_info=True)
 
             return {
                 "status": "waiting_for_human",
@@ -924,23 +1144,14 @@ class DeepAgentsActionExecutor(AgentExecutor):
                     },
                 },
             }
-        final_messages = result.get("messages", [])
-        raw_text = ""
-        if final_messages:
-            last = final_messages[-1]
-            content = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
-            raw_text = _extract_plain_text(content)
+        except Exception:
+            logger.exception("Planner agent failed; continuing without explicit plan.", exc_info=True)
 
-        # [PLAN]...[/PLAN] 블록만 plans로 기록 (정형화된 계획 텍스트만; 에러/요약 제외)
-        plans_text = _extract_plan_block(raw_text)
-        if not plans_text and raw_text:
-            plans_text = _extract_plain_text(raw_text).strip()
         _enqueue_status(
             event_queue,
             "task_completed",
             {
-            "message": "작업 계획 수립이 완료되었습니다.",
-            "plan": plans_text,
+                "plans": plan_text,
             },
             proc_inst_id,
             task_id,
@@ -952,17 +1163,175 @@ class DeepAgentsActionExecutor(AgentExecutor):
             agent_name="root_orchestrator",
         )
 
-        # 서브 에이전트 task_started/task_completed는 미들웨어에서 task() 호출 시 발행됨.
-        # 미들웨어가 없거나, 미들웨어가 있어도 오케스트레이터가 task()를 한 번도 호출하지 않은 경우
-        # 사후에 이벤트를 발행해 서브 에이전트 구성이 로그에 남도록 한다.
+        # 2단계: Worker Orchestrator 에게 plan_text 를 주입하여 실제 서브 에이전트 실행을 수행한다.
+        system_prompt = build_orchestrator_system_prompt(
+            base_rules=base_rules,
+            description=description,
+            instruction=instruction,
+            input_data=input_data,
+            agents=agent_rows,
+            feedback=feedback_summary,
+            form_info=form_info,
+            tenant_id=tenant_id or None,
+            plan_text=plan_text or None,
+        )
+
+        # 오케스트레이터에는 task()와 request_human_input만 부여. 스킬/MCP 도구는
+        # 서브에이전트에만 두어, 루트가 직접 업무를 수행하지 않고 위임만 하도록 한다.
+        orchestrator = build_orchestrator(
+            model_name=model_name,
+            system_prompt=system_prompt,
+            subagents=subagents,
+            tools=[],  # 도메인 도구 없음 → 반드시 서브에이전트 task()로 위임
+            middleware=extra_middleware,
+        )
+
+        # 이 시점 이후에 발생하는 모든 도구 호출은 job_uuid와 동일한 job_id로 로깅된다.
+        current_job_id["value"] = job_uuid
+
+        try:
+            result = await orchestrator.ainvoke(
+                {"messages": [{"role": "user", "content": query or ""}]}
+            )
+        except HitlInterrupt as hi:
+            # A tool signalled that human input is required during worker execution.
+            # Record a human_asked interrupt event and return waiting_for_human so the caller can pause.
+            decision = hi.decision or {}
+            question = decision.get("question") or "이 작업을 계속 진행하려면 사람이 추가 정보를 입력해야 합니다."
+            choices = decision.get("choices") or []
+            hitl_agent_name = "root_orchestrator"
+            for ctx in subagent_contexts:
+                if ctx.get("job_id") == hi.job_id:
+                    hitl_agent_name = ctx.get("name") or hitl_agent_name
+                    break
+            try:
+                hitl_job_id = str(uuid.uuid4())
+                _enqueue_status(
+                    event_queue,
+                    "human_asked",
+                    {
+                        "role": "user",
+                        "text": question,
+                        "type": "text",
+                        "options": choices,
+                        "reason": decision.get("reason"),
+                        "tool_call_context": {
+                            "job_id": hi.job_id,
+                            "tool_name": hi.tool_name,
+                        },
+                    },
+                    proc_inst_id,
+                    task_id,
+                    "action",
+                    job_id=hitl_job_id,
+                    exec_ctx=exec_ctx,
+                    logical_event_type="interrupt",
+                    phase="interrupt",
+                    agent_name=hitl_agent_name,
+                    status="ASKED",
+                )
+            except Exception:
+                logger.exception("Failed to enqueue human_asked event from tool HITL", exc_info=True)
+
+            return {
+                "status": "waiting_for_human",
+                "run_state": {
+                    "reason": decision.get("reason") or "Tool requested human input.",
+                    "pending_field": "human_input",
+                    "correlation_id": exec_ctx.correlation_id,
+                    "agent_path": list(exec_ctx.agent_path),
+                    "tool_name": hi.tool_name,
+                    "tool_call_context": {
+                        "job_id": hi.job_id,
+                        "tool_name": hi.tool_name,
+                    },
+                },
+            }
+        except Exception:
+            logger.exception("Worker orchestrator failed.", exc_info=True)
+            raise
+
+        # LangGraph DeepAgents 그래프 레벨에서 request_human_input 도구 호출로 인해
+        # interrupt 가 발생한 경우(__interrupt__ 페이로드)를 처리한다.
+        interrupt_payload = None
+        try:
+            interrupt_payload = extract_interrupt_payload(result)
+        except Exception:
+            logger.exception("Failed to extract graph-level interrupt payload", exc_info=True)
+
+        if interrupt_payload:
+            question = (
+                interrupt_payload.get("question")
+                if isinstance(interrupt_payload, dict)
+                else None
+            ) or "이 작업을 계속 진행하려면 사람이 추가 정보를 입력해야 합니다."
+            hitl_agent_name = (
+                (exec_ctx.agent_path[-1] if exec_ctx.agent_path else None)
+                or "root_orchestrator"
+            )
+            try:
+                hitl_job_id = str(uuid.uuid4())
+                _enqueue_status(
+                    event_queue,
+                    "human_asked",
+                    {
+                        "role": "user",
+                        "text": question,
+                        "type": "text",
+                        "options": [],
+                        "interrupt_payload": interrupt_payload,
+                    },
+                    proc_inst_id,
+                    task_id,
+                    "action",
+                    job_id=hitl_job_id,
+                    exec_ctx=exec_ctx,
+                    logical_event_type="interrupt",
+                    phase="interrupt",
+                    agent_name=hitl_agent_name,
+                    status="ASKED",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to enqueue human_asked event from graph-level HITL", exc_info=True
+                )
+
+            return {
+                "status": "waiting_for_human",
+                "run_state": {
+                    "reason": "DeepAgents graph requested human input.",
+                    "pending_field": "human_input",
+                    "correlation_id": exec_ctx.correlation_id,
+                    "agent_path": list(exec_ctx.agent_path),
+                    "tool_name": "request_human_input",
+                    "tool_call_context": {
+                        "job_id": hitl_job_id,
+                        "tool_name": "request_human_input",
+                    },
+                },
+            }
+
+        final_messages = result.get("messages", [])
+        raw_text = ""
+        if final_messages:
+            last = final_messages[-1]
+            content = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
+            raw_text = _extract_plain_text(content)
+
+        # 서브 에이전트 task_started/task_completed는 미들웨어에서 task() 호출 시 발행된다.
+        # 다만, 환경에 따라 AgentMiddleware 가 동작하지 않거나, task() 호출 계층이 미들웨어와
+        # 분리되어 있을 수 있으므로 아래 조건에서 fallback 이벤트를 발행한다.
         any_subagent_invoked = any(
             subagent_tool_log.get(ctx["job_id"]) for ctx in subagent_contexts
         )
-        if not subagent_event_middleware or not any_subagent_invoked:
-            if subagent_event_middleware and not any_subagent_invoked:
+        middleware_saw_task = bool(
+            (subagent_middleware_state or {}).get("saw_task_call")
+        )
+        if not subagent_event_middleware or not middleware_saw_task:
+            if subagent_event_middleware and not middleware_saw_task and any_subagent_invoked:
                 logger.warning(
-                    "Orchestrator completed without delegating to any subagent (task() not called); "
-                    "emitting subagent events as fallback."
+                    "Subagent middleware was attached but did not observe any task() calls; "
+                    "emitting subagent task_started/task_completed events as fallback."
                 )
             for ctx in subagent_contexts:
                 sub_job_id = ctx["job_id"]
@@ -1076,11 +1445,12 @@ class DeepAgentsActionExecutor(AgentExecutor):
         )
 
         logger.info("DeepAgents 멀티 에이전트 실행 완료")
-        return {"status": "completed"}
+        return None
 
+    @override
     async def cancel(
         self,
-        context: Any,
+        context: RequestContext,
         event_queue: EventQueue,
         exec_ctx: ExecutionContext | None = None,
     ) -> None:

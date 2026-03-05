@@ -17,4 +17,5 @@ dependencies = [
     "supabase>=2.0.0",
     "typing-extensions>=4.8.0",
     "process-gpt-agent-utils==0.3.3",
+    "process-gpt-agent-sdk==0.4.14",
 ]

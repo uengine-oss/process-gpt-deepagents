@@ -27,10 +27,10 @@ A2A 이벤트 발행 (TaskStatusUpdateEvent / TaskArtifactUpdateEvent)
 - `deepagents_action_executor.py`
   - A2A 래핑 멀티 에이전트 실행기 (AgentExecutor)
 - `database.py`
-  - Supabase 클라이언트 (agent_loader 등에서 사용)
-- `deep_agent_factory.py`
+  - Supabase 클라이언트 (subagents 등에서 사용)
+- `deepagents_factory.py`
   - 오케스트레이터 에이전트 생성 (서브에이전트 포함)
-- `agent_loader.py`
+- `subagents.py`
   - Supabase에서 에이전트 정의 로딩, 스킬 API 호출, 서브에이전트 설정 구성
 - `output_utils.py`
   - LLM 결과를 ProcessGPT 반환 포맷으로 변환
