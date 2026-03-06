@@ -144,6 +144,7 @@ def build_orchestrator_system_prompt(
     form_info: Mapping[str, Any] | None,
     tenant_id: str | None = None,
     plan_text: str | None = None,
+    output_language: str | None = None,
 ) -> str:
     """Compose a sectioned system_prompt for the DeepAgents orchestrator.
 
@@ -153,6 +154,14 @@ def build_orchestrator_system_prompt(
     """
     parts: list[str] = []
     parts.append(base_rules.rstrip())
+
+    # 사용자 입력이 한글인 경우 [PLAN] 및 최종 result를 한글로 작성하도록 지시
+    if output_language == "korean":
+        parts.append(
+            "\n\n=== Output language ===\n"
+            "The user's request is in Korean. You MUST write your [PLAN] block and all "
+            "final result/summary text in Korean. Do not use English for plans or result.\n"
+        )
 
     # 섹션 1: 워크아이템 요약 + 테넌트 컨텍스트
     desc = (description or "").strip()

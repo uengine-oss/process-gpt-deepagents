@@ -468,6 +468,13 @@ def _parse_block(source: str, header: str, next_headers: list[str]) -> str:
     return tail[:end_idx].strip()
 
 
+def _is_korean_user_input(text: str) -> bool:
+    """Return True if the text contains Korean (Hangul) characters."""
+    if not (text or "").strip():
+        return False
+    return bool(re.search(r"[가-힣]", text))
+
+
 def parse_workitem_query(query: str) -> dict[str, Any]:
     """Parse [Description]/[Instruction]/[InputData] blocks from the work-item query."""
     text = query or ""
@@ -1029,6 +1036,10 @@ class DeepAgentsActionExecutor(AgentExecutor):
         if form_fields or form_html:
             form_info = {"fields": form_fields, "html": form_html}
 
+        # 사용자가 한글로 입력한 경우 plans/result를 한글로 작성하도록 지시
+        user_text_for_lang = (query or "").strip() or f"{description or ''} {instruction or ''}".strip()
+        output_language = "korean" if _is_korean_user_input(user_text_for_lang) else None
+
         planner_system_prompt = build_orchestrator_system_prompt(
             base_rules=base_rules,
             description=description,
@@ -1039,6 +1050,7 @@ class DeepAgentsActionExecutor(AgentExecutor):
             form_info=form_info,
             tenant_id=tenant_id or None,
             plan_text=None,
+            output_language=output_language,
         )
         planner_agent = build_planner_agent(
             model_name=model_name,
@@ -1174,6 +1186,7 @@ class DeepAgentsActionExecutor(AgentExecutor):
             form_info=form_info,
             tenant_id=tenant_id or None,
             plan_text=plan_text or None,
+            output_language=output_language,
         )
 
         # 오케스트레이터에는 task()와 request_human_input만 부여. 스킬/MCP 도구는
@@ -1396,9 +1409,14 @@ class DeepAgentsActionExecutor(AgentExecutor):
                     "result": final_text,
                 },
             }
-            final_event_data = final_result_payload
         else:
-            final_event_data = pure_form_data
+            final_result_payload = pure_form_data
+
+        # 이벤트 테이블: result 키에 평문 텍스트만 저장 (중첩 result.output.result 구조 사용 안 함)
+        if not has_form:
+            final_event_result = final_text
+        else:
+            final_event_result = pure_form_data
 
         end_job = str(uuid.uuid4())
         _enqueue_status(
@@ -1421,7 +1439,7 @@ class DeepAgentsActionExecutor(AgentExecutor):
             "task_completed",
             {
                 "message": "최종 결과 생성이 완료되었습니다.",
-                "result": final_event_data,
+                "result": final_event_result,
             },
             proc_inst_id,
             task_id,
