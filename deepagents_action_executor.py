@@ -16,16 +16,19 @@ from a2a.types import TaskStatusUpdateEvent, TaskState, TaskArtifactUpdateEvent
 from a2a.utils import new_agent_text_message, new_text_artifact
 
 from deepagents_hitl import extract_interrupt_payload
-from subagents import build_subagent_configs
+from subagents import build_subagent_configs, DEFAULT_MCP_SERVER_NAMES
 from deepagents_factory import (
     build_orchestrator,
     build_orchestrator_system_prompt,
     default_orchestrator_prompt,
+    default_planner_prompt,
     build_planner_agent,
 )
+from database import get_latest_human_response
 from output_utils import convert_agent_output
 from processgpt_agent_utils.tools.safe_tool_loader import SafeToolLoader
 from processgpt_agent_utils.utils.context_manager import set_context
+from local_skills_api_tools import build_local_skills_api_tools
 
 logger = logging.getLogger(__name__)
 
@@ -277,14 +280,27 @@ def _enqueue_status(
     logical = logical_event_type or ("agent_started" if event_type == "task_started" else "agent_finished")
     effective_phase = phase or "reasoning"
 
-    # 1) 우리가 원하는 평탄화 payload(메타+도메인)를 먼저 만든다.
-    payload = build_event_payload(
-        exec_ctx,
-        logical_event_type=logical,
-        phase=effective_phase,
-        agent_name=agent_name,
-        extra_data=data,
-    )
+    # 1) events.data 로 저장할 payload 구성
+    #    - task_completed 인 경우: 메타데이터(depth, phase 등)를 제거하고
+    #      태스크 결과에 해당하는 plans/result/structured_plans 만 남긴다.
+    if event_type == "task_completed":
+        core: dict[str, Any] = {}
+        if isinstance(data, dict):
+            if "plans" in data:
+                core["plans"] = data["plans"]
+            if "structured_plans" in data:
+                core["structured_plans"] = data["structured_plans"]
+            if "result" in data:
+                core["result"] = data["result"]
+        payload = core
+    else:
+        payload = build_event_payload(
+            exec_ctx,
+            logical_event_type=logical,
+            phase=effective_phase,
+            agent_name=agent_name,
+            extra_data=data,
+        )
 
     # 2) a2a 메시지 객체 생성 (텍스트는 payload JSON)
     try:
@@ -370,7 +386,7 @@ def _create_subagent_event_middleware(
     proc_inst_id: str,
     task_id: str,
     name_to_context: dict[str, dict[str, Any]],
-    subagent_tool_log: dict[str, list[str]],
+    subagent_tool_log: dict[str, list[dict[str, Any]]],
 ) -> tuple[Any | None, dict[str, Any]]:
     """Create middleware that emits task_started/task_completed around each subagent (task tool) run.
 
@@ -383,6 +399,7 @@ def _create_subagent_event_middleware(
     state: dict[str, Any] = {"saw_task_call": False}
 
     if AgentMiddleware is None or ToolCallRequest is None:
+        logger.warning("SubagentEventMiddleware is not available, returning (None, state)")
         return None, state
 
     class SubagentEventMiddleware(AgentMiddleware):
@@ -391,15 +408,19 @@ def _create_subagent_event_middleware(
             if tool_name != "task":
                 return await handler(request)
 
-            # 서브 에이전트 실행을 담당하는 task() 호출을 한 번이라도 감쌌음을 표시.
-            state["saw_task_call"] = True
-
-            call = getattr(request, "call", None) or {}
-            args = call.get("args", {}) if isinstance(call, dict) else {}
+            tool_call = getattr(request, "tool_call", None) or {}
+            args = tool_call.get("args", {}) if isinstance(tool_call, dict) else {}
             subagent_type = args.get("subagent_type") or args.get("subagent_name") or ""
+            step_id = args.get("step_id") or args.get("step") or None
+            step_instruction = args.get("instruction")
             ctx = name_to_context.get(subagent_type) if subagent_type else None
             if not ctx:
+                # 서브 에이전트 컨텍스트를 찾지 못한 task() 호출은 폴백 로직에서
+                # 처리할 수 있도록 saw_task_call 플래그를 그대로 유지한다.
                 return await handler(request)
+
+            # 유효한 서브 에이전트 task() 호출을 한 번이라도 감쌌음을 표시.
+            state["saw_task_call"] = True
 
             job_id = ctx["job_id"]
             _enqueue_status(
@@ -411,6 +432,8 @@ def _create_subagent_event_middleware(
                     "goal": ctx["goal"],
                     "agent_profile": ctx["agent_profile"],
                     "agent_id": ctx.get("agent_id"),
+                    "step_id": step_id,
+                    "step_instruction": step_instruction,
                 },
                 proc_inst_id,
                 task_id,
@@ -419,16 +442,14 @@ def _create_subagent_event_middleware(
             )
             try:
                 result = await handler(request)
-                used_tools = subagent_tool_log.get(job_id, [])
-                작업_텍스트 = (
-                    f"다음 도구 호출을 통해 작업을 수행했습니다: {', '.join(sorted(set(used_tools)))}"
-                    if used_tools
-                    else "도구 호출 이벤트 없이 작업을 수행했습니다."
-                )
+                tool_details = subagent_tool_log.get(job_id, [])
+                work_summary = _build_tool_usage_summary(tool_details)
                 _enqueue_status(
                     event_queue,
                     "task_completed",
-                    {"수행한_작업": 작업_텍스트},
+                    {
+                        "result": work_summary
+                    },
                     proc_inst_id,
                     task_id,
                     "action",
@@ -439,7 +460,9 @@ def _create_subagent_event_middleware(
                 _enqueue_status(
                     event_queue,
                     "task_completed",
-                    {"수행한_작업": "작업 실행 중 오류가 발생했습니다."},
+                    {
+                        "result": "작업 실행 중 오류가 발생했습니다."
+                    },
                     proc_inst_id,
                     task_id,
                     "action",
@@ -590,6 +613,153 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _truncate_str(s: str, max_len: int = 100) -> str:
+    """Truncate a string to max_len characters, adding '...' if truncated."""
+    if len(s) <= max_len:
+        return s
+    return s[:max_len - 3] + "..."
+
+
+def _summarize_tool_input(tool_name: str, tool_input: Any) -> str:
+    """Generate a user-friendly summary of tool input."""
+    if not tool_input:
+        return ""
+    
+    if not isinstance(tool_input, dict):
+        return _truncate_str(str(tool_input), 150)
+    
+    # Tool-specific summaries for common tools
+    if tool_name == "find_helpful_skills":
+        task_desc = tool_input.get("task_description", "")
+        tenant = tool_input.get("tenant_id", "")
+        return f"'{_truncate_str(task_desc, 80)}' 작업에 도움이 되는 스킬 검색 (tenant: {tenant})"
+    
+    if tool_name == "read_skill_document":
+        skill = tool_input.get("skill_name", "")
+        doc = tool_input.get("document_path", "")
+        return f"스킬 '{skill}'의 문서 '{doc}' 읽기"
+    
+    if tool_name == "list_skill_files_http":
+        skill = tool_input.get("skill_name", "")
+        return f"스킬 '{skill}'의 파일 목록 조회"
+    
+    if tool_name == "read_skill_file_http":
+        skill = tool_input.get("skill_name", "")
+        file_path = tool_input.get("file_path", "")
+        return f"스킬 '{skill}'의 파일 '{file_path}' 읽기"
+    
+    if tool_name == "run_shell":
+        cmd = tool_input.get("command", "")
+        return f"셸 명령 실행: {_truncate_str(cmd, 120)}"
+    
+    if tool_name == "create_session":
+        session_id = tool_input.get("session_id", "")
+        return f"세션 '{session_id}' 생성"
+    
+    if tool_name == "delete_session":
+        session_id = tool_input.get("session_id", "")
+        return f"세션 '{session_id}' 삭제"
+    
+    # Generic fallback: list key parameters
+    key_params = []
+    for k, v in list(tool_input.items())[:3]:
+        if isinstance(v, str):
+            key_params.append(f"{k}='{_truncate_str(v, 30)}'")
+        elif isinstance(v, (int, float, bool)):
+            key_params.append(f"{k}={v}")
+    return ", ".join(key_params) if key_params else str(tool_input)[:100]
+
+
+def _summarize_tool_output(tool_name: str, tool_output: Any, error: Exception | None) -> str:
+    """Generate a user-friendly summary of tool output."""
+    if error is not None:
+        return f"오류 발생: {_truncate_str(str(error), 100)}"
+    
+    if tool_output is None:
+        return "결과 없음"
+    
+    # Handle string output
+    if isinstance(tool_output, str):
+        text = tool_output.strip()
+        if not text:
+            return "빈 결과"
+        # Check for common error patterns
+        if "permission denied" in text.lower():
+            return "권한 오류로 실패"
+        if "not found" in text.lower():
+            return "대상을 찾을 수 없음"
+        if "error" in text.lower() or "stderr" in text.lower():
+            return f"실행 결과 (오류 포함): {_truncate_str(text, 150)}"
+        return f"실행 완료: {_truncate_str(text, 150)}"
+    
+    # Handle dict output
+    if isinstance(tool_output, dict):
+        # Check for skill search results
+        if "skills" in tool_output:
+            skills = tool_output.get("skills", [])
+            if isinstance(skills, list):
+                count = len(skills)
+                if count == 0:
+                    return "검색된 스킬 없음"
+                skill_names = [s.get("skill_name", s.get("name", "?")) for s in skills[:3] if isinstance(s, dict)]
+                return f"{count}개 스킬 발견: {', '.join(skill_names)}" + ("..." if count > 3 else "")
+        
+        # Check for file listing results
+        if "files" in tool_output:
+            files = tool_output.get("files", [])
+            if isinstance(files, list):
+                return f"{len(files)}개 파일 발견"
+        
+        # Check for content field
+        if "content" in tool_output:
+            content = tool_output.get("content", "")
+            if isinstance(content, str):
+                return f"문서 내용 조회 완료 ({len(content)} 글자)"
+        
+        # Generic dict summary
+        return f"결과 반환 (키: {', '.join(list(tool_output.keys())[:5])})"
+    
+    # Handle list output
+    if isinstance(tool_output, list):
+        return f"{len(tool_output)}개 항목 반환"
+    
+    return _truncate_str(str(tool_output), 150)
+
+
+def _build_tool_usage_summary(tool_details: list[dict[str, Any]]) -> str:
+    """Build a user-friendly summary of all tool calls for a subagent."""
+    if not tool_details:
+        return "도구 호출 없이 작업을 수행했습니다."
+    
+    lines: list[str] = []
+    for idx, detail in enumerate(tool_details, 1):
+        tool_name = detail.get("tool_name", "unknown")
+        input_summary = detail.get("input_summary", "")
+        output_summary = detail.get("output_summary", "")
+        success = detail.get("success", True)
+        
+        status_icon = "✓" if success else "✗"
+        line = f"{idx}. [{status_icon}] {tool_name}"
+        if input_summary:
+            line += f": {input_summary}"
+        if output_summary:
+            line += f" → {output_summary}"
+        lines.append(line)
+    
+    return "다음 도구 호출을 통해 작업을 수행했습니다:\n" + "\n".join(lines)
+
+
+_MARKUP_TAG_RE = re.compile(
+    r"\[(PLAN|/PLAN|SUMMARY|/SUMMARY|RESULT|/RESULT|WorkItem|/WorkItem)\]",
+    re.IGNORECASE,
+)
+
+
+def _strip_markup_tags(text: str) -> str:
+    """Remove [PLAN], [/PLAN], [SUMMARY], [/SUMMARY], [RESULT], [/RESULT] etc. from text."""
+    return _MARKUP_TAG_RE.sub("", text)
+
+
 def _extract_plain_text(value: Any) -> str:
     """Extract plain text from common message/content structures without stringifying objects."""
     if isinstance(value, str):
@@ -611,22 +781,22 @@ def _extract_plain_text(value: Any) -> str:
         if isinstance(parsed, (list, dict)):
             # 파싱에 성공했다면, 그 안에서 텍스트 필드만 추출한다.
             return _extract_plain_text(parsed)
-        # 일반 문자열이면 그대로 반환
-        return value
+        # 일반 문자열이면 마커 태그 제거 후 반환
+        return _strip_markup_tags(value)
     if isinstance(value, list):
         parts: list[str] = []
         for item in value:
             if isinstance(item, str):
-                parts.append(item)
+                parts.append(_strip_markup_tags(item))
             elif isinstance(item, dict):
                 text = item.get("text") or item.get("content")
                 if isinstance(text, str):
-                    parts.append(text)
+                    parts.append(_strip_markup_tags(text))
         return "\n".join(p for p in parts if p)
     if isinstance(value, dict):
         text = value.get("text") or value.get("content")
         if isinstance(text, str):
-            return text
+            return _strip_markup_tags(text)
     return ""
 
 
@@ -649,6 +819,227 @@ def _extract_plan_block(source: str) -> str:
         block = text[start_idx:end_idx].strip()
     # Ensure we return plain text (no list/dict string representation)
     return _extract_plain_text(block) if block else ""
+def _validate_structured_plan(
+    structured_plans: dict[str, Any] | None,
+    *,
+    agent_rows: list[dict[str, Any]],
+    subagents: list[dict[str, Any]],
+    input_data: dict[str, Any],
+    all_tools: list[Any],
+) -> None:
+    """Best-effort validation of a structured plan against configured agents/tools.
+
+    - Logs warnings for unknown agent names, tools, or input keys.
+    - Does NOT raise; this must never block execution.
+    """
+    if not structured_plans:
+        return
+
+    steps = structured_plans.get("steps")
+    if not isinstance(steps, list):
+        return
+
+    # 에이전트 이름 집합 (DB rows + subagent configs)
+    known_agent_names: set[str] = set()
+    for row in agent_rows:
+        for key in ("alias", "username", "name", "id"):
+            value = row.get(key)
+            if value is None:
+                continue
+            known_agent_names.add(str(value))
+    for sa in subagents:
+        name = sa.get("name")
+        if isinstance(name, str):
+            known_agent_names.add(name)
+
+    # 인풋 키 집합
+    input_keys: set[str] = set(input_data.keys()) if isinstance(input_data, dict) else set()
+
+    # 툴 이름 집합 (MCP 서버 이름과 LangChain 툴 이름)
+    known_tool_names: set[str] = set(DEFAULT_MCP_SERVER_NAMES)
+    for t in all_tools:
+        name = getattr(t, "name", None) or getattr(t, "__class__", type(t)).__name__
+        if isinstance(name, str):
+            known_tool_names.add(name)
+
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        step_id = step.get("id") or step.get("step_number")
+        agent_name = step.get("agent_name")
+        if agent_name and agent_name not in known_agent_names:
+            logger.warning(
+                "Structured plan step references unknown agent '%s' (step=%s). Known agents: %s",
+                agent_name,
+                step_id,
+                sorted(known_agent_names),
+            )
+
+        for tool in step.get("tools") or []:
+            if isinstance(tool, str) and tool and tool not in known_tool_names:
+                logger.warning(
+                    "Structured plan step references unknown tool/MCP '%s' (step=%s). Known tools: %s",
+                    tool,
+                    step_id,
+                    sorted(known_tool_names),
+                )
+
+        for key in step.get("input_keys") or []:
+            if isinstance(key, str) and key and input_keys and key not in input_keys:
+                logger.warning(
+                    "Structured plan step references unknown InputData key '%s' (step=%s). Known keys: %s",
+                    key,
+                    step_id,
+                    sorted(input_keys),
+                )
+
+
+
+def _parse_structured_plan(plan_text: str) -> dict[str, Any] | None:
+    """Parse a [PLAN] text into a structured dict.
+
+    Supports two formats:
+
+    1. Legacy structured format (labels are parsed case-sensitively):
+        Step N: <one-line title>
+        Agent: <agent name>
+        Tools: <comma-separated tool/MCP server names>
+        InputKeys: <comma-separated InputData keys>
+        ExpectedOutput: <short description>
+        DependsOn: <comma-separated step numbers or '-'>
+
+    2. New markdown narrative format:
+        ## 1. 단계 제목
+        1. 세부 단계 설명...
+        2. 또 다른 세부 단계...
+        이 단계는 '에이전트명'가 수행합니다.
+
+    Returns:
+        {"steps": [...]} or None if no steps could be parsed.
+    """
+    text = (plan_text or "").strip()
+    if not text:
+        return None
+
+    lines = text.splitlines()
+    steps: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    current_content_lines: list[str] = []
+
+    # Legacy format: "Step N: title"
+    step_header_re = re.compile(r"^\s*Step\s+(\d+)\s*[:.]\s*(.*)$")
+    # New markdown format: "## N. title" or "## N title"
+    md_header_re = re.compile(r"^##\s*(\d+)\s*[.:]\s*(.*)$")
+    # Agent extraction from narrative: "이 단계는 '에이전트명'가" or "'에이전트명' 에이전트가"
+    agent_pattern_re = re.compile(r"['\"]([^'\"]+)['\"](?:가|이|에이전트|가 수행|이 수행|가 담당|이 담당)")
+    # Tool mentions in text: 'tool_name' 도구
+    tool_pattern_re = re.compile(r"['\"]([a-zA-Z_][a-zA-Z0-9_\-]*)['\"](?:\s*도구|\s*스킬|\s*tool|\s*skill)")
+
+    def _flush_current() -> None:
+        nonlocal current, current_content_lines
+        if current is None:
+            return
+        if "id" not in current and "step_number" in current:
+            current["id"] = f"step_{current['step_number']}"
+
+        # For markdown format, extract agent and tools from content lines
+        if current_content_lines and not current.get("agent_name"):
+            full_content = "\n".join(current_content_lines)
+            # Extract agent name
+            agent_match = agent_pattern_re.search(full_content)
+            if agent_match:
+                current["agent_name"] = agent_match.group(1)
+            # Extract tool names
+            tool_matches = tool_pattern_re.findall(full_content)
+            if tool_matches:
+                current["tools"] = list(dict.fromkeys(tool_matches))  # dedupe preserving order
+            # Store description
+            current["description"] = full_content.strip()
+
+        steps.append(current)
+        current = None
+        current_content_lines = []
+
+    for raw_line in lines:
+        line = raw_line.rstrip()
+
+        # Check for markdown header (new format)
+        md_match = md_header_re.match(line)
+        if md_match:
+            _flush_current()
+            step_no = int(md_match.group(1))
+            title = md_match.group(2).strip()
+            current = {
+                "step_number": step_no,
+                "title": title,
+                "agent_name": None,
+                "tools": [],
+                "input_keys": [],
+                "expected_output": "",
+                "depends_on": [],
+            }
+            continue
+
+        # Check for legacy header
+        m = step_header_re.match(line)
+        if m:
+            _flush_current()
+            step_no = int(m.group(1))
+            title = m.group(2).strip()
+            current = {
+                "step_number": step_no,
+                "title": title,
+                "agent_name": None,
+                "tools": [],
+                "input_keys": [],
+                "expected_output": "",
+                "depends_on": [],
+            }
+            continue
+
+        if current is None:
+            # Ignore lines before the first Step header.
+            continue
+
+        # Legacy format labels
+        if line.startswith("Agent:"):
+            value = line[len("Agent:") :].strip()
+            current["agent_name"] = value or None
+        elif line.startswith("Tools:"):
+            value = line[len("Tools:") :].strip()
+            if value and value != "-":
+                current["tools"] = [t.strip() for t in value.split(",") if t.strip()]
+        elif line.startswith("InputKeys:"):
+            value = line[len("InputKeys:") :].strip()
+            if value and value != "-":
+                current["input_keys"] = [k.strip() for k in value.split(",") if k.strip()]
+        elif line.startswith("ExpectedOutput:"):
+            value = line[len("ExpectedOutput:") :].strip()
+            current["expected_output"] = value
+        elif line.startswith("DependsOn:"):
+            value = line[len("DependsOn:") :].strip()
+            if value and value != "-":
+                deps: list[str] = []
+                for token in value.split(","):
+                    token = token.strip()
+                    if not token:
+                        continue
+                    # token may be "1" or "step_1" etc.
+                    if token.isdigit():
+                        deps.append(f"step_{token}")
+                    else:
+                        deps.append(token)
+                current["depends_on"] = deps
+        else:
+            # Collect content lines for markdown format parsing
+            if line:
+                current_content_lines.append(line)
+
+    _flush_current()
+
+    if not steps:
+        return None
+    return {"steps": steps}
 
 
 def _instrument_tools(
@@ -658,7 +1049,7 @@ def _instrument_tools(
     proc_inst_id: str | None,
     crew_type: str = "action",
     job_id_getter: callable | None = None,
-    job_tool_log: dict[str, list[str]] | None = None,
+    job_tool_log: dict[str, list[dict[str, Any]]] | None = None,
     exec_ctx: ExecutionContext | None = None,
     event_queue: Any | None = None,
 ) -> list[Any]:
@@ -755,12 +1146,18 @@ def _instrument_tools(
                     phase="tool_result",
                     agent_name=None,
                 )
-            # 서브 에이전트 작업 요약 작성을 위해 job_id별 사용된 도구 이름을 수집한다.
+            # 서브 에이전트 작업 요약 작성을 위해 job_id별 도구 호출 상세 정보를 수집한다.
             if job_tool_log is not None:
                 try:
                     name = data.get("tool_name")
                     if isinstance(name, str) and name:
-                        job_tool_log.setdefault(job_id, []).append(name)
+                        tool_detail: dict[str, Any] = {
+                            "tool_name": name,
+                            "input_summary": _summarize_tool_input(name, safe_input),
+                            "output_summary": _summarize_tool_output(name, safe_output, error),
+                            "success": error is None,
+                        }
+                        job_tool_log.setdefault(job_id, []).append(tool_detail)
                 except Exception:
                     logger.exception("Failed to collect tool usage for job summary", exc_info=True)
         except Exception:
@@ -865,8 +1262,23 @@ class DeepAgentsActionExecutor(AgentExecutor):
         logger.info("task_id=%s proc_inst_id=%s form_id=%s", task_id, proc_inst_id, form_id)
 
         # Prepare run_state / human_response before creating execution context.
-        run_state = (extras.get("run_state") or {}) if isinstance(extras.get("run_state"), dict) else {}
-        human_response_answer = extras.get("human_response_answer")
+        # 우선 HUMAN_ASKED 상태의 워크아이템인 경우 todolist.draft.run_state 와
+        # events 테이블의 최신 human_response 이벤트를 기반으로 재개 정보를 구성한다.
+        draft_status = row.get("draft_status")
+        draft = row.get("draft") if isinstance(row.get("draft"), dict) else None
+
+        if draft_status == "HUMAN_ASKED":
+            run_state = {}
+            if draft and isinstance(draft.get("run_state"), dict):
+                run_state = dict(draft.get("run_state") or {})
+            try:
+                human_response_answer = get_latest_human_response(task_id)
+            except Exception:
+                human_response_answer = None
+                logger.exception("Failed to load latest human_response for resume", exc_info=True)
+        else:
+            run_state = (extras.get("run_state") or {}) if isinstance(extras.get("run_state"), dict) else {}
+            human_response_answer = extras.get("human_response_answer")
 
         # Create or reuse execution context for this run.
         initial_agent_path = ["root_orchestrator"]
@@ -939,6 +1351,10 @@ class DeepAgentsActionExecutor(AgentExecutor):
             all_tools = tool_loader.create_tools_from_names(tool_names=[], agent_type=None)
             # CrewAI/MCP 툴을 LangChain BaseTool로 래핑하여 tool() 데코레이터 __name__ 오류 방지
             all_tools = _ensure_langchain_tools(all_tools)
+            # Tenant-local skills fallback: list/read skill files via HTTP API.
+            # These tools are tagged as _mcp_server="claude-skills" so they are attached to
+            # all subagents alongside the default MCP toolset.
+            all_tools.extend(build_local_skills_api_tools(mcp_server_name="claude-skills"))
         except Exception as e:
             logger.warning(
                 "MCP tools loading via SafeToolLoader failed (subagent config continues with no MCP tools): %s",
@@ -949,7 +1365,7 @@ class DeepAgentsActionExecutor(AgentExecutor):
         # job_id 컨텍스트: 기본값은 오케스트레이터(플래너) 작업의 job_id이며,
         # 서브 에이전트별 도구 호출은 각 서브 에이전트 전용 job_id로 분리된다.
         current_job_id: dict[str, str | None] = {"value": None}
-        subagent_tool_log: dict[str, list[str]] = {}
+        subagent_tool_log: dict[str, list[dict[str, Any]]] = {}
 
         agent_rows = extras.get("agents", []) or []
         subagents = build_subagent_configs(
@@ -1028,7 +1444,8 @@ class DeepAgentsActionExecutor(AgentExecutor):
         model_name = extras.get("model") or "openai:gpt-4o"
 
         # 1단계: Planner Agent 로 순수 플랜만 생성하고 planning 이벤트를 발행한다.
-        base_rules = default_orchestrator_prompt()
+        planner_base_rules = default_planner_prompt()
+        worker_base_rules = default_orchestrator_prompt()
         feedback_summary = extras.get("summarized_feedback") or ""
         form_fields = extras.get("form_fields")
         form_html = extras.get("form_html")
@@ -1041,7 +1458,7 @@ class DeepAgentsActionExecutor(AgentExecutor):
         output_language = "korean" if _is_korean_user_input(user_text_for_lang) else None
 
         planner_system_prompt = build_orchestrator_system_prompt(
-            base_rules=base_rules,
+            base_rules=planner_base_rules,
             description=description,
             instruction=instruction,
             input_data=input_data,
@@ -1087,9 +1504,42 @@ class DeepAgentsActionExecutor(AgentExecutor):
         )
 
         plan_text: str = ""
+        structured_plans: dict[str, Any] | None = None
         try:
+            # 플래너에는 원본 query 뿐 아니라 파싱된 Description/Instruction/InputData와
+            # 에이전트 메타데이터를 모두 포함한 구조화된 user 메시지를 전달한다.
+            try:
+                input_data_pretty = json.dumps(input_data, ensure_ascii=False, indent=2)
+            except Exception:
+                input_data_pretty = str(input_data)
+
+            agent_lines: list[str] = []
+            for ag in agent_rows:
+                name = ag.get("alias") or ag.get("username") or ag.get("name") or str(ag.get("id"))
+                role = ag.get("role") or "Unspecified role"
+                skills = ag.get("skills") or ""
+                tools = ag.get("tools") or ""
+                agent_lines.append(
+                    f"- Name: {name}, Role: {role}, Skills: {skills or '(none)'}, Tools: {tools or '(none)'}"
+                )
+            agents_block = "\n".join(agent_lines) if agent_lines else "(no agents configured)"
+
+            planner_user_content_parts: list[str] = []
+            planner_user_content_parts.append("[Description]\n" + (description or "(empty)"))
+            planner_user_content_parts.append("[Instruction]\n" + (instruction or "(empty)"))
+            planner_user_content_parts.append("[InputData]\n" + input_data_pretty)
+            planner_user_content_parts.append("[Agents]\n" + agents_block)
+            if feedback_summary:
+                planner_user_content_parts.append("[Feedback]\n" + str(feedback_summary))
+            if form_info:
+                planner_user_content_parts.append("[FormInfo]\n" + json.dumps(form_info, ensure_ascii=False))
+            if query:
+                planner_user_content_parts.append("[OriginalQuery]\n" + str(query))
+
+            planner_user_content = "\n\n".join(planner_user_content_parts)
+
             planner_result = await planner_agent.ainvoke(
-                {"messages": [{"role": "user", "content": query or ""}]}
+                {"messages": [{"role": "user", "content": planner_user_content}]}
             )
             planner_messages = planner_result.get("messages", [])
             planner_raw = ""
@@ -1102,6 +1552,12 @@ class DeepAgentsActionExecutor(AgentExecutor):
                 )
                 planner_raw = _extract_plain_text(planner_content)
             plan_text = _extract_plan_block(planner_raw) or _extract_plain_text(planner_raw).strip()
+            if plan_text:
+                try:
+                    structured_plans = _parse_structured_plan(plan_text)
+                except Exception:
+                    structured_plans = None
+                    logger.exception("Failed to parse structured plan from planner output", exc_info=True)
         except HitlInterrupt as hi:
             # A tool signalled that human input is required. Record a human_asked
             # interrupt event and return waiting_for_human so the caller can pause.
@@ -1159,11 +1615,26 @@ class DeepAgentsActionExecutor(AgentExecutor):
         except Exception:
             logger.exception("Planner agent failed; continuing without explicit plan.", exc_info=True)
 
+        # 플랜이 생성되었다면 서브에이전트/툴/입력 키와의 정합성을 사전에 점검한다.
+        try:
+            _validate_structured_plan(
+                structured_plans,
+                agent_rows=agent_rows,
+                subagents=subagents,
+                input_data=input_data,
+                all_tools=all_tools,
+            )
+        except Exception:
+            logger.exception("Failed to validate structured plan; continuing without hard failure", exc_info=True)
+
         _enqueue_status(
             event_queue,
             "task_completed",
             {
                 "plans": plan_text,
+                # structured_plans 는 UI에 그대로 노출되지 않는 내부용 JSON 구조이며,
+                # plans 와는 별도의 키로만 저장된다.
+                "structured_plans": structured_plans,
             },
             proc_inst_id,
             task_id,
@@ -1177,7 +1648,7 @@ class DeepAgentsActionExecutor(AgentExecutor):
 
         # 2단계: Worker Orchestrator 에게 plan_text 를 주입하여 실제 서브 에이전트 실행을 수행한다.
         system_prompt = build_orchestrator_system_prompt(
-            base_rules=base_rules,
+            base_rules=worker_base_rules,
             description=description,
             instruction=instruction,
             input_data=input_data,
@@ -1203,8 +1674,18 @@ class DeepAgentsActionExecutor(AgentExecutor):
         current_job_id["value"] = job_uuid
 
         try:
+            # 워커 오케스트레이터에는 원본 work-item 텍스트와 함께 플래너가 생성한 [PLAN]
+            # 텍스트를 그대로 전달하여, 마크다운 헤딩(## N. 제목) 및 자연어 설명을 기반으로
+            # task() 호출을 구성할 수 있도록 한다.
+            worker_user_parts: list[str] = []
+            if query:
+                worker_user_parts.append("[WorkItem]\n" + str(query))
+            if plan_text:
+                worker_user_parts.append("[PLAN]\n" + str(plan_text))
+            worker_user_content = "\n\n".join(worker_user_parts) if worker_user_parts else (query or "")
+
             result = await orchestrator.ainvoke(
-                {"messages": [{"role": "user", "content": query or ""}]}
+                {"messages": [{"role": "user", "content": worker_user_content}]}
             )
         except HitlInterrupt as hi:
             # A tool signalled that human input is required during worker execution.
@@ -1348,12 +1829,8 @@ class DeepAgentsActionExecutor(AgentExecutor):
                 )
             for ctx in subagent_contexts:
                 sub_job_id = ctx["job_id"]
-                used_tools = subagent_tool_log.get(sub_job_id, [])
-                작업_텍스트 = (
-                    f"다음 도구 호출을 통해 작업을 수행했습니다: {', '.join(sorted(set(used_tools)))}"
-                    if used_tools
-                    else "도구 호출 이벤트 없이 작업을 수행했습니다."
-                )
+                tool_details = subagent_tool_log.get(sub_job_id, [])
+                work_summary = _build_tool_usage_summary(tool_details)
                 _enqueue_status(
                     event_queue,
                     "task_started",
@@ -1375,8 +1852,10 @@ class DeepAgentsActionExecutor(AgentExecutor):
                     event_queue,
                     "task_completed",
                     {
-                        "message": f"서브 에이전트 '{ctx['name']}' 실행이 완료되었습니다.",
-                        "summary": 작업_텍스트,
+                        "result": {
+                            "message": f"서브 에이전트 '{ctx['name']}' 실행이 완료되었습니다.",
+                            "summary": work_summary,
+                        },
                     },
                     proc_inst_id,
                     task_id,
@@ -1412,7 +1891,6 @@ class DeepAgentsActionExecutor(AgentExecutor):
         else:
             final_result_payload = pure_form_data
 
-        # 이벤트 테이블: result 키에 평문 텍스트만 저장 (중첩 result.output.result 구조 사용 안 함)
         if not has_form:
             final_event_result = final_text
         else:
@@ -1423,7 +1901,10 @@ class DeepAgentsActionExecutor(AgentExecutor):
             event_queue,
             "task_started",
             {
-                "message": "최종 결과 생성을 시작했습니다.",
+                "role": "최종 결과 반환",
+                "name": "최종 결과 반환",
+                "goal": "요청된 폼 형식에 맞는 최종 결과를 반환합니다.",
+                "agent_profile": "/images/chat-icon.png",
             },
             proc_inst_id,
             task_id,
@@ -1438,7 +1919,6 @@ class DeepAgentsActionExecutor(AgentExecutor):
             event_queue,
             "task_completed",
             {
-                "message": "최종 결과 생성이 완료되었습니다.",
                 "result": final_event_result,
             },
             proc_inst_id,

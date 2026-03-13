@@ -117,84 +117,153 @@ def _build_system_prompt(
         names = ", ".join(agent_skills)
         parts.append(f"- Assigned skills: {names}")
         parts.append(
-            "- Default document path for each skill follows this template (do NOT invent paths): "
-            "\"/app/skills/{tenant_id}/{skill_name}/SKILL.md\"."
-        )
-        for s in agent_skills:
-            parts.append(
-                f"  * {s} → primary document_path: "
-                "\"/app/skills/{tenant_id}/"
-                f'{s}'
-                "/SKILL.md\""
-            )
-        parts.append(
-            "- When solving tasks, you MUST first use your assigned skills above. "
-            "For each assigned skill, call read_skill_document with all of the following "
-            "fallbacks IN ORDER (stop as soon as one returns a non-empty result):"
+            "- When solving tasks, you MUST first try to use your assigned skills above. "
+            "However, for built-in/global skills (like the default Anthropic skills), their "
+            "SKILL.md may not be directly readable via read_skill_document even though the "
+            "skill itself is loaded. Therefore you MUST discover and access skill documents "
+            "through find_helpful_skills before calling read_skill_document."
         )
         parts.append(
-            "  1) read_skill_document("
-            "skill_name=\"<name>\", "
-            "document_path=\"/app/skills/{tenant_id}/<name>/SKILL.md\", "
-            "include_base64=true)"
+            "- For each assigned skill name <name>, follow this workflow IN ORDER:"
         )
         parts.append(
-            "  2) If (1) returns no documents or a not-found error, retry with a wildcard "
-            "pattern that matches the full path such as "
-            "document_path=\"*/<name>/SKILL.md\"."
+            "  1) Call find_helpful_skills with:"
+            "     - tenant_id set to the tenant_id from Section 3,"
+            "     - task_description that includes ALL of the following, in a single string:"
+            "       * the user's current task (in their original language),"
+            "       * the exact skill name <name>,"
+            "       * both Korean and English mentions of the skill name if possible"
+            "         (e.g. \"xlsx 스킬\", \"xlsx skill\"),"
+            "       * a short description of why you want to use that skill."
         )
         parts.append(
-            "  3) If (2) also fails, finally retry with a simple relative path "
-            "document_path=\"SKILL.md\"."
+            "     - IMPORTANT: You MUST pass allowed_skill_names=[\"<name>\"] for this call. "
+            "This ensures tenant-local skills are included in the search scope. "
+            "You may include additional skill names in allowed_skill_names only when the "
+            "task explicitly requires multiple skills, but you MUST include <name>."
+        )
+        parts.append(
+            "  2) You MUST call find_helpful_skills TWICE per task for each assigned "
+            "skill you are trying to use: once with a Korean task_description and once "
+            "with an English task_description. If the user's query is in Korean, use it "
+            "directly for the Korean version and translate it to English for the second "
+            "call while still including the skill name <name> in both versions. If the "
+            "query is in English, translate it into natural Korean for the first call and "
+            "reuse/refine the English version for the second call, again explicitly "
+            "including the skill name <name> in both descriptions."
+        )
+        parts.append(
+            "  3) Merge and deduplicate the returned skill candidates from the Korean and "
+            "English calls. Identify the entries whose skill_name or description clearly "
+            "matches your assigned skill <name>."
+        )
+        parts.append(
+            "  4) For each such matched skill, inspect its \"Available Documents\" list in "
+            "the find_helpful_skills result. You MUST NOT invent filesystem-style paths like "
+            "\"/app/skills/{tenant_id}/<name>/SKILL.md\". Instead, call read_skill_document "
+            "using exactly the document_path values that appear in the Available Documents "
+            "list (for example \"SKILL.md\", \"LICENSE.txt\", or \"scripts/recalc.py\")."
+        )
+        parts.append(
+            "  5) If a SKILL.md is not listed for that skill, still proceed by reading any "
+            "other .md, .txt, or relevant script files listed there, and base your behavior "
+            "on the guidance found in those documents."
+        )
+        parts.append(
+            "- You MUST NOT assume that SKILL.md lives under any particular on-disk path "
+            "or that read_skill_document can open arbitrary filesystem locations. Only use "
+            "document_path values that are explicitly listed by find_helpful_skills or "
+            "directly documented by that skill."
         )
         parts.append(
             "- You MUST NOT give up after a single failed call to read_skill_document for "
-            "an assigned skill. Always apply the above fallback sequence before concluding "
-            "that the skill has no readable documents."
+            "an assigned skill. Try other document_path entries from the Available Documents "
+            "list (e.g. other .md or .txt files) before concluding that the skill has no "
+            "usable documentation."
         )
         parts.append(
-            "- Only when none of your assigned skills are suitable may you call "
-            "find_helpful_skills to discover additional skills."
-        )
-        parts.append(
-            "- You MUST NOT start a task by calling find_helpful_skills when you already "
-            "have assigned skills. Always attempt to use your own skills first (by reading "
-            "their SKILL.md and following their guidance); treat find_helpful_skills purely "
-            "as a fallback when your assigned skills are insufficient to complete the work."
-        )
-        parts.append(
-            "- Whenever you do call find_helpful_skills (fallback case), you MUST perform "
-            "two separate searches for the same task: first with a Korean task_description "
-            "and then with an English task_description. If the user's query is in Korean, "
-            "use it directly for the Korean call and translate it to English for the second "
-            "call. If the query is in English, translate it into natural Korean for the first "
-            "call, then reuse or refine the English version for the second call. Merge and "
-            "deduplicate the returned skill candidates from both calls before deciding which "
-            "skills to use."
+            "- Tenant-local skill HTTP fallback (MANDATORY when needed): Some skills may appear "
+            "in list_skills with sources like \"/app/skills/{tenant_id}/...\" but still be "
+            "unavailable via find_helpful_skills/read_skill_document (e.g. read_skill_document "
+            "returns 'skill not found'). In that case you MUST use the HTTP fallback tools:\n"
+            "  * list_skill_files_http(skill_name=\"<name>\") to get the file list\n"
+            "  * read_skill_file_http(skill_name=\"<name>\", file_path=\"<one of the returned paths>\") "
+            "to read file content\n"
+            "You MUST first list files, then choose which file(s) to read dynamically based on "
+            "the returned list (do NOT hardcode file paths in advance)."
         )
         parts.append(
             "- When a skill's documents include Python scripts (*.py files), you MUST execute "
-            "them using the computer-use MCP tool run_shell. First read the assigned skill "
-            "(e.g. global-investment-analyzer via read_skill_document with document_path "
-            "\"SKILL.md\"); if the skill lists or references .py "
-            "files, run those scripts with run_shell—do not only return code or instructions. "
-            "Actually invoke run_shell to execute the Python file (e.g. python <path from skill>)."
+            "them using the computer-use MCP tool run_shell. Follow this MANDATORY workflow:\n"
+            "  1) First, read the skill's SKILL.md (or other documentation) via read_skill_document.\n"
+            "  2) Identify ALL .py files mentioned or listed in the skill documentation.\n"
+            "  3) Read the actual .py file content using read_skill_document with the .py file path "
+            "(e.g. document_path=\"scripts/fetch_kospi.py\" or similar).\n"
+            "  4) Determine the FULL execution path of the .py file. If the skill is located at "
+            "\"/app/skills/{tenant_id}/{skill_name}/\", then the .py file path would be "
+            "\"/app/skills/{tenant_id}/{skill_name}/{relative_path_to_py}\".\n"
+            "  5) Execute the script using run_shell with: python /full/path/to/script.py [arguments]\n"
+            "  6) Pass required parameters (API tokens, dates, etc.) as command-line arguments or "
+            "environment variables. For example:\n"
+            "     - python /app/skills/tenant/skill/script.py --api-key=TOKEN --date=2024-01-01\n"
+            "     - Or: API_KEY=TOKEN python /app/skills/tenant/skill/script.py\n"
+            "  7) NEVER just show code snippets or explain how to run—ACTUALLY execute with run_shell.\n"
+            "  8) If the script requires input data from InputData (e.g. api_token, access_token), "
+            "extract those values and pass them to the script execution command."
+        )
+        parts.append(
+            "- Package installation: If the skill's .py script requires additional Python packages, "
+            "install them BEFORE running the script. Follow this order:\n"
+            "  1) First, try: pip install --user <package_name>\n"
+            "     (This installs to user directory and doesn't require root permissions)\n"
+            "  2) If that fails, try: pip install <package_name> (may work in some environments)\n"
+            "  3) For system packages (apt), if 'apt install' fails due to permission denied:\n"
+            "     - Do NOT give up. Try alternative approaches:\n"
+            "     - Use pip to install Python equivalents when possible\n"
+            "     - Check if the package is already available under a different name\n"
+            "     - Use 'python -m pip install' as an alternative\n"
+            "  4) After installation, proceed to run the actual skill script.\n"
+            "  5) IMPORTANT: Package installation is just preparation. The main goal is to "
+            "EXECUTE the skill's .py file and return the actual result."
+        )
+        parts.append(
+            "- When executing a skill's .py script, if the script path from the skill document is "
+            "relative (e.g. 'scripts/main.py' or just 'main.py'), construct the full path by prepending "
+            "the skill's base directory. Use list_skill_files_http to discover actual file paths "
+            "if needed, then execute with the full absolute path."
+        )
+        parts.append(
+            "- IMPORTANT: Python code may be embedded inside .md files (e.g., SKILL.md) as code blocks "
+            "(```python ... ```). When you find Python code in a .md file, you MUST still execute it:\n"
+            "  1) Extract the Python code from the markdown code block.\n"
+            "  2) Execute it using one of these methods:\n"
+            "     a) Save to a temp file and run: echo '<code>' > /tmp/skill_script.py && python /tmp/skill_script.py [args]\n"
+            "     b) Use python -c: python -c '<code>' (for short scripts, escape quotes properly)\n"
+            "     c) Use heredoc: python << 'EOF'\n<code>\nEOF\n"
+            "  3) Pass required arguments (API tokens, dates, etc.) as before.\n"
+            "  4) The code in .md files is meant to be executed, not just read or explained.\n"
+            "  5) If there are multiple code blocks, identify the main executable one (usually the "
+            "complete script, not just snippets or examples)."
         )
     else:
         parts.append("- Assigned skills: (none explicitly assigned)")
         parts.append(
             "- Because you have no assigned skills, you SHOULD start by calling "
             "find_helpful_skills with an appropriate task_description and tenant_id "
-            "to discover relevant skills before attempting any complex domain work."
+            "to discover relevant skills before attempting any complex domain work. "
+            "Make sure the task_description includes both the user's request and any "
+            "relevant skill names or keywords in both Korean and English when possible."
         )
         parts.append(
             "- In all cases when you use find_helpful_skills, you MUST call it twice per "
             "task: first with a Korean task_description and then with an English "
             "task_description for the same task. Use Korean if the user's request is in "
             "Korean (or translate the request into Korean), and create or refine an English "
-            "version for the second call. Combine the results from both calls so that skills "
-            "whose descriptions are written only in Korean or only in English can still be "
-            "discovered."
+            "version for the second call. In both calls, explicitly mention any relevant "
+            "skill names (for example \"xlsx 스킬\", \"xlsx skill\") inside the "
+            "task_description so that the search can match skills whose names appear only "
+            "in English or only in Korean. Combine the results from both calls so that skills "
+            "whose descriptions are written only in one language can still be discovered."
         )
 
     if tools:
@@ -207,9 +276,26 @@ def _build_system_prompt(
         "own past knowledge and decision rules before making important decisions."
     )
     parts.append(
-        "- When you need to run a Python script (*.py), use the computer-use MCP tool "
-        "run_shell to execute it (e.g. run_shell with the appropriate command). Do not "
-        "only show or suggest the command—actually call run_shell."
+        "- When you need to run Python code, use the computer-use MCP tool run_shell. IMPORTANT:\n"
+        "  * Do NOT show or suggest the command—ACTUALLY call run_shell immediately.\n"
+        "  * If the script requires packages not yet installed, install them first using "
+        "'pip install --user <package>' then run the script.\n"
+        "  * For .py files: Use the FULL absolute path (e.g., python /app/skills/.../main.py --token=XXX)\n"
+        "  * For code in .md files: Extract the code and run via:\n"
+        "    - Temp file: echo '...' > /tmp/script.py && python /tmp/script.py [args]\n"
+        "    - Or: python -c '...' (short scripts)\n"
+        "    - Or: python << 'EOF'\\n<code>\\nEOF (multiline)\n"
+        "  * Pass all required parameters (API keys, tokens, dates) as arguments or env vars.\n"
+        "  * If a command fails due to permission issues, try alternative approaches "
+        "(e.g., pip install --user instead of apt install).\n"
+        "  * If script output contains the answer, extract and report it to the orchestrator."
+    )
+    parts.append(
+        "- When the orchestrator delegates a specific step to you (for example with an "
+        "instruction derived from a plan step like '## 1. 단계 제목' or mentioning specific "
+        "tools/skills to use), you MUST treat that step description as your primary task "
+        "and actively use the attached MCP/skill tools that match the requested tools/skills "
+        "instead of answering with text only."
     )
 
     # 섹션 5: 협업 및 보고 방식
@@ -228,22 +314,35 @@ def _build_system_prompt(
     # 섹션 6: 자격 증명 및 사용자 개입 요청
     parts.append("\n=== Section 6: Credentials and user intervention ===")
     parts.append(
-        "- If you need an API key, token, or other credential that is not in the "
-        "work-item InputData or context, do NOT respond with only placeholder code or "
-        "'insert your API key here'. Request user intervention (e.g. via request_human_input "
-        "or the tool that signals requires_human); the workflow will ask the user for the "
-        "value and you will receive it to continue; then perform the actual tool/API call."
+        "- FIRST, check the work-item InputData (Section 2) for any API keys, tokens, or "
+        "credentials. Common field names include: api_token, access_token, api_key, token, "
+        "apiKey, accessToken, etc. If found, USE THEM DIRECTLY when executing skill scripts."
     )
     parts.append(
-        "- Whenever any information required to proceed is missing (API keys, tokens, "
-        "file paths, parameters, or other inputs), you MUST request user intervention "
-        "instead of guessing or inventing values. Do not assume defaults for credentials "
-        "or sensitive data."
+        "- When executing a skill's .py script that requires credentials, pass the token "
+        "from InputData as a command-line argument or environment variable. Example:\n"
+        "  * If InputData contains {'api_token': 'ABC123'}, run:\n"
+        "    python /path/to/script.py --api-token=ABC123\n"
+        "  * Or: API_TOKEN=ABC123 python /path/to/script.py"
     )
     parts.append(
-        "- Never return only code snippets or example responses when the task requires "
-        "real execution (e.g. fetching KOSPI, calling an external API). Perform the "
-        "actual tool calls once the required credential or information is available."
+        "- If you need an API key, token, or other credential that is NOT in the "
+        "work-item InputData or context, ONLY THEN request user intervention "
+        "(e.g. via request_human_input or the tool that signals requires_human)."
+    )
+    parts.append(
+        "- Whenever any information required to proceed is truly missing (not found in "
+        "InputData), you MUST request user intervention instead of guessing or inventing "
+        "values. Do not assume defaults for credentials or sensitive data."
+    )
+    parts.append(
+        "- CRITICAL: Never return only code snippets or example responses when the task "
+        "requires real execution (e.g. fetching KOSPI, calling an external API). You MUST:\n"
+        "  1) Find the skill's .py script using find_helpful_skills + list_skill_files_http\n"
+        "  2) Read the script to understand its usage and required arguments\n"
+        "  3) Extract credentials from InputData\n"
+        "  4) Execute the script with run_shell, passing all required arguments\n"
+        "  5) Return the ACTUAL execution result, not instructions on how to execute"
     )
 
     return "\n".join(parts)
