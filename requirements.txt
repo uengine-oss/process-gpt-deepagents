@@ -1,5 +1,5 @@
-process-gpt-agent-utils==0.3.3
-process-gpt-agent-sdk==0.4.14
+process-gpt-agent-utils==0.3.4
+process-gpt-agent-sdk==0.4.15
 jsonschema>=4.22.0
 python-dotenv>=1.0.0
 httpx>=0.27.0
@@ -11,3 +11,4 @@ langchain-openai>=0.1.0
 openai>=1.0.0
 supabase>=2.0.0
 typing-extensions>=4.8.0
+pytest>=8.0.0

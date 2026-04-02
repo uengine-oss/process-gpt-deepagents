@@ -1,0 +1,37 @@
+{
+    "skill_sources": [
+      {
+        "type": "github",
+        "url": "https://github.com/anthropics/skills",
+        "comment": "Official Anthropic skills - diverse examples with Python scripts, images, documents"
+      },
+      {
+        "type": "github",
+        "url": "https://github.com/K-Dense-AI/claude-scientific-skills",
+        "comment": "70+ scientific skills for bioinformatics, cheminformatics, and analysis"
+      },
+      {
+        "type": "local",
+        "path": "~/.claude/skills",
+        "comment": "Your custom local skills (optional - directory doesn't need to exist). For Docker/K8s deployments, set SKILLS_STORAGE_PATH env var to override (e.g., /app/skills)"
+      }
+    ],
+    "embedding_model": "all-MiniLM-L6-v2",
+    "default_top_k": 3,
+    "max_skill_content_chars": null,
+    "comment_max_chars": "Set to an integer (e.g., 5000) to truncate skill content, or null for unlimited",
+    "load_skill_documents": true,
+    "comment_load_docs": "Load additional files (scripts, references, assets) from skill directories",
+    "max_image_size_bytes": 5242880,
+    "comment_max_image": "Maximum image file size (5MB). Larger images store URL only",
+    "allowed_image_extensions": [".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"],
+    "text_file_extensions": [".md", ".py", ".txt", ".json", ".yaml", ".yml", ".sh", ".r", ".ipynb", ".xml"],
+    "auto_update_enabled": true,
+    "comment_auto_update": "Enable automatic hourly skill updates (checks at :00 of each hour)",
+    "auto_update_interval_minutes": 60,
+    "comment_interval": "Check for updates every N minutes (synced to clockface hours)",
+    "github_api_token": null,
+    "comment_token": "Optional GitHub personal access token for 5000 req/hr (default: 60 req/hr)"
+  }
+  
+  

@@ -34,5 +34,5 @@ RUN uv pip install --system --no-cache -r requirements.txt
 # 4) Copy source
 COPY . .
 
-EXPOSE 8000
+EXPOSE 8888
 CMD ["python", "deepagents_action_server.py"]

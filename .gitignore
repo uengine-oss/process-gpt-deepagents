@@ -9,3 +9,5 @@ __pycache__/
 # uv
 .uv/
 uv.lock
+logs/
+tmp/

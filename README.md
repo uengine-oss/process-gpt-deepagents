@@ -1,7 +1,8 @@
 # ProcessGPT DeepAgents Action Server
 
-ProcessGPT Agent SDK 폴링 서버 형태로, LangChain **Deep Agents (deepagents)** 로
-DB 기반 멀티 에이전트 오케스트레이션을 수행하고, 결과를 A2A 이벤트로 래핑해 반환합니다.
+ProcessGPT Agent SDK 폴링 서버 형태로, LangChain **Deep Agents (deepagents)** 를
+Middleware-First 방식으로 사용합니다. 단일 DeepAgent 실행 안에서 planning(todo),
+subagent 위임, 파일시스템 메모리, sandbox 실행, A2A 이벤트 로깅을 수행합니다.
 
 ## 아키텍처
 
@@ -13,9 +14,10 @@ DeepAgentsActionExecutor.execute(context, event_queue)
        │
        ├─ extras.agents (ID 목록) ──► Supabase users 테이블 조회 (database.get_supabase)
        │
-       ├─ 스킬 로딩 ──► Skills API 호출 (SKILL.md)
-       ├─ MCP 툴 ──► SafeToolLoader (에이전트별 필터링)
-       ├─ 서브에이전트 구성 ──► create_deep_agent(subagents=[...])
+       ├─ 런타임 라우팅 결정 ──► LiteLLM proxy 우선 (warn_fallback)
+       ├─ 스킬/로컬 도구 로딩 ──► SafeToolLoader (선택적 로컬 도구)
+       ├─ sandbox tools 주입 ──► sandbox_create/write/run/read/cleanup
+       ├─ 단일 DeepAgent 실행 ──► TodoList + Filesystem + SubAgent middleware
        ▼
 A2A 이벤트 발행 (TaskStatusUpdateEvent / TaskArtifactUpdateEvent)
 ```
@@ -29,9 +31,15 @@ A2A 이벤트 발행 (TaskStatusUpdateEvent / TaskArtifactUpdateEvent)
 - `database.py`
   - Supabase 클라이언트 (subagents 등에서 사용)
 - `deepagents_factory.py`
-  - 오케스트레이터 에이전트 생성 (서브에이전트 포함)
+  - 단일 런타임 DeepAgent 생성 (middleware 스택 포함)
 - `subagents.py`
   - Supabase에서 에이전트 정의 로딩, 스킬 API 호출, 서브에이전트 설정 구성
+- `runtime_config.py`
+  - 모델/라우팅 모드 결정 (`proxy` / `direct-fallback`)
+- `sandbox_runtime.py`
+  - sandbox 실행 추상화(로컬 기본 구현)
+- `sandbox_tools.py`
+  - sandbox 도구 래퍼 (`sandbox_*`)
 - `output_utils.py`
   - LLM 결과를 ProcessGPT 반환 포맷으로 변환
 - `health_server.py`
@@ -43,41 +51,19 @@ A2A 이벤트 발행 (TaskStatusUpdateEvent / TaskArtifactUpdateEvent)
 |---|---|
 | `SUPABASE_URL` | Supabase 프로젝트 URL |
 | `SUPABASE_KEY` | Supabase 서비스 롤 키 |
-| `SKILLS_API_BASE_URL` | 스킬 파일 API 베이스 URL (기본: `http://localhost:3000`) |
-| `OPENAI_API_KEY` | OpenAI API 키 |
-## 로컬 테스트 설치 (버전 충돌 회피)
+| `SKILLS_ROOT_DIR` | 스킬 파일 루트 경로 (예: `/app/skills`) |
+| `LLM_MODEL` | 기본 LLM 모델명 (예: `gpt-4o`) |
+| `LLM_EMBEDDING_MODEL` | 기본 임베딩 모델명 (예: `text-embedding-3-small`) |
+| `LLM_PROXY_URL` | LiteLLM 프록시 URL (예: `http://litellm-proxy:4000`) |
+| `LLM_PROXY_API_KEY` | LiteLLM 프록시 API 키 |
+| `SANDBOX_BASE_DIR` | sandbox 워크스페이스 루트 경로 |
 
-`process-gpt-llm-factory`가 `langchain<0.4`를 요구해 `deepagents`(langchain>=1.0)와 충돌합니다.  
-로컬에서만 쓰려면 **2단계 설치** 후, 필요 시 가상환경 안의 패키지를 직접 수정하세요.
+## 설치
 
-### 1) 2단계 설치
-
-```powershell
-# 프로젝트 루트에서
+```bash
 uv venv
-.\scripts\install-local.ps1
-```
-
-또는 수동:
-
-```powershell
 uv pip install -r requirements.txt
 ```
-
-### 2) 여전히 충돌이 나면: 가상환경 패키지 직접 수정
-
-로컬 테스트용으로만, 설치된 `process-gpt-llm-factory`의 langchain 요구 조건을 바꿉니다.
-
-- **METADATA 수정**  
-  `.venv\Lib\site-packages\process_gpt_llm_factory-*.dist-info\METADATA`  
-  - `Requires-Dist: langchain (>=0.2.0,<0.4.0)` 를  
-  - `Requires-Dist: langchain (>=1.0.0)` 로 변경 (또는 해당 줄 삭제)
-
-- **소스에서 버전 체크가 있다면**  
-  `.venv\Lib\site-packages\process_gpt_llm_factory\` 아래에서  
-  `langchain` 버전을 검사하는 코드가 있으면 해당 조건 완화/삭제
-
-실제 SDK·llm-factory 수정은 나중에 레포에서 진행하면 됩니다.
 
 ## 로컬 실행 (uv)
 
@@ -92,7 +78,7 @@ uv run python deepagents_action_server.py
 ```bash
 docker build -t process-gpt-deepagents-action:local .
 
-docker run --rm -p 8000:8000 \
+docker run --rm -p 8888:8888 \
   -e SUPABASE_URL="https://xxx.supabase.co" \
   -e SUPABASE_KEY="eyJ..." \
   -e OPENAI_API_KEY="sk-..." \
@@ -106,10 +92,98 @@ docker run --rm -p 8000:8000 \
 
 ## 커스터마이징
 
-- **모델**: `extras.model` (예: `openai:gpt-4o`), 없으면 기본값 `openai:gpt-4o`
+- **모델**: `extras.model` 우선, 없으면 `LLM_MODEL` 사용(기본 `gpt-4o`)
+- **LiteLLM 프록시**:
+  - `LLM_PROXY_URL`, `LLM_PROXY_API_KEY`를 사용
+  - 프록시 설정이 있으면 proxy 모드, 없으면 경고 후 direct fallback
 - **시스템 프롬프트**: `extras.system_prompt`로 오케스트레이터 프롬프트 오버라이드
 - **에이전트**: Supabase `users` 테이블에 `is_agent=true`로 등록
-  - `skills`: 쉼표 구분 스킬명 → API로 SKILL.md 자동 로딩
-  - `tools`: 쉼표 구분 MCP 툴명 → 에이전트별 자동 필터링
+  - `skills`: 쉼표 구분 스킬명 → 파일시스템 경로에서 SKILL.md 로딩
+  - `tools`: 쉼표 구분 도구명 → 에이전트별 자동 필터링 + sandbox 도구 결합
   - `persona` + `goal`: 서브에이전트 시스템 프롬프트 자동 구성
   - `model`: 서브에이전트별 모델 오버라이드 가능
+
+## 테스트
+
+```bash
+python3 -m pytest tests -q
+```
+
+핵심 검증 범위:
+- LiteLLM 라우팅 결정
+- sandbox 런타임/도구 동작
+- factory의 단일 runtime agent 생성
+- executor 이벤트 payload 기본 구조
+
+## 통합 검증 시나리오
+
+### 1) LiteLLM 프록시 경유 기본 시나리오
+
+사전 조건:
+- LiteLLM 프록시 실행 중 (`LLM_PROXY_URL` 접근 가능)
+- `.env`에 `LLM_PROXY_URL`, `LLM_PROXY_API_KEY` 설정
+
+검증:
+1. 서버 실행: `uv run python deepagents_action_server.py`
+2. 실제 작업 1건 실행(멀티스텝 요청 권장)
+3. 로그에서 `routing_mode=proxy` 확인
+4. 결과 이벤트에서 `task_started` -> `task_completed` -> 최종 artifact 순서 확인
+
+합격 기준:
+- 모델 호출이 실패 없이 완료
+- 최종 결과 payload가 `output.status`/`output.result` 규격 만족
+
+### 2) 프록시 미설정 fallback 시나리오 (`warn_fallback`)
+
+사전 조건:
+- `LLM_PROXY_URL` 제거
+
+검증:
+1. 동일 작업 실행
+2. 경고 로그(`direct provider fallback`) 발생 확인
+3. 실행이 중단되지 않고 완료되는지 확인
+
+합격 기준:
+- warning 존재
+- task 실행/결과 이벤트 정상 발행
+
+### 3) Todo + Subagent + Sandbox 시나리오
+
+사전 조건:
+- 대상 subagent에 sandbox 도구 사용 가능한 task 부여
+- sandbox는 항상 활성화됨
+
+검증:
+1. 작업 입력을 코드 생성/실행형으로 구성
+2. subagent가 sandbox 생성 -> 파일 작성 -> 쉘 실행 -> artifact 수집 흐름 수행
+3. 실행 이벤트/요약에 subagent 도구 사용 흔적 확인
+
+합격 기준:
+- sandbox 명령 exit code 0
+- artifact 경로가 반환됨
+- 최종 응답에 실행 결과 반영
+
+### 4) HITL 인터럽트/재개 시나리오
+
+사전 조건:
+- 승인/누락입력이 필요한 작업
+
+검증:
+1. 초기 실행 시 `human_asked` 이벤트 발행 확인
+2. `human_response_answer` 포함하여 재실행
+3. 이어서 완료까지 진행되는지 확인
+
+합격 기준:
+- interrupt -> resume -> complete 상태 전이 정상
+- run_state(correlation_id, tool context) 유지
+
+### 5) 회귀 시나리오 (이벤트 스키마 호환)
+
+검증:
+1. 기존 컨슈머가 사용하는 필수 필드 점검:
+   - `metadata.event_type`, `metadata.job_id`
+   - payload의 `logical_event_type`, `phase`
+2. 최종 artifact 이벤트 정상 수신 확인
+
+합격 기준:
+- 기존 대시보드/컨슈머 파싱 오류 없음

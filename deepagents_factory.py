@@ -1,4 +1,4 @@
-"""Factory for creating the multi-agent orchestrator via deepagents."""
+"""Factory for creating middleware-first deepagents runtime."""
 
 from __future__ import annotations
 
@@ -8,37 +8,31 @@ from typing import Any, Mapping, Sequence
 from deepagents import create_deep_agent
 from langgraph.graph.state import CompiledStateGraph
 
+from deepagents_backend import make_deepagent_backend_factory
 from deepagents_hitl import get_hitl_tools
+from execution_context import format_execution_clock_section
 
 logger = logging.getLogger(__name__)
 
-
-def build_orchestrator(
+def build_runtime_agent(
     *,
     model_name: str,
     system_prompt: str | None = None,
     subagents: list[dict[str, Any]] | None = None,
     tools: Sequence[Any] | None = None,
+    hitl_tools: Sequence[Any] | None = None,
     middleware: Sequence[Any] | None = None,
+    skills: list[str] | None = None,
 ) -> CompiledStateGraph:
-    """Create the top-level orchestrator agent with DB-driven subagents.
-
-    The main agent coordinates work by delegating to subagents via the
-    built-in ``task()`` tool. The orchestrator should only receive HITL
-    tools (request_human_input) and optionally shared utility tools.
-    Do NOT pass skill/MCP/API tools here — those belong to subagents;
-    giving them to the orchestrator leads to it doing work itself instead
-    of delegating. Optional *middleware* is passed to create_deep_agent
-    for subagent event hooks etc.
-    """
+    """Create single deep agent runtime with middleware-first architecture."""
     effective_prompt = system_prompt or default_orchestrator_prompt()
-    # DeepAgents 하네스와 동일하게 그래프 레벨 HITL 을 위해
-    # request_human_input 도구를 항상 주입한다. 오케스트레이터에는
-    # 스킬/MCP 도구를 넣지 않아 위임(task) 동작이 유지되도록 한다.
-    hitl_tools = list(get_hitl_tools())
-    tools = list(tools) if tools else []
-    all_tools = hitl_tools + tools
+    effective_hitl = list(hitl_tools) if hitl_tools is not None else list(get_hitl_tools())
+    root_tools = list(tools) if tools else []
+    all_tools = effective_hitl + root_tools
     middleware_list = list(middleware) if middleware else []
+    # NOTE:
+    # create_deep_agent() already injects TodoListMiddleware, FilesystemMiddleware,
+    # and SubAgentMiddleware internally. Adding them again causes duplicate middleware errors.
 
     agent = create_deep_agent(
         model=model_name,
@@ -46,27 +40,23 @@ def build_orchestrator(
         system_prompt=effective_prompt,
         subagents=subagents or [],
         middleware=middleware_list,
+        backend=make_deepagent_backend_factory(),
+        skills=skills if skills else None,
     )
     logger.info(
-        "Orchestrator created: model=%s subagents=%d tools=%d",
+        "Runtime agent created: model=%s subagents=%d tools=%d extra_middleware=%d",
         model_name,
         len(subagents or []),
-        len(tools),
+        len(root_tools),
+        len(middleware_list),
     )
     return agent
 
 
 def default_orchestrator_prompt() -> str:
-    """Base rules for the worker orchestrator: execution, delegation, HITL, and scope.
-
-    This prompt is primarily used for the *worker* DeepAgents graph that
-    actually calls subagents via task(). When a pre-computed plan is
-    provided in Section 7 of the system prompt, you MUST treat that plan
-    as the primary source of truth and focus on executing it instead of
-    creating a completely new plan.
-    """
+    """Base rules for middleware-first orchestrator agent."""
     return (
-        "You are the ProcessGPT Multi-Agent Orchestrator acting as an Execution Orchestrator.\n\n"
+        "You are the ProcessGPT Multi-Agent Orchestrator.\n\n"
         "You always receive a single user message called the *work-item query*.\n"
         "It has three sections:\n"
         "[Description]  – what this activity is trying to achieve.\n"
@@ -76,14 +66,20 @@ def default_orchestrator_prompt() -> str:
         "- the business goal,\n"
         "- any explicit constraints and approvals required,\n"
         "- which InputData keys are important.\n\n"
-        "Your role is delegation, coordination, and synthesis — you must NOT do domain work yourself:\n"
-        "- You have exactly two tools: task() (to delegate to subagents) and request_human_input() (for HITL). "
-        "You do NOT have access to skill tools, MCP tools, or API-calling tools; those belong to subagents.\n"
+        "Your role is to plan, delegate, execute, and synthesize results with middleware support:\n"
+        "- Use write_todos to keep your plan updated while solving multi-step work.\n"
+        "- Use task() to delegate domain work to subagents whenever specialized tools are needed.\n"
+        "- Use filesystem tools for large intermediate outputs to reduce context bloat.\n"
+        "- request_human_input() is available for HITL when approvals or missing critical data appear.\n"
         "- For any domain-specific work (data fetch, API calls, skill execution, analysis), you MUST call "
         "task() with the appropriate subagent from Section 2 and wait for their result. Never perform "
         "such work by yourself or reply with only text/code examples.\n"
-        "- Do NOT use a general-purpose subagent for domain work. Use the named subagents listed in "
+        "- Do NOT use a general-purpose subagent for domain work. Use the named domain subagents listed in "
         "Section 2 (e.g. financial/data/research agents with assigned skills).\n"
+        "- A built-in subagent named exactly `스킬 탐색 도우미` is always in Section 2. "
+        "For EVERY work-item you MUST call task() with subagent_type `스킬 탐색 도우미` once before any domain "
+        "subagent — no exceptions. Capture its ranked skill paths and MCP-backed recommendations first; only "
+        "then delegate execution/analysis to domain subagents using those results. Put this as step 1 in write_todos.\n"
         "- Break the work into small atomic steps. For each step that involves tools/skills/APIs, "
         "choose the most appropriate subagent by name/role/description and call task() with a clear "
         "instruction. Only after you receive subagent results may you synthesize the final answer.\n\n"
@@ -97,129 +93,56 @@ def default_orchestrator_prompt() -> str:
         "- Subagents own all execution tools and skills (MCP, APIs, memory, rule engines). You do not "
         "have these tools. Specify in your plan which subagent will do what; do not attempt to run "
         "skills or tools yourself.\n"
+        "- When a delegated subagent has memory/rule/RAG tools (mem0, memento, dmn_rule), instruct it "
+        "in task() to use them when Section 2 / the work-item implies personalization, rules, or "
+        "document grounding — not on every trivial step.\n"
         "- Do not call find_helpful_skills, read_skill_document, or any API/skill tools — only "
         "task() and request_human_input() are available to you.\n\n"
-        "Human-in-the-loop (HITL):\n"
+        "Missing skills / sandbox (orchestrator — do not bypass delegation):\n"
+        "- You MUST NOT finish the work-item alone with prose such as \"skill files are missing\", "
+        "\"cannot access Google Sheets\", or only generic Cloud Console setup steps when Section 2 "
+        "lists domain subagents. Those answers belong after real execution attempts by a subagent.\n"
+        "- Skill discovery is never optional: the mandatory `스킬 탐색 도우미` run comes first; domain subagents "
+        "then follow (1) mounted volume/FS skills, (2) claude-skills MCP, (3) sandbox execution per their "
+        "instructions. They MUST use sandbox_write_and_run (or write + shell) only after MCP "
+        "has been tried when MCP is configured.\n"
+        "- For execution tasks, domain subagents should prefer synthesized task-specific scripts "
+        "(built from request + InputData + skill references) over blindly executing original skill scripts. "
+        "Direct skill-script execution is allowed only when it exactly matches required inputs and behavior.\n"
+        "- When delegating with task(), include resolved dates and symbols in plain text (from the execution "
+        "clock block the runtime injects into your prompt) so subagents do not re-guess \"yesterday\" or "
+        "invent CLI flags.\n"
+        "- Your final synthesis MUST quote concrete subagent outputs (stdout/stderr, exit codes), "
+        "not replace them with manual runbooks.\n\n"
+        "Human-in-the-loop (HITL) — last resort only:\n"
+        "- request_human_input() stops the whole run. Use it only after subagents have exhausted "
+        "reasonable tool attempts (mem0/memento, MCP, sandbox, FS, API retries), or when law/policy "
+        "requires explicit human approval.\n"
         "- If Instructions or Description indicate approvals, sensitive data, or explicit "
-        "human review (e.g. terms like \"승인\", \"검토\", \"결재\", \"민감\", \"개인정보\", "
-        "\"approval\"), you MUST include at least one step where a human is asked to review "
-        "or approve either the plan or the final result.\n"
-        "- If essential InputData is missing for a requested action, you MUST include a "
-        "step to ask the human for the missing information before executing that action.\n"
-        "- Clearly describe what must be confirmed or provided by the human in those steps.\n\n"
+        "human review (e.g. \"승인\", \"결재\", \"민감\", \"개인정보\", \"approval\"), plan a human "
+        "review step — but still delegate tool-based work first where possible.\n"
+        "- If InputData looks incomplete, do NOT plan \"ask the human\" as step 1. Plan: (1) delegate "
+        "to subagents to retrieve from mem0/memento, infer from docs, list/discover APIs, use defaults; "
+        "(2) retry with corrected parameters; (3) only then consider HITL for what is still truly missing.\n"
+        "- Before any HITL for missing parameters, subagents must attempt autonomous discovery (skill docs, "
+        "API spec, endpoint list/search, error-guided retries). HITL is the last resort, not the first.\n"
+        "- Clearly describe what the human must confirm only when a human step is truly necessary.\n\n"
         "Task scope and robustness:\n"
         "- Perform only what the Description/Instruction explicitly request for this "
         "single work-item. Do not invent extra follow-up work.\n"
         "- If a tool or subagent fails, continue as far as possible with the remaining "
         "information and clearly state any limitations in the final synthesis.\n"
         "\n"
-        "Planning and logging requirements when you have NO pre-computed plan:\n"
-        "- If Section 7 is NOT present in the system prompt, first create an explicit, "
-        "step-by-step execution plan that can be logged as text.\n"
-        "- If the work-item requires any domain work (data, APIs, skills), your plan MUST "
-        "include at least one step where you call task() with a subagent; do not finish with "
-        "only a text answer when a subagent could perform the work.\n"
-        "- For each step, describe which subagent will act, which tools/skills it will likely "
-        "use, what inputs it will consume, and what outputs it will produce.\n"
-        "\n"
-        "Planning and logging requirements when a pre-computed plan IS present:\n"
-        "- When Section 7 of the system prompt contains a pre-computed execution plan (in a "
-        "human-readable [PLAN] block), you MUST treat it as the primary plan.\n"
-        "- The plan may be in narrative markdown format with headings like '## 1. Step Title' "
-        "followed by numbered sub-steps explaining the actions in detail, and ending with "
-        "a statement like '이 단계는 에이전트명이 수행합니다'.\n"
-        "- For each major step (markdown heading) in that [PLAN] block, you MUST delegate "
-        "the work to the appropriate agent by calling task().\n"
-        "- When you call task() for a given step, you MUST include at least the following "
-        "arguments in the tool input:\n"
-        "  * step_id: a string such as \"step_N\" derived from the step number,\n"
-        "  * subagent_type (or subagent_name): the Agent name mentioned in the plan,\n"
-        "  * instruction: a clear natural-language instruction that combines the step "
-        "description, relevant InputData keys, and any required context or previous step "
-        "outputs,\n"
-        "  * expected_output: a short description of what the subagent should return.\n"
-        "- You MUST call task() at least once for each executable step in the [PLAN] block; "
-        "do not skip steps or respond with only a textual summary when real execution is "
-        "possible.\n"
-        "- If you need to change the plan substantially, clearly describe the changes and "
-        "reasons in your final [SUMMARY]/[RESULT] block.\n"
-        "\n"
-        "Required final response format (you MUST structure your reply as follows):\n"
-        "- [PLAN] ... [/PLAN]: Put ONLY the step-by-step execution plan in this block. "
-        "Use numbered steps; for each step include agent/tools/input/output. Do NOT put "
-        "error messages, general commentary, or final results inside [PLAN]. This block is "
-        "stored as the official 'plans' field.\n"
-        "- [SUMMARY] ... [/SUMMARY] or [RESULT] ... [/RESULT]: Put execution summary, "
-        "constraints, or final outcome narrative here (not inside [PLAN]).\n"
-        "\n"
-        "Credentials and human-in-the-loop (HITL):\n"
-        "- When a subagent needs API keys, tokens, or other credentials for external services "
-        "that are not in InputData, do NOT have the subagent return only placeholder code or "
-        "'insert your API key here'. The system will ask the human for the missing credential "
-        "and then continue; plan for a step where the human provides it and the subagent "
-        "performs the real call.\n"
+        "Planning and logging requirements:\n"
+        "- Keep todo items updated with write_todos for all non-trivial tasks.\n"
+        "- Prefer explicit delegation to named subagents for tools/API/skills operations.\n"
+        "Credentials and HITL:\n"
+        "- When credentials are not in InputData, instruct subagents to use mem0/memento first, then MCP, "
+        "then sandbox — not immediate human upload requests. Reserve HITL for when tools genuinely "
+        "cannot supply the secret after those attempts.\n"
+        "- Do NOT have subagents stop at placeholder code; keep delegating until real calls or valid HITL.\n"
         "- Never return only placeholder code or example snippets when real execution is "
         "expected; ensure the plan leads to actual tool/API use once credentials are supplied.\n"
-    )
-
-
-def default_planner_prompt() -> str:
-    """Base rules for the planner: pure planning, agent assignment, and logging format.
-
-    This prompt is used for the lightweight *planner* agent that only
-    generates a [PLAN]...[/PLAN] block. The planner MUST NOT execute
-    tools or skills and must instead produce a high‑quality, user-friendly
-    narrative plan that the worker orchestrator can follow.
-    """
-    return (
-        "You are the ProcessGPT Task Execution Planner.\n\n"
-        "Your ONLY job is to read the work-item information and the available agents, then "
-        "produce a high-quality, step-by-step execution PLAN for them. You MUST NOT execute "
-        "any tools, skills, or APIs yourself. Instead, you describe what each agent will do.\n\n"
-        "Input structure:\n"
-        "- The user message you receive summarises:\n"
-        "  * [Description] – what this activity is trying to achieve.\n"
-        "  * [Instruction] – how it should be done, including required tools/MCP/skills.\n"
-        "  * [InputData]   – JSON with the actual business data for this activity.\n"
-        "  * Agents        – name/role/skills/tools for each available subagent.\n\n"
-        "Planning requirements:\n"
-        "- Break the work into small, atomic steps that real subagents can execute.\n"
-        "- For each step you MUST assign a concrete agent from the Agents list.\n"
-        "- For each step you MUST think about which tools/skills that agent will likely use,\n"
-        "  which InputData keys are important, and what output the agent should return.\n"
-        "- You MUST NOT plan to use tools or skills that are clearly unavailable to that agent.\n\n"
-        "Human-in-the-loop (HITL) planning hints:\n"
-        "- If Description/Instruction include approval- or sensitivity-related terms such as "
-        "\"승인\", \"검토\", \"결재\", \"민감\", \"개인정보\", \"approval\", \"sensitive\", "
-        "\"personal data\", you MUST include at least one step where a human reviews or "
-        "approves the result.\n"
-        "- If some required InputData is clearly missing for a requested action, you MUST "
-        "include a step in which a human is asked to provide the missing information.\n\n"
-        "Required [PLAN] format (user-friendly narrative style):\n"
-        "- Your final answer MUST contain one [PLAN]...[/PLAN] block.\n"
-        "- Inside [PLAN], write each major step as a Markdown heading (e.g. '## 1. 단계 제목').\n"
-        "- Under each heading, write a numbered list of detailed sub-steps in natural language.\n"
-        "- Each sub-step MUST describe:\n"
-        "  1) Which tool or skill will be called and with what purpose\n"
-        "  2) What parameters or input data will be used (reference InputData keys explicitly)\n"
-        "  3) What the expected outcome or return value is\n"
-        "  4) How this sub-step connects to the next action\n"
-        "- Write in a friendly, explanatory tone as if guiding a colleague through the process.\n"
-        "- Be specific about tool names, parameter values, and data flow between steps.\n"
-        "- At the end of each major step, briefly mention which agent will execute it.\n\n"
-        "Example format:\n"
-        "## 1. 데이터 조회\n\n"
-        "1. 먼저 'find_helpful_skills' 도구를 호출하여 작업에 필요한 스킬을 검색합니다. "
-        "`task_description`에 요청 내용을 전달합니다.\n"
-        "2. 검색 결과에서 적합한 스킬을 확인하고, 'read_skill_document' 도구로 해당 스킬의 "
-        "사용 방법을 읽습니다.\n"
-        "3. 스킬 문서에 따라 API를 호출합니다. InputData의 'api_key' 값을 사용하여 인증하고, "
-        "'query_params'에 지정된 조건으로 데이터를 조회합니다.\n"
-        "4. API 응답을 검토하여 필요한 데이터가 모두 포함되었는지 확인합니다.\n\n"
-        "이 단계는 '데이터 분석 에이전트'가 수행합니다.\n\n"
-        "- Do NOT include error messages, code snippets, or final business results inside [PLAN].\n"
-        "- Optionally, after the [PLAN] block you may add a [SUMMARY]...[/SUMMARY] block with a "
-        "natural-language explanation of the overall plan.\n"
     )
 
 
@@ -235,6 +158,7 @@ def build_orchestrator_system_prompt(
     tenant_id: str | None = None,
     plan_text: str | None = None,
     output_language: str | None = None,
+    hitl_resume: Mapping[str, str] | None = None,
 ) -> str:
     """Compose a sectioned system_prompt for the DeepAgents orchestrator.
 
@@ -244,6 +168,7 @@ def build_orchestrator_system_prompt(
     """
     parts: list[str] = []
     parts.append(base_rules.rstrip())
+    parts.append("\n\n" + format_execution_clock_section())
 
     # 사용자 입력이 한글인 경우 [PLAN] 및 최종 result를 한글로 작성하도록 지시
     if output_language == "korean":
@@ -267,6 +192,18 @@ def build_orchestrator_system_prompt(
         f"- InputData keys: {key_list}\n"
         f"- Tenant ID: {tenant}\n"
     )
+
+    if hitl_resume:
+        fkey = (hitl_resume.get("field") or "human_response").strip()
+        ans = (hitl_resume.get("answer") or "").strip()
+        if ans:
+            parts.append(
+                "\n=== Section 1b: Human follow-up after interrupt (HITL resume) ===\n"
+                f"The workflow was paused for human input. The following was provided under "
+                f"InputData key `{fkey}` — you MUST treat this as authoritative and continue "
+                f"immediately without asking for the same information again.\n\n"
+                f"{ans}\n"
+            )
 
     # 섹션 2: 에이전트 / 스킬 / 도구 맥락
     agent_lines: list[str] = []
@@ -305,6 +242,8 @@ def build_orchestrator_system_prompt(
         "- If the requested action clearly needs data that is not present in InputData, "
         "include a step where you ask the human to provide the missing information before "
         "executing the action.\n"
+        "- For non-sensitive API/query parameters, do not ask human first. Plan autonomous "
+        "parameter discovery + at least one corrective retry from tool error feedback before HITL.\n"
     )
 
     # 섹션 4: 폼/출력 구조 관련 정보 (있을 때만)
@@ -330,13 +269,27 @@ def build_orchestrator_system_prompt(
         "- You do not have domain tools (skills, APIs, MCP). All such work MUST be done by "
         "subagents via task(). Break the task into atomic steps and for each step that needs "
         "tools/skills/data, assign a subagent from Section 2.\n"
+        "- Mandatory order: step 1 MUST always be task() → `스킬 탐색 도우미` before any "
+        "other subagent. After you receive its skill recommendations, plan domain subagent steps.\n"
         "- For each step, specify: which subagent (by name) handles it, which tools/skills that "
         "subagent will use, what inputs it consumes, and what output it must return.\n"
-        "- Do not use the general-purpose subagent for domain work; use the named subagents "
-        "in Section 2 (e.g. those with roles/skills that match the request).\n"
+        "- If a subagent has mem0/memento/dmn_rule and the task benefits from them, mention in the "
+        "delegated instruction which to try and why (e.g. stored credentials vs DMN policy vs RAG docs).\n"
+        "- Do not use the general-purpose subagent for domain work; use the named domain subagents "
+        "in Section 2 (roles/skills that match the request). Use `스킬 탐색 도우미` only for "
+        "skill search/ranking (always first), not for full domain execution.\n"
         "- Your final reply MUST include a [PLAN]...[/PLAN] block containing only the "
         "step-by-step plan (no error text or results inside that block), and optionally "
         "[SUMMARY]...[/SUMMARY] or [RESULT]...[/RESULT] for summary/outcome.\n"
+        "- For data lookup/investigation requests (e.g. API-based queries), ensure delegated outputs include "
+        "verifiable evidence fields: source, endpoint_or_series, as_of, value, unit.\n"
+    )
+
+    parts.append(
+        "\n=== Section 5b: Sandbox fallback when skill files are missing ===\n"
+        "- API/Sheets/script work must not end as prose-only refusals (e.g. \"no skill files\").\n"
+        "- You MUST call task() with the appropriate subagent from Section 2 and instruct them to use "
+        "sandbox_write_and_run (or write + shell) after copy/read failures.\n"
     )
 
     # 섹션 6: 최종 출력 형식 요구사항
@@ -350,41 +303,45 @@ def build_orchestrator_system_prompt(
         "'result'.\n"
         "- When a concrete form schema is present, ensure that your outputs can be mapped "
         "into the form fields described above while still being safely serialisable as JSON.\n"
+        "- When a concrete form schema is present, your FINAL answer MUST be a single valid JSON object "
+        "(no markdown, no code fences, no extra prose). It MUST contain ONLY the form fields (keys) "
+        "described above, with correctly-typed values. This output form is the deliverable.\n"
+        "- Do NOT confuse input activities (e.g. any @activity:... mentions) with the output form. "
+        "Input activity names may be absent in the work-item; do not rely on them. Always populate the "
+        "output form fields regardless.\n"
     )
 
-    # (선택) 섹션 7: 사전 계산된 실행 플랜
+    # 선택: 외부에서 전달된 플랜 힌트가 있으면 참조 컨텍스트로 제공
     if plan_text:
         cleaned_plan = (str(plan_text).strip() or "")
         if cleaned_plan:
             parts.append(
-                "\n=== Section 7: Pre-computed execution plan (read-only) ===\n"
-                "The following plan was generated in a previous planning step. Use it as a strong "
-                "prior when delegating to subagents, but you may refine or adjust it if needed. "
-                "If you change the plan substantially, summarise the changes in your final result.\n\n"
+                "\n=== Section 7: External planning hint ===\n"
+                "Use this as optional context only and keep write_todos as source of truth.\n\n"
                 f"{cleaned_plan}\n"
             )
 
     return "\n".join(parts)
 
 
-def build_planner_agent(
+def build_orchestrator(
     *,
     model_name: str,
-    system_prompt: str,
+    system_prompt: str | None = None,
+    subagents: list[dict[str, Any]] | None = None,
+    tools: Sequence[Any] | None = None,
+    hitl_tools: Sequence[Any] | None = None,
+    middleware: Sequence[Any] | None = None,
+    skills: list[str] | None = None,
 ) -> CompiledStateGraph:
-    """Create a lightweight planner agent that only generates a PLAN block.
-
-    - No subagents or domain tools are attached.
-    - This agent should only be used to produce a [PLAN]...[/PLAN] block and
-      MUST NOT execute tools or skills.
-    """
-    agent = create_deep_agent(
-        model=model_name,
-        tools=[],
+    """Backward compatible alias for runtime agent builder."""
+    return build_runtime_agent(
+        model_name=model_name,
         system_prompt=system_prompt,
-        subagents=[],
-        middleware=[],
+        subagents=subagents,
+        tools=tools,
+        hitl_tools=hitl_tools,
+        middleware=middleware,
+        skills=skills,
     )
-    logger.info("Planner agent created: model=%s", model_name)
-    return agent
 

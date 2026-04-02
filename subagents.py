@@ -4,14 +4,50 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
+import re
 from typing import Any
 
 from database import get_supabase
+from execution_context import format_execution_clock_section
+from sandbox_tools import get_sandbox_tools
+from skill_resolution_tools import get_skill_resolution_tools
 
-# 기본 MCP 서버 이름 (SafeToolLoader 기본 설정과 동일하게 유지)
-DEFAULT_MCP_SERVER_NAMES: tuple[str, str] = ("claude-skills", "computer-use")
+# Tier 2: claude-skills MCP tools are attached to every subagent via DEFAULT_MCP_SERVER_NAMES
+# (when tenant_mcp includes that server). computer-use remains virtual (sandbox replaces shell).
+DEFAULT_MCP_SERVER_NAMES: tuple[str, ...] = ("claude-skills",)
+SKILLS_ROOT_DIR = (os.environ.get("SKILLS_ROOT_DIR") or "/app/skills").rstrip("/")
+VIRTUAL_TOOL_NAMES: set[str] = {"computer-use"}
+ALWAYS_ATTACH_LOCAL_TOOL_NAMES: tuple[str, ...] = ("mem0", "memento", "dmn_rule")
 
 logger = logging.getLogger(__name__)
+
+
+def _sandbox_tool_names() -> set[str]:
+    """Return the tool names provided by sandbox_tools.get_sandbox_tools()."""
+    try:
+        return {getattr(t, "name", type(t).__name__) for t in get_sandbox_tools()}
+    except Exception:
+        # Defensive: never block subagent config due to sandbox tool introspection.
+        return set()
+
+
+def _baseline_mcp_tools(server_to_tools: dict[str, list[Any]]) -> list[Any]:
+    """Match DEFAULT_MCP_SERVER_NAMES to server_to_tools keys case-insensitively."""
+    wanted = {b.lower().replace("_", "-") for b in DEFAULT_MCP_SERVER_NAMES}
+    out: list[Any] = []
+    for skey, tools in server_to_tools.items():
+        normalized = str(skey).lower().replace("_", "-")
+        if normalized in wanted or any(normalized.endswith(w) for w in wanted):
+            out.extend(tools)
+    return out
+
+
+def _skill_resolution_tool_names() -> set[str]:
+    try:
+        return {getattr(t, "name", type(t).__name__) for t in get_skill_resolution_tools()}
+    except Exception:
+        return set()
 
 
 def load_agents_from_db(
@@ -43,6 +79,54 @@ def _parse_csv(value: str | None) -> list[str]:
     return [s.strip() for s in value.split(",") if s.strip()]
 
 
+def parse_skills_csv(value: str | None) -> list[str]:
+    """Public helper for parsing users.skills CSV values."""
+    return _parse_csv(value)
+
+
+# Skill-folder style slugs in user text (e.g. global-investment-analyzer).
+_SKILL_SLUG_IN_TEXT = re.compile(
+    r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b",
+    flags=re.IGNORECASE,
+)
+
+
+def hinted_skill_slugs_from_query(
+    text: str,
+    *,
+    allowed_skill_names: list[str] | None = None,
+) -> list[str]:
+    """Extract skill name candidates from the work-item text (kebab-case + allowed list matches).
+
+    Used to steer the skill-discovery subagent and find_helpful_skills allowlists
+    when the user names a skill directly or it appears in assigned agent skills.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    lower_blob = raw.lower()
+
+    for name in allowed_skill_names or []:
+        n = (name or "").strip()
+        if not n:
+            continue
+        key = n.lower()
+        if key in lower_blob or key.replace("_", "-") in lower_blob:
+            if n not in seen:
+                seen.add(n)
+                out.append(n)
+
+    for m in _SKILL_SLUG_IN_TEXT.finditer(raw):
+        slug = m.group(0).strip()
+        if slug and slug not in seen:
+            seen.add(slug)
+            out.append(slug)
+
+    return out
+
+
 def _build_description(agent_row: dict[str, Any], name: str) -> str:
     """Build subagent description from row description, persona, and goal."""
     base = agent_row.get("description") or f"Agent: {name}"
@@ -63,8 +147,8 @@ def _build_system_prompt(
 ) -> str:
     """Compose a richer, sectioned system prompt for a subagent.
 
-    Skill content is not inlined; subagents load it at runtime via MCP
-    (e.g. read_skill_document), and may also use mem0/dmn_rule or other
+    Skill content is not inlined; subagents load it at runtime from mounted
+    filesystem paths (tenant-aware), and may also use mem0/dmn_rule or other
     tools that have been attached to them.
     """
     parts: list[str] = []
@@ -86,6 +170,8 @@ def _build_system_prompt(
     if goal:
         parts.append(f"- Goal: {goal}")
 
+    parts.append("\n" + format_execution_clock_section())
+
     # 섹션 2: 현재 워크아이템 컨텍스트 (요약 형태로)
     q = (query or "").strip()
     if q:
@@ -101,201 +187,204 @@ def _build_system_prompt(
     t_id = (tenant_id or "").strip() or "(unknown)"
     parts.append("\n=== Section 3: Tenant context ===")
     parts.append(f"- Current tenant_id: {t_id}")
-    parts.append(
-        "- When you call any tools or skills that accept a tenant_id argument "
-        "(for example, claude-skills tools such as find_helpful_skills), you MUST "
-        "pass exactly this tenant_id value and MUST NOT invent or modify it. "
-        "Do NOT use values like 'finance_department' unless they are identical "
-        "to the current tenant_id shown above."
-    )
+    parts.append("- Use this tenant_id to resolve skill paths under the mounted skills root.")
 
     # 섹션 4: 스킬 / 도구 사용 규칙
     agent_skills = _parse_csv(agent_row.get("skills"))
     tools = _parse_csv(agent_row.get("tools"))
     parts.append("\n=== Section 4: Skills and tools usage ===")
+    parts.append(
+        "\n=== Section 4a0: Built-in knowledge tools (use when they add value; not every task needs them) ===\n"
+        "Your tool list may include local tools that are NOT generic MCP — treat them by purpose:\n"
+        "- **mem0** — Long-term personalized memory: user/org preferences, standing facts, credentials or secrets "
+        "the user chose to store, prior task notes, and anything that should persist across runs.\n"
+        "  Use mem0 when: the task could benefit from personalization; [Instruction]/[Description]/user text "
+        "mentions memory, prior runs, preferences, or stored keys; or you are about to ask the human for "
+        "information that might already live in memory.\n"
+        "  Skip mem0 when: the task is purely stateless/format-only and nothing suggests stored context.\n"
+        "- **dmn_rule** — Business rules & decision logic: policies, thresholds, eligibility, DMN-style rules "
+        "that must govern *what* to do or *whether* an action is allowed.\n"
+        "  Use dmn_rule when: the request involves compliance, approvals, routing rules, or any "
+        "structured decision that should not be invented from general knowledge.\n"
+        "  Skip when: no rule-governed decision is involved.\n"
+        "- **memento** — RAG / document retrieval over tenant-linked corpora: finding relevant internal "
+        "documents, passages, or evidence to ground answers.\n"
+        "  Use memento when: you need supporting documents, similar past cases, or authoritative text "
+        "that may exist outside the current work-item text.\n"
+        "  Skip when: everything needed is already in [Instruction]/[InputData] and no retrieval is implied.\n"
+        "\n"
+        "Ordering (soft, not mandatory): when you *do* use these tools, prefer calling them **before** "
+        "heavy MCP or sandbox work so their outputs can steer parameters, credentials, and risk choices. "
+        "If a tool returns nothing useful, proceed without looping endlessly.\n"
+        "\n"
+        "**Human-in-the-loop (HITL) and credentials / file uploads:**\n"
+        "- Do **not** jump to `request_human_input` (or similar) for API keys, tokens, or credential files "
+        "just because [Instruction] says \"upload a file\" or \"provide a key\", if mem0 (or memento for "
+        "documented secrets) might already hold them — **query the relevant tools first**, then decide.\n"
+        "- Only after you have **reasonably tried** attached mem0 / dmn_rule / memento (when applicable to "
+        "the task) and still lack a required secret or file, escalate to human intervention with a clear, "
+        "minimal question.\n"
+        "- Summarize what you retrieved from memory/rule/RAG tools and how it changed your plan; if nothing "
+        "was found, say so briefly and continue.\n"
+    )
+    parts.append(
+        "\n=== Section 4a: Three-tier skill resolution (STRICT ORDER) ===\n"
+        "- At the start of non-trivial tasks, use write_todos with items that include: "
+        "`tier1_volume_fs`, `tier2_claude_skills_mcp` (only if Tier 1 fails), "
+        "`tier3_sandbox` (only if Tier 2 fails and execution is required). "
+        "- Tier 1 — Volume + filesystem: Call skill_volume_probe(tenant_id, skill_names_csv) "
+        "with Section 3 tenant_id and your assigned skill folder names (comma-separated). "
+        "That tool emits server-side logs automatically; still call "
+        "report_skill_resolution_tier(1, \"started\"|\"success\"|\"failed\", short detail) "
+        "so tier transitions appear in the same stream as Tier 2/3. "
+        "Then use built-in ls/read_file/glob on paths under the skills root; prefer "
+        "sandbox_copy_mounted_skill to mirror files into the sandbox before running scripts.\n"
+        "- Tier 2 — claude-skills MCP: ONLY after Tier 1 shows missing SKILL.md / empty copy / "
+        "skill_volume_probe.tier1_any_hit is false for what you need. "
+        "Use the MCP tools from the claude-skills server (e.g. search/list/read similar skills). "
+        "Call report_skill_resolution_tier(2, \"started\"|\"success\"|\"failed\", short detail) when entering/leaving this tier.\n"
+        "- Tier 3 — Sandbox code: ONLY when Tier 2 did not produce a runnable skill AND the task "
+        "requires code execution. Follow Section 4c. "
+        "Call report_skill_resolution_tier(3, ... ) similarly.\n"
+        "- Do not jump to Tier 3 while claude-skills MCP tools are available and you have not tried Tier 2.\n"
+    )
     if agent_skills:
         names = ", ".join(agent_skills)
         parts.append(f"- Assigned skills: {names}")
         parts.append(
-            "- When solving tasks, you MUST first try to use your assigned skills above. "
-            "However, for built-in/global skills (like the default Anthropic skills), their "
-            "SKILL.md may not be directly readable via read_skill_document even though the "
-            "skill itself is loaded. Therefore you MUST discover and access skill documents "
-            "through find_helpful_skills before calling read_skill_document."
+            f"- Skills root directory: {SKILLS_ROOT_DIR} "
+            "(mounted docker volume)."
         )
         parts.append(
-            "- For each assigned skill name <name>, follow this workflow IN ORDER:"
+            "- Default document path for each skill follows this template (do NOT invent paths): "
+            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/{{skill_name}}/SKILL.md\"."
+        )
+        for s in agent_skills:
+            parts.append(
+                f"  * {s} → primary document_path: "
+                f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/"
+                f'{s}'
+                "/SKILL.md\""
+            )
+        parts.append(
+            "- When solving tasks, you MUST first read assigned skill documents using "
+            "filesystem tools (ls/read_file)."
         )
         parts.append(
-            "  1) Call find_helpful_skills with:"
-            "     - tenant_id set to the tenant_id from Section 3,"
-            "     - task_description that includes ALL of the following, in a single string:"
-            "       * the user's current task (in their original language),"
-            "       * the exact skill name <name>,"
-            "       * both Korean and English mentions of the skill name if possible"
-            "         (e.g. \"xlsx 스킬\", \"xlsx skill\"),"
-            "       * a short description of why you want to use that skill."
+            "  1) Check directory existence with ls on "
+            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/<name>/\"."
         )
         parts.append(
-            "     - IMPORTANT: You MUST pass allowed_skill_names=[\"<name>\"] for this call. "
-            "This ensures tenant-local skills are included in the search scope. "
-            "You may include additional skill names in allowed_skill_names only when the "
-            "task explicitly requires multiple skills, but you MUST include <name>."
+            "  2) Read the primary document with read_file on "
+            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/<name>/SKILL.md\"."
         )
         parts.append(
-            "  2) You MUST call find_helpful_skills TWICE per task for each assigned "
-            "skill you are trying to use: once with a Korean task_description and once "
-            "with an English task_description. If the user's query is in Korean, use it "
-            "directly for the Korean version and translate it to English for the second "
-            "call while still including the skill name <name> in both versions. If the "
-            "query is in English, translate it into natural Korean for the first call and "
-            "reuse/refine the English version for the second call, again explicitly "
-            "including the skill name <name> in both descriptions."
+            "  3) If missing, inspect the same directory for alternative docs/scripts and continue."
         )
         parts.append(
-            "  3) Merge and deduplicate the returned skill candidates from the Korean and "
-            "English calls. Identify the entries whose skill_name or description clearly "
-            "matches your assigned skill <name>."
-        )
-        parts.append(
-            "  4) For each such matched skill, inspect its \"Available Documents\" list in "
-            "the find_helpful_skills result. You MUST NOT invent filesystem-style paths like "
-            "\"/app/skills/{tenant_id}/<name>/SKILL.md\". Instead, call read_skill_document "
-            "using exactly the document_path values that appear in the Available Documents "
-            "list (for example \"SKILL.md\", \"LICENSE.txt\", or \"scripts/recalc.py\")."
-        )
-        parts.append(
-            "  5) If a SKILL.md is not listed for that skill, still proceed by reading any "
-            "other .md, .txt, or relevant script files listed there, and base your behavior "
-            "on the guidance found in those documents."
-        )
-        parts.append(
-            "- You MUST NOT assume that SKILL.md lives under any particular on-disk path "
-            "or that read_skill_document can open arbitrary filesystem locations. Only use "
-            "document_path values that are explicitly listed by find_helpful_skills or "
-            "directly documented by that skill."
-        )
-        parts.append(
-            "- You MUST NOT give up after a single failed call to read_skill_document for "
-            "an assigned skill. Try other document_path entries from the Available Documents "
-            "list (e.g. other .md or .txt files) before concluding that the skill has no "
-            "usable documentation."
-        )
-        parts.append(
-            "- Tenant-local skill HTTP fallback (MANDATORY when needed): Some skills may appear "
-            "in list_skills with sources like \"/app/skills/{tenant_id}/...\" but still be "
-            "unavailable via find_helpful_skills/read_skill_document (e.g. read_skill_document "
-            "returns 'skill not found'). In that case you MUST use the HTTP fallback tools:\n"
-            "  * list_skill_files_http(skill_name=\"<name>\") to get the file list\n"
-            "  * read_skill_file_http(skill_name=\"<name>\", file_path=\"<one of the returned paths>\") "
-            "to read file content\n"
-            "You MUST first list files, then choose which file(s) to read dynamically based on "
-            "the returned list (do NOT hardcode file paths in advance)."
+            "- You MUST NOT give up after one failed read. Explore neighboring files "
+            "in the skill directory and proceed with best available instructions."
         )
         parts.append(
             "- When a skill's documents include Python scripts (*.py files), you MUST execute "
-            "them using the computer-use MCP tool run_shell. Follow this MANDATORY workflow:\n"
-            "  1) First, read the skill's SKILL.md (or other documentation) via read_skill_document.\n"
-            "  2) Identify ALL .py files mentioned or listed in the skill documentation.\n"
-            "  3) Read the actual .py file content using read_skill_document with the .py file path "
-            "(e.g. document_path=\"scripts/fetch_kospi.py\" or similar).\n"
-            "  4) Determine the FULL execution path of the .py file. If the skill is located at "
-            "\"/app/skills/{tenant_id}/{skill_name}/\", then the .py file path would be "
-            "\"/app/skills/{tenant_id}/{skill_name}/{relative_path_to_py}\".\n"
-            "  5) Execute the script using run_shell with: python /full/path/to/script.py [arguments]\n"
-            "  6) Pass required parameters (API tokens, dates, etc.) as command-line arguments or "
-            "environment variables. For example:\n"
-            "     - python /app/skills/tenant/skill/script.py --api-key=TOKEN --date=2024-01-01\n"
-            "     - Or: API_KEY=TOKEN python /app/skills/tenant/skill/script.py\n"
-            "  7) NEVER just show code snippets or explain how to run—ACTUALLY execute with run_shell.\n"
-            "  8) If the script requires input data from InputData (e.g. api_token, access_token), "
-            "extract those values and pass them to the script execution command."
+            "them in sandbox. Read SKILL.md, locate referenced .py files, then run them "
+            "with sandbox_run_shell—do not only return code or instructions."
         )
         parts.append(
-            "- Package installation: If the skill's .py script requires additional Python packages, "
-            "install them BEFORE running the script. Follow this order:\n"
-            "  1) First, try: pip install --user <package_name>\n"
-            "     (This installs to user directory and doesn't require root permissions)\n"
-            "  2) If that fails, try: pip install <package_name> (may work in some environments)\n"
-            "  3) For system packages (apt), if 'apt install' fails due to permission denied:\n"
-            "     - Do NOT give up. Try alternative approaches:\n"
-            "     - Use pip to install Python equivalents when possible\n"
-            "     - Check if the package is already available under a different name\n"
-            "     - Use 'python -m pip install' as an alternative\n"
-            "  4) After installation, proceed to run the actual skill script.\n"
-            "  5) IMPORTANT: Package installation is just preparation. The main goal is to "
-            "EXECUTE the skill's .py file and return the actual result."
+            "- IMPORTANT: Do NOT blindly run skill scripts as-is by default. Treat skill scripts as "
+            "reference modules/templates first. Build a task-specific execution script from "
+            "the user request + InputData + skill docs, then execute that synthesized script."
         )
         parts.append(
-            "- When executing a skill's .py script, if the script path from the skill document is "
-            "relative (e.g. 'scripts/main.py' or just 'main.py'), construct the full path by prepending "
-            "the skill's base directory. Use list_skill_files_http to discover actual file paths "
-            "if needed, then execute with the full absolute path."
+            "- Direct execution of an original skill script is allowed only when ALL are true: "
+            "(a) the script's declared purpose exactly matches the request, "
+            "(b) required inputs are already present in InputData/context, and "
+            "(c) no task-specific parameter remapping is needed."
         )
         parts.append(
-            "- IMPORTANT: Python code may be embedded inside .md files (e.g., SKILL.md) as code blocks "
-            "(```python ... ```). When you find Python code in a .md file, you MUST still execute it:\n"
-            "  1) Extract the Python code from the markdown code block.\n"
-            "  2) Execute it using one of these methods:\n"
-            "     a) Save to a temp file and run: echo '<code>' > /tmp/skill_script.py && python /tmp/skill_script.py [args]\n"
-            "     b) Use python -c: python -c '<code>' (for short scripts, escape quotes properly)\n"
-            "     c) Use heredoc: python << 'EOF'\n<code>\nEOF\n"
-            "  3) Pass required arguments (API tokens, dates, etc.) as before.\n"
-            "  4) The code in .md files is meant to be executed, not just read or explained.\n"
-            "  5) If there are multiple code blocks, identify the main executable one (usually the "
-            "complete script, not just snippets or examples)."
+            "- Mandatory materialization + execution path (do not skip):\n"
+            "  1) sandbox_create → note workspace_id.\n"
+            "  2) sandbox_copy_mounted_skill with the same tenant_id as Section 3 and each "
+            "assigned skill folder name (copies host-mounted files into the workspace).\n"
+            "  3) Prefer sandbox_write_and_run (or write_files + run_shell) to execute a synthesized script "
+            "that imports/reuses skill logic with task-specific parameters. "
+            "Run original skill scripts directly only when they exactly match the requested task and inputs.\n"
+            "  4) sandbox_read_workspace_files for key outputs if needed.\n"
+            "  Your final message to the orchestrator MUST include actual command outputs "
+            "(stdout/stderr snippets), not only generic API usage examples."
+        )
+        parts.append(
+            "- If sandbox_copy_mounted_skill reports source_missing or source_not_dir, or "
+            "copied_files is empty, you MUST use sandbox_write_and_run (preferred) or "
+            "sandbox_write_files + sandbox_run_shell: synthesize a complete script from the "
+            "work-item Instruction + InputData, run it, and return stdout/stderr. "
+            "Never stop at placeholder code or setup prose only."
         )
     else:
         parts.append("- Assigned skills: (none explicitly assigned)")
         parts.append(
-            "- Because you have no assigned skills, you SHOULD start by calling "
-            "find_helpful_skills with an appropriate task_description and tenant_id "
-            "to discover relevant skills before attempting any complex domain work. "
-            "Make sure the task_description includes both the user's request and any "
-            "relevant skill names or keywords in both Korean and English when possible."
+            "- Because you have no assigned skills, inspect tenant skill directories under "
+            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/\" and choose the most relevant one."
         )
         parts.append(
-            "- In all cases when you use find_helpful_skills, you MUST call it twice per "
-            "task: first with a Korean task_description and then with an English "
-            "task_description for the same task. Use Korean if the user's request is in "
-            "Korean (or translate the request into Korean), and create or refine an English "
-            "version for the second call. In both calls, explicitly mention any relevant "
-            "skill names (for example \"xlsx 스킬\", \"xlsx skill\") inside the "
-            "task_description so that the search can match skills whose names appear only "
-            "in English or only in Korean. Combine the results from both calls so that skills "
-            "whose descriptions are written only in one language can still be discovered."
+            "- If nothing usable is on disk, use sandbox_write_and_run to implement the task "
+            "from Instruction + InputData without waiting for skill files."
         )
+
+    parts.append(
+        "\n=== Section 4c: Tier 3 — sandbox when FS + MCP did not yield a runnable skill ===\n"
+        "Use Tier 3 only after Tier 1 (volume/FS) and Tier 2 (claude-skills MCP) are exhausted or "
+        "MCP is unavailable, and the task still requires code execution.\n"
+        "Typical triggers: ls/read_file failed for expected paths; "
+        "sandbox_copy_mounted_skill returns source_missing, source_not_dir, or copied_files=[]; "
+        "or MCP returned no executable skill.\n"
+        "Order (do not skip step 3):\n"
+        "  1) sandbox_create if you do not yet have workspace_id.\n"
+        "  2) Write one complete Python (or shell) program that performs the requested action "
+        "using data from the work-item; embed credentials from InputData when provided. "
+        "This script should be task-specific (synthesized), not a blind copy of skill scripts.\n"
+        "  3) sandbox_write_and_run(relative_path like \"fallback_main.py\", content=...) "
+        "— or equivalent sandbox_write_files + sandbox_run_shell.\n"
+        "  4) Return exit_code, stdout, stderr to the orchestrator (trim if very long). "
+        "On failure, still report tool output — do not replace it with generic setup instructions only.\n"
+        "Ending with \"skill files are missing\" without having run step 3 is forbidden.\n"
+    )
+
+    # NOTE: Avoid domain-specific hardcoding here.
+    # Keep subagent prompts general; domain tactics should emerge from tools/skills + execution.
+    parts.append(
+        "\n=== Section 4d: Execution-first & discovery-first (general) ===\n"
+        "- Prefer executing in sandbox over returning instructions.\n"
+        "- Execution policy: synthesized task-specific scripts first; direct execution of original "
+        "skill scripts is secondary and allowed only when the script precisely matches the request.\n"
+        "- If an external resource identifier is missing (file id, document id, URL, etc.),\n"
+        "  first attempt discovery using available tools/APIs in sandbox (search/list candidates, probe),\n"
+        "  and only ask the user when you have exhausted reasonable discovery attempts.\n"
+        "- Never end with placeholders (e.g. \"replace YOUR_* and run\"). Return concrete outputs\n"
+        "  (stdout/stderr, exit codes, extracted data) from real execution attempts.\n"
+        "- For lookup/investigation tasks using provided credentials (API key/token), you MUST execute\n"
+        "  at least one real API request and include evidence fields in your final report:\n"
+        "  source, endpoint_or_series, as_of, value, unit (or explain which field is unavailable).\n"
+        "- If a skill script produces wrong/empty data, do not stop; apply minimal corrective rerun\n"
+        "  (e.g. alternate stat code/params from the same API) and report both failure and final success.\n"
+    )
 
     if tools:
         parts.append(f"- Declared tools (by name/server): {', '.join(tools)}")
     else:
-        parts.append("- Declared tools: (none explicitly declared; use default MCP tools if available)")
+        parts.append("- Declared tools: (none explicitly declared; rely on built-in and sandbox tools)")
 
     parts.append(
-        "- If mem0 or dmn_rule tools are attached to you, use them to retrieve your "
-        "own past knowledge and decision rules before making important decisions."
+        "- When mem0, memento, or dmn_rule are attached, treat them as first-class tools: use them when "
+        "Section 4a0 applies, so skill selection and execution reflect stored knowledge and rules."
     )
     parts.append(
-        "- When you need to run Python code, use the computer-use MCP tool run_shell. IMPORTANT:\n"
-        "  * Do NOT show or suggest the command—ACTUALLY call run_shell immediately.\n"
-        "  * If the script requires packages not yet installed, install them first using "
-        "'pip install --user <package>' then run the script.\n"
-        "  * For .py files: Use the FULL absolute path (e.g., python /app/skills/.../main.py --token=XXX)\n"
-        "  * For code in .md files: Extract the code and run via:\n"
-        "    - Temp file: echo '...' > /tmp/script.py && python /tmp/script.py [args]\n"
-        "    - Or: python -c '...' (short scripts)\n"
-        "    - Or: python << 'EOF'\\n<code>\\nEOF (multiline)\n"
-        "  * Pass all required parameters (API keys, tokens, dates) as arguments or env vars.\n"
-        "  * If a command fails due to permission issues, try alternative approaches "
-        "(e.g., pip install --user instead of apt install).\n"
-        "  * If script output contains the answer, extract and report it to the orchestrator."
+        "- Keep all skill file reads inside the tenant root directory and never access "
+        "other tenant paths."
     )
     parts.append(
-        "- When the orchestrator delegates a specific step to you (for example with an "
-        "instruction derived from a plan step like '## 1. 단계 제목' or mentioning specific "
-        "tools/skills to use), you MUST treat that step description as your primary task "
-        "and actively use the attached MCP/skill tools that match the requested tools/skills "
-        "instead of answering with text only."
+        "- Prefer sandbox tools for generated code execution: create a sandbox workspace, "
+        "write files, run shell commands in that sandbox, collect artifacts, then cleanup."
     )
 
     # 섹션 5: 협업 및 보고 방식
@@ -314,35 +403,46 @@ def _build_system_prompt(
     # 섹션 6: 자격 증명 및 사용자 개입 요청
     parts.append("\n=== Section 6: Credentials and user intervention ===")
     parts.append(
-        "- FIRST, check the work-item InputData (Section 2) for any API keys, tokens, or "
-        "credentials. Common field names include: api_token, access_token, api_key, token, "
-        "apiKey, accessToken, etc. If found, USE THEM DIRECTLY when executing skill scripts."
+        "- **Human intervention is the last resort.** Before any `request_human_input`, "
+        "`requires_human: true`, or upload request, work through this checklist in order "
+        "(skip steps for tools you do not have): "
+        "(1) mem0 / memento / dmn_rule per Section 4a0; "
+        "(2) skill FS + Tier 1–2 discovery; "
+        "(3) relevant MCP tools (list/search/read/call); "
+        "(4) sandbox probes or scripted discovery; "
+        "(5) at least one retry with parameters inferred from errors or docs. "
+        "Only then escalate to the human with a single, minimal question.\n"
     )
     parts.append(
-        "- When executing a skill's .py script that requires credentials, pass the token "
-        "from InputData as a command-line argument or environment variable. Example:\n"
-        "  * If InputData contains {'api_token': 'ABC123'}, run:\n"
-        "    python /path/to/script.py --api-token=ABC123\n"
-        "  * Or: API_TOKEN=ABC123 python /path/to/script.py"
+        "- If you need an API key, token, or other credential that is not in the "
+        "work-item InputData or context, follow Section 4a0 first: query **mem0** (and **memento** "
+        "when the secret may live in stored documents). Do NOT respond with only placeholder code or "
+        "'insert your API key here'. Only if retrieval does not yield what you need, request user "
+        "intervention (e.g. via request_human_input or the tool that signals requires_human); "
+        "then perform the actual tool/API call."
     )
     parts.append(
-        "- If you need an API key, token, or other credential that is NOT in the "
-        "work-item InputData or context, ONLY THEN request user intervention "
-        "(e.g. via request_human_input or the tool that signals requires_human)."
+        "- Whenever any information required to proceed is missing (API keys, tokens, "
+        "file paths, parameters, or other inputs), separate credentials/sensitive data "
+        "from non-sensitive query parameters. Prefer resolving credentials via mem0/memento "
+        "(Section 4a0) before asking the human. Non-sensitive parameters should be resolved by "
+        "autonomous discovery (skill docs, API docs/spec, list/search endpoints, prior tool outputs) "
+        "before asking the user."
     )
     parts.append(
-        "- Whenever any information required to proceed is truly missing (not found in "
-        "InputData), you MUST request user intervention instead of guessing or inventing "
-        "values. Do not assume defaults for credentials or sensitive data."
+        "- Do NOT ask human input for optional query filters (date range, pagination, region, etc.) "
+        "when a sensible default allows immediate execution. Ask only when a truly required value "
+        "is missing and no safe default exists."
     )
     parts.append(
-        "- CRITICAL: Never return only code snippets or example responses when the task "
-        "requires real execution (e.g. fetching KOSPI, calling an external API). You MUST:\n"
-        "  1) Find the skill's .py script using find_helpful_skills + list_skill_files_http\n"
-        "  2) Read the script to understand its usage and required arguments\n"
-        "  3) Extract credentials from InputData\n"
-        "  4) Execute the script with run_shell, passing all required arguments\n"
-        "  5) Return the ACTUAL execution result, not instructions on how to execute"
+        "- If an API responds with missing-required-parameter errors (e.g. ERROR-100), do not "
+        "immediately ask the human. Infer required fields from docs/error messages, retry with "
+        "corrected parameters, and only escalate when at least one reasonable correction attempt fails."
+    )
+    parts.append(
+        "- Never return only code snippets or example responses when the task requires "
+        "real execution (e.g. fetching KOSPI, calling an external API). Perform the "
+        "actual tool calls once the required credential or information is available."
     )
 
     return "\n".join(parts)
@@ -358,12 +458,14 @@ def build_subagent_configs(
 
     all_tools defaults to [] (no MCP/process-gpt tool loading). query is the todolist
     user request, included in each subagent system prompt. Assigned skill names are
-    passed in the prompt; subagents load skill content at runtime via claude-skills MCP
-    (read_skill_document, etc.) from the MCP server's mounted volume.
+    passed in the prompt; subagents load skill content at runtime from mounted
+    filesystem paths (tenant-scoped).
     """
     if all_tools is None:
         all_tools = []
+    all_tools = list(all_tools) + list(get_sandbox_tools()) + list(get_skill_resolution_tools())
     tools_map: dict[str, Any] = {getattr(t, "name", str(t)): t for t in all_tools}
+    sandbox_names = _sandbox_tool_names()
     server_to_tools: dict[str, list[Any]] = {}
     for t in all_tools:
         server = getattr(t, "_mcp_server", None)
@@ -376,13 +478,15 @@ def build_subagent_configs(
         description = _build_description(row, name)
         system_prompt = _build_system_prompt(row, query=query, tenant_id=tenant_id)
 
-        agent_tool_names = _parse_csv(row.get("tools"))
+        declared_tool_names = _parse_csv(row.get("tools"))
+        # computer-use 는 샌드박스로 대체; claude-skills 는 MCP(Tier2) + FS(Tier1) 병행.
+        agent_tool_names = [t for t in declared_tool_names if t not in VIRTUAL_TOOL_NAMES]
         has_skills = bool(_parse_csv(row.get("skills")))
         if not agent_tool_names and has_skills:
-            # 스킬만 지정된 에이전트는 기본 MCP 서버(claude-skills, computer-use)를 우선적으로 사용하도록 한다.
-            agent_tool_names = list(DEFAULT_MCP_SERVER_NAMES)
+            # 스킬만 지정된 에이전트도 sandbox/built-in 도구 중심으로 동작한다.
+            agent_tool_names = []
 
-        # 각 서브 에이전트는 고유한 MCP 툴 인스턴스를 가져야 한다.
+        # 각 서브 에이전트는 고유한 툴 인스턴스를 가져야 한다.
         # 그렇지 않으면 도구 호출 로깅 시 job_id를 서브 에이전트별로 분리할 수 없다.
         filtered_tools: list[Any] = []
         seen_ids: set[int] = set()
@@ -401,18 +505,17 @@ def build_subagent_configs(
                         seen_ids.add(id(t))
 
         # 2차: 어떤 이유로든 filtered_tools 가 비어 있으면,
-        #     기본 MCP 서버(claude-skills, computer-use)의 툴을 fallback 으로 붙인다.
+        #     기본 보조 서버 툴을 fallback 으로 붙인다(현재 기본 보조 서버 없음).
         if not filtered_tools:
             fallback_tools: list[Any] = []
-            for server_name in DEFAULT_MCP_SERVER_NAMES:
-                for t in server_to_tools.get(server_name, []):
-                    if id(t) not in seen_ids:
-                        fallback_tools.append(copy.copy(t))
-                        seen_ids.add(id(t))
+            for t in _baseline_mcp_tools(server_to_tools):
+                if id(t) not in seen_ids:
+                    fallback_tools.append(copy.copy(t))
+                    seen_ids.add(id(t))
             if fallback_tools:
                 logger.warning(
                     "Agent '%s' had no resolved tools (requested=%s); "
-                    "attaching default MCP tools from %s instead",
+                    "attaching default fallback tools from %s instead",
                     name,
                     agent_tool_names or "[]",
                     ", ".join(DEFAULT_MCP_SERVER_NAMES),
@@ -421,27 +524,68 @@ def build_subagent_configs(
             elif agent_tool_names:
                 # fallback 도 실패한 경우에만 경고를 남긴다.
                 logger.warning(
-                    "Agent '%s' requested tools %s but none matched loaded tools or default MCP servers",
+                    "Agent '%s' requested tools %s but none matched loaded tools/default fallback servers",
                     name,
                     agent_tool_names,
                 )
 
-        # 3차: 기본 MCP 서버(claude-skills, computer-use)의 툴은
+        # 3차: 기본 보조 서버의 툴은
         #    "모든" 서브 에이전트에 항상 포함되도록 보장한다.
         #    (이미 포함된 경우에는 seen_ids 체크로 중복을 방지한다.)
         baseline_added = 0
-        for server_name in DEFAULT_MCP_SERVER_NAMES:
-            for t in server_to_tools.get(server_name, []):
-                if id(t) not in seen_ids:
-                    filtered_tools.append(copy.copy(t))
-                    seen_ids.add(id(t))
-                    baseline_added += 1
+        for t in _baseline_mcp_tools(server_to_tools):
+            if id(t) not in seen_ids:
+                filtered_tools.append(copy.copy(t))
+                seen_ids.add(id(t))
+                baseline_added += 1
         if baseline_added > 0:
             logger.info(
-                "Attached default MCP tools %s to agent '%s' (added=%d, total_tools=%d)",
+                "Attached default fallback tools %s to agent '%s' (added=%d, total_tools=%d)",
                 ", ".join(DEFAULT_MCP_SERVER_NAMES),
                 name,
                 baseline_added,
+                len(filtered_tools),
+            )
+
+        # 3b차: 테넌트 컨텍스트 지식/기억/규칙 도구(mem0/memento/dmn_rule)는
+        #      agent_rows[*].tools 에 명시되지 않아도 "항상" 서브에이전트에 부착한다.
+        #      이유: 오케스트레이터는 도메인 작업을 subagent에 위임해야 하고,
+        #      이 도구들은 루트(tool=0) 경로로는 호출되지 않기 때문이다.
+        local_added = 0
+        for tn in ALWAYS_ATTACH_LOCAL_TOOL_NAMES:
+            t = tools_map.get(tn)
+            if t is None:
+                continue
+            if id(t) not in seen_ids:
+                filtered_tools.append(copy.copy(t))
+                seen_ids.add(id(t))
+                local_added += 1
+        if local_added > 0:
+            logger.info(
+                "Attached tenant context tools %s to agent '%s' (added=%d, total_tools=%d)",
+                ", ".join(ALWAYS_ATTACH_LOCAL_TOOL_NAMES),
+                name,
+                local_added,
+                len(filtered_tools),
+            )
+
+        # 4차: 샌드박스 실행 도구는 "모든" 서브 에이전트에 기본 포함한다.
+        # 결과 품질(실제 실행) 보장을 위해 tools 선언 여부와 무관하게 항상 붙인다.
+        sandbox_added = 0
+        if sandbox_names:
+            for tn in sorted(sandbox_names):
+                t = tools_map.get(tn)
+                if t is None:
+                    continue
+                if id(t) not in seen_ids:
+                    filtered_tools.append(copy.copy(t))
+                    seen_ids.add(id(t))
+                    sandbox_added += 1
+        if sandbox_added > 0:
+            logger.info(
+                "Attached default sandbox tools to agent '%s' (added=%d, total_tools=%d)",
+                name,
+                sandbox_added,
                 len(filtered_tools),
             )
 
@@ -465,4 +609,3 @@ def build_subagent_configs(
         )
 
     return subagents
-
