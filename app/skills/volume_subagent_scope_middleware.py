@@ -10,7 +10,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from langchain_core.messages import ToolMessage
 
-from skill_volume_tool_events import (
+from app.skills.volume_tool_events import (
     skill_volume_active_exec_ctx,
     skill_volume_active_job_id,
     skill_volume_tool_event_binding,

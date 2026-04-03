@@ -34,6 +34,7 @@ services:
     restart: unless-stopped
     command: ["--host", "0.0.0.0", "--port", "8765", "--config", "/app/config.json", "--verbose"]
 
+  # Builds from ./Dockerfile; CMD runs `python deepagents_server.py` (repo root copied to /app).
   deepagents:
     build:
       context: .
@@ -46,6 +47,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - SKILLS_ROOT_DIR=/app/skills
+      # GitHub 카탈로그 스킬은 볼륨에 없을 수 있음 — sandbox_copy_mounted_skill 이 HTTP로 물리화할 때 사용
+      - PROCESSGPT_SKILLS_API_BASE_URL=http://claude-skills:8765
       # .env 의 SUPABASE_URL(127.0.0.1) 대신 호스트 Supabase CLI API
       - SUPABASE_URL=http://host.docker.internal:54321
       - DB_HOST=host.docker.internal

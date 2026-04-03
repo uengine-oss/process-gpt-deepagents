@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend
 
-from skill_volume_backend_instrumentation import InstrumentingSkillVolumeBackend
+from app.skills.volume_backend_instrumentation import InstrumentingSkillVolumeBackend
 
 if TYPE_CHECKING:
     from deepagents.backends.protocol import BackendFactory, BackendProtocol

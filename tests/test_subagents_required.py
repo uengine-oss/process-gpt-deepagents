@@ -8,8 +8,8 @@ from unittest.mock import MagicMock, patch
 class SubagentsRequiredTests(unittest.TestCase):
     def test_execute_raises_without_agents(self) -> None:
         try:
-            from deepagents_action_executor import (
-                DeepAgentsActionExecutor,
+            from deepagents_executor import (
+                DeepAgentsExecutor,
                 MissingSubagentsConfigurationError,
             )
         except Exception as exc:  # pragma: no cover
@@ -17,7 +17,7 @@ class SubagentsRequiredTests(unittest.TestCase):
             return
 
         async def run() -> None:
-            ex = DeepAgentsActionExecutor()
+            ex = DeepAgentsExecutor()
             ctx = MagicMock()
             ctx.get_user_input.return_value = "[Description] x\n[Instruction] y\n[InputData] {}"
             ctx.get_context_data.return_value = {
@@ -30,7 +30,7 @@ class SubagentsRequiredTests(unittest.TestCase):
             }
             eq = MagicMock()
             with patch(
-                "deepagents_action_executor.TaggingSafeToolLoader"
+                "deepagents_executor.TaggingSafeToolLoader"
             ) as mock_loader:
                 mock_loader.return_value.create_tools_from_names.return_value = []
                 await ex.execute(ctx, eq)

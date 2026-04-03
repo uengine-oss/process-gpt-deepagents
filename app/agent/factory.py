@@ -8,9 +8,9 @@ from typing import Any, Mapping, Sequence
 from deepagents import create_deep_agent
 from langgraph.graph.state import CompiledStateGraph
 
-from deepagents_backend import make_deepagent_backend_factory
-from deepagents_hitl import get_hitl_tools
-from execution_context import format_execution_clock_section
+from app.agent.backend import make_deepagent_backend_factory
+from app.agent.hitl import get_hitl_tools
+from app.execution_context import format_execution_clock_section
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,8 @@ def default_orchestrator_prompt() -> str:
         "- which InputData keys are important.\n\n"
         "Your role is to plan, delegate, execute, and synthesize results with middleware support:\n"
         "- Use write_todos to keep your plan updated while solving multi-step work.\n"
+        "- Before ANY task() call (including mandatory `스킬 탐색 도우미`), you MUST call write_todos "
+        "at least once in this run; the runtime blocks task() until write_todos has succeeded.\n"
         "- Use task() to delegate domain work to subagents whenever specialized tools are needed.\n"
         "- Use filesystem tools for large intermediate outputs to reduce context bloat.\n"
         "- request_human_input() is available for HITL when approvals or missing critical data appear.\n"
@@ -96,6 +98,9 @@ def default_orchestrator_prompt() -> str:
         "- When a delegated subagent has memory/rule/RAG tools (mem0, memento, dmn_rule), instruct it "
         "in task() to use them when Section 2 / the work-item implies personalization, rules, or "
         "document grounding — not on every trivial step.\n"
+        "- If [Instruction] or [Description] **explicitly** names ``memento``, ``mem0``, or ``dmn_rule``, "
+        "every task() to a subagent that has that tool MUST require **at least one real invocation** "
+        "(not just mentioning it) and to ground the answer on the tool output.\n"
         "- Do not call find_helpful_skills, read_skill_document, or any API/skill tools — only "
         "task() and request_human_input() are available to you.\n\n"
         "Missing skills / sandbox (orchestrator — do not bypass delegation):\n"

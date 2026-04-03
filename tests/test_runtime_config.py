@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import unittest
 
-from runtime_config import resolve_model_routing
+from app.runtime_config import resolve_model_routing
 
 
 class RuntimeConfigTests(unittest.TestCase):

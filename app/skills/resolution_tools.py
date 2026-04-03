@@ -52,6 +52,12 @@ def skill_volume_probe(tenant_id: str, skill_names_csv: str) -> str:
         "found_skill_md": found,
         "missing": missing,
         "tier1_any_hit": bool(found),
+        "catalog_note": (
+            "Skills from GitHub sources (list_skills / MCP) may not exist under "
+            "<skills_root>/<tenant_id>/<name>/ on the volume. "
+            "sandbox_copy_mounted_skill can still materialize them via claude-skills HTTP API "
+            "when PROCESSGPT_SKILLS_API_BASE_URL is set (e.g. http://claude-skills:8765 in Compose)."
+        ),
     }
     log_rec = {
         "event": "skill_volume_probe",

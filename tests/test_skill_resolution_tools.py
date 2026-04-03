@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import skill_resolution_tools as srt
-from skill_resolution_tools import get_skill_resolution_tools
+import app.skills.resolution_tools as srt
+from app.skills.resolution_tools import get_skill_resolution_tools
 
 
 class SkillResolutionToolsTests(unittest.TestCase):
@@ -26,7 +26,7 @@ class SkillResolutionToolsTests(unittest.TestCase):
             prev = srt.SKILLS_ROOT_DIR
             try:
                 srt.SKILLS_ROOT_DIR = str(root)
-                with self.assertLogs("skill_resolution_tools", level=logging.INFO) as al:
+                with self.assertLogs("app.skills.resolution_tools", level=logging.INFO) as al:
                     raw = self._call(
                         srt.skill_volume_probe,
                         {"tenant_id": "t1", "skill_names_csv": "my_skill,other"},

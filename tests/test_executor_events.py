@@ -6,7 +6,7 @@ import unittest
 class ExecutorEventTests(unittest.TestCase):
     def test_build_event_payload_shape(self) -> None:
         try:
-            from deepagents_action_executor import ExecutionContext, build_event_payload
+            from deepagents_executor import ExecutionContext, build_event_payload
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -29,7 +29,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_execution_context_agent_role_in_payload(self) -> None:
         try:
-            from deepagents_action_executor import ExecutionContext, build_event_payload
+            from deepagents_executor import ExecutionContext, build_event_payload
         except Exception as exc:  # pragma: no cover
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -52,7 +52,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_depth1_task_started_includes_required_agent_fields(self) -> None:
         try:
-            from deepagents_action_executor import _ensure_required_root_task_started_fields
+            from deepagents_executor import _ensure_required_root_task_started_fields
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -70,7 +70,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_should_defer_hitl_interrupt_for_missing_parameter(self) -> None:
         try:
-            from deepagents_action_executor import _should_defer_hitl_interrupt
+            from deepagents_executor import _should_defer_hitl_interrupt
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -85,7 +85,7 @@ class ExecutorEventTests(unittest.TestCase):
     def test_should_defer_hitl_interrupt_for_credentials_text_by_default(self) -> None:
         """Credential-shaped questions defer by default so mem0/MCP/sandbox can run first."""
         try:
-            from deepagents_action_executor import _should_defer_hitl_interrupt
+            from deepagents_executor import _should_defer_hitl_interrupt
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -99,7 +99,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_should_not_defer_when_raw_hitl_immediate(self) -> None:
         try:
-            from deepagents_action_executor import _should_defer_hitl_interrupt
+            from deepagents_executor import _should_defer_hitl_interrupt
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -113,7 +113,7 @@ class ExecutorEventTests(unittest.TestCase):
     def test_should_defer_natural_language_only_no_structural_flags(self) -> None:
         """Approval/legal wording alone does not trigger immediate HITL — tools must set flags."""
         try:
-            from deepagents_action_executor import _should_defer_hitl_interrupt
+            from deepagents_executor import _should_defer_hitl_interrupt
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -126,7 +126,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_should_not_defer_when_defer_hitl_false(self) -> None:
         try:
-            from deepagents_action_executor import _should_defer_hitl_interrupt
+            from deepagents_executor import _should_defer_hitl_interrupt
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -139,7 +139,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_should_not_defer_when_credential_required(self) -> None:
         try:
-            from deepagents_action_executor import _should_defer_hitl_interrupt
+            from deepagents_executor import _should_defer_hitl_interrupt
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -151,7 +151,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_resolve_pending_field_from_decision(self) -> None:
         try:
-            from deepagents_action_executor import _resolve_pending_field_from_decision
+            from deepagents_executor import _resolve_pending_field_from_decision
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -161,7 +161,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_non_final_task_completed_is_not_terminal(self) -> None:
         try:
-            from deepagents_action_executor import _enqueue_status
+            from deepagents_executor import _enqueue_status
             from a2a.types import TaskState
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
@@ -190,7 +190,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_classify_tenant_context_tool(self) -> None:
         try:
-            from deepagents_action_executor import _classify_tenant_context_tool
+            from deepagents_executor import _classify_tenant_context_tool
         except Exception as exc:  # pragma: no cover
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -207,7 +207,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_hitl_guard_requires_context_attempts(self) -> None:
         try:
-            from deepagents_action_executor import _make_request_human_input_context_guard
+            from deepagents_executor import _make_request_human_input_context_guard
         except Exception as exc:  # pragma: no cover
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -227,7 +227,7 @@ class ExecutorEventTests(unittest.TestCase):
 
     def test_duplicate_hitl_request_detection(self) -> None:
         try:
-            from deepagents_action_executor import _is_duplicate_hitl_request
+            from deepagents_executor import _is_duplicate_hitl_request
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"executor import unavailable: {exc}")
             return
@@ -248,7 +248,7 @@ class ExecutorEventTests(unittest.TestCase):
         try:
             from langchain_core.messages import ToolMessage
 
-            from deepagents_action_executor import _coerce_tool_output_for_tool_node
+            from deepagents_executor import _coerce_tool_output_for_tool_node
         except Exception as exc:  # pragma: no cover
             self.skipTest(f"executor/langchain import unavailable: {exc}")
             return

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from sandbox_runtime import LocalSandboxRuntime
+from app.sandbox.runtime import LocalSandboxRuntime
 
 
 class SandboxRuntimeTests(unittest.TestCase):

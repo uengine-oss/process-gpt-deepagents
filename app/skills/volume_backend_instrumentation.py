@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from skill_volume_tool_events import log_skill_volume_tool
+from app.skills.volume_tool_events import log_skill_volume_tool
 
 
 class InstrumentingSkillVolumeBackend:

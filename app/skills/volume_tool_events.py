@@ -61,7 +61,7 @@ def _emit_pair(
     job_id = skill_volume_active_job_id.get() or binding.default_job_id
     exec_ctx = skill_volume_active_exec_ctx.get() or binding.root_exec_ctx
     try:
-        from deepagents_action_executor import _enqueue_status
+        from deepagents_executor import _enqueue_status
     except Exception:
         return
     safe_in = {k: _truncate_for_event(v) for k, v in tool_input.items()}

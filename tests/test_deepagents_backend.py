@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import MagicMock
 
-from deepagents_backend import make_deepagent_backend_factory, skills_route_prefix
+from app.agent.backend import make_deepagent_backend_factory, skills_route_prefix
 
 
 class DeepagentsBackendTests(unittest.TestCase):

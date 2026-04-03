@@ -6,12 +6,12 @@ from unittest.mock import patch
 class DeepAgentsFactoryTests(unittest.TestCase):
     def test_build_runtime_agent_calls_create_deep_agent(self) -> None:
         try:
-            import deepagents_factory
+            import app.agent.factory as deepagents_factory
         except Exception as exc:  # pragma: no cover - optional dependency environment
             self.skipTest(f"deepagents_factory import unavailable: {exc}")
             return
 
-        with patch("deepagents_factory.create_deep_agent") as create_mock:
+        with patch("app.agent.factory.create_deep_agent") as create_mock:
             create_mock.return_value = object()
             agent = deepagents_factory.build_runtime_agent(
                 model_name="openai:gpt-4o",

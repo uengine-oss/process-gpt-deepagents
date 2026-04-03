@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 class SkillDiscoverySubagentTests(unittest.TestCase):
     def test_hinted_slugs_from_kebab_case(self) -> None:
-        from subagents import hinted_skill_slugs_from_query
+        from app.agent.subagents import hinted_skill_slugs_from_query
 
         h = hinted_skill_slugs_from_query(
             "global-investment-analyzer 스킬에 대해서 설명해줘.",
@@ -15,7 +15,7 @@ class SkillDiscoverySubagentTests(unittest.TestCase):
         self.assertIn("global-investment-analyzer", h)
 
     def test_hinted_slugs_includes_allowed_when_mentioned(self) -> None:
-        from subagents import hinted_skill_slugs_from_query
+        from app.agent.subagents import hinted_skill_slugs_from_query
 
         h = hinted_skill_slugs_from_query(
             "global-investment-analyzer 와 other-skill 사용",
@@ -25,7 +25,7 @@ class SkillDiscoverySubagentTests(unittest.TestCase):
         self.assertIn("other-skill", h)
 
     def test_synthetic_row_name_matches_subagent(self) -> None:
-        from skill_discovery_subagent import (
+        from app.skills.discovery_subagent import (
             SKILL_DISCOVERY_EVENT_ROLE,
             SKILL_DISCOVERY_SUBAGENT_NAME,
             build_skill_discovery_subagent,
@@ -39,7 +39,7 @@ class SkillDiscoverySubagentTests(unittest.TestCase):
         self.assertEqual(sa.get("name"), SKILL_DISCOVERY_SUBAGENT_NAME)
 
     def test_claude_skills_tools_attached_when_tagged(self) -> None:
-        from skill_discovery_subagent import build_skill_discovery_subagent
+        from app.skills.discovery_subagent import build_skill_discovery_subagent
 
         t1 = MagicMock()
         t1.name = "search_skills"

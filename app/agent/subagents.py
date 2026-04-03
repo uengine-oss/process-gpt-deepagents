@@ -8,10 +8,13 @@ import os
 import re
 from typing import Any
 
-from database import get_supabase
-from execution_context import format_execution_clock_section
-from sandbox_tools import get_sandbox_tools
-from skill_resolution_tools import get_skill_resolution_tools
+from processgpt_agent_utils.tools.dmn_rule_tool import DMNRuleTool
+from processgpt_agent_utils.tools.knowledge_manager import Mem0Tool
+
+from app.database import get_supabase
+from app.execution_context import format_execution_clock_section
+from app.sandbox.tools import get_sandbox_tools
+from app.skills.resolution_tools import get_skill_resolution_tools
 
 # Tier 2: claude-skills MCP tools are attached to every subagent via DEFAULT_MCP_SERVER_NAMES
 # (when tenant_mcp includes that server). computer-use remains virtual (sandbox replaces shell).
@@ -21,6 +24,63 @@ VIRTUAL_TOOL_NAMES: set[str] = {"computer-use"}
 ALWAYS_ATTACH_LOCAL_TOOL_NAMES: tuple[str, ...] = ("mem0", "memento", "dmn_rule")
 
 logger = logging.getLogger(__name__)
+
+
+def _wrap_tools_langchain(tools: list[Any]) -> list[Any]:
+    """Match :func:`executor.langchain_tools._ensure_langchain_tools` for freshly built local tools."""
+    if not tools:
+        return tools
+    try:
+        from app.executor.langchain_tools import _ensure_langchain_tools
+
+        return _ensure_langchain_tools(tools)
+    except Exception:
+        logger.debug("LangChain tool wrap skipped for tenant context tools", exc_info=True)
+        return tools
+
+
+def _make_mem0_for_user_id(
+    tenant_id: str | None,
+    user_id: str,
+    fallback: Any | None,
+) -> Any | None:
+    """Mem0Tool bound to one agent/user id (memory.search agent_id)."""
+    uid = (user_id or "").strip()
+    if not uid:
+        return fallback
+    try:
+        raw = Mem0Tool(tenant_id=tenant_id, user_id=uid)
+        wrapped = _wrap_tools_langchain([raw])
+        return wrapped[0] if wrapped else raw
+    except Exception:
+        logger.exception(
+            "Mem0Tool per-agent construction failed (tenant_id=%s user_id=%s); using shared tool",
+            tenant_id,
+            uid,
+        )
+        return fallback
+
+
+def _make_dmn_rule_for_user_id(
+    tenant_id: str | None,
+    user_id: str,
+    fallback: Any | None,
+) -> Any | None:
+    """DMNRuleTool loads rules for proc_def.owner == user_id."""
+    uid = (user_id or "").strip()
+    if not uid:
+        return fallback
+    try:
+        raw = DMNRuleTool(tenant_id=tenant_id, user_id=uid)
+        wrapped = _wrap_tools_langchain([raw])
+        return wrapped[0] if wrapped else raw
+    except Exception:
+        logger.exception(
+            "DMNRuleTool per-agent construction failed (tenant_id=%s user_id=%s); using shared tool",
+            tenant_id,
+            uid,
+        )
+        return fallback
 
 
 def _sandbox_tool_names() -> set[str]:
@@ -549,22 +609,30 @@ def build_subagent_configs(
 
         # 3b차: 테넌트 컨텍스트 지식/기억/규칙 도구(mem0/memento/dmn_rule)는
         #      agent_rows[*].tools 에 명시되지 않아도 "항상" 서브에이전트에 부착한다.
-        #      이유: 오케스트레이터는 도메인 작업을 subagent에 위임해야 하고,
-        #      이 도구들은 루트(tool=0) 경로로는 호출되지 않기 때문이다.
+        # mem0 / dmn_rule 은 에이전트(users.id)별로 인스턴스를 새로 만든다(process-gpt-agent-utils 가
+        # user_id를 memory.search 의 agent_id 및 DMN owner 로 사용).
+        # memento 는 proc_inst 단위라 로더가 만든 공유 인스턴스를 copy 로 부착한다.
+        agent_uid = str(row.get("id") or "").strip()
         local_added = 0
         for tn in ALWAYS_ATTACH_LOCAL_TOOL_NAMES:
-            t = tools_map.get(tn)
+            if tn == "mem0":
+                t = _make_mem0_for_user_id(tenant_id, agent_uid, tools_map.get("mem0"))
+            elif tn == "dmn_rule":
+                t = _make_dmn_rule_for_user_id(tenant_id, agent_uid, tools_map.get("dmn_rule"))
+            else:
+                t = tools_map.get(tn)
             if t is None:
                 continue
             if id(t) not in seen_ids:
-                filtered_tools.append(copy.copy(t))
+                filtered_tools.append(copy.copy(t) if tn == "memento" else t)
                 seen_ids.add(id(t))
                 local_added += 1
         if local_added > 0:
             logger.info(
-                "Attached tenant context tools %s to agent '%s' (added=%d, total_tools=%d)",
+                "Attached tenant context tools %s to agent '%s' (agent_uid=%s, added=%d, total_tools=%d)",
                 ", ".join(ALWAYS_ATTACH_LOCAL_TOOL_NAMES),
                 name,
+                agent_uid or "(fallback)",
                 local_added,
                 len(filtered_tools),
             )

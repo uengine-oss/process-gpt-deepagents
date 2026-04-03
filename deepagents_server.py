@@ -1,4 +1,4 @@
-"""DeepAgents A2A 서버: process-gpt-agent-sdk로 폴링 및 실행 (ProcessGPTAgentServer + DeepAgentsActionExecutor)."""
+"""DeepAgents A2A 서버: process-gpt-agent-sdk로 폴링 및 실행 (ProcessGPTAgentServer + DeepAgentsExecutor)."""
 
 from __future__ import annotations
 
@@ -27,12 +27,12 @@ from processgpt_agent_sdk.database import (
 )
 from processgpt_agent_sdk.utils import summarize_error_to_user
 
-from database import claim_resumable_hitl_task, set_task_waiting_hitl
-from deepagents_action_executor import (
-    DeepAgentsActionExecutor,
+from app.database import claim_resumable_hitl_task, set_task_waiting_hitl
+from deepagents_executor import (
+    DeepAgentsExecutor,
     MissingSubagentsConfigurationError,
 )
-from health_server import start_health_server
+from app.health_server import start_health_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logging.getLogger("deepagents_executor").setLevel(logging.INFO)
-logging.getLogger("database").setLevel(logging.INFO)
+logging.getLogger("app.database").setLevel(logging.INFO)
 
 
 def _log_skills_volume_inventory(
@@ -264,7 +264,7 @@ class _ThreadSafeEventQueueProxy:
         self._inner.task_done()
 
 
-class DeepAgentsActionServer(ProcessGPTAgentServer):
+class DeepAgentsServer(ProcessGPTAgentServer):
     """HITL 시 crew_completed 미발행, run_state 저장으로 재개 가능하도록 하는 서버."""
 
     async def run(self) -> None:
@@ -416,8 +416,8 @@ async def main() -> None:
         _log_skills_volume_inventory()
         start_health_server(host="0.0.0.0", port=8888)
 
-        executor = DeepAgentsActionExecutor()
-        server = DeepAgentsActionServer(
+        executor = DeepAgentsExecutor()
+        server = DeepAgentsServer(
             agent_executor=executor,
             agent_type="deepagents",
         )

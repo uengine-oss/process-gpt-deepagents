@@ -41,9 +41,11 @@ class LocalSandboxRuntime:
     def __init__(self, base_dir: str | None = None) -> None:
         root = base_dir or os.environ.get("SANDBOX_BASE_DIR") or tempfile.gettempdir()
         self.base_dir = str(Path(root).resolve())
+        os.makedirs(self.base_dir, exist_ok=True)
 
     def create_workspace(self, job_id: str, agent_name: str) -> SandboxWorkspace:
         safe_agent = agent_name.replace("/", "_").replace(" ", "_")
+        os.makedirs(self.base_dir, exist_ok=True)
         ws_path = tempfile.mkdtemp(prefix=f"sbx_{safe_agent}_{job_id}_", dir=self.base_dir)
         ws_id = Path(ws_path).name
         return SandboxWorkspace(

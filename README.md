@@ -10,9 +10,9 @@ subagent 위임, 파일시스템 메모리, sandbox 실행, A2A 이벤트 로깅
 ProcessGPT Agent SDK 폴링
        │
        ▼
-DeepAgentsActionExecutor.execute(context, event_queue)
+DeepAgentsExecutor.execute(context, event_queue)
        │
-       ├─ extras.agents (ID 목록) ──► Supabase users 테이블 조회 (database.get_supabase)
+       ├─ extras.agents (ID 목록) ──► Supabase users 테이블 조회 (app.database.get_supabase)
        │
        ├─ 런타임 라우팅 결정 ──► LiteLLM proxy 우선 (warn_fallback)
        ├─ 스킬/로컬 도구 로딩 ──► SafeToolLoader (선택적 로컬 도구)
@@ -24,26 +24,17 @@ A2A 이벤트 발행 (TaskStatusUpdateEvent / TaskArtifactUpdateEvent)
 
 ## 구성
 
-- `deepagents_action_server.py`
-  - ProcessGPT Agent SDK 서버 엔트리포인트 (폴링)
-- `deepagents_action_executor.py`
-  - A2A 래핑 멀티 에이전트 실행기 (AgentExecutor)
-- `database.py`
-  - Supabase 클라이언트 (subagents 등에서 사용)
-- `deepagents_factory.py`
-  - 단일 런타임 DeepAgent 생성 (middleware 스택 포함)
-- `subagents.py`
-  - Supabase에서 에이전트 정의 로딩, 스킬 API 호출, 서브에이전트 설정 구성
-- `runtime_config.py`
-  - 모델/라우팅 모드 결정 (`proxy` / `direct-fallback`)
-- `sandbox_runtime.py`
-  - sandbox 실행 추상화(로컬 기본 구현)
-- `sandbox_tools.py`
-  - sandbox 도구 래퍼 (`sandbox_*`)
-- `output_utils.py`
-  - LLM 결과를 ProcessGPT 반환 포맷으로 변환
-- `health_server.py`
-  - `/health` 엔드포인트 제공
+- **루트 엔트리**
+  - `deepagents_server.py` — ProcessGPT Agent SDK 서버 (폴링)
+  - `deepagents_executor.py` — A2A 래핑 멀티 에이전트 실행기 (`AgentExecutor`)
+- **`app/`** — 애플리케이션 패키지
+  - `database.py`, `execution_context.py`, `runtime_config.py`, `output_utils.py`, `health_server.py` — 인프라·유틸
+  - `app/sandbox/` — `runtime`, `tools`, `output_delivery` (산출 파일은 선택적으로 Supabase **public** Storage `files` 버킷에 올려 `public_url`을 manifest/본문에 실음)
+  - `app/storage_public.py` — 위 업로드·공개 URL 생성 (`SUPABASE_PUBLIC_FILES_BUCKET`, `DISABLE_SUPABASE_STORAGE_UPLOAD`)
+  - `app/skills/` — 스킬 탐색·해결·볼륨 이벤트/미들웨어/백엔드 계측
+  - `app/tooling/` — `TaggingSafeToolLoader`, `ConfigurableMementoTool`
+  - `app/agent/` — DeepAgent `factory`, `hitl`, `backend`, `subagents`
+  - `app/executor/` — A2A enqueue, HITL, 미들웨어, 도구 인스트루먼트 등 실행기 보조 모듈
 
 ## 환경변수
 
@@ -70,7 +61,7 @@ uv pip install -r requirements.txt
 ```powershell
 # .env 로드 후
 $env:APP_ENV="local"
-uv run python deepagents_action_server.py
+uv run python deepagents_server.py
 ```
 
 ## Docker
@@ -124,7 +115,7 @@ python3 -m pytest tests -q
 - `.env`에 `LLM_PROXY_URL`, `LLM_PROXY_API_KEY` 설정
 
 검증:
-1. 서버 실행: `uv run python deepagents_action_server.py`
+1. 서버 실행: `uv run python deepagents_server.py`
 2. 실제 작업 1건 실행(멀티스텝 요청 권장)
 3. 로그에서 `routing_mode=proxy` 확인
 4. 결과 이벤트에서 `task_started` -> `task_completed` -> 최종 artifact 순서 확인

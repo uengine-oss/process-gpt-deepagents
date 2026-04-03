@@ -7,13 +7,15 @@ import json
 import logging
 from typing import Any
 
-from execution_context import format_execution_clock_section
-from sandbox_tools import get_sandbox_tools
-from skill_resolution_tools import get_skill_resolution_tools
-from subagents import (
+from app.execution_context import format_execution_clock_section
+from app.sandbox.tools import get_sandbox_tools
+from app.skills.resolution_tools import get_skill_resolution_tools
+from app.agent.subagents import (
     ALWAYS_ATTACH_LOCAL_TOOL_NAMES,
     SKILLS_ROOT_DIR,
     _baseline_mcp_tools,
+    _make_dmn_rule_for_user_id,
+    _make_mem0_for_user_id,
     _sandbox_tool_names,
     _skill_resolution_tool_names,
 )
@@ -188,6 +190,7 @@ def build_skill_discovery_subagent(
     all_tools: list[Any] | None = None,
     query: str = "",
     tenant_id: str | None = None,
+    context_tools_user_id: str | None = None,
     allowed_skill_names: list[str] | None = None,
     allowed_skill_names_by_agent: dict[str, list[str]] | None = None,
     hinted_skill_slugs: list[str] | None = None,
@@ -228,21 +231,28 @@ def build_skill_discovery_subagent(
                 filtered_tools.append(copy.copy(t))
                 seen_ids.add(id(t))
 
-    # Tenant context tools (mem0/memento/dmn_rule) are always attached to *all* subagents,
-    # including the built-in skill discovery agent, so orchestration can rely on them.
+    # Tenant context tools: mem0/dmn_rule use context_tools_user_id (typically first domain agent id)
+    # because the built-in discovery agent has no real users.id. memento stays proc_inst-scoped (shared).
+    ctx_uid = (context_tools_user_id or "").strip()
     local_added = 0
     for tn in ALWAYS_ATTACH_LOCAL_TOOL_NAMES:
-        t = tools_map.get(tn)
+        if tn == "mem0":
+            t = _make_mem0_for_user_id(tenant_id, ctx_uid, tools_map.get("mem0"))
+        elif tn == "dmn_rule":
+            t = _make_dmn_rule_for_user_id(tenant_id, ctx_uid, tools_map.get("dmn_rule"))
+        else:
+            t = tools_map.get(tn)
         if t is None:
             continue
         if id(t) not in seen_ids:
-            filtered_tools.append(copy.copy(t))
+            filtered_tools.append(copy.copy(t) if tn == "memento" else t)
             seen_ids.add(id(t))
             local_added += 1
     if local_added > 0:
         logger.info(
-            "Skill discovery subagent: attached tenant context tools %s (added=%d, total_tools=%d)",
+            "Skill discovery subagent: attached tenant context tools %s (context_tools_user_id=%s, added=%d, total_tools=%d)",
             ", ".join(ALWAYS_ATTACH_LOCAL_TOOL_NAMES),
+            ctx_uid or "(shared fallback)",
             local_added,
             len(filtered_tools),
         )
