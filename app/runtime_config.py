@@ -1,4 +1,8 @@
-"""Runtime configuration for model routing and LiteLLM proxy policy."""
+"""Runtime configuration for model routing (direct provider only).
+
+This project intentionally does **not** use an OpenAI-compatible proxy layer.
+Set `LLM_MODEL` (default: `anthropic:claude-opus-4-6`) and `ANTHROPIC_API_KEY`.
+"""
 
 from __future__ import annotations
 
@@ -16,64 +20,43 @@ class ModelRoutingConfig:
 
     model_name: str
     embedding_model_name: str | None
-    route_mode: str  # proxy | direct-fallback
+    route_mode: str  # direct
     openai_base_url: str | None
 
 
 def resolve_model_routing(
     extras: dict[str, Any] | None,
     *,
-    default_model: str = "gpt-4o",
-    default_embedding_model: str = "text-embedding-3-small",
+    default_model: str = "anthropic:claude-opus-4-6",
+    default_embedding_model: str | None = None,
     policy: str = "warn_fallback",
 ) -> ModelRoutingConfig:
-    """Resolve model and routing policy.
-
-    policy=warn_fallback:
-    - If LLM_PROXY_URL is set, treat calls as proxy-routed.
-    - If not set, warn and allow direct provider route.
-    """
+    """Resolve model name (direct provider routing only)."""
 
     payload = extras or {}
     # Environment model is the primary source of truth; extras.model is fallback only.
     model_name = str(os.environ.get("LLM_MODEL") or payload.get("model") or default_model)
-    embedding_model = str(os.environ.get("LLM_EMBEDDING_MODEL") or default_embedding_model)
-    proxy_url = (os.environ.get("LLM_PROXY_URL") or "").strip() or None
-    proxy_api_key = (os.environ.get("LLM_PROXY_API_KEY") or "").strip() or None
+    embedding_model_env = (os.environ.get("LLM_EMBEDDING_MODEL") or "").strip()
+    embedding_model = embedding_model_env or default_embedding_model
 
-    # Normalize short model names to OpenAI provider prefix expected by deepagents/langchain.
+    # Normalize short model names to an explicit provider prefix.
     if ":" not in model_name:
-        model_name = f"openai:{model_name}"
+        model_name = f"anthropic:{model_name}"
+
+    proxy_url = (os.environ.get("LLM_PROXY_URL") or "").strip() or None
+    if proxy_url:
+        logger.warning(
+            "Ignoring LLM_PROXY_URL=%r (proxy mode disabled; using direct provider).",
+            proxy_url,
+        )
 
     if policy != "warn_fallback":
         logger.warning("Unknown routing policy '%s'; using warn_fallback.", policy)
-
-    if proxy_url:
-        # Export OpenAI-compatible envs for downstream SDK layers.
-        os.environ["OPENAI_BASE_URL"] = proxy_url.rstrip("/")
-        if proxy_api_key:
-            os.environ["OPENAI_API_KEY"] = proxy_api_key
-        logger.info(
-            "LLM routing resolved: mode=proxy model=%s base_url=%s",
-            model_name,
-            proxy_url,
-        )
-        return ModelRoutingConfig(
-            model_name=model_name,
-            embedding_model_name=embedding_model,
-            route_mode="proxy",
-            openai_base_url=proxy_url,
-        )
-
-    logger.warning(
-        "LLM proxy base URL is not configured (LLM_PROXY_URL missing). "
-        "Continuing with direct provider fallback. model=%s",
-        model_name,
-    )
+    logger.info("LLM routing resolved: mode=direct model=%s", model_name)
     return ModelRoutingConfig(
         model_name=model_name,
         embedding_model_name=embedding_model,
-        route_mode="direct-fallback",
+        route_mode="direct",
         openai_base_url=None,
     )
 

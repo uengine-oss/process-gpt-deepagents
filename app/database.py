@@ -1,12 +1,9 @@
-"""Supabase client and DB operations: polling, events, task updates, context fetches."""
+"""Supabase client and DB helpers used by this service (HITL resume, agent loading, storage)."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import socket
-import uuid
 from typing import Any
 
 from dotenv import load_dotenv
@@ -17,8 +14,6 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 _supabase: SupabaseClient | None = None
-
-CONSUMER_ID = f"deepagents-{uuid.uuid4().hex[:8]}"
 
 
 def get_supabase() -> SupabaseClient:
@@ -33,169 +28,26 @@ def get_supabase() -> SupabaseClient:
     return _supabase
 
 
-def get_consumer_id() -> str:
-    """Consumer identifier for polling (env or hostname:pid)."""
-    if os.environ.get("CONSUMER_ID"):
-        return os.environ["CONSUMER_ID"]
-    return f"{socket.gethostname()}:{os.getpid()}"
+def get_tenant_mcp_config(tenant_id: str) -> dict[str, Any] | None:
+    """Fetch tenants.mcp JSON for a tenant (best-effort).
 
-
-# ---------------------------------------------------------------------------
-# Polling
-# ---------------------------------------------------------------------------
-
-
-def poll_pending_todo(
-    agent_orch: str,
-    consumer: str | None = None,
-    env: str | None = None,
-    limit: int = 1,
-) -> dict[str, Any] | None:
-    """Claim one pending task via fetch_pending_task RPC. Returns the row or None."""
-    sb = get_supabase()
-    p_env = (env or os.environ.get("ENV") or "").lower()
-    if p_env != "dev":
-        p_env = "prod"
-    resp = sb.rpc(
-        "fetch_pending_task",
-        {
-            "p_agent_orch": agent_orch,
-            "p_consumer": consumer or get_consumer_id(),
-            "p_limit": limit,
-            "p_env": p_env,
-        },
-    ).execute()
-    rows = resp.data or []
-    if not rows:
-        return None
-    row = rows[0]
-    if row.get("feedback") in ([], {}):
-        row["feedback"] = None
-    if row.get("output") in ([], {}):
-        row["output"] = None
-    if row.get("draft") in ([], {}):
-        row["draft"] = None
-    return row
-
-
-def fetch_pending_tasks(
-    agent_orch: str,
-    *,
-    consumer: str | None = None,
-    limit: int = 5,
-    env: str = "dev",
-) -> list[dict[str, Any]]:
-    """Call fetch_pending_task RPC to atomically claim pending work items."""
-    sb = get_supabase()
-    resp = sb.rpc(
-        "fetch_pending_task",
-        {
-            "p_agent_orch": agent_orch,
-            "p_consumer": consumer or CONSUMER_ID,
-            "p_limit": limit,
-            "p_env": env,
-        },
-    ).execute()
-    tasks = resp.data or []
-    if tasks:
-        logger.info("Claimed %d pending task(s) [consumer=%s]", len(tasks), consumer or CONSUMER_ID)
-    return tasks
-
-
-# ---------------------------------------------------------------------------
-# Events table (public.events)
-# ---------------------------------------------------------------------------
-# event_type_enum: task_started, task_completed, tool_usage_started, tool_usage_finished,
-#                  crew_completed, human_asked, human_response, human_checked, task_working, error
-# event_status: ASKED, APPROVED, REJECTED (or null)
-
-
-def insert_event(
-    *,
-    id: str,
-    job_id: str,
-    todo_id: str | None = None,
-    proc_inst_id: str | None = None,
-    event_type: str,
-    status: str | None = None,
-    crew_type: str | None = None,
-    data: dict[str, Any] | list[Any] | str | None = None,
-) -> None:
-    """Insert one row into public.events. data is sent as JSON object so DB stores jsonb."""
-    sb = get_supabase()
-    if data is None:
-        data = {}
-    if not isinstance(data, (dict, list)):
-        data = {"value": str(data)}
-    # Ensure correlation_id is always present for tracing; when missing and data is a dict,
-    # fall back to job_id so existing callers automatically gain a minimal correlation key.
-    if isinstance(data, dict) and "correlation_id" not in data:
-        data.setdefault("correlation_id", job_id)
-    payload = {
-        "id": id,
-        "job_id": job_id,
-        "todo_id": todo_id,
-        "proc_inst_id": proc_inst_id,
-        "event_type": event_type,
-        "status": status,
-        "crew_type": crew_type,
-        "data": data,
-    }
-    sb.table("events").insert(payload).execute()
-    logger.info("insert_event ok event_type=%s todo_id=%s", event_type, todo_id)
-
-
-def insert_events_bulk(payloads: list[dict[str, Any]]) -> None:
-    """Insert multiple rows into public.events. data kept as dict/list for jsonb."""
-    if not payloads:
-        return
-    sb = get_supabase()
-    for p in payloads:
-        if p.get("data") is not None and not isinstance(p.get("data"), (dict, list)):
-            p["data"] = {"value": str(p["data"])}
-    sb.table("events").insert(payloads).execute()
-    logger.info("insert_events_bulk ok count=%d", len(payloads))
-
-
-# ---------------------------------------------------------------------------
-# Task status / result
-# ---------------------------------------------------------------------------
-
-
-def update_task_error(todo_id: str) -> None:
-    """Mark todolist row as FAILED and clear consumer."""
-    sb = get_supabase()
-    sb.table("todolist").update({"draft_status": "FAILED", "consumer": None}).eq("id", todo_id).execute()
-    logger.info("update_task_error ok todo_id=%s", todo_id)
-
-
-def save_task_result(todo_id: str, payload: Any, final: bool = False) -> None:
-    """Write agent result into todolist (draft / draft_status) as proper JSON.
-
-    - If payload is a dict/list, it is sent as-is so that Supabase stores it
-      into the jsonb `draft` column as a JSON object/array.
-    - Other types are stored as-is; callers that need JSON should pass a
-      dict/list payload.
+    tenants 스키마:
+      create table public.tenants (..., mcp jsonb null, ...)
     """
+    tid = (tenant_id or "").strip()
+    if not tid:
+        return None
     sb = get_supabase()
-    draft = payload
-    draft_status = "COMPLETED" if final else "STARTED"
-    sb.table("todolist").update({"draft": draft, "draft_status": draft_status}).eq("id", todo_id).execute()
-    logger.info("save_task_result ok todo_id=%s final=%s", todo_id, final)
-
-
-def update_task_draft(
-    task_id: str | int,
-    tenant_id: str,
-    draft: str,
-    draft_status: str,
-) -> None:
-    """Write the agent result back into the todolist row."""
-    sb = get_supabase()
-    sb.table("todolist").update(
-        {"draft": draft, "draft_status": draft_status},
-    ).eq("id", task_id).eq("tenant_id", tenant_id).execute()
-    logger.info("Updated task %s → draft_status=%s", task_id, draft_status)
+    try:
+        resp = sb.table("tenants").select("mcp").eq("id", tid).single().execute()
+    except Exception:
+        logger.exception("get_tenant_mcp_config failed tenant_id=%s", tid, exc_info=True)
+        return None
+    row = getattr(resp, "data", None)
+    if not isinstance(row, dict):
+        return None
+    mcp = row.get("mcp")
+    return mcp if isinstance(mcp, dict) else None
 
 
 def set_task_waiting_hitl(todo_id: str, run_state: dict[str, Any]) -> None:
@@ -316,110 +168,38 @@ def claim_resumable_hitl_task(*, agent_orch: str, consumer: str, limit_scan: int
     return row
 
 
-# ---------------------------------------------------------------------------
-# Context preparation (for executor extras)
-# ---------------------------------------------------------------------------
-
-
-def fetch_form_def(tool_val: str, tenant_id: str) -> tuple[str, list[dict[str, Any]], str | None]:
-    """Return (form_id, form_fields, form_html)."""
-    form_id = (tool_val or "").replace("formHandler:", "", 1)
-    sb = get_supabase()
-    resp = (
-        sb.table("form_def")
-        .select("fields_json, html")
-        .eq("id", form_id)
-        .eq("tenant_id", tenant_id or "")
-        .execute()
-    )
-    data = resp.data or []
-    if not data:
-        return (
-            form_id or "freeform",
-            [{"key": "freeform", "type": "textarea", "text": "자유형식 입력", "placeholder": "원하는 내용을 자유롭게 입력해주세요."}],
-            None,
-        )
-    row = data[0]
-    fields = row.get("fields_json") or [{"key": "freeform", "type": "textarea", "text": "자유형식 입력"}]
-    return (form_id or "freeform", fields, row.get("html"))
-
-
-def fetch_users_grouped(user_ids: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return (agents, users) from users table for given ids (is_agent split)."""
-    ids = [u for u in (user_ids or []) if u]
-    if not ids:
-        return ([], [])
-    sb = get_supabase()
-    resp = sb.table("users").select("*").in_("id", ids).execute()
-    rows = resp.data or []
-    agents, users = [], []
-    for r in rows:
-        if r.get("is_agent") is True:
-            agents.append(r)
-        else:
-            users.append(r)
-    return (agents, users)
-
-
-def fetch_agents_by_user_ids(user_ids: list[str], tenant_id: str) -> list[dict[str, Any]]:
-    """Return agent rows from users table for given user ids and tenant (is_agent=true)."""
-    ids = [u.strip() for u in (user_ids or []) if u and u.strip()]
-    if not ids or not tenant_id:
-        return []
-    sb = get_supabase()
-    resp = (
-        sb.table("users")
-        .select("*")
-        .in_("id", ids)
-        .eq("tenant_id", tenant_id)
-        .eq("is_agent", True)
-        .execute()
-    )
-    rows = resp.data or []
-    logger.info("fetch_agents_by_user_ids: %d agent(s) for tenant=%s", len(rows), tenant_id)
-    return rows
-
-
-def fetch_email_users_by_proc_inst_id(proc_inst_id: str) -> str:
-    """Comma-separated emails for human users in this proc_inst."""
-    if not proc_inst_id:
-        return ""
-    sb = get_supabase()
-    tl = sb.table("todolist").select("user_id").eq("proc_inst_id", proc_inst_id).execute()
-    ids_set = set()
-    for row in (tl.data or []):
-        for uid in (row.get("user_id") or "").split(","):
-            u = uid.strip()
-            if u:
-                ids_set.add(u)
-    if not ids_set:
-        return ""
-    ur = (
-        sb.table("users")
-        .select("id, email, is_agent")
-        .in_("id", list(ids_set))
-        .eq("is_agent", False)
-        .execute()
-    )
-    emails = [u.get("email", "").strip() for u in (ur.data or []) if u.get("email")]
-    return ",".join(sorted(set(emails)))
-
-
-def fetch_tenant_mcp(tenant_id: str) -> dict[str, Any] | None:
-    """Return tenant MCP config or None."""
-    if not tenant_id:
+def get_todolist_draft_status(todo_id: str) -> str | None:
+    """Fetch latest draft_status for a todolist row (best-effort)."""
+    tid = (todo_id or "").strip()
+    if not tid:
         return None
     sb = get_supabase()
-    resp = sb.table("tenants").select("mcp").eq("id", tenant_id).single().execute()
-    if not getattr(resp, "data", None):
+    resp = sb.table("todolist").select("draft_status").eq("id", tid).single().execute()
+    row = getattr(resp, "data", None)
+    if not isinstance(row, dict):
         return None
-    return resp.data.get("mcp")
+    val = row.get("draft_status")
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s or None
 
 
-def fetch_proc_inst_sources(proc_inst_id: str) -> list[dict[str, Any]]:
-    """Return proc_inst_source rows for the given proc_inst_id."""
-    if not proc_inst_id:
-        return []
+def release_consumer_if_cancelled(*, todo_id: str, consumer: str | None) -> bool:
+    """If the task is CANCELLED, clear consumer to avoid a stuck claim lock.
+
+    Returns True when an update attempt was made successfully, False otherwise.
+    """
+    tid = (todo_id or "").strip()
+    if not tid:
+        return False
     sb = get_supabase()
-    resp = sb.table("proc_inst_source").select("*").eq("proc_inst_id", proc_inst_id).execute()
-    return resp.data or []
+    try:
+        q = sb.table("todolist").update({"consumer": None}).eq("id", tid).eq("draft_status", "CANCELLED")
+        if (consumer or "").strip():
+            q = q.eq("consumer", str(consumer).strip())
+        q.execute()
+        return True
+    except Exception:
+        logger.exception("release_consumer_if_cancelled failed todo_id=%s", tid, exc_info=True)
+        return False

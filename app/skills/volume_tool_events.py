@@ -9,6 +9,30 @@ from typing import Any
 
 _MAX_EVENT_CHARS = 12000
 
+
+def align_tool_event_job_id(*, resolved_job_id: str, exec_ctx: Any) -> str:
+    """ContextVar job_id 가 루트로 남아 있을 때, ``agent_path`` 마지막 세그먼트로 서브 job_id 를 복원."""
+    try:
+        if exec_ctx is None:
+            return resolved_job_id
+        ap = getattr(exec_ctx, "agent_path", None) or []
+        if not isinstance(ap, (list, tuple)) or len(ap) < 2:
+            return resolved_job_id
+        binding = skill_volume_tool_event_binding.get()
+        if binding is None:
+            return resolved_job_id
+        m = getattr(binding, "subagent_name_to_job_id", None)
+        if not isinstance(m, dict):
+            return resolved_job_id
+        sub_name = str(ap[-1]).strip()
+        mapped = m.get(sub_name)
+        if mapped:
+            return str(mapped)
+    except Exception:
+        return resolved_job_id
+    return resolved_job_id
+
+
 skill_volume_tool_event_binding: ContextVar["SkillVolumeToolEventBinding | None"] = ContextVar(
     "skill_volume_tool_event_binding", default=None
 )
@@ -58,8 +82,9 @@ def _emit_pair(
     binding = skill_volume_tool_event_binding.get()
     if binding is None or binding.event_queue is None:
         return
-    job_id = skill_volume_active_job_id.get() or binding.default_job_id
+    raw_job_id = skill_volume_active_job_id.get() or binding.default_job_id
     exec_ctx = skill_volume_active_exec_ctx.get() or binding.root_exec_ctx
+    job_id = align_tool_event_job_id(resolved_job_id=raw_job_id, exec_ctx=exec_ctx)
     try:
         from deepagents_executor import _enqueue_status
     except Exception:

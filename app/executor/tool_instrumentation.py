@@ -18,6 +18,7 @@ from .hitl_utils import (
 from .json_safe import _json_safe
 from .workitem_text import _coerce_tool_input_dict
 from app.sandbox.output_delivery import note_sandbox_tool_output_paths
+from app.skills.volume_tool_events import align_tool_event_job_id
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +326,10 @@ def _instrument_tools(
 
             def make_sync_wrapper(base_tool: Any, original):
                 def wrapper(tool_input: Any, *args: Any, **kwargs: Any) -> Any:
-                    job_id = _resolve_job_id()
+                    job_id = align_tool_event_job_id(
+                        resolved_job_id=_resolve_job_id(),
+                        exec_ctx=exec_ctx,
+                    )
                     effective_input = _augment_tool_input(base_tool, tool_input)
                     blocked_output = _run_tool_call_guard(base_tool, effective_input)
                     if blocked_output is not None:
@@ -386,7 +390,10 @@ def _instrument_tools(
 
             def make_async_wrapper(base_tool: Any, original):
                 async def wrapper(tool_input: Any, *args: Any, **kwargs: Any) -> Any:
-                    job_id = _resolve_job_id()
+                    job_id = align_tool_event_job_id(
+                        resolved_job_id=_resolve_job_id(),
+                        exec_ctx=exec_ctx,
+                    )
                     effective_input = _augment_tool_input(base_tool, tool_input)
                     blocked_output = _run_tool_call_guard(base_tool, effective_input)
                     if blocked_output is not None:

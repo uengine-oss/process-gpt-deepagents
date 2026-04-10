@@ -27,12 +27,17 @@ from processgpt_agent_sdk.database import (
 )
 from processgpt_agent_sdk.utils import summarize_error_to_user
 
-from app.database import claim_resumable_hitl_task, set_task_waiting_hitl
+from app.database import (
+    claim_resumable_hitl_task,
+    get_todolist_draft_status,
+    release_consumer_if_cancelled,
+    set_task_waiting_hitl,
+)
 from deepagents_executor import (
     DeepAgentsExecutor,
     MissingSubagentsConfigurationError,
 )
-from app.health_server import start_health_server
+from app.http_server import start_http_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +47,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("deepagents_executor").setLevel(logging.INFO)
 logging.getLogger("app.database").setLevel(logging.INFO)
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    """Parse boolean-ish environment flags (default: False)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    v = str(raw).strip().lower()
+    if v in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "f", "no", "n", "off", ""}:
+        return False
+    return default
+
+
+def _file_logging_enabled() -> bool:
+    # 기본값은 OFF. (명시적으로 켜야 logs/ 생성 및 파일 저장)
+    return _env_flag("DEEPAGENTS_FILE_LOGGING", default=False)
 
 
 def _log_skills_volume_inventory(
@@ -122,6 +145,9 @@ def _safe_json_for_log(obj: Any) -> str:
 
 def _install_db_event_file_logging_hooks() -> None:
     """DB에 기록되는 이벤트 payload를 작업별 파일 로그에도 남기기 위한 훅."""
+    if not _file_logging_enabled():
+        logger.info("📝 파일 로그 비활성화(DEEPAGENTS_FILE_LOGGING=off): DB 이벤트 payload 훅 설치 스킵")
+        return
     try:
         import processgpt_agent_sdk.database as sdk_db
         import processgpt_agent_sdk.processgpt_agent_framework as sdk_fw
@@ -192,6 +218,8 @@ class _TaskFileLogSession(contextlib.AbstractContextManager["_TaskFileLogSession
         self._handler: logging.Handler | None = None
 
     def __enter__(self) -> "_TaskFileLogSession":
+        if not _file_logging_enabled():
+            return self
         now = dt.datetime.now()
         ts = now.strftime("%Y%m%d-%H%M%S")
         date_dir = now.strftime("%Y-%m-%d")
@@ -212,6 +240,8 @@ class _TaskFileLogSession(contextlib.AbstractContextManager["_TaskFileLogSession
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        if not _file_logging_enabled():
+            return None
         if self._handler is not None:
             logging.getLogger().removeHandler(self._handler)
             try:
@@ -290,6 +320,15 @@ class DeepAgentsServer(ProcessGPTAgentServer):
                         row = None
 
                 if row:
+                    # draft_status=CANCELLED이면 즉시 중단(실행 진입 전 차단).
+                    # 폴링 후 취소되는 레이스를 위해 process_todolist_item에서도 재확인한다.
+                    if str(row.get("draft_status") or "").strip().upper() == "CANCELLED":
+                        tid = str(row.get("id") or "")
+                        logger.info("🛑 [취소된 작업 감지] 실행 없이 스킵 | todo_id=%s", tid)
+                        release_consumer_if_cancelled(todo_id=tid, consumer=consumer)
+                        await asyncio.sleep(1)
+                        continue
+
                     logger.info("✅ [새 작업 발견] Task ID: %s", row.get("id"))
                     logger.info(
                         "• Activity: %s | Tool: %s | Tenant: %s | draft_status=%s",
@@ -316,7 +355,12 @@ class DeepAgentsServer(ProcessGPTAgentServer):
     async def process_todolist_item(self, row: Dict[str, Any]) -> None:
         task_id = row.get("id")
         proc_inst_id = row.get("proc_inst_id")
-        with _TaskFileLogSession(task_id=task_id, proc_inst_id=proc_inst_id):
+        cm = (
+            _TaskFileLogSession(task_id=task_id, proc_inst_id=proc_inst_id)
+            if _file_logging_enabled()
+            else contextlib.nullcontext()
+        )
+        with cm:
             logger.info("\n🎯 [작업 처리 시작] Task ID: %s", task_id)
             logger.info(
                 "📥 폴링으로 작업 감지됨 | task_id=%s proc_inst_id=%s agent_orch=%s",
@@ -327,6 +371,17 @@ class DeepAgentsServer(ProcessGPTAgentServer):
             friendly_text: Optional[str] = None
 
             try:
+                # 레이스 방지: 폴링으로 row를 받은 뒤 사람이 CANCELLED로 바꿨을 수 있으므로 DB 최신값으로 재확인
+                latest = get_todolist_draft_status(str(task_id))
+                if (latest or "").strip().upper() == "CANCELLED":
+                    logger.info(
+                        "🛑 [취소 확인] 실행 진입 전 중단 | todo_id=%s latest_draft_status=%s",
+                        str(task_id),
+                        latest,
+                    )
+                    release_consumer_if_cancelled(todo_id=str(task_id), consumer=get_consumer_id())
+                    return
+
                 context = ProcessGPTRequestContext(row)
                 await context.prepare_context()
                 logger.info("✅ RequestContext 준비 완료 | task_id=%s", task_id)
@@ -414,9 +469,9 @@ async def main() -> None:
     try:
         logger.info("🚀 DeepAgents Server 시작 중...")
         _log_skills_volume_inventory()
-        start_health_server(host="0.0.0.0", port=8888)
 
         executor = DeepAgentsExecutor()
+        start_http_server(executor, host="0.0.0.0", port=8888)
         server = DeepAgentsServer(
             agent_executor=executor,
             agent_type="deepagents",

@@ -6,9 +6,11 @@ import ast
 import json
 import logging
 import re
+from urllib.parse import urlparse
 from typing import Any
 
 logger = logging.getLogger(__name__)
+_HTTP_URL_RE = re.compile(r"https?://[^\s<>'\"\]\)]+", flags=re.IGNORECASE)
 
 
 def _parse_block(source: str, header: str, next_headers: list[str]) -> str:
@@ -69,7 +71,22 @@ def parse_workitem_query(query: str) -> dict[str, Any]:
             if isinstance(parsed, dict):
                 input_data = parsed
         except Exception:
-            logger.warning("Failed to parse InputData JSON from query; using empty dict.")
+            # Some clients send Python-like dict/list literals instead of strict JSON.
+            try:
+                parsed_literal = ast.literal_eval(candidate)
+                if isinstance(parsed_literal, dict):
+                    input_data = parsed_literal
+            except Exception:
+                # Last-resort fallback: preserve file URLs so downstream can still download inputs.
+                urls = list(dict.fromkeys(_HTTP_URL_RE.findall(raw)))
+                if urls:
+                    files: list[dict[str, str]] = []
+                    for url in urls:
+                        parsed_url = urlparse(url)
+                        name = parsed_url.path.rstrip("/").split("/")[-1] or "input_file"
+                        files.append({"name": name, "url": url})
+                    input_data = {"files": files}
+                logger.warning("Failed to parse InputData JSON from query; used URL fallback=%s", bool(urls))
 
     return {
         "description": desc,
@@ -77,6 +94,50 @@ def parse_workitem_query(query: str) -> dict[str, Any]:
         "input_data_raw": input_raw,
         "input_data": input_data,
     }
+
+
+def cut_index_after_leading_workitem_echo_for_stream(text: str) -> int:
+    """Return index in ``text`` immediately after a leading work-item template echo.
+
+    Matches HTTP 채팅 등에서 쓰는 ``[Description]`` / ``[Instruction]`` / ``[InputData]`` +
+    단일 JSON 객체(``InputData`` 본문) 형태. 이 접두부는 SSE 토큰에서 숨긴다.
+
+    - 텍스트가 (앞 공백 제거 후) ``[Description]``로 시작하지 않으면 ``0``.
+    - 세 마커가 올바른 순서로 없으면 ``0`` (오탐 방지).
+    - ``[InputData]`` 뒤 JSON이 아직 끝나지 않았으면 ``len(text)`` (토큰 유출 방지).
+    """
+    if not text:
+        return 0
+    lead = text.lstrip()
+    if not lead.startswith("[Description]"):
+        return 0
+    ws = len(text) - len(lead)
+    d = lead.find("[Description]")
+    i = lead.find("[Instruction]")
+    a = lead.find("[InputData]")
+    if d < 0 or i < 0 or a < 0 or not (d <= i < a):
+        return 0
+    abs_input = ws + a + len("[InputData]")
+    tail = text[abs_input:]
+    j = 0
+    while j < len(tail) and tail[j] in " \t\r\n":
+        j += 1
+    if j >= len(tail):
+        return len(text)
+    payload = tail[j:]
+    try:
+        _obj, consumed = json.JSONDecoder().raw_decode(payload)
+    except json.JSONDecodeError:
+        return len(text)
+    end = abs_input + j + consumed
+    while end < len(text) and text[end] in "\r\n":
+        end += 1
+    return end
+
+def strip_leading_workitem_echo_for_sse(text: str) -> str:
+    """Drop leading work-item template from final SSE ``done`` text (same rules as stream cut)."""
+    cut = cut_index_after_leading_workitem_echo_for_stream(text)
+    return text[cut:]
 
 
 def _extract_plain_text(value: Any) -> str:
@@ -119,9 +180,9 @@ def _extract_plain_text(value: Any) -> str:
     return ""
 
 
-def _join_todo_contents(value: Any) -> str:
-    """Join todo item `content` values into a single plain-text message."""
-    parsed = value
+def _normalized_todo_entries(value: Any) -> list[str]:
+    """Normalize ``write_todos`` ``todos`` argument to non-empty content strings."""
+    parsed: Any = value
     if isinstance(value, str):
         raw = value.strip()
         if raw:
@@ -136,23 +197,28 @@ def _join_todo_contents(value: Any) -> str:
     if isinstance(parsed, dict):
         parsed = parsed.get("todos", parsed)
 
+    out: list[str] = []
     if isinstance(parsed, list):
-        parts: list[str] = []
         for item in parsed:
             if isinstance(item, dict):
                 content = item.get("content")
                 if isinstance(content, str) and content.strip():
-                    parts.append(content.strip())
+                    out.append(content.strip())
             elif isinstance(item, str) and item.strip():
-                parts.append(item.strip())
-        if parts:
-            return "\n".join(parts)
+                out.append(item.strip())
+        return out
 
     if isinstance(parsed, dict):
         content = parsed.get("content")
         if isinstance(content, str) and content.strip():
-            return content.strip()
-    return ""
+            return [content.strip()]
+    return []
+
+
+def _join_todo_contents(value: Any) -> str:
+    """Join todo item `content` values into a single plain-text message."""
+    parts = _normalized_todo_entries(value)
+    return "\n".join(parts) if parts else ""
 
 
 def _extract_form_field_keys(form_fields: Any) -> list[str]:
@@ -214,42 +280,6 @@ def _coerce_tool_input_dict(tool_input: Any) -> dict[str, Any] | None:
         except Exception:
             return None
     return None
-
-
-def _extract_plan_block(source: str) -> str:
-    """Extract the [PLAN]...[/PLAN] block from orchestrator output. Returns plain text only."""
-    if not source or not isinstance(source, str):
-        return ""
-    text = source.strip()
-    start_marker = "[PLAN]"
-    end_marker = "[/PLAN]"
-    start_idx = text.find(start_marker)
-    if start_idx == -1:
-        return ""
-    start_idx += len(start_marker)
-    end_idx = text.find(end_marker, start_idx)
-    if end_idx == -1:
-        # No closing tag: take from start to end of string
-        block = text[start_idx:].strip()
-    else:
-        block = text[start_idx:end_idx].strip()
-    # Ensure we return plain text (no list/dict string representation)
-    return _extract_plain_text(block) if block else ""
-
-
-def _strip_plan_blocks(source: str) -> str:
-    """Remove any [PLAN]...[/PLAN] blocks from user-facing output."""
-    if not source or not isinstance(source, str):
-        return ""
-    text = source
-    # Remove complete blocks.
-    text = re.sub(r"\[PLAN\].*?\[/PLAN\]\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
-    # If there's a dangling opening tag, drop everything from it onward.
-    m = re.search(r"\[PLAN\]", text, flags=re.IGNORECASE)
-    if m:
-        text = text[: m.start()].rstrip()
-    return text.strip()
-
 
 def _extract_result_block(source: str) -> str:
     """Extract the [RESULT]...[/RESULT] block from output, if present."""

@@ -204,3 +204,12 @@ $$;
 GRANT EXECUTE ON FUNCTION public.fetch_pending_task(text, text, integer, text) TO anon;
 
 
+create table public.tenants (
+  id text not null,
+  owner uuid null default auth.uid (),
+  is_deleted boolean not null default false,
+  deleted_at timestamp with time zone null,
+  mcp jsonb null,
+  skills text[] null,
+  constraint tenants_pkey primary key (id)
+) TABLESPACE pg_default;

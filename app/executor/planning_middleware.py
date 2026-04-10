@@ -1,9 +1,8 @@
-"""Root orchestrator middleware: tool_usage events + planning task_completed on write_todos."""
+"""Root orchestrator middleware: tool_usage events + planning task_completed on write_todos (and pipeline spec elsewhere)."""
 
 from __future__ import annotations
 
 import logging
-import uuid
 from typing import Any
 
 from .a2a_events import _enqueue_status
@@ -17,7 +16,6 @@ try:
     from langchain.agents.middleware.types import AgentMiddleware
 except ImportError:
     AgentMiddleware = None  # type: ignore[misc, assignment]
-
 
 def _create_write_todos_planning_middleware(
     *,
@@ -36,8 +34,6 @@ def _create_write_todos_planning_middleware(
         async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
             base_tool = getattr(request, "tool", None)
             tool_name = getattr(base_tool, "name", None) or ""
-            if tool_name == "task":
-                return await handler(request)
             if getattr(base_tool, "_processgpt_instrumented", False):
                 return await handler(request)
 
@@ -47,7 +43,8 @@ def _create_write_todos_planning_middleware(
             event_tool_name = str(tool_name) if tool_name else type(base_tool).__name__
 
             async def _run_with_tool_usage_events() -> Any:
-                tool_call_job_id = str(uuid.uuid4())
+                # 루트 오케스트레이터 run과 동일한 job_id로 수집·표시 정합성 유지 (매 호출 uuid4 금지)
+                tool_call_job_id = str(job_uuid)
                 try:
                     _enqueue_status(
                         event_queue,

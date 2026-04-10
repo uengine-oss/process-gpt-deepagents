@@ -14,7 +14,7 @@ class DeepAgentsFactoryTests(unittest.TestCase):
         with patch("app.agent.factory.create_deep_agent") as create_mock:
             create_mock.return_value = object()
             agent = deepagents_factory.build_runtime_agent(
-                model_name="openai:gpt-4o",
+                model_name="anthropic:claude-opus-4-6",
                 subagents=[{"name": "a", "description": "d", "system_prompt": "s", "tools": []}],
                 tools=[],
                 middleware=[],
@@ -25,6 +25,21 @@ class DeepAgentsFactoryTests(unittest.TestCase):
             self.assertIn("backend", kwargs)
             self.assertTrue(callable(kwargs["backend"]))
             self.assertIn("skills", kwargs)
+            self.assertIn("memory", kwargs)
+            self.assertIn("checkpointer", kwargs)
+            self.assertIn("store", kwargs)
+
+    def test_default_orchestrator_prompt_instructs_native_task_delegation(self) -> None:
+        try:
+            from app.agent.factory import default_orchestrator_prompt
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"deepagents_factory import unavailable: {exc}")
+            return
+
+        p = default_orchestrator_prompt()
+        self.assertIn("task()", p)
+        self.assertIn("서브에이전트", p)
+        self.assertIn("DeepAgents", p)
 
 
 if __name__ == "__main__":

@@ -50,12 +50,3 @@ def start_health_server(host: str = "0.0.0.0", port: int = 8888) -> tuple[Thread
     thread.start()
     logger.info("Health server started on http://%s:%d/health", host, port)
     return server, thread
-
-
-def stop_health_server(server: ThreadingHTTPServer) -> None:
-    try:
-        server.shutdown()
-        server.server_close()
-        logger.info("Health server stopped")
-    except Exception as e:
-        logger.warning("Health server stop failed: %s", e)

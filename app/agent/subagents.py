@@ -8,20 +8,20 @@ import os
 import re
 from typing import Any
 
-from processgpt_agent_utils.tools.dmn_rule_tool import DMNRuleTool
-from processgpt_agent_utils.tools.knowledge_manager import Mem0Tool
-
 from app.database import get_supabase
 from app.execution_context import format_execution_clock_section
 from app.sandbox.tools import get_sandbox_tools
 from app.skills.resolution_tools import get_skill_resolution_tools
 
-# Tier 2: claude-skills MCP tools are attached to every subagent via DEFAULT_MCP_SERVER_NAMES
+# Tier 2: MCP tools are attached to every subagent via DEFAULT_MCP_SERVER_NAMES
 # (when tenant_mcp includes that server). computer-use remains virtual (sandbox replaces shell).
+# NOTE: 서브에이전트는 기본적으로 claude-skills + (mem0/memento/dmn_rule)만 가진다.
+# work-assistant MCP는 "루트(딥 에이전트) 전용"으로 사용하며 서브에이전트에는 기본 부착하지 않는다.
 DEFAULT_MCP_SERVER_NAMES: tuple[str, ...] = ("claude-skills",)
 SKILLS_ROOT_DIR = (os.environ.get("SKILLS_ROOT_DIR") or "/app/skills").rstrip("/")
 VIRTUAL_TOOL_NAMES: set[str] = {"computer-use"}
 ALWAYS_ATTACH_LOCAL_TOOL_NAMES: tuple[str, ...] = ("mem0", "memento", "dmn_rule")
+_BLOCKED_SUBAGENT_MCP_SERVERS: set[str] = {"work-assistant"}
 
 logger = logging.getLogger(__name__)
 
@@ -39,48 +39,23 @@ def _wrap_tools_langchain(tools: list[Any]) -> list[Any]:
         return tools
 
 
-def _make_mem0_for_user_id(
-    tenant_id: str | None,
-    user_id: str,
-    fallback: Any | None,
-) -> Any | None:
-    """Mem0Tool bound to one agent/user id (memory.search agent_id)."""
-    uid = (user_id or "").strip()
-    if not uid:
-        return fallback
-    try:
-        raw = Mem0Tool(tenant_id=tenant_id, user_id=uid)
-        wrapped = _wrap_tools_langchain([raw])
-        return wrapped[0] if wrapped else raw
-    except Exception:
-        logger.exception(
-            "Mem0Tool per-agent construction failed (tenant_id=%s user_id=%s); using shared tool",
-            tenant_id,
-            uid,
-        )
-        return fallback
+def _clone_tool_for_user_id(base_tool: Any, user_id: str) -> Any:
+    """Reuse the same underlying client/memory, but bind user_id per subagent.
 
-
-def _make_dmn_rule_for_user_id(
-    tenant_id: str | None,
-    user_id: str,
-    fallback: Any | None,
-) -> Any | None:
-    """DMNRuleTool loads rules for proc_def.owner == user_id."""
+    IMPORTANT: This avoids per-subagent initialization (e.g. DB connections) while still
+    keeping `mem0`/`dmn_rule` scoped to each subagent's user_id.
+    """
+    t = copy.copy(base_tool)
     uid = (user_id or "").strip()
-    if not uid:
-        return fallback
-    try:
-        raw = DMNRuleTool(tenant_id=tenant_id, user_id=uid)
-        wrapped = _wrap_tools_langchain([raw])
-        return wrapped[0] if wrapped else raw
-    except Exception:
-        logger.exception(
-            "DMNRuleTool per-agent construction failed (tenant_id=%s user_id=%s); using shared tool",
-            tenant_id,
-            uid,
-        )
-        return fallback
+    # Mem0Tool / DMNRuleTool in processgpt_agent_utils keep user binding in private attrs.
+    if uid:
+        for attr in ("_user_id", "_namespace", "user_id", "namespace"):
+            if hasattr(t, attr):
+                try:
+                    setattr(t, attr, uid)
+                except Exception:
+                    pass
+    return t
 
 
 def _sandbox_tool_names() -> set[str]:
@@ -129,6 +104,30 @@ def load_agents_from_db(
     )
     agents = resp.data or []
     logger.info("Loaded %d agent(s) from DB for tenant=%s", len(agents), tenant_id)
+    return agents
+
+
+def load_tenant_agents_for_chat(
+    tenant_id: str,
+    *,
+    limit: int = 64,
+) -> list[dict[str, Any]]:
+    """List agent rows (is_agent=true) for HTTP /chat when no explicit agent_ids are given."""
+    tid = (tenant_id or "").strip()
+    if not tid:
+        return []
+    lim = max(1, min(int(limit), 256))
+    resp = (
+        get_supabase()
+        .table("users")
+        .select("*")
+        .eq("tenant_id", tid)
+        .eq("is_agent", True)
+        .limit(lim)
+        .execute()
+    )
+    agents = resp.data or []
+    logger.info("Loaded %d chat agent row(s) for tenant=%s", len(agents), tid)
     return agents
 
 
@@ -205,305 +204,104 @@ def _build_system_prompt(
     query: str = "",
     tenant_id: str | None = None,
 ) -> str:
-    """Compose a richer, sectioned system prompt for a subagent.
-
-    Skill content is not inlined; subagents load it at runtime from mounted
-    filesystem paths (tenant-aware), and may also use mem0/dmn_rule or other
-    tools that have been attached to them.
-    """
+    """서브에이전트용 시스템 프롬프트(한글, 중복/충돌 정리 버전)."""
     parts: list[str] = []
 
-    name = agent_row.get("alias") or agent_row.get("username") or agent_row.get("name") or str(agent_row.get("id"))
-    role = agent_row.get("role") or "Unspecified role"
-    base_desc = agent_row.get("description") or ""
+    name = (
+        agent_row.get("alias")
+        or agent_row.get("username")
+        or agent_row.get("name")
+        or str(agent_row.get("id"))
+    )
+    role = agent_row.get("role") or "역할 미지정"
+    base_desc = (agent_row.get("description") or "").strip()
     persona = (agent_row.get("persona") or "").strip()
     goal = (agent_row.get("goal") or "").strip()
 
-    # 섹션 1: 역할 / 도메인
-    parts.append("=== Section 1: Your role and domain ===")
-    parts.append(f"- Name: {name}")
-    parts.append(f"- Role: {role}")
+    q = (query or "").strip()
+    t_id = (tenant_id or "").strip() or "(unknown)"
+    agent_skills = _parse_csv(agent_row.get("skills"))
+    declared_tools = _parse_csv(agent_row.get("tools"))
+
+    parts.append("=== 섹션 1: 역할/도메인 ===")
+    parts.append(f"- 이름: {name}")
+    parts.append(f"- 역할: {role}")
     if base_desc:
-        parts.append(f"- Description: {base_desc.strip()}")
+        parts.append(f"- 설명: {base_desc}")
     if persona:
-        parts.append(f"- Persona: {persona}")
+        parts.append(f"- 페르소나: {persona}")
     if goal:
-        parts.append(f"- Goal: {goal}")
+        parts.append(f"- 목표: {goal}")
 
     parts.append("\n" + format_execution_clock_section())
 
-    # 섹션 2: 현재 워크아이템 컨텍스트 (요약 형태로)
-    q = (query or "").strip()
     if q:
-        parts.append("\n=== Section 2: Current work-item context ===")
+        parts.append("\n=== 섹션 2: 현재 워크아이템 컨텍스트 ===")
         parts.append(
-            "The following text is the current work-item query (including [Description], "
-            "[Instruction], [InputData]). Focus on the parts that are relevant to your "
-            "role when deciding how to act:\n"
+            "아래는 현재 워크아이템 쿼리([Description]/[Instruction]/[InputData])입니다. "
+            "당신의 역할과 직접 관련된 부분을 중심으로 행동을 결정하세요.\n"
         )
         parts.append(q)
 
-    # 섹션 3: 테넌트 컨텍스트
-    t_id = (tenant_id or "").strip() or "(unknown)"
-    parts.append("\n=== Section 3: Tenant context ===")
-    parts.append(f"- Current tenant_id: {t_id}")
-    parts.append("- Use this tenant_id to resolve skill paths under the mounted skills root.")
+    parts.append("\n=== 섹션 3: 테넌트/스킬 경로 ===")
+    parts.append(f"- tenant_id: {t_id}")
+    parts.append(f"- 스킬 루트(마운트 볼륨): \"{SKILLS_ROOT_DIR}/{{tenant_id}}/\"")
+    parts.append("- 이 tenant_id를 사용해 스킬/문서 경로를 해석하세요(다른 tenant 경로 접근 금지).")
 
-    # 섹션 4: 스킬 / 도구 사용 규칙
-    agent_skills = _parse_csv(agent_row.get("skills"))
-    tools = _parse_csv(agent_row.get("tools"))
-    parts.append("\n=== Section 4: Skills and tools usage ===")
+    parts.append("\n=== 섹션 4: 실행 원칙(중요) ===")
     parts.append(
-        "\n=== Section 4a0: Built-in knowledge tools (use when they add value; not every task needs them) ===\n"
-        "Your tool list may include local tools that are NOT generic MCP — treat them by purpose:\n"
-        "- **mem0** — Long-term personalized memory: user/org preferences, standing facts, credentials or secrets "
-        "the user chose to store, prior task notes, and anything that should persist across runs.\n"
-        "  Use mem0 when: the task could benefit from personalization; [Instruction]/[Description]/user text "
-        "mentions memory, prior runs, preferences, or stored keys; or you are about to ask the human for "
-        "information that might already live in memory.\n"
-        "  Skip mem0 when: the task is purely stateless/format-only and nothing suggests stored context.\n"
-        "- **dmn_rule** — Business rules & decision logic: policies, thresholds, eligibility, DMN-style rules "
-        "that must govern *what* to do or *whether* an action is allowed.\n"
-        "  Use dmn_rule when: the request involves compliance, approvals, routing rules, or any "
-        "structured decision that should not be invented from general knowledge.\n"
-        "  Skip when: no rule-governed decision is involved.\n"
-        "- **memento** — RAG / document retrieval over tenant-linked corpora: finding relevant internal "
-        "documents, passages, or evidence to ground answers.\n"
-        "  Use memento when: you need supporting documents, similar past cases, or authoritative text "
-        "that may exist outside the current work-item text.\n"
-        "  Skip when: everything needed is already in [Instruction]/[InputData] and no retrieval is implied.\n"
-        "\n"
-        "Ordering (soft, not mandatory): when you *do* use these tools, prefer calling them **before** "
-        "heavy MCP or sandbox work so their outputs can steer parameters, credentials, and risk choices. "
-        "If a tool returns nothing useful, proceed without looping endlessly.\n"
-        "\n"
-        "**Human-in-the-loop (HITL) and credentials / file uploads:**\n"
-        "- Do **not** jump to `request_human_input` (or similar) for API keys, tokens, or credential files "
-        "just because [Instruction] says \"upload a file\" or \"provide a key\", if mem0 (or memento for "
-        "documented secrets) might already hold them — **query the relevant tools first**, then decide.\n"
-        "- Only after you have **reasonably tried** attached mem0 / dmn_rule / memento (when applicable to "
-        "the task) and still lack a required secret or file, escalate to human intervention with a clear, "
-        "minimal question.\n"
-        "- Summarize what you retrieved from memory/rule/RAG tools and how it changed your plan; if nothing "
-        "was found, say so briefly and continue.\n"
+        "- 이 작업은 **실행 우선**입니다. 가능한 경우 샌드박스에서 실제 실행을 수행하고, 결과(stdout/stderr, exit code)를 보고하세요.\n"
+        "- 스킬 스크립트가 있어도 기본은 **요청+InputData+스킬 문서를 반영한 태스크 전용 스크립트 합성 후 실행**입니다.\n"
+        "- 원본 스킬 스크립트의 직접 실행은 (a) 목적이 요청과 정확히 일치하고 (b) 입력이 이미 준비되어 있고 (c) 파라미터 변환이 불필요할 때만 허용됩니다.\n"
+        "- 오케스트레이터가 이번 `task()`를 **하나의 독립 산출**(예: 인벤토리 표, 파싱 JSON, 업로드된 파일 URL)로 정의했다면 범위를 넓히지 말고 그 산출만 완수하세요.\n"
     )
+
+    parts.append("\n=== 섹션 4a: 지식/규칙/문서 도구(mem0/memento/dmn_rule) ===")
     parts.append(
-        "\n=== Section 4a: Three-tier skill resolution (STRICT ORDER) ===\n"
-        "- At the start of non-trivial tasks, use write_todos with items that include: "
-        "`tier1_volume_fs`, `tier2_claude_skills_mcp` (only if Tier 1 fails), "
-        "`tier3_sandbox` (only if Tier 2 fails and execution is required). "
-        "- Tier 1 — Volume + filesystem: Call skill_volume_probe(tenant_id, skill_names_csv) "
-        "with Section 3 tenant_id and your assigned skill folder names (comma-separated). "
-        "That tool emits server-side logs automatically; still call "
-        "report_skill_resolution_tier(1, \"started\"|\"success\"|\"failed\", short detail) "
-        "so tier transitions appear in the same stream as Tier 2/3. "
-        "Then use built-in ls/read_file/glob on paths under the skills root; prefer "
-        "sandbox_copy_mounted_skill to mirror files into the sandbox before running scripts.\n"
-        "- Tier 2 — claude-skills MCP: ONLY after Tier 1 shows missing SKILL.md / empty copy / "
-        "skill_volume_probe.tier1_any_hit is false for what you need. "
-        "Use the MCP tools from the claude-skills server (e.g. search/list/read similar skills). "
-        "Call report_skill_resolution_tier(2, \"started\"|\"success\"|\"failed\", short detail) when entering/leaving this tier.\n"
-        "- Tier 3 — Sandbox code: ONLY when Tier 2 did not produce a runnable skill AND the task "
-        "requires code execution. Follow Section 4c. "
-        "Call report_skill_resolution_tier(3, ... ) similarly.\n"
-        "- Do not jump to Tier 3 while claude-skills MCP tools are available and you have not tried Tier 2.\n"
+        "- `mem0`: 개인화/누적 지식(선호, 과거 실행 정보, 사용자가 저장한 자격 증명 등). "
+        "사람에게 묻기 전에 먼저 조회하는 것을 권장합니다.\n"
+        "- `dmn_rule`: 정책/결재/자격/라우팅 등 규칙 기반 의사결정이 필요한 경우 사용합니다.\n"
+        "- `memento`: **RAG**. 워크아이템·InputData·지시문에 **문서/파일 URL·스토리지 경로**가 있으면 추측하지 말고 "
+        "`memento`로 **적극 조회**해 근거(발췌·출처)를 확보하세요. 오케스트레이터가 `write_todos`로 배정한 \"문서 확인\" 단계는 여기서 수행합니다.\n"
+        "- pdf/xlsx/docx/pptx/csv/zip 등 **바이너리·복합 문서**는 `memento`만으로 부족할 수 있으므로, "
+        "할당 스킬(SKILL.md)·`read_file`/샌드박스(다운로드·파싱·추출 스크립트)를 조합해 **실제 내용을 읽은 뒤** 결론을 내세요.\n"
+        "- 위 도구들이 유의미하면 MCP/무거운 실행 전에 먼저 호출해 파라미터/리스크 결정을 보정하세요.\n"
     )
+
+    parts.append("\n=== 섹션 4b: 스킬 해석 3티어(엄격한 순서) ===")
+    parts.append(
+        "- 티어1(볼륨/FS): `skill_volume_probe` → `ls/read_file/glob` → 필요 시 `sandbox_copy_mounted_skill`\n"
+        "- 티어2(claude-skills MCP): 티어1에서 파일 누락/빈 복사 등으로 실패했을 때만 MCP로 탐색/문서 확인\n"
+        "- 티어3(샌드박스 폴백): 티어1·2로 실행 가능한 스킬을 못 찾았지만 코드 실행이 필요한 경우, "
+        "`sandbox_write_and_run`로 태스크 전용 스크립트를 작성·실행\n"
+        "- 티어 전환 시 `report_skill_resolution_tier(1|2|3, started|success|failed, detail)`를 호출해 기록하세요.\n"
+    )
+
     if agent_skills:
-        names = ", ".join(agent_skills)
-        parts.append(f"- Assigned skills: {names}")
+        parts.append("\n=== 섹션 4c: 할당 스킬 ===")
+        parts.append(f"- 할당 스킬: {', '.join(agent_skills)}")
         parts.append(
-            f"- Skills root directory: {SKILLS_ROOT_DIR} "
-            "(mounted docker volume)."
-        )
-        parts.append(
-            "- Default document path for each skill follows this template (do NOT invent paths): "
-            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/{{skill_name}}/SKILL.md\"."
-        )
-        for s in agent_skills:
-            parts.append(
-                f"  * {s} → primary document_path: "
-                f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/"
-                f'{s}'
-                "/SKILL.md\""
-            )
-        parts.append(
-            "- When solving tasks, you MUST first read assigned skill documents using "
-            "filesystem tools (ls/read_file)."
-        )
-        parts.append(
-            "  1) Check directory existence with ls on "
-            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/<name>/\"."
-        )
-        parts.append(
-            "  2) Read the primary document with read_file on "
-            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/<name>/SKILL.md\"."
-        )
-        parts.append(
-            "  3) If missing, inspect the same directory for alternative docs/scripts and continue."
-        )
-        parts.append(
-            "- You MUST NOT give up after one failed read. Explore neighboring files "
-            "in the skill directory and proceed with best available instructions."
-        )
-        parts.append(
-            "- When a skill's documents include Python scripts (*.py files), you MUST execute "
-            "them in sandbox. Read SKILL.md, locate referenced .py files, then run them "
-            "with sandbox_run_shell—do not only return code or instructions."
-        )
-        parts.append(
-            "- IMPORTANT: Do NOT blindly run skill scripts as-is by default. Treat skill scripts as "
-            "reference modules/templates first. Build a task-specific execution script from "
-            "the user request + InputData + skill docs, then execute that synthesized script."
-        )
-        parts.append(
-            "- Direct execution of an original skill script is allowed only when ALL are true: "
-            "(a) the script's declared purpose exactly matches the request, "
-            "(b) required inputs are already present in InputData/context, and "
-            "(c) no task-specific parameter remapping is needed."
-        )
-        parts.append(
-            "- Mandatory materialization + execution path (do not skip):\n"
-            "  1) sandbox_create → note workspace_id.\n"
-            "  2) sandbox_copy_mounted_skill with the same tenant_id as Section 3 and each "
-            "assigned skill folder name (copies host-mounted files into the workspace).\n"
-            "  3) Prefer sandbox_write_and_run (or write_files + run_shell) to execute a synthesized script "
-            "that imports/reuses skill logic with task-specific parameters. "
-            "Run original skill scripts directly only when they exactly match the requested task and inputs.\n"
-            "  4) sandbox_read_workspace_files for key outputs if needed.\n"
-            "  Your final message to the orchestrator MUST include actual command outputs "
-            "(stdout/stderr snippets), not only generic API usage examples."
-        )
-        parts.append(
-            "- If sandbox_copy_mounted_skill reports source_missing or source_not_dir, or "
-            "copied_files is empty, you MUST use sandbox_write_and_run (preferred) or "
-            "sandbox_write_files + sandbox_run_shell: synthesize a complete script from the "
-            "work-item Instruction + InputData, run it, and return stdout/stderr. "
-            "Never stop at placeholder code or setup prose only."
+            "- 기본 문서 경로 템플릿(경로를 발명하지 마세요): "
+            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/{{skill_name}}/SKILL.md\""
         )
     else:
-        parts.append("- Assigned skills: (none explicitly assigned)")
+        parts.append("\n=== 섹션 4c: 할당 스킬 ===")
+        parts.append("- 할당 스킬: (명시 없음)")
         parts.append(
-            "- Because you have no assigned skills, inspect tenant skill directories under "
-            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/\" and choose the most relevant one."
-        )
-        parts.append(
-            "- If nothing usable is on disk, use sandbox_write_and_run to implement the task "
-            "from Instruction + InputData without waiting for skill files."
+            f"- \"{SKILLS_ROOT_DIR}/{{tenant_id}}/\" 아래를 탐색해 가장 관련 높은 스킬 폴더를 선택하세요."
         )
 
+    parts.append("\n=== 섹션 5: 보고 형식 ===")
     parts.append(
-        "\n=== Section 4c: Tier 3 — sandbox when FS + MCP did not yield a runnable skill ===\n"
-        "Use Tier 3 only after Tier 1 (volume/FS) and Tier 2 (claude-skills MCP) are exhausted or "
-        "MCP is unavailable, and the task still requires code execution.\n"
-        "Typical triggers: ls/read_file failed for expected paths; "
-        "sandbox_copy_mounted_skill returns source_missing, source_not_dir, or copied_files=[]; "
-        "or MCP returned no executable skill.\n"
-        "Order (do not skip step 3):\n"
-        "  1) sandbox_create if you do not yet have workspace_id.\n"
-        "  2) Write one complete Python (or shell) program that performs the requested action "
-        "using data from the work-item; embed credentials from InputData when provided. "
-        "This script should be task-specific (synthesized), not a blind copy of skill scripts.\n"
-        "  3) sandbox_write_and_run(relative_path like \"fallback_main.py\", content=...) "
-        "— or equivalent sandbox_write_files + sandbox_run_shell.\n"
-        "  4) Return exit_code, stdout, stderr to the orchestrator (trim if very long). "
-        "On failure, still report tool output — do not replace it with generic setup instructions only.\n"
-        "Ending with \"skill files are missing\" without having run step 3 is forbidden.\n"
+        "- 오케스트레이터가 합성할 수 있게 **간결하고 검증 가능한 결과**를 반환하세요.\n"
+        "- 실행이 있었다면: 사용한 도구/명령, exit code, stdout/stderr 핵심, 생성/수정된 파일(있다면) 요약을 포함하세요.\n"
+        "- 조회/조사 성격이면: source, endpoint_or_series, as_of, value, unit 같은 증거 필드를 포함하세요.\n"
+        "- 실패 시에도 도구 출력(에러 메시지)을 숨기지 말고, 최소 1회 이상 오류 기반 보정 재시도 후 상태를 보고하세요.\n"
     )
 
-    # NOTE: Avoid domain-specific hardcoding here.
-    # Keep subagent prompts general; domain tactics should emerge from tools/skills + execution.
-    parts.append(
-        "\n=== Section 4d: Execution-first & discovery-first (general) ===\n"
-        "- Prefer executing in sandbox over returning instructions.\n"
-        "- Execution policy: synthesized task-specific scripts first; direct execution of original "
-        "skill scripts is secondary and allowed only when the script precisely matches the request.\n"
-        "- If an external resource identifier is missing (file id, document id, URL, etc.),\n"
-        "  first attempt discovery using available tools/APIs in sandbox (search/list candidates, probe),\n"
-        "  and only ask the user when you have exhausted reasonable discovery attempts.\n"
-        "- Never end with placeholders (e.g. \"replace YOUR_* and run\"). Return concrete outputs\n"
-        "  (stdout/stderr, exit codes, extracted data) from real execution attempts.\n"
-        "- For lookup/investigation tasks using provided credentials (API key/token), you MUST execute\n"
-        "  at least one real API request and include evidence fields in your final report:\n"
-        "  source, endpoint_or_series, as_of, value, unit (or explain which field is unavailable).\n"
-        "- If a skill script produces wrong/empty data, do not stop; apply minimal corrective rerun\n"
-        "  (e.g. alternate stat code/params from the same API) and report both failure and final success.\n"
-    )
-
-    if tools:
-        parts.append(f"- Declared tools (by name/server): {', '.join(tools)}")
-    else:
-        parts.append("- Declared tools: (none explicitly declared; rely on built-in and sandbox tools)")
-
-    parts.append(
-        "- When mem0, memento, or dmn_rule are attached, treat them as first-class tools: use them when "
-        "Section 4a0 applies, so skill selection and execution reflect stored knowledge and rules."
-    )
-    parts.append(
-        "- Keep all skill file reads inside the tenant root directory and never access "
-        "other tenant paths."
-    )
-    parts.append(
-        "- Prefer sandbox tools for generated code execution: create a sandbox workspace, "
-        "write files, run shell commands in that sandbox, collect artifacts, then cleanup."
-    )
-
-    # 섹션 5: 협업 및 보고 방식
-    parts.append("\n=== Section 5: Collaboration and reporting ===")
-    parts.append(
-        "- You are part of a multi-agent team orchestrated by a top-level agent. "
-        "When delegated a subtask, focus on your domain expertise, use your tools "
-        "appropriately, and return clear, concise results that the orchestrator can "
-        "combine with outputs from other agents."
-    )
-    parts.append(
-        "- When using tools, prefer higher-level or safer tools first (e.g. read-only "
-        "queries, mem0/memento, dmn_rule) before performing irreversible mutations."
-    )
-
-    # 섹션 6: 자격 증명 및 사용자 개입 요청
-    parts.append("\n=== Section 6: Credentials and user intervention ===")
-    parts.append(
-        "- **Human intervention is the last resort.** Before any `request_human_input`, "
-        "`requires_human: true`, or upload request, work through this checklist in order "
-        "(skip steps for tools you do not have): "
-        "(1) mem0 / memento / dmn_rule per Section 4a0; "
-        "(2) skill FS + Tier 1–2 discovery; "
-        "(3) relevant MCP tools (list/search/read/call); "
-        "(4) sandbox probes or scripted discovery; "
-        "(5) at least one retry with parameters inferred from errors or docs. "
-        "Only then escalate to the human with a single, minimal question.\n"
-    )
-    parts.append(
-        "- If you need an API key, token, or other credential that is not in the "
-        "work-item InputData or context, follow Section 4a0 first: query **mem0** (and **memento** "
-        "when the secret may live in stored documents). Do NOT respond with only placeholder code or "
-        "'insert your API key here'. Only if retrieval does not yield what you need, request user "
-        "intervention (e.g. via request_human_input or the tool that signals requires_human); "
-        "then perform the actual tool/API call."
-    )
-    parts.append(
-        "- Whenever any information required to proceed is missing (API keys, tokens, "
-        "file paths, parameters, or other inputs), separate credentials/sensitive data "
-        "from non-sensitive query parameters. Prefer resolving credentials via mem0/memento "
-        "(Section 4a0) before asking the human. Non-sensitive parameters should be resolved by "
-        "autonomous discovery (skill docs, API docs/spec, list/search endpoints, prior tool outputs) "
-        "before asking the user."
-    )
-    parts.append(
-        "- Do NOT ask human input for optional query filters (date range, pagination, region, etc.) "
-        "when a sensible default allows immediate execution. Ask only when a truly required value "
-        "is missing and no safe default exists."
-    )
-    parts.append(
-        "- If an API responds with missing-required-parameter errors (e.g. ERROR-100), do not "
-        "immediately ask the human. Infer required fields from docs/error messages, retry with "
-        "corrected parameters, and only escalate when at least one reasonable correction attempt fails."
-    )
-    parts.append(
-        "- Never return only code snippets or example responses when the task requires "
-        "real execution (e.g. fetching KOSPI, calling an external API). Perform the "
-        "actual tool calls once the required credential or information is available."
-    )
+    if declared_tools:
+        parts.append("\n=== 섹션 6: 선언된 도구(참고) ===")
+        parts.append("- " + ", ".join(declared_tools))
 
     return "\n".join(parts)
 
@@ -523,14 +321,18 @@ def build_subagent_configs(
     """
     if all_tools is None:
         all_tools = []
+    # NOTE:
+    # 도구(MCP 클라이언트 포함)는 루트에서 1회 로드 후 서브에이전트가 재사용한다.
+    # 서브에이전트에는 "요구사항에 맞는 최소 도구셋"만 필터링해서 붙인다.
     all_tools = list(all_tools) + list(get_sandbox_tools()) + list(get_skill_resolution_tools())
     tools_map: dict[str, Any] = {getattr(t, "name", str(t)): t for t in all_tools}
-    sandbox_names = _sandbox_tool_names()
     server_to_tools: dict[str, list[Any]] = {}
     for t in all_tools:
         server = getattr(t, "_mcp_server", None)
         if server:
             server_to_tools.setdefault(server, []).append(t)
+    sandbox_names = _sandbox_tool_names()
+    skill_resolution_names = _skill_resolution_tool_names()
 
     subagents: list[dict[str, Any]] = []
     for row in agent_rows:
@@ -538,107 +340,133 @@ def build_subagent_configs(
         description = _build_description(row, name)
         system_prompt = _build_system_prompt(row, query=query, tenant_id=tenant_id)
 
-        declared_tool_names = _parse_csv(row.get("tools"))
-        # computer-use 는 샌드박스로 대체; claude-skills 는 MCP(Tier2) + FS(Tier1) 병행.
-        agent_tool_names = [t for t in declared_tool_names if t not in VIRTUAL_TOOL_NAMES]
-        has_skills = bool(_parse_csv(row.get("skills")))
-        if not agent_tool_names and has_skills:
-            # 스킬만 지정된 에이전트도 sandbox/built-in 도구 중심으로 동작한다.
-            agent_tool_names = []
+        agent_type = str(row.get("agent_type") or "").strip()
+        is_a2a = agent_type.lower() == "a2a"
 
-        # 각 서브 에이전트는 고유한 툴 인스턴스를 가져야 한다.
-        # 그렇지 않으면 도구 호출 로깅 시 job_id를 서브 에이전트별로 분리할 수 없다.
+        # users.tools 컬럼 해석:
+        # - 일반 서브에이전트: MCP 서버명 목록
+        # - a2a 서브에이전트: "도구명" 목록 (서버명이 아님)
+        declared_tool_names = _parse_csv(row.get("tools"))
+        declared_skill_names = _parse_csv(row.get("skills"))
+        # computer-use 같은 가상 툴 이름은 무시한다.
+        agent_tool_or_server_names = [t for t in declared_tool_names if t not in VIRTUAL_TOOL_NAMES]
+        # 기본 정책:
+        # - 일반 서브에이전트: users.tools에 명시된 MCP 서버 + 기본 claude-skills
+        # - a2a 서브에이전트: users.tools에 명시된 MCP 서버만 (그 외 모든 도구 부착 금지)
+        wanted_servers_norm: set[str] = set()
+        baseline_servers = [] if is_a2a else list(DEFAULT_MCP_SERVER_NAMES)
+        for s in [*agent_tool_or_server_names, *baseline_servers]:
+            key = str(s or "").strip()
+            if not key:
+                continue
+            norm = key.lower().replace("_", "-")
+            if norm in _BLOCKED_SUBAGENT_MCP_SERVERS:
+                continue
+            wanted_servers_norm.add(norm)
+
+        # IMPORTANT:
+        # Subagents reuse already-loaded tool instances (root-loaded).
+        # job_id separation is handled by executor-side instrumentation/contextvars, not by copying tools.
         filtered_tools: list[Any] = []
         seen_ids: set[int] = set()
 
-        # 1차: 에이전트가 선언한 tools 기준으로 매핑
-        for tn in agent_tool_names:
-            if tn in tools_map:
-                t = tools_map[tn]
-                if id(t) not in seen_ids:
-                    filtered_tools.append(copy.copy(t))
-                    seen_ids.add(id(t))
-            if tn in server_to_tools:
-                for t in server_to_tools[tn]:
-                    if id(t) not in seen_ids:
-                        filtered_tools.append(copy.copy(t))
-                        seen_ids.add(id(t))
+        def _server_matches(tool_server: str, wanted_norm: set[str]) -> bool:
+            # TaggingSafeToolLoader 가 붙이는 _mcp_server 키는 테넌트 설정에 따라 alias가 있을 수 있어
+            # canonical/endswith 매칭으로 흡수한다.
+            norm = str(tool_server or "").strip().lower().replace("_", "-")
+            if not norm:
+                return False
+            if norm in wanted_norm:
+                return True
+            return any(norm.endswith(w) for w in wanted_norm)
 
-        # 2차: 어떤 이유로든 filtered_tools 가 비어 있으면,
-        #     기본 보조 서버 툴을 fallback 으로 붙인다(현재 기본 보조 서버 없음).
-        if not filtered_tools:
-            fallback_tools: list[Any] = []
-            for t in _baseline_mcp_tools(server_to_tools):
+        # 1차: MCP 서버 필터링 (users.tools + 기본 claude-skills)
+        for server_key, tools in server_to_tools.items():
+            if not _server_matches(str(server_key), wanted_servers_norm):
+                continue
+            for t in tools:
                 if id(t) not in seen_ids:
-                    fallback_tools.append(copy.copy(t))
+                    filtered_tools.append(t)
                     seen_ids.add(id(t))
-            if fallback_tools:
-                logger.warning(
-                    "Agent '%s' had no resolved tools (requested=%s); "
-                    "attaching default fallback tools from %s instead",
-                    name,
-                    agent_tool_names or "[]",
-                    ", ".join(DEFAULT_MCP_SERVER_NAMES),
-                )
-                filtered_tools.extend(fallback_tools)
-            elif agent_tool_names:
-                # fallback 도 실패한 경우에만 경고를 남긴다.
-                logger.warning(
-                    "Agent '%s' requested tools %s but none matched loaded tools/default fallback servers",
-                    name,
-                    agent_tool_names,
-                )
 
-        # 3차: 기본 보조 서버의 툴은
-        #    "모든" 서브 에이전트에 항상 포함되도록 보장한다.
-        #    (이미 포함된 경우에는 seen_ids 체크로 중복을 방지한다.)
-        baseline_added = 0
-        for t in _baseline_mcp_tools(server_to_tools):
-            if id(t) not in seen_ids:
-                filtered_tools.append(copy.copy(t))
-                seen_ids.add(id(t))
-                baseline_added += 1
-        if baseline_added > 0:
+        # a2a 에이전트는 users.tools에 있는 도구만 사용한다.
+        # 따라서 아래 "기본 도구" 부착 단계(로컬 3개/샌드박스/스킬 해석)는 모두 스킵한다.
+        if is_a2a:
+            # a2a의 users.tools는 "도구명"이므로 tools_map에서 직접 매칭한다.
+            filtered_tools = []
+            seen_ids = set()
+            for tn in agent_tool_or_server_names:
+                t = tools_map.get(tn)
+                if t is None:
+                    continue
+                # work-assistant는 루트 전용 정책 유지(서브에이전트에는 차단).
+                srv = str(getattr(t, "_mcp_server", "") or "").strip().lower().replace("_", "-")
+                if srv and srv in _BLOCKED_SUBAGENT_MCP_SERVERS:
+                    continue
+                if id(t) not in seen_ids:
+                    filtered_tools.append(t)
+                    seen_ids.add(id(t))
+
+            subagent: dict[str, Any] = {
+                "name": name,
+                "description": description,
+                "system_prompt": system_prompt,
+                "tools": filtered_tools,
+                "capabilities": {
+                    "skills": list(declared_skill_names),
+                    "tools": list(declared_tool_names),
+                    "agent_type": agent_type,
+                },
+            }
+            model = row.get("model")
+            if model:
+                subagent["model"] = model
+                try:
+                    caps = subagent.get("capabilities")
+                    if isinstance(caps, dict):
+                        caps["model"] = model
+                except Exception:
+                    pass
+            subagents.append(subagent)
             logger.info(
-                "Attached default fallback tools %s to agent '%s' (added=%d, total_tools=%d)",
-                ", ".join(DEFAULT_MCP_SERVER_NAMES),
+                "Built subagent config (a2a strict): name=%s tools=%d model=%s",
                 name,
-                baseline_added,
                 len(filtered_tools),
+                model or "(inherit)",
             )
+            continue
 
-        # 3b차: 테넌트 컨텍스트 지식/기억/규칙 도구(mem0/memento/dmn_rule)는
+        # 2b차: 테넌트 컨텍스트 지식/기억/규칙 도구(mem0/memento/dmn_rule)는
         #      agent_rows[*].tools 에 명시되지 않아도 "항상" 서브에이전트에 부착한다.
-        # mem0 / dmn_rule 은 에이전트(users.id)별로 인스턴스를 새로 만든다(process-gpt-agent-utils 가
-        # user_id를 memory.search 의 agent_id 및 DMN owner 로 사용).
-        # memento 는 proc_inst 단위라 로더가 만든 공유 인스턴스를 copy 로 부착한다.
+        #
+        # CRITICAL 원칙:
+        # - 로컬 도구는 루트에서 1회 로드된 인스턴스를 재사용한다. (서브에이전트마다 새로 로드 금지)
+        # - 서브에이전트별 user_id만 바꿔서 동일 인스턴스(내부 클라이언트/스토어)를 재사용한다.
         agent_uid = str(row.get("id") or "").strip()
         local_added = 0
-        for tn in ALWAYS_ATTACH_LOCAL_TOOL_NAMES:
-            if tn == "mem0":
-                t = _make_mem0_for_user_id(tenant_id, agent_uid, tools_map.get("mem0"))
-            elif tn == "dmn_rule":
-                t = _make_dmn_rule_for_user_id(tenant_id, agent_uid, tools_map.get("dmn_rule"))
-            else:
-                t = tools_map.get(tn)
-            if t is None:
-                continue
-            if id(t) not in seen_ids:
-                filtered_tools.append(copy.copy(t) if tn == "memento" else t)
-                seen_ids.add(id(t))
-                local_added += 1
+        if agent_uid:
+            for tn in ALWAYS_ATTACH_LOCAL_TOOL_NAMES:
+                base = tools_map.get(tn)
+                if base is None:
+                    continue
+                # 얕은 복사로 user_id만 바인딩(내부 클라이언트/스토어는 공유)
+                t = _clone_tool_for_user_id(base, agent_uid)
+                t = _wrap_tools_langchain([t])[0]
+                if id(t) not in seen_ids:
+                    filtered_tools.append(t)
+                    seen_ids.add(id(t))
+                    local_added += 1
         if local_added > 0:
             logger.info(
-                "Attached tenant context tools %s to agent '%s' (agent_uid=%s, added=%d, total_tools=%d)",
+                "Attached per-subagent tenant context tools %s to agent '%s' (agent_uid=%s, added=%d, total_tools=%d)",
                 ", ".join(ALWAYS_ATTACH_LOCAL_TOOL_NAMES),
                 name,
-                agent_uid or "(fallback)",
+                agent_uid,
                 local_added,
                 len(filtered_tools),
             )
 
-        # 4차: 샌드박스 실행 도구는 "모든" 서브 에이전트에 기본 포함한다.
-        # 결과 품질(실제 실행) 보장을 위해 tools 선언 여부와 무관하게 항상 붙인다.
+        # 3차: 샌드박스 도구는 "모든" 서브 에이전트에 기본 포함한다.
         sandbox_added = 0
         if sandbox_names:
             for tn in sorted(sandbox_names):
@@ -646,7 +474,7 @@ def build_subagent_configs(
                 if t is None:
                     continue
                 if id(t) not in seen_ids:
-                    filtered_tools.append(copy.copy(t))
+                    filtered_tools.append(t)
                     seen_ids.add(id(t))
                     sandbox_added += 1
         if sandbox_added > 0:
@@ -657,16 +485,49 @@ def build_subagent_configs(
                 len(filtered_tools),
             )
 
+        # 4차: 스킬 해석/볼륨 탐색 도구(find_helpful_skills 등과 별개)도 기본 포함한다.
+        # (요구사항에 제거 요청이 없으므로 기존 동작 유지)
+        sr_added = 0
+        if skill_resolution_names:
+            for tn in sorted(skill_resolution_names):
+                t = tools_map.get(tn)
+                if t is None:
+                    continue
+                if id(t) not in seen_ids:
+                    filtered_tools.append(t)
+                    seen_ids.add(id(t))
+                    sr_added += 1
+        if sr_added > 0:
+            logger.info(
+                "Attached skill resolution tools to agent '%s' (added=%d, total_tools=%d)",
+                name,
+                sr_added,
+                len(filtered_tools),
+            )
+
         subagent: dict[str, Any] = {
             "name": name,
             "description": description,
             "system_prompt": system_prompt,
             "tools": filtered_tools,
+            # Capability metadata: routing must NOT depend on agent name/role.
+            # Use only DB-stored capabilities (skills/tools/model) + attached tool names.
+            "capabilities": {
+                "skills": list(declared_skill_names),
+                "tools": list(declared_tool_names),
+                "agent_type": agent_type,
+            },
         }
 
         model = row.get("model")
         if model:
             subagent["model"] = model
+            try:
+                caps = subagent.get("capabilities")
+                if isinstance(caps, dict):
+                    caps["model"] = model
+            except Exception:
+                pass
 
         subagents.append(subagent)
         logger.info(

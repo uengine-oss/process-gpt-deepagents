@@ -29,6 +29,30 @@ def tenant_skill_sources_for_middleware(tenant_id: str | None) -> list[str] | No
     return [f"{route}{tid}/"]
 
 
+def tenant_memory_sources_for_middleware(tenant_id: str | None) -> list[str] | None:
+    """Paths for create_deep_agent(memory=...) — optional AGENTS.md under tenant skills dir + env extras.
+
+    Missing files are ignored by deepagents ``MemoryMiddleware`` (file_not_found).
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    extra = (os.environ.get("DEEP_AGENT_MEMORY_PATHS") or "").strip()
+    if extra:
+        for p in extra.split(","):
+            s = p.strip()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+    tid = (tenant_id or "").strip().strip("/")
+    if tid:
+        route, _ = skills_route_prefix(skills_root_dir=None)
+        tenant_agents = f"{route}{tid}/AGENTS.md"
+        if tenant_agents not in seen:
+            seen.add(tenant_agents)
+            out.append(tenant_agents)
+    return out or None
+
+
 def make_deepagent_backend_factory(
     skills_root_dir: str | None = None,
 ) -> "BackendFactory":

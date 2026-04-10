@@ -12,3 +12,6 @@ openai>=1.0.0
 supabase>=2.0.0
 typing-extensions>=4.8.0
 pytest>=8.0.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+sse-starlette>=2.1.0

@@ -36,10 +36,10 @@ class ExecutorEventTests(unittest.TestCase):
 
         ctx = ExecutionContext(
             correlation_id="c1",
-            agent_path=["작업 실행 기획자", "스킬 탐색 도우미"],
+            agent_path=["작업 실행 기획자", "서브 에이전트"],
             task_id="t1",
             proc_inst_id="p1",
-            agent_role="스킬 탐색 도우미",
+            agent_role="서브 에이전트",
         )
         payload = build_event_payload(
             ctx,
@@ -47,7 +47,7 @@ class ExecutorEventTests(unittest.TestCase):
             phase="tool_call",
             extra_data={"tool_name": "search"},
         )
-        self.assertEqual(payload["role"], "스킬 탐색 도우미")
+        self.assertEqual(payload["role"], "서브 에이전트")
         self.assertEqual(payload["tool_name"], "search")
 
     def test_depth1_task_started_includes_required_agent_fields(self) -> None:

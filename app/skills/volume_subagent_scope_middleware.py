@@ -36,6 +36,15 @@ def _tool_call_parts(request: ToolCallRequest) -> tuple[str | None, dict[str, An
 class SubagentJobScopeMiddleware(AgentMiddleware):
     """Set ContextVars so InstrumentingSkillVolumeBackend events use the subagent job_id/exec_ctx."""
 
+    @staticmethod
+    def _tool_call_id(request: ToolCallRequest) -> str:
+        tc = request.tool_call
+        if isinstance(tc, dict):
+            cid = tc.get("id")
+        else:
+            cid = getattr(tc, "id", None)
+        return str(cid).strip() if cid else ""
+
     def wrap_tool_call(
         self,
         request: ToolCallRequest,
@@ -48,7 +57,8 @@ class SubagentJobScopeMiddleware(AgentMiddleware):
             if name == "task" and binding is not None:
                 sub_type = str(args.get("subagent_type") or "").strip()
                 if sub_type:
-                    jid = binding.subagent_name_to_job_id.get(sub_type)
+                    mapped = str(binding.subagent_name_to_job_id.get(sub_type) or "").strip()
+                    jid = mapped or self._tool_call_id(request)
                     ect = binding.subagent_name_to_exec_ctx.get(sub_type)
                     if jid:
                         tokens.append((skill_volume_active_job_id, skill_volume_active_job_id.set(jid)))
@@ -71,7 +81,8 @@ class SubagentJobScopeMiddleware(AgentMiddleware):
             if name == "task" and binding is not None:
                 sub_type = str(args.get("subagent_type") or "").strip()
                 if sub_type:
-                    jid = binding.subagent_name_to_job_id.get(sub_type)
+                    mapped = str(binding.subagent_name_to_job_id.get(sub_type) or "").strip()
+                    jid = mapped or self._tool_call_id(request)
                     ect = binding.subagent_name_to_exec_ctx.get(sub_type)
                     if jid:
                         tokens.append((skill_volume_active_job_id, skill_volume_active_job_id.set(jid)))

@@ -14,7 +14,7 @@ DeepAgentsExecutor.execute(context, event_queue)
        │
        ├─ extras.agents (ID 목록) ──► Supabase users 테이블 조회 (app.database.get_supabase)
        │
-       ├─ 런타임 라우팅 결정 ──► LiteLLM proxy 우선 (warn_fallback)
+       ├─ 런타임 라우팅 결정 ──► direct provider (Anthropic)
        ├─ 스킬/로컬 도구 로딩 ──► SafeToolLoader (선택적 로컬 도구)
        ├─ sandbox tools 주입 ──► sandbox_create/write/run/read/cleanup
        ├─ 단일 DeepAgent 실행 ──► TodoList + Filesystem + SubAgent middleware
@@ -43,10 +43,9 @@ A2A 이벤트 발행 (TaskStatusUpdateEvent / TaskArtifactUpdateEvent)
 | `SUPABASE_URL` | Supabase 프로젝트 URL |
 | `SUPABASE_KEY` | Supabase 서비스 롤 키 |
 | `SKILLS_ROOT_DIR` | 스킬 파일 루트 경로 (예: `/app/skills`) |
-| `LLM_MODEL` | 기본 LLM 모델명 (예: `gpt-4o`) |
-| `LLM_EMBEDDING_MODEL` | 기본 임베딩 모델명 (예: `text-embedding-3-small`) |
-| `LLM_PROXY_URL` | LiteLLM 프록시 URL (예: `http://litellm-proxy:4000`) |
-| `LLM_PROXY_API_KEY` | LiteLLM 프록시 API 키 |
+| `LLM_MODEL` | 기본 LLM 모델명 (예: `anthropic:claude-opus-4-6`) |
+| `ANTHROPIC_API_KEY` | Anthropic API 키 |
+| `LLM_EMBEDDING_MODEL` | (선택) 임베딩 모델명 |
 | `SANDBOX_BASE_DIR` | sandbox 워크스페이스 루트 경로 |
 
 ## 설치
@@ -72,7 +71,7 @@ docker build -t process-gpt-deepagents-action:local .
 docker run --rm -p 8888:8888 \
   -e SUPABASE_URL="https://xxx.supabase.co" \
   -e SUPABASE_KEY="eyJ..." \
-  -e OPENAI_API_KEY="sk-..." \
+  -e ANTHROPIC_API_KEY="sk-ant-..." \
   process-gpt-deepagents-action:local
 ```
 
@@ -83,10 +82,8 @@ docker run --rm -p 8888:8888 \
 
 ## 커스터마이징
 
-- **모델**: `extras.model` 우선, 없으면 `LLM_MODEL` 사용(기본 `gpt-4o`)
-- **LiteLLM 프록시**:
-  - `LLM_PROXY_URL`, `LLM_PROXY_API_KEY`를 사용
-  - 프록시 설정이 있으면 proxy 모드, 없으면 경고 후 direct fallback
+- **모델**: `extras.model` 우선, 없으면 `LLM_MODEL` 사용(기본 `anthropic:claude-opus-4-6`)
+- **프록시**: 사용하지 않습니다. (`LLM_PROXY_URL`이 설정돼 있어도 런타임에서 무시합니다.)
 - **시스템 프롬프트**: `extras.system_prompt`로 오케스트레이터 프롬프트 오버라이드
 - **에이전트**: Supabase `users` 테이블에 `is_agent=true`로 등록
   - `skills`: 쉼표 구분 스킬명 → 파일시스템 경로에서 SKILL.md 로딩
@@ -101,42 +98,28 @@ python3 -m pytest tests -q
 ```
 
 핵심 검증 범위:
-- LiteLLM 라우팅 결정
+- LLM 라우팅 결정
 - sandbox 런타임/도구 동작
 - factory의 단일 runtime agent 생성
 - executor 이벤트 payload 기본 구조
 
 ## 통합 검증 시나리오
 
-### 1) LiteLLM 프록시 경유 기본 시나리오
+### 1) Direct provider(Anthropic) 기본 시나리오
 
 사전 조건:
-- LiteLLM 프록시 실행 중 (`LLM_PROXY_URL` 접근 가능)
-- `.env`에 `LLM_PROXY_URL`, `LLM_PROXY_API_KEY` 설정
+- `ANTHROPIC_API_KEY` 설정
+- `LLM_MODEL=anthropic:claude-opus-4-6` (또는 `extras.model`로 오버라이드)
 
 검증:
 1. 서버 실행: `uv run python deepagents_server.py`
 2. 실제 작업 1건 실행(멀티스텝 요청 권장)
-3. 로그에서 `routing_mode=proxy` 확인
+3. 로그에서 `mode=direct` 확인
 4. 결과 이벤트에서 `task_started` -> `task_completed` -> 최종 artifact 순서 확인
 
 합격 기준:
 - 모델 호출이 실패 없이 완료
 - 최종 결과 payload가 `output.status`/`output.result` 규격 만족
-
-### 2) 프록시 미설정 fallback 시나리오 (`warn_fallback`)
-
-사전 조건:
-- `LLM_PROXY_URL` 제거
-
-검증:
-1. 동일 작업 실행
-2. 경고 로그(`direct provider fallback`) 발생 확인
-3. 실행이 중단되지 않고 완료되는지 확인
-
-합격 기준:
-- warning 존재
-- task 실행/결과 이벤트 정상 발행
 
 ### 3) Todo + Subagent + Sandbox 시나리오
 

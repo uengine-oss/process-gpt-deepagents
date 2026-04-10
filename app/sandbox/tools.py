@@ -354,7 +354,19 @@ def sandbox_copy_mounted_skill(
     tenant = (tenant_id or "").strip().strip("/")
     skill = (skill_name or "").strip().strip("/")
     if not tenant or not skill:
-        raise ValueError("tenant_id and skill_name must be non-empty")
+        # Do not raise: tool exceptions abort the whole LangGraph run.
+        # Return a structured error so the agent can recover (e.g. use sandbox_write_and_run directly).
+        return {
+            "source": None,
+            "dest": None,
+            "copied_files": [],
+            "error": "missing_required_params",
+            "message": "tenant_id and skill_name must be non-empty",
+            "hint": (
+                "Call sandbox_copy_mounted_skill with non-empty tenant_id/skill_name, or skip "
+                "skill materialization and use sandbox_write_and_run to operate directly on input asset URLs."
+            ),
+        }
 
     root = ""
     for base in uniq:
