@@ -65,6 +65,7 @@ from app.executor.a2a_events import (
 from app.executor.context import ExecutionContext, build_event_payload
 from app.executor.evidence import _build_execution_evidence
 from app.executor.exceptions import HitlInterrupt, MissingSubagentsConfigurationError
+from app.executor.json_safe import _json_safe
 from app.executor.hitl_utils import (
     _classify_tenant_context_tool,
     _is_duplicate_hitl_request,
@@ -98,6 +99,7 @@ from app.executor.tenant_context import (
 from app.executor.tool_instrumentation import (
     _coerce_tool_output_for_tool_node,
     _instrument_tools,
+    http_chat_tool_display_name,
 )
 from app.executor.workitem_text import (
     _build_form_event_result,
@@ -118,19 +120,7 @@ from app.executor.form_prefill import (
 logger = logging.getLogger(__name__)
 
 
-# --- HTTP chat Fast Path (work-assistant only) ---
-#
-# Goal: reduce TTFT/cost for common Q&A by avoiding:
-# - loading full MCP tool catalog
-# - preflight tenant context tools (mem0/memento/dmn_rule)
-# - building DB-backed subagent configs
-#
-# When enabled, we run a minimal DeepAgent graph first (no subagents, only work-assistant tools).
-# If the model indicates escalation is needed, we fall back to the existing Full Path logic.
-_ENV_HTTP_CHAT_FAST_PATH = "DEEPAGENTS_HTTP_CHAT_FAST_PATH"
-_ENV_HTTP_CHAT_FAST_PATH_MAX_TOOL_CALLS = "DEEPAGENTS_HTTP_CHAT_FAST_PATH_MAX_TOOL_CALLS"
 _ENV_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT = "DEEPAGENTS_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT"
-_FAST_PATH_ESCALATION_SENTINEL = "__DEEPAGENTS_NEEDS_ESCALATION__"
 
 
 def _truthy_env(name: str, default: bool = False) -> bool:
@@ -140,64 +130,6 @@ def _truthy_env(name: str, default: bool = False) -> bool:
     return raw in ("1", "true", "yes", "y", "on")
 
 
-def _detect_input_has_files(input_data: Any) -> bool:
-    if not isinstance(input_data, dict):
-        return False
-    try:
-        if int(input_data.get("file_count") or 0) > 0:
-            return True
-    except Exception:
-        pass
-    if input_data.get("file") is not None:
-        return True
-    files = input_data.get("files")
-    return isinstance(files, list) and len(files) > 0
-
-
-def _build_http_chat_fast_system_prompt() -> str:
-    # Keep it short: avoid huge system prompts that hurt TTFT.
-    # We rely on the work-assistant tool set + explicit escalation contract.
-    max_calls_raw = (os.environ.get(_ENV_HTTP_CHAT_FAST_PATH_MAX_TOOL_CALLS) or "").strip()
-    max_calls_note = ""
-    if max_calls_raw:
-        try:
-            n = int(max_calls_raw)
-        except Exception:
-            n = 0
-        if n > 0:
-            max_calls_note = f"- 도구 호출은 최대 {n}회까지만 시도하고, 그 안에 해결이 안 되면 즉시 승격하세요.\n"
-    return (
-        "당신은 HTTP 채팅 Fast Path 오케스트레이터입니다.\n"
-        "- 사용 가능한 도구는 work-assistant MCP 도구뿐입니다.\n"
-        "- 사용자의 요청이 이 도구만으로 충분히 해결 가능하면, 즉시 도구를 호출해 **짧은 최종 답변**을 작성하세요.\n"
-        + max_calls_note
-        + "- 만약 work-assistant 도구만으로 해결이 불가능하거나, 파일 처리/멀티스텝 실행/샌드박스/서브에이전트가 필요하면:\n"
-        + "  반드시 아래 JSON만 출력하세요(다른 문장 금지):\n"
-        + f'  {{"needs_escalation": true, "reason": "<짧은 이유>", "sentinel": "{_FAST_PATH_ESCALATION_SENTINEL}"}}\n'
-        + "- 절대 장문으로 추측/가이드만 작성하지 마세요. 가능한 경우에만 답하고, 아니면 즉시 승격을 요청하세요.\n"
-    )
-
-
-def _parse_fast_path_decision(raw_text: str) -> tuple[bool, str]:
-    """Return (needs_escalation, reason)."""
-    txt = (raw_text or "").strip()
-    if not txt:
-        return True, "empty_response"
-    # Structured JSON first
-    parsed = _loose_json_loads(txt)
-    if isinstance(parsed, dict):
-        if bool(parsed.get("needs_escalation")):
-            rsn = str(parsed.get("reason") or "").strip() or "needs_escalation"
-            return True, rsn
-        if str(parsed.get("sentinel") or "") == _FAST_PATH_ESCALATION_SENTINEL:
-            rsn = str(parsed.get("reason") or "").strip() or "needs_escalation"
-            return True, rsn
-    # Fallback: sentinel in plain text (avoid brittleness)
-    if _FAST_PATH_ESCALATION_SENTINEL in txt:
-        return True, "sentinel"
-    return False, ""
-
-
 def _http_chat_tool_calls_summary(subagent_tool_log: dict[str, list[str]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for agent, tools in (subagent_tool_log or {}).items():
@@ -205,31 +137,375 @@ def _http_chat_tool_calls_summary(subagent_tool_log: dict[str, list[str]]) -> li
     return out
 
 
+def _http_chat_skill_calls_summary(
+    subagent_skill_log: dict[str, list[str]],
+    *,
+    orchestrator_job_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """HTTP /chat 응답용 스킬 사용 요약.
+
+    Shape matches tool_calls: [{"agent": "...", "skills": ["a", "b"]}, ...]
+    """
+    out: list[dict[str, Any]] = []
+    if not isinstance(subagent_skill_log, dict):
+        return out
+    for agent_name, skills in subagent_skill_log.items():
+        if not agent_name:
+            continue
+        if not isinstance(skills, list):
+            continue
+        uniq = [str(x) for x in skills if str(x)]
+        if not uniq:
+            continue
+        label = str(agent_name)
+        if orchestrator_job_id and label == str(orchestrator_job_id):
+            label = "작업 실행 기획자"
+        out.append({"agent": label, "skills": uniq})
+    return out
+
+
+def _http_chat_merge_tool_calls_summary(
+    orchestrator_tool_log: dict[str, list[str]],
+    subagent_tool_log: dict[str, list[str]],
+    *,
+    orchestrator_job_id: str,
+) -> list[dict[str, Any]]:
+    """루트 오케스트레이터(MCP 등) + 서브에이전트 도구 로그를 HTTP 응답용 한 줄 요약으로 합친다.
+
+    루트와 HITL 도구는 동일한 job_uuid 버킷에 쌓일 수 있어 orchestrator_job_id 기준으로 병합한다.
+    """
+    root_tools: list[str] = []
+    for k, tl in (orchestrator_tool_log or {}).items():
+        if str(k) != str(orchestrator_job_id):
+            continue
+        if not isinstance(tl, list):
+            continue
+        root_tools.extend(str(x) for x in tl if str(x))
+
+    rows: list[dict[str, Any]] = []
+    for agent, tls in (subagent_tool_log or {}).items():
+        if str(agent) == str(orchestrator_job_id):
+            if isinstance(tls, list):
+                root_tools.extend(str(x) for x in tls if str(x))
+            continue
+        if isinstance(tls, list) and tls:
+            rows.append({"agent": str(agent), "tools": list(tls)})
+
+    out: list[dict[str, Any]] = []
+    if root_tools:
+        out.append({"agent": "작업 실행 기획자", "tools": list(dict.fromkeys(root_tools))})
+    out.extend(rows)
+    return out
+
+
+def _last_assistant_message(messages: list[Any]) -> Any | None:
+    for m in reversed(messages or []):
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        if role is not None and str(role) == "assistant":
+            return m
+    return None
+
+
+def _tool_calls_from_assistant_message(msg: Any) -> list[dict[str, Any]]:
+    """LangChain AIMessage.tool_calls / dict 메시지를 평범한 dict 리스트로 정규화."""
+    if msg is None:
+        return []
+    raw: Any = None
+    if isinstance(msg, dict):
+        raw = msg.get("tool_calls")
+    else:
+        raw = getattr(msg, "tool_calls", None)
+    if not raw:
+        return []
+    out: list[dict[str, Any]] = []
+    for tc in raw:
+        if isinstance(tc, dict):
+            name = str(tc.get("name") or "").strip()
+            args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+            tid = str(tc.get("id") or "").strip()
+            if name:
+                out.append({"name": name, "args": dict(args), "id": tid})
+            continue
+        try:
+            name = str(getattr(tc, "name", "") or "").strip()
+            args = getattr(tc, "args", None)
+            if not isinstance(args, dict):
+                args = {}
+            tid = str(getattr(tc, "id", "") or "").strip()
+            if name:
+                out.append({"name": name, "args": args, "id": tid})
+        except Exception:
+            continue
+    return out
+
+
+def _assistant_messages_with_tool_calls_in_order(messages: list[Any]) -> list[Any]:
+    """tool_calls가 비어 있지 않은 assistant 메시지를 대화 순서대로 반환.
+
+    도구 실행 후 마지막 assistant가 최종 답변 텍스트만 가진 경우가 많아,
+    ``_last_assistant_message``만 쓰면 ``plan_tools``를 놓친다.
+    """
+    out: list[Any] = []
+    for m in messages or []:
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        if role is None or str(role) != "assistant":
+            continue
+        if _tool_calls_from_assistant_message(m):
+            out.append(m)
+    return out
+
+
+def _display_tool_name_for_plan(internal_name: str, tools_by_name: dict[str, Any] | None) -> str:
+    if not internal_name:
+        return internal_name
+    if not tools_by_name:
+        return internal_name
+    t = tools_by_name.get(internal_name)
+    if t is None:
+        return internal_name
+    return http_chat_tool_display_name(t, internal_name)
+
+
+def _plan_skills_from_tool_entries(entries: list[dict[str, Any]]) -> list[str]:
+    skills: list[str] = []
+    for e in entries:
+        name = str(e.get("name") or "")
+        args = e.get("args") if isinstance(e.get("args"), dict) else {}
+        if name == "read_skill_document":
+            sn = args.get("skill_name")
+            if isinstance(sn, str) and sn.strip():
+                skills.append(sn.strip())
+        elif name == "sandbox_copy_mounted_skill":
+            one = args.get("skill_name")
+            if isinstance(one, str) and one.strip():
+                skills.append(one.strip())
+            many = args.get("skill_names_csv")
+            if isinstance(many, str) and many.strip():
+                skills.extend([s.strip() for s in many.split(",") if s.strip()])
+            many2 = args.get("skill_names")
+            if isinstance(many2, list):
+                skills.extend([str(s).strip() for s in many2 if str(s).strip()])
+    return list(dict.fromkeys(skills))
+
+
+def _plan_signature_for_tool_calls(tcs: list[dict[str, Any]]) -> str:
+    keys = []
+    for tc in tcs:
+        tid = (tc.get("id") or "").strip()
+        keys.append(tid or f"n:{tc.get('name')}|a:{json.dumps(tc.get('args') or {}, sort_keys=True, default=str)}")
+    return "|".join(keys)
+
+
+def _emit_http_plan_event(http_stream_event_emit: Any, payload: dict[str, Any]) -> None:
+    if http_stream_event_emit is None:
+        return
+    try:
+        http_stream_event_emit(payload)
+    except Exception:
+        logger.exception("http_chat plan event emit failed | type=%s", payload.get("type"), exc_info=True)
+
+
+def _coerce_langgraph_stream_chunk(part: Any) -> list[tuple[str, Any]]:
+    """LangGraph astream 한 덩어리를 (mode, payload) 목록으로 통일.
+
+    - ``version=\"v2\"``: ``{\"type\": \"values\"|\"messages\", \"data\": ...}``
+    - 구버전/멀티 모드: ``(\"values\", state)``, ``(\"messages\", (chunk, meta))``
+    - 서브그래프: ``(namespace, \"values\", state)`` 등 3-튜플
+    """
+    if isinstance(part, dict):
+        t = part.get("type")
+        if t in ("values", "messages"):
+            return [(t, part.get("data"))]
+        return []
+    if isinstance(part, tuple):
+        if len(part) == 2 and isinstance(part[0], str) and part[0] in ("values", "messages"):
+            return [(part[0], part[1])]
+        if len(part) == 3 and isinstance(part[1], str) and part[1] in ("values", "messages"):
+            return [(part[1], part[2])]
+    return []
+
+
+def _llm_stream_text_piece(msg: Any) -> str:
+    """LangGraph ``messages`` 스트림 청크에서 사용자에게 보여줄 텍스트 델타만 추출."""
+    if msg is None:
+        return ""
+    try:
+        from langchain_core.messages import AIMessageChunk
+
+        if isinstance(msg, AIMessageChunk):
+            c = getattr(msg, "content", None)
+            return _extract_plain_text(c) if c not in (None, "") else ""
+    except ImportError:
+        pass
+    role = getattr(msg, "type", None) or getattr(msg, "role", None)
+    if role is not None and str(role).lower() not in ("ai", "assistant"):
+        return ""
+    c = getattr(msg, "content", None)
+    return _extract_plain_text(c) if c not in (None, "") else ""
+
+
+async def _iter_http_chat_astream_parts(orchestrator: Any, state_input: dict[str, Any]) -> Any:
+    """LangGraph astream을 ``values`` + ``messages``(토큰)로 통합하거나, 불가 시 ``values``만.
+
+    Yields: ``{"kind": "values"|"messages", "data": ..., "dual": bool}``
+
+    주의: 멀티 모드에서 구버전 LangGraph는 dict가 아니라 ``(\"values\", state)`` 튜플을
+    돌려준다. 이를 무시하면 스트림이 비어 ``ainvoke`` 폴백만 타게 되어 plan_*/토큰이 전혀 안 나간다.
+    """
+    attempts: list[dict[str, Any]] = [
+        {"stream_mode": ["values", "messages"], "version": "v2"},
+        {"stream_mode": ["values", "messages"]},
+    ]
+    for attempt in attempts:
+        received = 0
+        yielded = False
+        first_bad: Any | None = None
+        try:
+            async for part in orchestrator.astream(state_input, **attempt):
+                received += 1
+                pairs = _coerce_langgraph_stream_chunk(part)
+                if not pairs:
+                    if first_bad is None:
+                        first_bad = part
+                    continue
+                for mode, data in pairs:
+                    if mode == "values":
+                        yield {"kind": "values", "data": data, "dual": True}
+                        yielded = True
+                    elif mode == "messages":
+                        yield {"kind": "messages", "data": data, "dual": True}
+                        yielded = True
+            if yielded:
+                return
+            if received > 0:
+                logger.warning(
+                    "HTTP chat: astream %s got %d chunks but none parsed as values/messages "
+                    "(first chunk type=%s repr=%r); using values-only fallback",
+                    attempt,
+                    received,
+                    type(first_bad).__name__,
+                    repr(first_bad)[:500],
+                )
+                break
+        except TypeError:
+            continue
+        except Exception as e:
+            logger.info("HTTP chat: astream attempt %s failed: %s", attempt, e)
+            continue
+
+    async for state in orchestrator.astream(state_input, stream_mode="values"):
+        yield {"kind": "values", "data": state, "dual": False}
+
+
 async def _ainvoke_or_stream_values(
     orchestrator: Any,
     state_input: dict[str, Any],
     *,
     stream_emit: Any | None,
+    http_stream_event_emit: Any | None = None,
+    plan_tools_by_name: dict[str, Any] | None = None,
 ) -> Any:
-    """Run graph; optional async stream_emit(delta) for partial assistant text (values mode)."""
+    """Run graph; HTTP 스트림은 가능하면 LLM 토큰(messages) + 상태(values), 아니면 values만.
+
+    - ``messages`` 모드: 모델이 스트리밍을 지원하면 답변이 작은 청크로 ``stream_emit``에 전달된다.
+    - ``values`` 모드: ``plan_*`` 이벤트 및(폴백 시) 노드 단위 텍스트 델타.
+    """
     if stream_emit is None:
         return await orchestrator.ainvoke(state_input)
     prev_stream_len = 0
+    msg_cumulative = ""
+    msg_streamable_emitted_len = 0
     final_state: Any = None
-    async for state in orchestrator.astream(state_input, stream_mode="values"):
+    any_dual_stream = False
+    emitted_tool_plan_sigs: set[str] = set()
+    last_todos_sig: str | None = None
+
+    async for item in _iter_http_chat_astream_parts(orchestrator, state_input):
+        if item.get("dual"):
+            any_dual_stream = True
+
+        if item["kind"] == "messages":
+            raw = item.get("data")
+            msg_obj: Any = None
+            if isinstance(raw, tuple) and len(raw) >= 1:
+                msg_obj = raw[0]
+            elif raw is not None:
+                msg_obj = raw
+            if msg_obj is None:
+                continue
+            piece = _llm_stream_text_piece(msg_obj)
+            if not piece:
+                continue
+            msg_cumulative += piece
+            cut = cut_index_after_leading_workitem_echo_for_stream(msg_cumulative)
+            streamable = msg_cumulative[cut:]
+            if len(streamable) > msg_streamable_emitted_len:
+                delta = streamable[msg_streamable_emitted_len:]
+                if delta:
+                    await stream_emit(delta)
+                msg_streamable_emitted_len = len(streamable)
+            continue
+
+        state = item.get("data")
         final_state = state
         if not isinstance(state, dict):
             continue
+
+        if http_stream_event_emit is not None and "todos" in state:
+            try:
+                sig = json.dumps(_json_safe(state.get("todos")), ensure_ascii=False, sort_keys=True, default=str)
+            except Exception:
+                sig = str(id(state.get("todos")))
+            if sig != last_todos_sig:
+                last_todos_sig = sig
+                _emit_http_plan_event(
+                    http_stream_event_emit,
+                    {
+                        "type": "plan_todos",
+                        "todos": _json_safe(state.get("todos")),
+                    },
+                )
+
         msgs = state.get("messages") or []
-        if not msgs:
+        las = _last_assistant_message(msgs)
+        if http_stream_event_emit is not None:
+            for am in _assistant_messages_with_tool_calls_in_order(msgs):
+                tcs = _tool_calls_from_assistant_message(am)
+                if not tcs:
+                    continue
+                psig = _plan_signature_for_tool_calls(tcs)
+                if not psig or psig in emitted_tool_plan_sigs:
+                    continue
+                emitted_tool_plan_sigs.add(psig)
+                tool_entries = []
+                for tc in tcs:
+                    internal = str(tc.get("name") or "")
+                    display = _display_tool_name_for_plan(internal, plan_tools_by_name)
+                    tool_entries.append(
+                        {
+                            "tool": display,
+                            "name": internal,
+                            "args": _json_safe(tc.get("args") or {}),
+                            "id": str(tc.get("id") or ""),
+                        }
+                    )
+                _emit_http_plan_event(
+                    http_stream_event_emit,
+                    {"type": "plan_tools", "tools": tool_entries},
+                )
+                planned_skills = _plan_skills_from_tool_entries(tcs)
+                if planned_skills:
+                    _emit_http_plan_event(
+                        http_stream_event_emit,
+                        {"type": "plan_skills", "skills": planned_skills},
+                    )
+
+        if item.get("dual"):
             continue
-        raw = msgs[-1]
-        # HTTP SSE 스트리밍에서는 "assistant 응답"만 토큰으로 흘려야 한다.
-        # values 스트림에는 user/system/tool 메시지도 섞여 들어올 수 있어 필터링한다.
-        role = raw.get("role") if isinstance(raw, dict) else getattr(raw, "role", None)
-        if role and str(role) != "assistant":
+
+        if not msgs or las is None:
             continue
-        content = raw.get("content") if isinstance(raw, dict) else getattr(raw, "content", None)
+        content = las.get("content") if isinstance(las, dict) else getattr(las, "content", None)
         txt = _extract_plain_text(content)
         cut = cut_index_after_leading_workitem_echo_for_stream(txt)
         streamable = txt[cut:]
@@ -240,6 +516,21 @@ async def _ainvoke_or_stream_values(
             if delta:
                 await stream_emit(delta)
             prev_stream_len = len(streamable)
+
+    if any_dual_stream and stream_emit is not None and isinstance(final_state, dict):
+        msgs = final_state.get("messages") or []
+        las = _last_assistant_message(msgs)
+        if las is not None:
+            content = las.get("content") if isinstance(las, dict) else getattr(las, "content", None)
+            full_txt = _extract_plain_text(content)
+            cut = cut_index_after_leading_workitem_echo_for_stream(full_txt)
+            streamable = full_txt[cut:]
+            if len(streamable) > msg_streamable_emitted_len:
+                tail = streamable[msg_streamable_emitted_len:]
+                if tail:
+                    await stream_emit(tail)
+                msg_streamable_emitted_len = len(streamable)
+
     if final_state is None:
         return await orchestrator.ainvoke(state_input)
     return final_state
@@ -395,10 +686,6 @@ class DeepAgentsExecutor(AgentExecutor):
             users_email=extras.get("notify_user_emails", []),
         )
 
-        # Fast Path (HTTP chat only): attempt work-assistant-only run before any heavy setup.
-        fast_path_enabled = bool(http_chat) and _truthy_env(_ENV_HTTP_CHAT_FAST_PATH, default=False)
-        input_has_files = _detect_input_has_files(input_data)
-
         domain_agent_rows = extras.get("agents", []) or []
         all_tools: list[Any] = []
         # SafeToolLoader local tools(mem0/dmn_rule)는 user_id가 필요하다.
@@ -440,210 +727,6 @@ class DeepAgentsExecutor(AgentExecutor):
             except Exception:
                 logger.exception("Failed to inject work-assistant MCP config; continuing", exc_info=True)
         mcp_servers = mcp_cfg.get("mcpServers") or {}
-
-        # Fast Path: short-circuit on files (full execution required).
-        # Note: this is intentionally deterministic — file-bearing requests are almost always not Q&A-only.
-        if fast_path_enabled and input_has_files:
-            fast_path_enabled = False
-            logger.info(
-                "HTTP chat fast path skipped (input_has_files=true) | task_id=%s tenant_id=%s",
-                task_id,
-                (tenant_id or "").strip(),
-            )
-
-        if fast_path_enabled:
-            t_fast0 = time.time()
-            # Minimal tool load: work-assistant server only (no mem0/memento/dmn_rule, no claude-skills).
-            fast_tools: list[Any] = []
-            fast_tool_log: dict[str, list[str]] = {}
-            fast_skill_log: dict[str, list[str]] = {}
-            try:
-                if http_stream_event_emit is not None:
-                    http_stream_event_emit(
-                        {
-                            "type": "status",
-                            "phase": "fast_path",
-                            "message": "빠른 경로(work-assistant)로 우선 처리합니다.",
-                        }
-                    )
-            except Exception:
-                logger.exception("HTTP chat fast_path status emit failed", exc_info=True)
-            try:
-                tool_loader_fast = TaggingSafeToolLoader(
-                    tenant_id=tenant_id or None,
-                    user_id=tool_user_id or None,
-                    agent_name="작업 실행 기획자",
-                    mcp_config=mcp_cfg,
-                )
-                fast_tools = tool_loader_fast.create_tools_from_names(
-                    tool_names=["work-assistant"],
-                    agent_type=None,
-                )
-                fast_tools = _ensure_langchain_tools(fast_tools)
-            except Exception as e:
-                logger.warning(
-                    "HTTP chat fast path tool loading failed; falling back to full path: %s",
-                    e,
-                    exc_info=False,
-                )
-                fast_tools = []
-
-            if fast_tools:
-                # Instrument root tools so /chat can return tool_calls and SSE can emit tool_end.
-                # Use the root job_uuid for logging.
-                try:
-                    max_calls_raw = (os.environ.get(_ENV_HTTP_CHAT_FAST_PATH_MAX_TOOL_CALLS) or "").strip()
-                    try:
-                        max_calls = int(max_calls_raw) if max_calls_raw else 0
-                    except Exception:
-                        max_calls = 0
-                    fast_call_counter = {"n": 0}
-
-                    def _fast_tool_call_guard(base_tool: Any, tool_input: Any) -> Any | None:
-                        tool_name = str(getattr(base_tool, "name", "") or "")
-                        fast_call_counter["n"] += 1
-                        if max_calls > 0 and fast_call_counter["n"] > max_calls:
-                            return {
-                                "error": "fast_path_tool_call_budget_exceeded",
-                                "message": f"Fast path 도구 호출 예산({max_calls})을 초과했습니다. Full Path로 승격하세요.",
-                                "requires_human": False,
-                            }
-                        try:
-                            if http_stream_event_emit is not None:
-                                http_stream_event_emit(
-                                    {
-                                        "type": "tool_start",
-                                        "tool": tool_name,
-                                        "input": _coerce_tool_input_dict(tool_input) or tool_input,
-                                    }
-                                )
-                        except Exception:
-                            logger.exception("http_chat fast_path tool_start emit failed", exc_info=True)
-                        return None
-
-                    def _fast_tool_result_hook(
-                        *,
-                        base_tool: Any,
-                        job_id: str,
-                        tool_input: Any,
-                        tool_output: Any,
-                        error: Exception | None,
-                    ) -> None:
-                        del job_id, tool_input
-                        try:
-                            if http_stream_event_emit is None:
-                                return
-                            tname0 = str(getattr(base_tool, "name", "") or "")
-                            payload: dict[str, Any] = {"type": "tool_end", "tool": tname0}
-                            if error is not None:
-                                payload["output"] = {"error": f"{type(error).__name__}: {str(error)}"}
-                            else:
-                                content0 = getattr(tool_output, "content", None)
-                                if isinstance(content0, str):
-                                    s = content0.strip()
-                                    if s.startswith("{") and s.endswith("}"):
-                                        try:
-                                            parsed = json.loads(s)
-                                        except Exception:
-                                            parsed = None
-                                        payload["output"] = parsed if isinstance(parsed, dict) else {"content": content0}
-                                    else:
-                                        payload["output"] = {"content": content0}
-                                elif isinstance(tool_output, dict):
-                                    payload["output"] = tool_output
-                                elif isinstance(tool_output, list):
-                                    payload["output"] = {"content": json.dumps(tool_output, ensure_ascii=False)}
-                                elif isinstance(tool_output, (str, int, float, bool)):
-                                    payload["output"] = {"content": str(tool_output)}
-                                else:
-                                    payload["output"] = {"content": str(tool_output)}
-                            http_stream_event_emit(payload)
-                        except Exception:
-                            logger.exception("http_chat fast_path tool_end emit failed", exc_info=True)
-
-                    _instrument_tools(
-                        fast_tools,
-                        todo_id=task_id or None,
-                        proc_inst_id=proc_inst_id or None,
-                        crew_type="action",
-                        job_id_getter=lambda: job_uuid,
-                        job_tool_log=fast_tool_log,
-                        job_skill_log=fast_skill_log,
-                        tool_result_hook=_fast_tool_result_hook,
-                        exec_ctx=exec_ctx,
-                        event_queue=event_queue,
-                        tool_input_augmenter=None,
-                        tool_call_guard=_fast_tool_call_guard,
-                        context_tool_tracker=None,
-                    )
-                except Exception:
-                    logger.exception("HTTP chat fast path tool instrumentation failed; continuing", exc_info=True)
-
-                # Build a minimal orchestrator (no subagents).
-                fast_prompt = _build_http_chat_fast_system_prompt()
-                fast_orchestrator = build_orchestrator(
-                    model_name=resolve_model_routing(extras, default_model="anthropic:claude-opus-4-6").model_name,
-                    system_prompt=fast_prompt,
-                    subagents=[],
-                    tools=fast_tools,
-                    hitl_tools=[],
-                    middleware=[],
-                    skills=None,
-                )
-
-                # Stream assistant deltas if configured (HTTP /chat/stream).
-                stream_emit = extras.get("_http_chat_stream_emit")
-                fast_state = await _ainvoke_or_stream_values(
-                    fast_orchestrator,
-                    {"messages": [{"role": "user", "content": invoke_user_text}]},
-                    stream_emit=stream_emit,
-                )
-
-                # Extract final assistant text for escalation decision.
-                fast_msgs = fast_state.get("messages") if isinstance(fast_state, dict) else None
-                fast_text = ""
-                if isinstance(fast_msgs, list) and fast_msgs:
-                    last = fast_msgs[-1]
-                    content = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
-                    fast_text = _extract_plain_text(content)
-                needs_escalation, esc_reason = _parse_fast_path_decision(fast_text)
-
-                logger.info(
-                    "HTTP chat fast path completed | task_id=%s escalated=%s elapsed_ms=%d tools=%d tool_calls=%d reason=%s",
-                    task_id,
-                    needs_escalation,
-                    int((time.time() - t_fast0) * 1000),
-                    len(fast_tools),
-                    sum(len(v) for v in fast_tool_log.values()) if isinstance(fast_tool_log, dict) else 0,
-                    esc_reason or "",
-                )
-
-                # If successful, short-circuit: set http_chat result_box and return.
-                if not needs_escalation:
-                    result_box = extras.get("_http_chat_result_box")
-                    if http_chat and isinstance(result_box, dict):
-                        body = unwrap_output_wrapper_result_text((fast_text or "").strip()).strip()
-                        if not body:
-                            body = "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다."
-                        result_box["response"] = ensure_trailing_newline(body)
-                        # Reuse the existing summary format: agent name -> tools
-                        result_box["tool_calls"] = _http_chat_tool_calls_summary(fast_tool_log)
-                        result_box["final_output"] = {"output": {"status": "SUCCESS", "result": body}}
-                    return None
-
-                # Escalation: optionally inform the client immediately.
-                try:
-                    if http_stream_event_emit is not None:
-                        http_stream_event_emit(
-                            {
-                                "type": "status",
-                                "phase": "escalation",
-                                "message": "요청이 복잡하여 확장 실행(서브에이전트/추가 도구)으로 전환합니다.",
-                                "reason": esc_reason or "needs_escalation",
-                            }
-                        )
-                except Exception:
-                    logger.exception("HTTP chat escalation status emit failed", exc_info=True)
 
         # mem0 / memento / dmn_rule 은 SafeToolLoader 로컬 도구(언더스코어 이름). MCP 서버가 아니다.
         # 하이픈 키(dmn-rule 등)로 넘기면 MCP 조회만 시도하고 실패하므로 여기서는 요청하지 않는다.
@@ -735,6 +818,8 @@ class DeepAgentsExecutor(AgentExecutor):
             )
 
         # 서브 에이전트별 도구 호출은 각 서브 에이전트 전용 job_id로 분리된다.
+        # 루트 오케스트레이터(MCP work-assistant 등)는 별도 로그에 쌓은 뒤 HTTP 응답에서 합친다.
+        orchestrator_tool_log: dict[str, list[str]] = {}
         subagent_tool_log: dict[str, list[str]] = {}
         subagent_skill_log: dict[str, list[str]] = {}
         # Structured domain execution outputs captured from tool results (e.g. sandbox stdout JSON).
@@ -823,7 +908,10 @@ class DeepAgentsExecutor(AgentExecutor):
             try:
                 if http_stream_event_emit is not None:
                     tname0 = str(getattr(base_tool, "name", "") or "")
-                    payload: dict[str, Any] = {"type": "tool_end", "tool": tname0}
+                    payload: dict[str, Any] = {
+                        "type": "tool_end",
+                        "tool": http_chat_tool_display_name(base_tool, tname0),
+                    }
                     if error is not None:
                         payload["output"] = {"error": f"{type(error).__name__}: {str(error)}"}
                     else:
@@ -1038,7 +1126,7 @@ class DeepAgentsExecutor(AgentExecutor):
                             http_stream_event_emit(
                                 {
                                     "type": "tool_start",
-                                    "tool": tool_name,
+                                    "tool": http_chat_tool_display_name(base_tool, tool_name),
                                     "input": _coerce_tool_input_dict(tool_input) or tool_input,
                                 }
                             )
@@ -1393,6 +1481,48 @@ class DeepAgentsExecutor(AgentExecutor):
             seen_tool_names.add(key)
             deduped_root_tools.append(t)
 
+        plan_tools_by_name: dict[str, Any] = {}
+        for t in deduped_root_tools:
+            nm = str(getattr(t, "name", "") or "").strip()
+            if nm and nm not in plan_tools_by_name:
+                plan_tools_by_name[nm] = t
+
+        # 루트 오케스트레이터 도구(MCP 등)도 서브와 동일하게 invoke 래핑 → HTTP tool_calls / SSE tool_* 에 남긴다.
+        try:
+
+            def _root_orchestrator_tool_call_guard(base_tool: Any, tool_input: Any) -> Any | None:
+                tool_name = str(getattr(base_tool, "name", "") or "")
+                try:
+                    if http_stream_event_emit is not None:
+                        http_stream_event_emit(
+                            {
+                                "type": "tool_start",
+                                "tool": http_chat_tool_display_name(base_tool, tool_name),
+                                "input": _coerce_tool_input_dict(tool_input) or tool_input,
+                            }
+                        )
+                except Exception:
+                    logger.exception("http_chat root orchestrator tool_start emit failed", exc_info=True)
+                return None
+
+            _instrument_tools(
+                deduped_root_tools,
+                todo_id=task_id or None,
+                proc_inst_id=proc_inst_id or None,
+                crew_type="action",
+                job_id_getter=lambda: job_uuid,
+                job_tool_log=orchestrator_tool_log,
+                job_skill_log=subagent_skill_log,
+                tool_result_hook=_domain_tool_result_hook,
+                exec_ctx=exec_ctx,
+                event_queue=event_queue,
+                tool_input_augmenter=None,
+                tool_call_guard=_root_orchestrator_tool_call_guard,
+                context_tool_tracker=context_tool_tracker,
+            )
+        except Exception:
+            logger.exception("root orchestrator tool instrumentation failed; continuing", exc_info=True)
+
         orchestrator = build_orchestrator(
             model_name=model_name,
             system_prompt=system_prompt,
@@ -1594,6 +1724,8 @@ class DeepAgentsExecutor(AgentExecutor):
                     orchestrator,
                     state_input,
                     stream_emit=stream_emit,
+                    http_stream_event_emit=http_stream_event_emit,
+                    plan_tools_by_name=plan_tools_by_name,
                 )
                 await _emit_planning_completed_if_ready(result)
                 if not _planning_completed_flag():
@@ -2231,7 +2363,15 @@ class DeepAgentsExecutor(AgentExecutor):
             if not has_form and not (chat_body or "").strip():
                 chat_body = "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다."
             result_box["response"] = ensure_trailing_newline(chat_body)
-            result_box["tool_calls"] = _http_chat_tool_calls_summary(subagent_tool_log)
+            result_box["tool_calls"] = _http_chat_merge_tool_calls_summary(
+                orchestrator_tool_log,
+                subagent_tool_log,
+                orchestrator_job_id=job_uuid,
+            )
+            result_box["skill_calls"] = _http_chat_skill_calls_summary(
+                subagent_skill_log,
+                orchestrator_job_id=job_uuid,
+            )
             result_box["final_output"] = final_result_payload
         return None
 

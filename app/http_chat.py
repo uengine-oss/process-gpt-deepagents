@@ -37,6 +37,10 @@ class ChatRequest(BaseModel):
     files: List[Dict[str, Any]] = Field(default_factory=list, description="첨부 파일(다중)")
     file_count: int = Field(default=0, description="첨부 파일 개수")
     stream: bool = Field(default=True, description="(호환 필드) 스트리밍은 /chat/stream 사용")
+    agent_ids: Optional[List[str]] = Field(
+        default=None,
+        description="(선택) 서브에이전트로 쓸 에이전트 id(UUID) 목록. 생략·null이면 테넌트 채팅용 에이전트 전체",
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict, description="추가 메타데이터")
 
 
@@ -44,6 +48,7 @@ class ChatResponse(BaseModel):
     response: str = Field(default="", description="에이전트 응답 텍스트(또는 폼 JSON 문자열)")
     conversation_id: str = Field(..., description="대화 ID")
     tool_calls: List[Dict[str, Any]] = Field(default_factory=list, description="서브에이전트별 도구 사용 요약")
+    skill_calls: List[Dict[str, Any]] = Field(default_factory=list, description="서브에이전트별 스킬 사용 요약")
     status: str = Field(default="completed", description="completed | input_required")
     question: str = Field(default="", description="HITL 시 질문 텍스트")
     run_state: Optional[Dict[str, Any]] = Field(default=None, description="HITL 재개용 run_state")
@@ -55,7 +60,7 @@ def _build_effective_metadata(request: ChatRequest) -> Dict[str, Any]:
     # InputData용 메타데이터에서는 내부/비직렬화 값을 제거한다.
     meta: Dict[str, Any] = {}
     for k, v in (request.metadata or {}).items():
-        # 내부 키는 InputData로 내보내지 않는다.
+        # 내부 키는 InputData로 보내지 않는다.
         if isinstance(k, str) and (k.startswith("_") or k.startswith("__")):
             continue
         # callable(함수 등)은 JSON 직렬화 불가.
@@ -94,22 +99,20 @@ def _format_workitem_query(message: str, request: ChatRequest) -> str:
     )
 
 
-def _parse_agent_ids(metadata: Dict[str, Any]) -> list[str]:
-    raw = metadata.get("agent_ids")
-    if raw is None:
-        raw = metadata.get("agents")
-    if isinstance(raw, str) and raw.strip():
-        return [s.strip() for s in raw.split(",") if s.strip()]
-    if isinstance(raw, list):
-        return [str(x).strip() for x in raw if str(x).strip()]
-    return []
+def _normalized_agent_ids(request: ChatRequest) -> list[str]:
+    out: list[str] = []
+    for x in request.agent_ids or []:
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out
 
 
-async def _resolve_agents(tenant_id: str, metadata: Dict[str, Any]) -> list[dict[str, Any]]:
+async def _resolve_agents(tenant_id: str, request: ChatRequest) -> list[dict[str, Any]]:
     tid = (tenant_id or "").strip()
     if not tid:
         return []
-    ids = _parse_agent_ids(metadata)
+    ids = _normalized_agent_ids(request)
     if ids:
         return load_agents_from_db(ids, tid)
     return load_tenant_agents_for_chat(tid)
@@ -184,11 +187,11 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             len(msg),
         )
 
-        agents = await _resolve_agents(tenant_id, request.metadata or {})
+        agents = await _resolve_agents(tenant_id, request)
         if not agents:
             raise HTTPException(
                 status_code=400,
-                detail="테넌트에 사용 가능한 에이전트(is_agent)가 없습니다. metadata.agent_ids로 지정하세요.",
+                detail="테넌트에 사용 가능한 에이전트(is_agent)가 없습니다. 요청의 agent_ids로 지정하세요.",
             )
 
         tenant_mcp = get_tenant_mcp_config(tenant_id) or {}
@@ -274,6 +277,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                 response="",
                 conversation_id=conv_id,
                 tool_calls=[],
+                skill_calls=[],
                 status="input_required",
                 question=qtext,
                 run_state=rs if isinstance(rs, dict) else None,
@@ -290,6 +294,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             response=str(result_box.get("response") or ""),
             conversation_id=conv_id,
             tool_calls=list(result_box.get("tool_calls") or []),
+            skill_calls=list(result_box.get("skill_calls") or []),
             status="completed",
         )
 
@@ -311,6 +316,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         token_count = 0
         tool_event_count = 0
         token_preview_parts: list[str] = []
+        streamed_tool_events: list[dict[str, Any]] = []
 
         async def emit_token(delta: str) -> None:
             nonlocal token_count
@@ -329,16 +335,13 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             et = str(evt.get("type") or "")
             if et in ("tool_start", "tool_end"):
                 tool_event_count += 1
-
-            async def _put() -> None:
-                await q.put(evt)
-
+            # Cross-thread 안전: run_coroutine_threadsafe로 큐 put 보장.
             try:
-                loop.call_soon_threadsafe(lambda: asyncio.create_task(_put()))
+                asyncio.run_coroutine_threadsafe(q.put(evt), loop)
             except Exception:
-                # 마지막 수단: 같은 스레드/루프면 직접 스케줄
+                # 마지막 수단: 같은 루프/스레드면 직접 await 불가하므로 task로 스케줄.
                 try:
-                    asyncio.create_task(_put())
+                    asyncio.create_task(q.put(evt))
                 except Exception:
                     logger.exception("emit_tool_event failed", exc_info=True)
 
@@ -374,17 +377,60 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             # 표준 SSE 형식 (요구사항):
             # - event 필드 없이 data만 사용 (event: ... 라인 제거)
             # - 매 메시지는 data: {JSON 한 줄} 1개만 전송
-            # - 프롬프트/프리플라이트 텍스트는 보내지 않음 (토큰/툴/완료만)
-            yield {"data": json.dumps({"conversation_id": conv_id}, ensure_ascii=False)}
+            # - 프롬프트/프리플라이트 텍스트는 보내지 않음
+            # - 토큰·예정(plan_*)·실행(tool_*)·run_meta·done 순 (plan_* 는 호출 직전 예고)
+            yield {"data": json.dumps({"type": "meta", "conversation_id": conv_id}, ensure_ascii=False)}
             task = asyncio.create_task(runner())
             try:
                 while True:
                     evt = await q.get()
                     if evt.get("type") == "_internal_done":
                         break
+                    # tool 이벤트는 종료 시 요약 저장용으로도 수집해둔다.
+                    et = str(evt.get("type") or "")
+                    if et in ("tool_start", "tool_end"):
+                        try:
+                            streamed_tool_events.append(evt)
+                        except Exception:
+                            pass
                     yield {"data": json.dumps(evt, ensure_ascii=False)}
             finally:
                 await task
+            # 스트림 종료 직전: 누적 요약(run_meta). 실시간 예정 목록은 plan_tools / plan_skills / plan_todos.
+            meta_payload: dict[str, Any] = {
+                "type": "run_meta",
+                "conversation_id": conv_id,
+                "counts": {
+                    "tokens": token_count,
+                    "tool_events": tool_event_count,
+                },
+                # streamed tool_start/tool_end (원문)
+                "streamed_tool_events": streamed_tool_events,
+                # executor가 최종적으로 모아준 요약 (가능한 경우)
+                "tool_calls": [],
+                "skill_calls": [],
+                "todos": [],
+            }
+            # 요청자가 제공한 todos(기획/체크리스트)를 그대로 반영할 수 있게 한다.
+            try:
+                md0 = request.metadata or {}
+                todos0 = md0.get("todos") if isinstance(md0, dict) else None
+                if isinstance(todos0, list):
+                    meta_payload["todos"] = todos0
+            except Exception:
+                pass
+            try:
+                if "response" in outcome:
+                    r = outcome["response"]
+                    tool_calls = getattr(r, "tool_calls", None)
+                    skill_calls = getattr(r, "skill_calls", None)
+                    if isinstance(tool_calls, list):
+                        meta_payload["tool_calls"] = tool_calls
+                    if isinstance(skill_calls, list):
+                        meta_payload["skill_calls"] = skill_calls
+            except Exception:
+                logger.exception("run_meta extraction failed", exc_info=True)
+            yield {"data": json.dumps(meta_payload, ensure_ascii=False)}
             if "http_error" in outcome:
                 done_err = json.dumps(outcome["http_error"], ensure_ascii=False)
                 yield {

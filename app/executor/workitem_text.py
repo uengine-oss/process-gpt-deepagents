@@ -281,6 +281,7 @@ def _coerce_tool_input_dict(tool_input: Any) -> dict[str, Any] | None:
             return None
     return None
 
+
 def _extract_result_block(source: str) -> str:
     """Extract the [RESULT]...[/RESULT] block from output, if present."""
     if not source or not isinstance(source, str):

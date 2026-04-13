@@ -22,6 +22,24 @@ from app.skills.volume_tool_events import align_tool_event_job_id
 
 logger = logging.getLogger(__name__)
 
+def http_chat_tool_display_name(base_tool: Any, internal_name: str) -> str:
+    """``_mcp_server``가 있으면 ``{mcp명}__{도구명}``으로 표시한다.
+
+    LangChain 도구의 실제 ``.name``(및 A2A ``tool_usage_*``의 tool_name)은 바꾸지 않고,
+    HTTP ``tool_*`` 스트림과 ``job_tool_log`` 집계에만 적용한다. 로컬 도구는 접두사 없음.
+    """
+    raw = (internal_name or "").strip()
+    if not raw:
+        return raw
+    srv = str(getattr(base_tool, "_mcp_server", "") or "").strip()
+    if not srv:
+        return raw
+    mcp_label = srv.lower().replace("_", "-")
+    prefix = f"{mcp_label}__"
+    if raw.startswith(prefix):
+        return raw
+    return f"{prefix}{raw}"
+
 
 def _coerce_tool_output_for_tool_node(
     output: Any,
@@ -285,7 +303,9 @@ def _instrument_tools(
                 try:
                     name = data.get("tool_name")
                     if isinstance(name, str) and name:
-                        job_tool_log.setdefault(job_id, []).append(name)
+                        job_tool_log.setdefault(job_id, []).append(
+                            http_chat_tool_display_name(base_tool, name)
+                        )
                 except Exception:
                     logger.exception("Failed to collect tool usage for job summary", exc_info=True)
         except Exception:
