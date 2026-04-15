@@ -87,7 +87,7 @@ spec:
       volumes:
         - name: skills-storage
           persistentVolumeClaim:
-            claimName: claude-skills-storage
+            claimName: claude-skills-storage-rwx
 ---
 apiVersion: v1
 kind: Service

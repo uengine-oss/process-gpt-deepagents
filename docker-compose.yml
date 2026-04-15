@@ -51,7 +51,6 @@ services:
       - DB_HOST=host.docker.internal
       - PROCESSGPT_SKILLS_API_BASE_URL=http://host.docker.internal:8765
       - SUPABASE_URL=http://host.docker.internal:54321
-      - LLM_PROXY_URL=http://host.docker.internal:4000
       - MEMENTO_RETRIEVE_URL=http://host.docker.internal:8005/retrieve
     env_file:
       - .env
