@@ -25,6 +25,21 @@ _BLOCKED_SUBAGENT_MCP_SERVERS: set[str] = {"work-assistant"}
 
 logger = logging.getLogger(__name__)
 
+_OPENAI_FORBIDDEN_MESSAGE_NAME_CHARS = re.compile(r'[\s<|\\/>"]+')
+
+
+def _openai_safe_agent_name(display_name: str, *, fallback: str) -> str:
+    """Return OpenAI ChatCompletions-safe token for message/agent names.
+
+    OpenAI requires messages[*].name to match: ^[^\\s<|\\\\/>]+$
+    """
+    s = (display_name or "").strip()
+    if not s:
+        s = fallback
+    s = _OPENAI_FORBIDDEN_MESSAGE_NAME_CHARS.sub("_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or fallback
+
 
 def _wrap_tools_langchain(tools: list[Any]) -> list[Any]:
     """Match :func:`executor.langchain_tools._ensure_langchain_tools` for freshly built local tools."""
@@ -336,8 +351,12 @@ def build_subagent_configs(
 
     subagents: list[dict[str, Any]] = []
     for row in agent_rows:
-        name = row.get("alias") or row.get("username") or str(row.get("id"))
-        description = _build_description(row, name)
+        display_name = row.get("alias") or row.get("username") or str(row.get("id"))
+        # IMPORTANT: deepagents/langchain may propagate agent identifiers into messages[*].name.
+        # When routing through LiteLLM->OpenAI, invalid names (spaces) cause 400.
+        fallback = str(row.get("id") or "agent")
+        name = _openai_safe_agent_name(str(display_name), fallback=fallback)
+        description = _build_description(row, display_name)
         system_prompt = _build_system_prompt(row, query=query, tenant_id=tenant_id)
 
         agent_type = str(row.get("agent_type") or "").strip()

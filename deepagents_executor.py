@@ -41,7 +41,7 @@ from app.sandbox.output_delivery import (
     take_sandbox_output_paths_task,
 )
 from app.sandbox.tools import collect_open_workspace_paths_for_globs, get_sandbox_tools
-from app.runtime_config import resolve_model_routing
+from app.runtime_config import ModelRoutingConfig, resolve_model_routing
 from app.skills.resolution_tools import get_skill_resolution_tools
 from app.skills.volume_subagent_scope_middleware import SubagentJobScopeMiddleware
 from app.skills.volume_tool_events import (
@@ -62,10 +62,9 @@ from app.executor.a2a_events import (
     _enqueue_status,
     _ensure_required_root_task_started_fields,
 )
-from app.executor.context import ExecutionContext, build_event_payload
-from app.executor.evidence import _build_execution_evidence
+from app.executor.context import ExecutionContext, _build_execution_evidence, build_event_payload
 from app.executor.exceptions import HitlInterrupt, MissingSubagentsConfigurationError
-from app.executor.json_safe import _json_safe
+from app.executor.tool_calls import _json_safe
 from app.executor.hitl_utils import (
     _classify_tenant_context_tool,
     _is_duplicate_hitl_request,
@@ -75,22 +74,21 @@ from app.executor.hitl_utils import (
     _should_defer_hitl_interrupt,
 )
 from app.executor.langchain_tools import _ensure_langchain_tools
-from app.executor.execution_state_invariants import strict_pipeline_state_violations
 from app.executor.execution_state_validator import (
     messages_to_audit_blob,
+    strict_pipeline_state_violations,
     validate_native_execution_contract,
 )
 from app.executor.input_assets import build_asset_inventory, collect_input_assets
 from app.executor.asset_role_resolver import resolve_asset_roles
-from app.executor.pipeline_runner import execute_pipeline_spec
 from app.executor.pipeline_spec_middleware import create_pipeline_spec_middleware
+from app.executor.deep_required_root_gate_middleware import _create_deep_required_root_gate_middleware
 from app.executor.planning_middleware import _create_write_todos_planning_middleware
 from app.executor.subagent_middleware import (
     _create_subagent_event_middleware,
     _emit_subagent_timeline_fallback,
     _reconcile_partial_subagent_task_completed,
 )
-from app.executor.todo_runner import execute_todos
 from app.executor.tenant_context import (
     _mcp_config_without_blocked_servers,
     _prefetch_tenant_context_once,
@@ -121,6 +119,18 @@ logger = logging.getLogger(__name__)
 
 
 _ENV_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT = "DEEPAGENTS_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT"
+# Optional override for MCP URL; otherwise derived from PROCESSGPT_SKILLS_API_BASE_URL + /mcp (default base http://localhost:8765).
+_ENV_CLAUDE_SKILLS_MCP_URL = "CLAUDE_SKILLS_MCP_URL"
+
+
+def _default_claude_skills_mcp_url() -> str:
+    explicit = (os.environ.get(_ENV_CLAUDE_SKILLS_MCP_URL) or "").strip()
+    if explicit:
+        return explicit
+    base = (os.environ.get("PROCESSGPT_SKILLS_API_BASE_URL") or "").strip().rstrip("/")
+    if not base:
+        base = "http://localhost:8765"
+    return f"{base}/mcp"
 
 
 def _truthy_env(name: str, default: bool = False) -> bool:
@@ -204,6 +214,92 @@ def _last_assistant_message(messages: list[Any]) -> Any | None:
         if role is not None and str(role) == "assistant":
             return m
     return None
+
+
+def _maybe_int(value: Any) -> int | None:
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        s = str(value).strip()
+        if not s:
+            return None
+        s = s.replace(",", "")
+        return int(s)
+    except Exception:
+        return None
+
+
+def _maybe_date_yyyy_mm_dd(value: Any) -> str | None:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    if len(s) == 8 and s.isdigit():
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        return s
+    return None
+
+
+def _extract_close_facts_from_dict(blob: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract (symbol, name, date, close, currency, source) from dict-like outputs."""
+    if not isinstance(blob, dict):
+        return None
+
+    symbol = blob.get("symbol") or blob.get("ticker") or blob.get("code") or blob.get("itemCode")
+    date = blob.get("date")
+    close = blob.get("close")
+    currency = blob.get("currency") or "KRW"
+    source = blob.get("source")
+    name = blob.get("name") or blob.get("stockName")
+
+    date2 = _maybe_date_yyyy_mm_dd(date)
+    close2 = _maybe_int(close)
+
+    # korea_econ_api stdout shape
+    if (date2 is None or close2 is None) and isinstance(blob.get("data"), dict):
+        data = blob.get("data") if isinstance(blob.get("data"), dict) else {}
+        if not name:
+            name = data.get("stockName")
+        dti = data.get("dealTrendInfos")
+        if isinstance(dti, list) and dti:
+            first = dti[0] if isinstance(dti[0], dict) else {}
+            if date2 is None:
+                date2 = _maybe_date_yyyy_mm_dd(first.get("bizdate"))
+            if close2 is None:
+                close2 = _maybe_int(first.get("closePrice"))
+            if not symbol:
+                symbol = first.get("itemCode") or symbol
+        if not source and isinstance(blob.get("source"), str):
+            source = blob.get("source")
+
+    if date2 is None or close2 is None:
+        return None
+
+    return {
+        "symbol": str(symbol).strip() if symbol is not None else "",
+        "name": str(name).strip() if isinstance(name, str) else "",
+        "date": date2,
+        "close": close2,
+        "currency": str(currency).strip() if currency else "KRW",
+        "source": str(source).strip() if isinstance(source, str) else "",
+    }
+
+
+def _render_close_sentence_ko(*, facts: dict[str, Any], user_text: str) -> str:
+    date = str(facts.get("date") or "").strip()
+    close_i = _maybe_int(facts.get("close"))
+    symbol = str(facts.get("symbol") or "").strip()
+    name = str(facts.get("name") or "").strip()
+    if not date or close_i is None:
+        return ""
+    prefix = f"어제({date})" if ("어제" in (user_text or "")) else date
+    subject = "삼성전자" if (not name and symbol == "005930") else (name or "해당 종목")
+    suffix = f"({symbol})" if symbol else ""
+    return f"{prefix} {subject}{suffix} 종가는 {close_i:,}원입니다."
 
 
 def _tool_calls_from_assistant_message(msg: Any) -> list[dict[str, Any]]:
@@ -303,6 +399,36 @@ def _emit_http_plan_event(http_stream_event_emit: Any, payload: dict[str, Any]) 
         http_stream_event_emit(payload)
     except Exception:
         logger.exception("http_chat plan event emit failed | type=%s", payload.get("type"), exc_info=True)
+
+
+def _planned_skills_from_tool_call(tool_name: str, args: dict[str, Any]) -> list[str]:
+    """Heuristic: extract referenced skill names from a tool call."""
+    tn = (tool_name or "").strip()
+    if not tn or not isinstance(args, dict):
+        return []
+    skills: list[str] = []
+    if tn == "read_skill_document":
+        sn = args.get("skill_name")
+        if isinstance(sn, str) and sn.strip():
+            skills.append(sn.strip())
+    if tn == "skill_volume_probe":
+        many = args.get("skill_names_csv")
+        if isinstance(many, str) and many.strip():
+            skills.extend([s.strip() for s in many.split(",") if s.strip()])
+        many2 = args.get("skill_names")
+        if isinstance(many2, list):
+            skills.extend([str(s).strip() for s in many2 if str(s).strip()])
+    if tn == "sandbox_copy_mounted_skill":
+        one = args.get("skill_name")
+        if isinstance(one, str) and one.strip():
+            skills.append(one.strip())
+        many = args.get("skill_names_csv")
+        if isinstance(many, str) and many.strip():
+            skills.extend([s.strip() for s in many.split(",") if s.strip()])
+        many2 = args.get("skill_names")
+        if isinstance(many2, list):
+            skills.extend([str(s).strip() for s in many2 if str(s).strip()])
+    return list(dict.fromkeys(skills))
 
 
 def _coerce_langgraph_stream_chunk(part: Any) -> list[tuple[str, Any]]:
@@ -415,6 +541,7 @@ async def _ainvoke_or_stream_values(
     prev_stream_len = 0
     msg_cumulative = ""
     msg_streamable_emitted_len = 0
+    streamed_cumulative = ""
     final_state: Any = None
     any_dual_stream = False
     emitted_tool_plan_sigs: set[str] = set()
@@ -443,6 +570,7 @@ async def _ainvoke_or_stream_values(
                 delta = streamable[msg_streamable_emitted_len:]
                 if delta:
                     await stream_emit(delta)
+                    streamed_cumulative += delta
                 msg_streamable_emitted_len = len(streamable)
             continue
 
@@ -468,37 +596,8 @@ async def _ainvoke_or_stream_values(
 
         msgs = state.get("messages") or []
         las = _last_assistant_message(msgs)
-        if http_stream_event_emit is not None:
-            for am in _assistant_messages_with_tool_calls_in_order(msgs):
-                tcs = _tool_calls_from_assistant_message(am)
-                if not tcs:
-                    continue
-                psig = _plan_signature_for_tool_calls(tcs)
-                if not psig or psig in emitted_tool_plan_sigs:
-                    continue
-                emitted_tool_plan_sigs.add(psig)
-                tool_entries = []
-                for tc in tcs:
-                    internal = str(tc.get("name") or "")
-                    display = _display_tool_name_for_plan(internal, plan_tools_by_name)
-                    tool_entries.append(
-                        {
-                            "tool": display,
-                            "name": internal,
-                            "args": _json_safe(tc.get("args") or {}),
-                            "id": str(tc.get("id") or ""),
-                        }
-                    )
-                _emit_http_plan_event(
-                    http_stream_event_emit,
-                    {"type": "plan_tools", "tools": tool_entries},
-                )
-                planned_skills = _plan_skills_from_tool_entries(tcs)
-                if planned_skills:
-                    _emit_http_plan_event(
-                        http_stream_event_emit,
-                        {"type": "plan_skills", "skills": planned_skills},
-                    )
+        # NOTE: plan_tools / plan_skills are emitted from the tool_start guard/hook.
+        # Emitting them again from streamed assistant tool_calls duplicates SSE events.
 
         if item.get("dual"):
             continue
@@ -515,6 +614,7 @@ async def _ainvoke_or_stream_values(
             delta = streamable[prev_stream_len:]
             if delta:
                 await stream_emit(delta)
+                streamed_cumulative += delta
             prev_stream_len = len(streamable)
 
     if any_dual_stream and stream_emit is not None and isinstance(final_state, dict):
@@ -529,7 +629,13 @@ async def _ainvoke_or_stream_values(
                 tail = streamable[msg_streamable_emitted_len:]
                 if tail:
                     await stream_emit(tail)
+                    streamed_cumulative += tail
                 msg_streamable_emitted_len = len(streamable)
+    # Ensure the final state carries the streamed assistant text.
+    # Some backends end the state with tool/function messages or empty assistant tool-call messages,
+    # which makes final response extraction unreliable if we only look at state["messages"][-1].
+    if stream_emit is not None and isinstance(final_state, dict) and streamed_cumulative:
+        final_state["_http_chat_streamed_text"] = streamed_cumulative
 
     if final_state is None:
         return await orchestrator.ainvoke(state_input)
@@ -688,8 +794,7 @@ class DeepAgentsExecutor(AgentExecutor):
 
         domain_agent_rows = extras.get("agents", []) or []
         all_tools: list[Any] = []
-        # SafeToolLoader local tools(mem0/dmn_rule)는 user_id가 필요하다.
-        # 이 시스템에서는 에이전트의 id가 곧 user_id이므로 agents[].id를 최우선 사용한다.
+        # Prefer agents[].id as tool user_id when available.
         first_agent_user_id = ""
         if isinstance(domain_agent_rows, list):
             for ag in domain_agent_rows:
@@ -699,45 +804,46 @@ class DeepAgentsExecutor(AgentExecutor):
                         first_agent_user_id = aid
                         break
         raw_user_id = first_agent_user_id or extras.get("user_id") or extras.get("request_user_id") or row.get("user_id") or ""
-        # todolist.user_id can be CSV in some flows; mem0/dmn_rule expect a single user id.
+        # todolist.user_id can be CSV; tools expect a single user id.
         tool_user_id = str(raw_user_id).split(",")[0].strip() if raw_user_id else ""
         http_stream_event_emit = extras.get("_http_chat_stream_event_emit")
         mcp_cfg_raw = extras.get("tenant_mcp")
         mcp_cfg: dict[str, Any] = _mcp_config_without_blocked_servers(mcp_cfg_raw)
-        # HTTP 채팅 경로에서만 런타임 MCP 서버(work-assistant)를 추가 주입한다.
-        # DB(tenants.mcp)에 저장하지 않고, 도구 로딩은 루트에서 1회만 수행한다.
-        if http_chat:
-            try:
-                mcp_cfg = dict(mcp_cfg or {})
-                mcp_servers0 = mcp_cfg.get("mcpServers")
-                if not isinstance(mcp_servers0, dict):
-                    mcp_servers0 = {}
-                else:
-                    mcp_servers0 = dict(mcp_servers0)
-                if "work-assistant" not in mcp_servers0:
-                    mcp_servers0["work-assistant"] = {
-                        "command": "uvx",
-                        "args": ["process-gpt-mcp"],
-                        "env": {
-                            "SUPABASE_URL": str(os.environ.get("SUPABASE_URL") or ""),
-                            "SUPABASE_ANON_KEY": str(os.environ.get("SUPABASE_ANON_KEY") or ""),
-                        },
-                    }
-                mcp_cfg["mcpServers"] = mcp_servers0
-            except Exception:
-                logger.exception("Failed to inject work-assistant MCP config; continuing", exc_info=True)
+        # Merge defaults: claude-skills (always, same shape as Cursor mcp.json) + work-assistant for HTTP chat only.
+        try:
+            mcp_cfg = dict(mcp_cfg or {})
+            mcp_servers0 = mcp_cfg.get("mcpServers")
+            if not isinstance(mcp_servers0, dict):
+                mcp_servers0 = {}
+            else:
+                mcp_servers0 = dict(mcp_servers0)
+            if "claude-skills" not in mcp_servers0:
+                mcp_servers0["claude-skills"] = {"url": _default_claude_skills_mcp_url()}
+            if http_chat and "work-assistant" not in mcp_servers0:
+                mcp_servers0["work-assistant"] = {
+                    "command": "uvx",
+                    "args": ["process-gpt-mcp"],
+                    "env": {
+                        "SUPABASE_URL": str(os.environ.get("SUPABASE_URL") or ""),
+                        "SUPABASE_ANON_KEY": str(os.environ.get("SUPABASE_ANON_KEY") or ""),
+                    },
+                }
+            mcp_cfg["mcpServers"] = mcp_servers0
+        except Exception:
+            logger.exception("Failed to inject default MCP servers (claude-skills / work-assistant); continuing", exc_info=True)
         mcp_servers = mcp_cfg.get("mcpServers") or {}
 
-        # mem0 / memento / dmn_rule 은 SafeToolLoader 로컬 도구(언더스코어 이름). MCP 서버가 아니다.
-        # 하이픈 키(dmn-rule 등)로 넘기면 MCP 조회만 시도하고 실패하므로 여기서는 요청하지 않는다.
-        # NOTE: HTTP 채팅은 TTFT/안정성이 더 중요하므로 기본적으로 preflight(테넌트 지식 도구)를 끈다.
-        # (mem0는 vecs/pg 연결을 시도하며 로컬 환경에서 종종 실패 → noisy error logs)
+        # NOTE: HTTP chat defaults to disabling tenant context preflight for TTFT/stability.
         enable_tenant_context_preflight = (not http_chat) or _truthy_env(
             _ENV_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT, default=False
         )
         local_tenant_context_tool_names = ("mem0", "memento", "dmn_rule") if enable_tenant_context_preflight else ()
-        # 테넌트 MCP 설정에서 해석할 **실제 MCP** 서버(예: claude-skills).
-        desired_mcp_servers = ("claude-skills", "work-assistant")
+        # MCP servers to request.
+        desired_mcp_servers = (
+            ("claude-skills", "work-assistant")
+            if http_chat
+            else ("claude-skills",)
+        )
         resolved_server_keys: dict[str, list[str]] = {name: [] for name in desired_mcp_servers}
         if isinstance(mcp_servers, dict):
             for key in mcp_servers:
@@ -747,8 +853,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     if normalized == canonical or normalized.endswith(canonical):
                         resolved_server_keys[canonical].append(raw)
 
-            # SafeToolLoader 는 _get_mcp_config 에서 dict key exact match를 사용하므로,
-            # alias 키만 있는 경우에도 표준 키로 조회되도록 mcp_config에 canonical alias를 주입한다.
+            # Ensure canonical keys exist for exact-match lookup.
             for canonical, found_keys in resolved_server_keys.items():
                 if found_keys and canonical not in mcp_servers:
                     primary_key = found_keys[0]
@@ -818,7 +923,8 @@ class DeepAgentsExecutor(AgentExecutor):
             )
 
         # 서브 에이전트별 도구 호출은 각 서브 에이전트 전용 job_id로 분리된다.
-        # 루트 오케스트레이터(MCP work-assistant 등)는 별도 로그에 쌓은 뒤 HTTP 응답에서 합친다.
+        # 루트 오케스트레이터(MCP claude-skills / chat 전용 work-assistant / worker 전용 process-gpt-mcp 등)는
+        # 별도 로그에 쌓은 뒤 HTTP 응답에서 합친다.
         orchestrator_tool_log: dict[str, list[str]] = {}
         subagent_tool_log: dict[str, list[str]] = {}
         subagent_skill_log: dict[str, list[str]] = {}
@@ -1123,6 +1229,37 @@ class DeepAgentsExecutor(AgentExecutor):
                     # HTTP SSE: tool_start 이벤트 스트리밍(호출 직전).
                     try:
                         if http_stream_event_emit is not None:
+                            # "호출 직전 예고" 이벤트: plan_tools / plan_skills
+                            try:
+                                merged0 = _coerce_tool_input_dict(tool_input)
+                                args0: dict[str, Any] = {}
+                                tid0 = ""
+                                if isinstance(merged0, dict):
+                                    if isinstance(merged0.get("args"), dict):
+                                        args0 = dict(merged0["args"])
+                                    tid0 = str(merged0.get("id") or "")
+                                _emit_http_plan_event(
+                                    http_stream_event_emit,
+                                    {
+                                        "type": "plan_tools",
+                                        "tools": [
+                                            {
+                                                "tool": http_chat_tool_display_name(base_tool, tool_name),
+                                                "name": tool_name,
+                                                "args": _json_safe(args0),
+                                                "id": tid0,
+                                            }
+                                        ],
+                                    },
+                                )
+                                skills0 = _planned_skills_from_tool_call(tool_name, args0)
+                                if skills0:
+                                    _emit_http_plan_event(
+                                        http_stream_event_emit,
+                                        {"type": "plan_skills", "skills": skills0},
+                                    )
+                            except Exception:
+                                logger.exception("http_chat plan_tools emit failed; continuing", exc_info=True)
                             http_stream_event_emit(
                                 {
                                     "type": "tool_start",
@@ -1155,17 +1292,10 @@ class DeepAgentsExecutor(AgentExecutor):
                             domain_tier_state["skill_docs_read"] = True
                             return None
 
-                        # Prevent domain subagents from re-running skill discovery search.
-                        # Skill discovery is centralized in `스킬 탐색 도우미`; domain should only read docs.
+                    # Domain subagents are allowed to use skill discovery.
+                    # (User requirement) `find_helpful_skills` 제한 금지.
                     if tool_name == "find_helpful_skills":
-                            return {
-                                "error": "domain_skill_search_forbidden",
-                                "message": (
-                                    "도메인 서브에이전트는 `find_helpful_skills`로 스킬 탐색을 수행할 수 없습니다. "
-                                "필요한 경우 `read_skill_document`로 스킬 문서를 확인한 뒤 실행 단계로 진행하세요."
-                                ),
-                                "requires_human": False,
-                            }
+                        return None
 
                         # Require skill materialization before running arbitrary sandbox code.
                         # This prevents "ignore skill discovery, generate random API script" failures.
@@ -1358,6 +1488,17 @@ class DeepAgentsExecutor(AgentExecutor):
             hitl_resume=hitl_resume,
             pipeline_asset_roles=pipeline_asset_roles,
         )
+        if http_chat:
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                "[HTTP_CHAT_EXECUTION_RULES]\n"
+                "- **work-assistant MCP 도구만**으로 요청을 끝까지 처리할 수 있으면, `task()`로 서브에이전트에 위임하지 말고 해당 MCP 도구 호출로 해결하라.\n"
+                "- 반대로 **work-assistant MCP 도구만으로는** 목표를 달성할 수 없다고 판단되면(예: 공개 시세·일반 웹 조회, 스킬 스크립트 실행, 샌드박스·코드 실행, MCP에 없는 전용 작업), "
+                "반드시 `task()`를 호출해 적절한 서브에이전트에게 실행을 위임하라. 루트에서 MCP 밖 작업을 추측·빈 문서만 읽는 방식으로 대체하지 마라.\n"
+                "- `write_todos`/`write_pipeline_spec`는 '중간 계획 제출'일 뿐이다. 계획을 제출했다면 같은 실행(run) 안에서 바로 실행(task/도구 호출)로 이어가고, 실행 결과를 근거로 최종 답변을 합성하라.\n"
+                "- 실행형 요청에서는 '불가능하다/연동이 없다'고 단정하기 전에, 반드시 최소 1회 이상 **work-assistant MCP 도구** 또는 `task()` 호출을 시도하고(실패하면 그 실패 근거를) 남겨라.\n"
+                "- 실행 결과(도구/서브에이전트 출력)를 근거로 최종 답변을 합성하라. 추측으로 채우지 마라.\n"
+            )
 
         # NOTE: 루트(DeepAgent) task_started 는 서브에이전트 이벤트보다 먼저 발행되어야 한다.
         # (DB 인입 시점 기준으로 서브가 먼저 시작한 것처럼 보이는 문제 방지)
@@ -1389,6 +1530,7 @@ class DeepAgentsExecutor(AgentExecutor):
             "saw_write_todos": False,
             "saw_write_pipeline_spec": False,
             "planning_completed_emitted": False,
+            "saw_task_delegation": False,
         }
         pipeline_spec_mw = create_pipeline_spec_middleware(
             event_queue=event_queue,
@@ -1406,8 +1548,9 @@ class DeepAgentsExecutor(AgentExecutor):
             exec_ctx=exec_ctx,
             planning_gate=planning_progress,
         )
-        # DeepAgents 네이티브: 루트가 task()로 서브에이전트를 호출하므로 write_todos/파이프라인 제출 게이트를 쓰지 않는다.
-        enforce_write_todos_planning = False
+        # HTTP 채팅에서는 task() 호출 전 플랜 제출을 강제한다.
+        # (MCP만으로 해결되는 요청은 task()를 호출하지 않으므로 영향 없음)
+        enforce_write_todos_planning = bool(http_chat)
 
         def _planning_completed_flag() -> bool:
             # write_todos / write_pipeline_spec 미들웨어도 같은 dict 를 갱신한다(단일 소스).
@@ -1444,9 +1587,16 @@ class DeepAgentsExecutor(AgentExecutor):
             subagent_tool_log=subagent_tool_log,
             subagent_skill_log=subagent_skill_log,
             on_before_subagent_start=_before_subagent_start_callback,
-            planning_gate=None,
+            planning_gate=planning_progress if enforce_write_todos_planning else None,
         )
         extra_middleware: list[Any] = [SubagentJobScopeMiddleware()]
+        deep_gate_mw = None
+        if http_chat:
+            deep_gate_mw = _create_deep_required_root_gate_middleware(
+                planning_gate=planning_progress,
+            )
+        if deep_gate_mw is not None:
+            extra_middleware.append(deep_gate_mw)
         if pipeline_spec_mw is not None:
             extra_middleware.append(pipeline_spec_mw)
         if write_todos_planning_mw is not None:
@@ -1490,10 +1640,52 @@ class DeepAgentsExecutor(AgentExecutor):
         # 루트 오케스트레이터 도구(MCP 등)도 서브와 동일하게 invoke 래핑 → HTTP tool_calls / SSE tool_* 에 남긴다.
         try:
 
+            def _emit_http_plan_for_tool_start(base_tool: Any, tool_name: str, tool_input: Any) -> None:
+                """Emit plan_tools/plan_skills/plan_todos immediately before tool_start (HTTP SSE)."""
+                if http_stream_event_emit is None:
+                    return
+                merged = _coerce_tool_input_dict(tool_input)
+                args0: dict[str, Any] = {}
+                tid0 = ""
+                if isinstance(merged, dict):
+                    if isinstance(merged.get("args"), dict):
+                        args0 = dict(merged["args"])
+                    tid0 = str(merged.get("id") or "")
+                display = http_chat_tool_display_name(base_tool, tool_name)
+                _emit_http_plan_event(
+                    http_stream_event_emit,
+                    {
+                        "type": "plan_tools",
+                        "tools": [
+                            {
+                                "tool": display,
+                                "name": tool_name,
+                                "args": _json_safe(args0),
+                                "id": tid0,
+                            }
+                        ],
+                    },
+                )
+                skills0 = _planned_skills_from_tool_call(tool_name, args0)
+                if skills0:
+                    _emit_http_plan_event(
+                        http_stream_event_emit,
+                        {"type": "plan_skills", "skills": skills0},
+                    )
+                # For write_todos, emit plan_todos from the tool input directly (state stream may omit it).
+                if tool_name == "write_todos":
+                    todos0 = args0.get("todos")
+                    if todos0 is not None:
+                        _emit_http_plan_event(
+                            http_stream_event_emit,
+                            {"type": "plan_todos", "todos": _json_safe(todos0)},
+                        )
+
             def _root_orchestrator_tool_call_guard(base_tool: Any, tool_input: Any) -> Any | None:
                 tool_name = str(getattr(base_tool, "name", "") or "")
                 try:
                     if http_stream_event_emit is not None:
+                        _emit_http_plan_for_tool_start(base_tool, tool_name, tool_input)
                         http_stream_event_emit(
                             {
                                 "type": "tool_start",
@@ -1532,6 +1724,7 @@ class DeepAgentsExecutor(AgentExecutor):
             middleware=extra_middleware,
             skills=tenant_skill_sources_for_middleware(tenant_id or None),
             memory=tenant_memory_sources_for_middleware(tenant_id or None),
+            model_routing=routing_cfg,
         )
         logger.info(
             "오케스트레이터 빌드 완료 | task_id=%s model=%s subagents=%d middleware=%d",
@@ -1597,139 +1790,27 @@ class DeepAgentsExecutor(AgentExecutor):
                 )
                 planning_progress["planning_completed_emitted"] = True
 
-            # 기본: DeepAgents 그래프 단일 실행(task()로 내부 서브에이전트 디스패치).
-            # 레거시: DEEPAGENTS_LEGACY_EXTERNAL_EXECUTOR=1 이면 파이프라인/TODO 외부 루프 유지(호환·디버그).
-            legacy_external = (os.environ.get("DEEPAGENTS_LEGACY_EXTERNAL_EXECUTOR") or "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-            )
             stream_emit = extras.get("_http_chat_stream_emit")
-            if stream_emit is not None and legacy_external:
-                logger.warning("HTTP chat stream emit ignored when DEEPAGENTS_LEGACY_EXTERNAL_EXECUTOR is enabled")
-                stream_emit = None
 
             state_input: dict[str, Any] = {
                 "messages": [{"role": "user", "content": invoke_user_text}],
                 "pipeline_outputs": initial_pipeline_outputs,
             }
-            last_pipeline_sig: str | None = None
             result: Any = None
             strict_pipeline_violations: list[str] = []
 
-            if legacy_external:
-                max_loops = int((os.environ.get("DEEPAGENTS_TODO_EXEC_MAX_LOOPS") or "5").strip() or 5)
-                max_conc = int((os.environ.get("DEEPAGENTS_TODO_EXEC_MAX_CONCURRENCY") or "4").strip() or 4)
-
-                for _loop_idx in range(max_loops):
-                    result = await orchestrator.ainvoke(state_input)
-                    await _emit_planning_completed_if_ready(result)
-
-                    if not isinstance(result, dict):
-                        break
-
-                    ps = result.get("pipeline_spec")
-                    if isinstance(ps, dict) and isinstance(ps.get("steps"), list) and ps["steps"]:
-                        try:
-                            sig = json.dumps(ps, ensure_ascii=False, sort_keys=True)
-                        except Exception:
-                            sig = str(id(ps))
-                        if sig != last_pipeline_sig:
-                            last_pipeline_sig = sig
-                            _, pr_info = await execute_pipeline_spec(
-                                pipeline_spec=ps,
-                                invoke_user_text=invoke_user_text,
-                                model_name=model_name,
-                                subagents=subagents,
-                                name_to_exec_ctx={str(c["name"]): c["exec_ctx"] for c in subagent_contexts},
-                                event_queue=event_queue,
-                                proc_inst_id=proc_inst_id,
-                                task_id=task_id,
-                                name_to_subagent_job_id=name_to_subagent_job_id,
-                                shared_job_tool_log=subagent_tool_log,
-                                shared_job_skill_log=subagent_skill_log,
-                            )
-                            evidence_blob = ""
-                            try:
-                                evidence_blob = json.dumps(pr_info, ensure_ascii=False)
-                            except Exception:
-                                evidence_blob = _extract_plain_text(pr_info)
-                            _po = result.get("pipeline_outputs")
-                            state_input = {
-                                "messages": [
-                                    {"role": "user", "content": invoke_user_text},
-                                    {
-                                        "role": "user",
-                                        "content": (
-                                            "아래는 시스템이 파이프라인 스펙을 실행한 결과입니다. "
-                                            "필요하면 `write_pipeline_spec`으로 스펙을 수정·재제출하고, 최종 결과를 합성하세요.\n\n"
-                                            "[PIPELINE_EXECUTION_RESULTS_V1]\n"
-                                            f"{evidence_blob}\n"
-                                        ),
-                                    },
-                                ],
-                                "todos": result.get("todos"),
-                                "pipeline_spec": ps,
-                                "pipeline_outputs": _po if isinstance(_po, dict) else initial_pipeline_outputs,
-                            }
-                            continue
-
-                    todos_state = result.get("todos")
-                    updated_todos, run_info = await execute_todos(
-                        todos_state=todos_state,
-                        invoke_user_text=invoke_user_text,
-                        model_name=model_name,
-                        subagents=subagents,
-                        name_to_exec_ctx={str(c["name"]): c["exec_ctx"] for c in subagent_contexts},
-                        event_queue=event_queue,
-                        proc_inst_id=proc_inst_id,
-                        task_id=task_id,
-                        max_concurrency=max_conc,
-                        name_to_subagent_job_id=name_to_subagent_job_id,
-                        shared_job_tool_log=subagent_tool_log,
-                        shared_job_skill_log=subagent_skill_log,
-                    )
-                    executed = int(run_info.get("executed") or 0)
-                    if executed <= 0:
-                        break
-
-                    evidence_blob = ""
-                    try:
-                        evidence_blob = json.dumps(run_info, ensure_ascii=False)
-                    except Exception:
-                        evidence_blob = _extract_plain_text(run_info)
-
-                    _po_todo = result.get("pipeline_outputs")
-                    state_input = {
-                        "messages": [
-                            {"role": "user", "content": invoke_user_text},
-                            {
-                                "role": "user",
-                                "content": (
-                                    "아래는 시스템이 TODO를 실행한 결과입니다. "
-                                    "당신은 이를 근거로 TODO를 필요하면 업데이트(write_todos)하거나 "
-                                    "파이프라인을 `write_pipeline_spec`으로 조정하고, 최종 결과를 합성하세요.\n\n"
-                                    "[TODO_EXECUTION_RESULTS_V1]\n"
-                                    f"{evidence_blob}\n"
-                                ),
-                            },
-                        ],
-                        "todos": updated_todos,
-                        "pipeline_outputs": _po_todo if isinstance(_po_todo, dict) else initial_pipeline_outputs,
-                    }
-                    if isinstance(result.get("pipeline_spec"), dict):
-                        state_input["pipeline_spec"] = result["pipeline_spec"]
-            else:
-                result = await _ainvoke_or_stream_values(
-                    orchestrator,
-                    state_input,
-                    stream_emit=stream_emit,
-                    http_stream_event_emit=http_stream_event_emit,
-                    plan_tools_by_name=plan_tools_by_name,
-                )
-                await _emit_planning_completed_if_ready(result)
-                if not _planning_completed_flag():
-                    await _emit_planning_completed_fallback("에이전트 실행이 완료되었습니다.")
+            result = await _ainvoke_or_stream_values(
+                orchestrator,
+                state_input,
+                stream_emit=stream_emit,
+                http_stream_event_emit=http_stream_event_emit,
+                plan_tools_by_name=plan_tools_by_name,
+            )
+            await _emit_planning_completed_if_ready(result)
+            if not _planning_completed_flag():
+                await _emit_planning_completed_fallback("에이전트 실행이 완료되었습니다.")
+            # NOTE: chat/worker 실행 로직을 동일하게 유지하기 위해, HTTP 채팅만 재실행하는
+            # follow-up(후속 실행) 메커니즘은 사용하지 않는다.
 
             logger.info(
                 "오케스트레이터 실행 완료 | task_id=%s result_type=%s keys=%s",
@@ -1959,9 +2040,29 @@ class DeepAgentsExecutor(AgentExecutor):
         final_messages = result.get("messages", [])
         raw_text = ""
         if final_messages:
-            last = final_messages[-1]
-            content = last.get("content") if isinstance(last, dict) else getattr(last, "content", None)
+            # Some providers append tool/function messages at the end, or end with an
+            # assistant tool-call message whose content is empty. For final display text,
+            # prefer the last assistant message.
+            last_assistant = _last_assistant_message(final_messages) or final_messages[-1]
+            content = (
+                last_assistant.get("content")
+                if isinstance(last_assistant, dict)
+                else getattr(last_assistant, "content", None)
+            )
             raw_text = _extract_plain_text(content)
+            if not (raw_text or "").strip():
+                # Fallback: some runs end with ToolMessage/Command-like messages where the useful
+                # text is not on the last assistant turn. Pick the last non-empty content from any message.
+                for m in reversed(final_messages):
+                    c = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+                    t = _extract_plain_text(c)
+                    if t.strip():
+                        raw_text = t
+                        break
+        if not (raw_text or "").strip() and isinstance(result, dict):
+            # Streaming path fallback: use the cumulative streamed assistant text captured in
+            # `_ainvoke_or_stream_values` when the final state messages are not reliable.
+            raw_text = str(result.get("_http_chat_streamed_text") or "")
 
         # 미들웨어가 실제 task()를 감싸지 못한 런타임만 fallback으로 started/completed를 발행.
         # (fallback 내부에서 asyncio.sleep(1.2)로 최종 이벤트와 DB 시각 정렬을 분리한다.)
@@ -2006,6 +2107,7 @@ class DeepAgentsExecutor(AgentExecutor):
             form_id: str,
             form_fields: Any,
             evidence: dict[str, Any],
+            model_routing: ModelRoutingConfig | None,
         ) -> dict[str, Any] | None:
             """Use an LLM-only finalizer to produce the exact form JSON deliverable.
 
@@ -2040,6 +2142,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 hitl_tools=[],
                 middleware=[],
                 skills=None,
+                model_routing=model_routing,
             )
             msg = (
                 "EVIDENCE (JSON):\n"
@@ -2063,13 +2166,50 @@ class DeepAgentsExecutor(AgentExecutor):
         has_form = bool(form_fields) and form_id not in (None, "", "defaultform")
         if not has_form:
             base_text = original_wo_form or wrapped_result.get("cleaned") or ""
-            # 모델이 리스트/딕셔너리 구조를 문자열로 반환한 경우에도
-            # 내부 text/content 필드만 추출하여 순수 텍스트로 만든다.
-            final_text = _extract_plain_text(base_text).strip()
+            # 최종 텍스트는 "output 래퍼(JSON)" 형태로 올 수 있으므로, 먼저 래퍼를 벗겨낸다.
+            # (OpenAI 계열은 `{ "output": { "status": ..., "result": "..." } }`만 반환하는 경우가 흔함)
+            final_text = unwrap_output_wrapper_result_text(str(base_text)).strip()
             result_block = _extract_result_block(final_text)
             if result_block:
                 final_text = result_block
             final_text = unwrap_output_wrapper_result_text(final_text).strip()
+
+            # Deterministic rendering for factual "close price" queries (no extra LLM call).
+            # If we can extract (date, close, symbol/name) from structured outputs, render a Korean sentence.
+            try:
+                facts0: dict[str, Any] | None = None
+                parsed0 = _loose_json_loads(final_text) if (final_text or "").strip() else None
+                if isinstance(parsed0, dict):
+                    facts0 = _extract_close_facts_from_dict(parsed0)
+                if facts0 is None and isinstance(structured_domain_outputs_by_job, dict):
+                    for _job, bucket in structured_domain_outputs_by_job.items():
+                        if not isinstance(bucket, dict):
+                            continue
+                        for _k, items in bucket.items():
+                            if not isinstance(items, list):
+                                continue
+                            for it in reversed(items):
+                                if not isinstance(it, dict):
+                                    continue
+                                ps = it.get("parsed_stdout")
+                                if isinstance(ps, dict):
+                                    facts0 = _extract_close_facts_from_dict(ps)
+                                    if facts0:
+                                        break
+                            if facts0:
+                                break
+                        if facts0:
+                            break
+                if facts0:
+                    sentence = _render_close_sentence_ko(
+                        facts=facts0, user_text=str(invoke_user_text or "")
+                    )
+                    if sentence:
+                        wrapped_result.setdefault("final_output_facts", facts0)
+                        final_text = sentence
+            except Exception:
+                logger.exception("Failed to render deterministic close-price sentence; continuing", exc_info=True)
+
             result_status = "SUCCESS" if final_text else "Fail"
             final_result_payload = {
                 "output": {
@@ -2109,6 +2249,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     form_id=str(form_id),
                     form_fields=form_fields,
                     evidence=evidence,
+                    model_routing=routing_cfg,
                 )
                 if isinstance(finalized, dict):
                     pure_form_data = finalized
@@ -2218,15 +2359,24 @@ class DeepAgentsExecutor(AgentExecutor):
         # Count scanner-found artifacts AND upload-tool deliverables (e.g. sandbox_upload_file_to_public_storage).
         # Previously only `file_manifest` was checked, so runs that produced public_url solely via the upload
         # hook (`deliverable_files_from_tools`) were wrongly treated as missing evidence.
-        has_execution_evidence = any(
+        orchestrator_used_tools = False
+        try:
+            orchestrator_used_tools = bool(orchestrator_tool_log.get(str(job_uuid), []))
+        except Exception:
+            orchestrator_used_tools = False
+
+        has_execution_evidence = orchestrator_used_tools or any(
             bool((run.get("tools_used") or []))
             for run in (execution_evidence.get("subagent_runs") or [])
         ) or bool(combined_manifest)
-        if not has_execution_evidence and not http_chat:
+        if not has_execution_evidence:
             final_result_payload = {
                 "output": {
                     "status": "Fail",
-                    "result": "실행 증거가 부족하여 결과를 확정할 수 없습니다. 자동 탐색/실행 단계를 재시도해 주세요.",
+                    "result": (
+                        "실행 증거(도구 호출/위임 결과)가 부족하여 결과를 확정할 수 없습니다. "
+                        "반드시 최소 1회 이상 MCP 도구 호출 또는 `task()` 위임을 수행한 뒤 결과를 종합해 주세요."
+                    ),
                 }
             }
             wrapped_result["final_output"] = final_result_payload
@@ -2303,7 +2453,10 @@ class DeepAgentsExecutor(AgentExecutor):
             (
                 final_event_result
                 if has_form
-                else {"message": "최종 결과 생성이 완료되었습니다.", "result": final_event_result}
+                else {
+                    "message": (final_event_result or "").strip() or "최종 결과 생성이 완료되었습니다.",
+                    "result": final_event_result,
+                }
             ),
             proc_inst_id,
             task_id,
@@ -2361,7 +2514,16 @@ class DeepAgentsExecutor(AgentExecutor):
             else:
                 chat_body = (final_text or "").strip()
             if not has_form and not (chat_body or "").strip():
-                chat_body = "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다."
+                # Prefer the actual streamed assistant text over a generic fallback message.
+                # This preserves partial answers even when the run fails to produce a final_text.
+                streamed = ""
+                try:
+                    streamed = str(result.get("_http_chat_streamed_text") or "").strip() if isinstance(result, dict) else ""
+                except Exception:
+                    streamed = ""
+                raw_fallback = (raw_text or "").strip()
+                candidate = unwrap_output_wrapper_result_text(streamed or raw_fallback).strip()
+                chat_body = candidate or "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다."
             result_box["response"] = ensure_trailing_newline(chat_body)
             result_box["tool_calls"] = _http_chat_merge_tool_calls_summary(
                 orchestrator_tool_log,
@@ -2373,6 +2535,8 @@ class DeepAgentsExecutor(AgentExecutor):
                 orchestrator_job_id=job_uuid,
             )
             result_box["final_output"] = final_result_payload
+            # (의도적으로) 요청 분류/케이스 분기 스냅샷은 남기지 않는다.
+            # 정책은 도구 호출 게이트로만 강제한다.
         return None
 
     @override

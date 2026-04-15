@@ -173,7 +173,7 @@ def enqueue_sandbox_file_artifacts(
         logger.exception("a2a types unavailable; cannot emit file artifacts")
         return []
 
-    from app.storage_public import build_deliverable_object_path, try_upload_bytes_to_public_files
+    from app.database import build_deliverable_object_path, try_upload_bytes_to_public_files
 
     for name, raw, mime in files:
         safe_name = name or "artifact.bin"

@@ -15,7 +15,7 @@ from .hitl_utils import (
     _record_context_tool_attempt,
     _should_defer_hitl_interrupt,
 )
-from .json_safe import _json_safe
+from .tool_calls import _json_safe
 from .workitem_text import _coerce_tool_input_dict
 from app.sandbox.output_delivery import note_sandbox_tool_output_paths
 from app.skills.volume_tool_events import align_tool_event_job_id

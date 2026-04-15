@@ -139,6 +139,8 @@ def _create_subagent_event_middleware(
             ctx = name_to_context.get(subagent_type) if subagent_type else None
             if not ctx:
                 raw = await handler(request)
+                if planning_gate is not None:
+                    planning_gate["saw_task_delegation"] = True
                 return merge_task_command_pipeline_outputs(raw, str(subagent_type or ""))
 
             # task_started.goal 은 주입([SKILL_HANDOFF_*], [TENANT_CONTEXT_*]) 전의 위임 문구만 쓴다.
@@ -198,6 +200,9 @@ def _create_subagent_event_middleware(
                 finally:
                     skill_volume_active_exec_ctx.reset(tok_e)
                     skill_volume_active_job_id.reset(tok_j)
+
+                if planning_gate is not None:
+                    planning_gate["saw_task_delegation"] = True
 
                 used_tools = subagent_tool_log.get(job_id, [])
                 used_skills = subagent_skill_log.get(job_id, [])

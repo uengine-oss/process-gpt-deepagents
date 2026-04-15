@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.executor.evidence import _build_execution_evidence
+from app.executor.context import _build_execution_evidence
 
 
 def test_build_execution_evidence_uses_ctx_job_id_for_tool_log() -> None:

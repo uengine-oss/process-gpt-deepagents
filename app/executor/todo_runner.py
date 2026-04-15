@@ -1,9 +1,4 @@
-"""Legacy TODO-driven worker runner (외부 서브그래프).
-
-기본 제품 경로에서는 ``deepagents_executor``가 ``DEEPAGENTS_LEGACY_EXTERNAL_EXECUTOR=1`` 일 때만
-이 모듈을 통해 TODO를 독립 ``build_runtime_agent(subagents=[])`` 워커로 실행합니다.
-일반 모드에서는 오케스트레이터가 그래프 내부 ``task()``로 서브에이전트를 호출합니다.
-"""
+"""TODO utilities and (optional) worker-style todo execution helpers."""
 
 from __future__ import annotations
 
@@ -18,6 +13,7 @@ from app.executor.a2a_events import _enqueue_status
 from app.executor.context import ExecutionContext
 from app.executor.tool_instrumentation import _instrument_tools
 from app.executor.workitem_text import _extract_plain_text
+from app.runtime_config import ModelRoutingConfig
 from app.skills.volume_tool_events import skill_volume_active_exec_ctx, skill_volume_active_job_id
 
 logger = logging.getLogger(__name__)
@@ -248,6 +244,7 @@ async def run_todo_subagent_job(
     name_to_subagent_job_id: dict[str, str] | None = None,
     shared_job_tool_log: dict[str, list[str]] | None = None,
     shared_job_skill_log: dict[str, list[str]] | None = None,
+    model_routing: ModelRoutingConfig | None = None,
 ) -> None:
     """Execute a single todo-shaped task dict; mutates ``td`` and writes ``results[tid]``."""
     tid = _todo_id(td)
@@ -371,6 +368,7 @@ async def run_todo_subagent_job(
         middleware=[],
         skills=None,
         memory=None,
+        model_routing=model_routing,
     )
 
     todo_user_msg = (
@@ -530,6 +528,7 @@ async def execute_todos(
     name_to_subagent_job_id: dict[str, str] | None = None,
     shared_job_tool_log: dict[str, list[str]] | None = None,
     shared_job_skill_log: dict[str, list[str]] | None = None,
+    model_routing: ModelRoutingConfig | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Execute runnable todos (fan-out), updating status and collecting results."""
     todos = _normalized_todos(todos_state)
@@ -570,6 +569,7 @@ async def execute_todos(
                 name_to_subagent_job_id=name_to_subagent_job_id,
                 shared_job_tool_log=shared_job_tool_log,
                 shared_job_skill_log=shared_job_skill_log,
+                model_routing=model_routing,
             )
 
     executed_total = 0

@@ -2,14 +2,15 @@
 
 - ``create_deep_agent`` composes TodoListMiddleware, FilesystemMiddleware, SubAgentMiddleware, etc.
 - The orchestrator runs **inside** the DeepAgents graph and delegates to subagents via ``task()``.
-- ``write_pipeline_spec`` / ``write_todos`` are optional notes or trace helpers only; they do not
-  replace native ``task()`` execution unless legacy external executor mode is enabled.
+- ``write_pipeline_spec`` / ``write_todos`` are optional notes or trace helpers in the default path;
+  HTTP 채팅에서 오케스트레이션 정책(deep/hybrid)이 켜지면 플랜 제출이 ``task()`` 전에 강제될 수 있다.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Mapping, Sequence
 
 from deepagents import create_deep_agent
@@ -19,11 +20,118 @@ from app.agent.backend import make_deepagent_backend_factory
 from app.agent.hitl import get_hitl_tools
 from app.execution_context import format_execution_clock_section
 from app.executor.asset_role_resolver import format_pipeline_asset_roles_for_system_prompt
+from app.runtime_config import ModelRoutingConfig
 
 logger = logging.getLogger(__name__)
 
 # Fallback if JSON formatting fails (aligned with asset_role_resolver budget).
 _MAX_ASSET_ROLES_FALLBACK_CHARS = 480_000
+
+
+# OpenAI Chat Completions validation:
+# - messages[*].name must match: ^[^\s<|\\/>]+$
+_OPENAI_FORBIDDEN_MESSAGE_NAME_CHARS = re.compile(r'[\s<|\\/>"]+')
+
+
+def _sanitize_openai_message_name(value: str | None, *, fallback: str = "agent", max_len: int = 64) -> str:
+    s = (value or "").strip()
+    if not s:
+        s = fallback
+    s = _OPENAI_FORBIDDEN_MESSAGE_NAME_CHARS.sub("_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        s = fallback
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("_") or fallback
+    return s
+
+
+def _openai_name_sanitization_middleware() -> Any | None:
+    """Sanitize BaseMessage.name before hitting OpenAI/LiteLLM.
+
+    This prevents 400 BadRequest errors when agent/user display names contain spaces,
+    e.g. "포트폴리오 분석 매니저".
+    """
+    try:
+        from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
+    except Exception:
+        return None
+
+    class OpenAINameSanitizationMiddleware(AgentMiddleware):
+        async def awrap_model_call(self, request: ModelRequest[Any], handler: Any) -> Any:
+            msgs = getattr(request, "messages", None)
+            if not isinstance(msgs, list) or not msgs:
+                return await handler(request)
+
+            changed = False
+            new_msgs: list[Any] = []
+            for m in msgs:
+                name = getattr(m, "name", None)
+                if isinstance(name, str) and name:
+                    safe = _sanitize_openai_message_name(name)
+                    if safe != name:
+                        changed = True
+                        # Prefer immutable copy when available, else mutate best-effort.
+                        if hasattr(m, "model_copy"):
+                            try:
+                                m = m.model_copy(update={"name": safe})
+                            except Exception:
+                                try:
+                                    setattr(m, "name", safe)
+                                except Exception:
+                                    pass
+                        elif hasattr(m, "copy"):
+                            try:
+                                m = m.copy(update={"name": safe})
+                            except Exception:
+                                try:
+                                    setattr(m, "name", safe)
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                setattr(m, "name", safe)
+                            except Exception:
+                                pass
+                new_msgs.append(m)
+
+            if not changed:
+                return await handler(request)
+            return await handler(request.override(messages=new_msgs))
+
+    return OpenAINameSanitizationMiddleware()
+
+
+def _openai_compatible_litellm_model_id(resolved_model_name: str) -> str:
+    """Map ``anthropic:claude-…`` (LangChain style) to the OpenAI ``model`` string sent to the proxy."""
+    s = (resolved_model_name or "").strip()
+    if ":" in s:
+        _, rest = s.split(":", 1)
+        return (rest.strip() or s).strip()
+    return s
+
+
+def _model_argument_for_deep_agent(
+    *,
+    model_name: str,
+    model_routing: ModelRoutingConfig | None,
+) -> Any:
+    """Return either a provider string for direct mode or a ``ChatOpenAI`` for proxy mode."""
+    if (
+        model_routing is not None
+        and model_routing.route_mode == "proxy"
+        and model_routing.openai_base_url
+        and model_routing.proxy_api_key
+    ):
+        from langchain_openai import ChatOpenAI
+
+        openai_model = _openai_compatible_litellm_model_id(model_routing.model_name)
+        return ChatOpenAI(
+            model=openai_model,
+            api_key=model_routing.proxy_api_key,
+            base_url=model_routing.openai_base_url,
+        )
+    return model_name
 
 
 def build_runtime_agent(
@@ -38,6 +146,7 @@ def build_runtime_agent(
     memory: list[str] | None = None,
     checkpointer: Any | None = None,
     store: Any | None = None,
+    model_routing: ModelRoutingConfig | None = None,
 ) -> CompiledStateGraph:
     """Create single deep agent runtime with middleware-first architecture."""
     effective_prompt = system_prompt or default_orchestrator_prompt()
@@ -48,9 +157,16 @@ def build_runtime_agent(
     # NOTE:
     # create_deep_agent() already injects TodoListMiddleware, FilesystemMiddleware,
     # and SubAgentMiddleware internally. Adding them again causes duplicate middleware errors.
+    try:
+        mw = _openai_name_sanitization_middleware()
+        if mw is not None:
+            middleware_list.append(mw)
+    except Exception:
+        logger.exception("Failed to attach OpenAI name sanitization middleware; continuing", exc_info=True)
 
+    model_arg = _model_argument_for_deep_agent(model_name=model_name, model_routing=model_routing)
     agent = create_deep_agent(
-        model=model_name,
+        model=model_arg,
         tools=all_tools,
         system_prompt=effective_prompt,
         subagents=subagents or [],
@@ -70,8 +186,10 @@ def build_runtime_agent(
                 "Ignoring invalid DEEP_AGENT_RECURSION_LIMIT=%r (expected int)",
                 lim_raw,
             )
+    _mode = (model_routing.route_mode if model_routing else "direct") or "direct"
     logger.info(
-        "Runtime agent created: model=%s subagents=%d tools=%d extra_middleware=%d memory_sources=%d",
+        "Runtime agent created: routing=%s model=%s subagents=%d tools=%d extra_middleware=%d memory_sources=%d",
+        _mode,
         model_name,
         len(subagents or []),
         len(root_tools),
@@ -99,8 +217,8 @@ def default_orchestrator_prompt() -> str:
         "구조화 산출물(가능하면 JSON)과 의미 있는 키 이름을 유지하세요: "
         "template_schema, process_facts, reference_facts, filled_template, artifact_file, public_url, "
         "deliverable_files, execution_trace. 마크다운만으로 끝내지 말고 **기계가 처리하기 쉬운 JSON**을 우선합니다.\n\n"
-        "`write_todos`·`write_pipeline_spec`은 선택적 메모/관찰용일 뿐이며, **실행의 중심이 아닙니다**. "
-        "실제 실행은 반드시 `task()` 디스패치로 진행합니다.\n\n"
+        "`write_todos`·`write_pipeline_spec`은 기본적으로 선택적 메모/관찰용이며, **실행의 중심은 `task()`** 입니다. "
+        "(HTTP 채팅에서 정책상 플랜 선행이 강제되는 경우는 예외.)\n\n"
         "매핑 시 근거가 없는 셀 값을 지어내지 말고, 빈칸·missing_reason·evidence_status를 남깁니다.\n\n"
         "HITL: `request_human_input()`은 최후 수단입니다.\n\n"
         "산출물이 파일(xlsx 등)이면 샌드박스/업로드 도구로 **public URL**까지 확보하고, "
@@ -276,6 +394,7 @@ def build_orchestrator(
     memory: list[str] | None = None,
     checkpointer: Any | None = None,
     store: Any | None = None,
+    model_routing: ModelRoutingConfig | None = None,
 ) -> CompiledStateGraph:
     """Backward compatible alias for runtime agent builder."""
     return build_runtime_agent(
@@ -289,5 +408,6 @@ def build_orchestrator(
         memory=memory,
         checkpointer=checkpointer,
         store=store,
+        model_routing=model_routing,
     )
 

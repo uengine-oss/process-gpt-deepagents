@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -172,6 +174,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         request: ChatRequest,
         *,
         stream_emit: Any | None = None,
+        stream_event_emit: Any | None = None,
     ) -> ChatResponse:
         t0 = time.time()
         tenant_id = (request.tenant_id or "").strip()
@@ -228,9 +231,10 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
 
         if stream_emit is not None:
             extras["_http_chat_stream_emit"] = stream_emit
-            # tool 이벤트를 SSE로 보내기 위한 emitter (sync callable)
+        if stream_event_emit is not None:
+            # tool/plan 이벤트를 SSE로 보내기 위한 emitter (sync callable)
             # - DeepAgentsExecutor 내부에서 호출되며, http_chat이 루프에 안전하게 전달한다.
-            extras["_http_chat_stream_event_emit"] = request.metadata.get("_http_chat_stream_event_emit") if isinstance(request.metadata, dict) else None
+            extras["_http_chat_stream_event_emit"] = stream_event_emit
 
         set_context(
             task_id=conv_id,
@@ -305,7 +309,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             hj = _extract_bearer_jwt(http_request)
             if hj:
                 request = request.model_copy(update={"user_jwt": hj})
-        return await _run_chat(request, stream_emit=None)
+        return await _run_chat(request, stream_emit=None, stream_event_emit=None)
 
     @app.post("/chat/stream")
     async def chat_stream(http_request: Request, request: ChatRequest) -> EventSourceResponse:
@@ -316,6 +320,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         token_count = 0
         tool_event_count = 0
         token_preview_parts: list[str] = []
+        streamed_token_parts: list[str] = []
         streamed_tool_events: list[dict[str, Any]] = []
 
         async def emit_token(delta: str) -> None:
@@ -325,6 +330,9 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             token_count += 1
             if len(token_preview_parts) < 12:
                 token_preview_parts.append(delta)
+            # Keep the full streamed token sequence so we can reconstruct the final answer
+            # even when the graph fails to produce a usable ChatResponse.response.
+            streamed_token_parts.append(delta)
             await q.put({"type": "token", "content": delta})
 
         def emit_tool_event(evt: dict[str, Any]) -> None:
@@ -354,16 +362,13 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                     if hj:
                         req0 = req0.model_copy(update={"user_jwt": hj})
                 req2 = req0.model_copy(update={"conversation_id": conv_id})
-                # tool emitter를 metadata에 임시 주입(요청 객체는 불변이므로 model_copy로 전달)
-                md = dict(req2.metadata or {})
-                md["_http_chat_stream_event_emit"] = emit_tool_event
-                req2 = req2.model_copy(update={"metadata": md})
                 # token/tool 이벤트를 DeepAgentsExecutor로 전달
                 # - token: async (그래프 values 스트림에서 await)
                 # - tool: sync (도구 호출 가드/훅에서 call_soon_threadsafe)
                 outcome["response"] = await _run_chat(
                     req2,
                     stream_emit=emit_token,
+                    stream_event_emit=emit_tool_event,
                 )
             except HTTPException as he:
                 outcome["http_error"] = {"status_code": he.status_code, "detail": he.detail}
@@ -374,12 +379,38 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                 await q.put({"type": "_internal_done"})
 
         async def event_generator():
+            # Save SSE events to workspace logs for easier debugging.
+            # Format: one JSON object per line (jsonl), matching the SSE `data` payloads.
+            sse_log_fp: Any = None
+            sse_log_path = ""
+            try:
+                day = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+                base_dir = os.path.join(os.getcwd(), "logs", day)
+                os.makedirs(base_dir, exist_ok=True)
+                sse_log_path = os.path.join(base_dir, f"chat-stream-{conv_id}.jsonl")
+                sse_log_fp = open(sse_log_path, "a", encoding="utf-8")
+            except Exception:
+                sse_log_fp = None
+                sse_log_path = ""
+
+            def _log_evt(evt: dict[str, Any]) -> None:
+                if sse_log_fp is None:
+                    return
+                try:
+                    sse_log_fp.write(json.dumps(evt, ensure_ascii=False) + "\n")
+                    sse_log_fp.flush()
+                except Exception:
+                    # Never break streaming due to logging issues.
+                    pass
+
             # 표준 SSE 형식 (요구사항):
             # - event 필드 없이 data만 사용 (event: ... 라인 제거)
             # - 매 메시지는 data: {JSON 한 줄} 1개만 전송
             # - 프롬프트/프리플라이트 텍스트는 보내지 않음
             # - 토큰·예정(plan_*)·실행(tool_*)·run_meta·done 순 (plan_* 는 호출 직전 예고)
-            yield {"data": json.dumps({"type": "meta", "conversation_id": conv_id}, ensure_ascii=False)}
+            meta_evt = {"type": "meta", "conversation_id": conv_id}
+            _log_evt(meta_evt)
+            yield {"data": json.dumps(meta_evt, ensure_ascii=False)}
             task = asyncio.create_task(runner())
             try:
                 while True:
@@ -393,6 +424,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                             streamed_tool_events.append(evt)
                         except Exception:
                             pass
+                    _log_evt(evt)
                     yield {"data": json.dumps(evt, ensure_ascii=False)}
             finally:
                 await task
@@ -430,25 +462,30 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                         meta_payload["skill_calls"] = skill_calls
             except Exception:
                 logger.exception("run_meta extraction failed", exc_info=True)
+            _log_evt(meta_payload)
             yield {"data": json.dumps(meta_payload, ensure_ascii=False)}
             if "http_error" in outcome:
                 done_err = json.dumps(outcome["http_error"], ensure_ascii=False)
+                done_evt = {
+                    "type": "done",
+                    "content": ensure_trailing_newline(done_err),
+                }
+                _log_evt(done_evt)
                 yield {
                     "data": json.dumps(
-                        {
-                            "type": "done",
-                            "content": ensure_trailing_newline(done_err),
-                        },
+                        done_evt,
                         ensure_ascii=False,
                     )
                 }
             elif "error" in outcome:
+                done_evt = {
+                    "type": "done",
+                    "content": ensure_trailing_newline(str(outcome["error"])),
+                }
+                _log_evt(done_evt)
                 yield {
                     "data": json.dumps(
-                        {
-                            "type": "done",
-                            "content": ensure_trailing_newline(str(outcome["error"])),
-                        },
+                        done_evt,
                         ensure_ascii=False,
                     )
                 }
@@ -462,10 +499,15 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                 done_text = unwrap_output_wrapper_result_text(done_text).strip()
                 done_text = strip_leading_workitem_echo_for_sse(done_text).lstrip()
                 if not done_text:
-                    # 실행은 되었지만 응답 추출이 비었을 때의 안전장치 (클라이언트가 빈 done을 받으면 UX가 깨짐)
-                    done_text = "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다."
+                    # Prefer the actual streamed tokens over a generic fallback.
+                    streamed_full = "".join(streamed_token_parts).strip()
+                    streamed_full = unwrap_output_wrapper_result_text(streamed_full).strip()
+                    streamed_full = strip_leading_workitem_echo_for_sse(streamed_full).lstrip()
+                    done_text = streamed_full or "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다."
                 done_text = ensure_trailing_newline(done_text)
-                yield {"data": json.dumps({"type": "done", "content": done_text}, ensure_ascii=False)}
+                done_evt = {"type": "done", "content": done_text}
+                _log_evt(done_evt)
+                yield {"data": json.dumps(done_evt, ensure_ascii=False)}
                 logger.info(
                     "[http_chat] stream_done | conv_id=%s tenant_id=%s tokens=%d tool_events=%d preview=%r",
                     conv_id,
@@ -474,6 +516,13 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                     tool_event_count,
                     "".join(token_preview_parts)[:240],
                 )
+            try:
+                if sse_log_fp is not None:
+                    sse_log_fp.close()
+                    if sse_log_path:
+                        logger.info("[http_chat] sse_log_saved | conv_id=%s path=%s", conv_id, sse_log_path)
+            except Exception:
+                pass
 
         # ping은 ": ping ..." 주석 라인으로 출력되어 data-only 파서에 방해가 될 수 있어 사실상 비활성화한다.
         # (sse-starlette 구현은 ping이 falsy면 기본값으로 되돌릴 수 있어, 매우 큰 값으로 설정)

@@ -6,8 +6,7 @@ import logging
 from typing import Any
 
 from .a2a_events import _enqueue_status
-from .json_safe import _json_safe
-from .tool_calls import _tool_call_args_from_request
+from .tool_calls import _json_safe, _tool_call_args_from_request
 from .workitem_text import _join_todo_contents
 
 logger = logging.getLogger(__name__)

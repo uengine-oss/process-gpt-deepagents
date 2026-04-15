@@ -1,1 +1,1 @@
-"""MCP / SafeToolLoader extensions (tagging, memento)."""
+"""MCP / SafeToolLoader extensions (tagging + env-based Memento)."""

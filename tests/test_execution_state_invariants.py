@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.executor.execution_state_invariants import strict_pipeline_state_violations
+from app.executor.execution_state_validator import strict_pipeline_state_violations
 
 
 def test_no_violation_when_outputs_present() -> None:

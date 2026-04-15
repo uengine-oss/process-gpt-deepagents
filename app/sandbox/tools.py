@@ -496,7 +496,7 @@ def sandbox_upload_file_to_public_storage(
     task_id = (task_id_var.get() or "").strip() or None
     proc_inst = (proc_inst_id_var.get() or "").strip() or None
 
-    from app.storage_public import (
+    from app.database import (
         build_deliverable_object_path,
         is_public_storage_upload_enabled,
         try_upload_bytes_to_public_files,
