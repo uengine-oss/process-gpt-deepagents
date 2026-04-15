@@ -63,7 +63,7 @@ jobs:
           cd gitops-repo
           
           # Update deepagents deployment image
-          yq eval '.spec.template.spec.containers[0].image = "'$IMAGE_NAME'"' -i deployments/deepagents-deployment.yaml
+          yq eval '.spec.template.spec.containers[0].image = "'$IMAGE_NAME'"' -i deployments/process-gpt-deepagents.yaml
           
           echo "Updated image to: $IMAGE_NAME"
 
