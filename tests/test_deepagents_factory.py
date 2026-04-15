@@ -40,7 +40,6 @@ class DeepAgentsFactoryTests(unittest.TestCase):
 
         routing = ModelRoutingConfig(
             model_name="anthropic:claude-opus-4-6",
-            embedding_model_name=None,
             route_mode="proxy",
             openai_base_url="http://litellm:4000/v1",
             proxy_api_key="sk-virtual",

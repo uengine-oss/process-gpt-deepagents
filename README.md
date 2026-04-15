@@ -51,7 +51,6 @@ A2A 이벤트 발행 (TaskStatusUpdateEvent / TaskArtifactUpdateEvent)
 | `MEMENTO_RETRIEVE_URL` | (선택) Memento 검색 API 베이스 URL; 미설정 시 로컬 도구 로더는 Memento를 주입하지 않음 |
 | `SKILLS_ROOT_DIR` | 스킬 파일 루트 경로 (예: `/app/skills`) |
 | `LLM_MODEL` | 기본 LLM 모델명 (예: `anthropic:claude-opus-4-6`). 프록시 모드에서는 게이트웨이가 기대하는 `model` 문자열에 맞추세요(보통 `anthropic:` 뒤 접미사가 OpenAI 호환 요청에 전달됨). |
-| `LLM_EMBEDDING_MODEL` | (선택) 임베딩 모델명 |
 | `LLM_PROXY_URL` | (선택) OpenAI 호환 게이트웨이 베이스 URL(`ChatOpenAI`의 `base_url` 그대로). 경로는 게이트웨이 문서대로. **URL만 있고 프록시 키가 없으면** 직접 Anthropic으로 폴백(`app/runtime_config.py`). |
 | `LLM_PROXY_API_KEY` | (선택) 프록시용 키. 없으면 `OPENAI_API_KEY`를 동일 용도로 사용. |
 | `ANTHROPIC_API_KEY` | 직접 Anthropic 호출(프록시 미사용·위 폴백 시). |
@@ -93,7 +92,7 @@ docker run --rm -p 8888:8888 \
 ## 커스터마이징
 
 - **모델**: `extras.model` 우선, 없으면 `LLM_MODEL` 사용(기본 `anthropic:claude-opus-4-6`)
-- **프록시(OpenAI 호환 게이트웨이)**: `LLM_MODEL`·`LLM_EMBEDDING_MODEL`·`LLM_PROXY_URL`·`LLM_PROXY_API_KEY` 다음에 `ANTHROPIC_API_KEY`·`OPENAI_API_KEY`를 두는 것을 권장(`.env.example`과 동일). `LLM_PROXY_URL` + (`LLM_PROXY_API_KEY` 또는 `OPENAI_API_KEY`)가 있으면 `langchain_openai.ChatOpenAI`로 붙고, **URL만 있고 둘 다 없으면** `resolve_model_routing`이 직접 Anthropic으로 폴백합니다. `LLM_PROXY_URL`은 가공하지 않습니다. Supabase `users.model`로 서브에이전트 모델만 바꿀 수 있으며, 프록시 경로에선 게이트웨이가 이해하는 `model` id여야 합니다.
+- **프록시(OpenAI 호환 게이트웨이)**: `LLM_MODEL`·`LLM_PROXY_URL`·`LLM_PROXY_API_KEY` 다음에 `ANTHROPIC_API_KEY`·`OPENAI_API_KEY`를 두는 것을 권장(`.env.example`과 동일). `LLM_PROXY_URL` + (`LLM_PROXY_API_KEY` 또는 `OPENAI_API_KEY`)가 있으면 `langchain_openai.ChatOpenAI`로 붙고, **URL만 있고 둘 다 없으면** `resolve_model_routing`이 직접 Anthropic으로 폴백합니다. `LLM_PROXY_URL`은 가공하지 않습니다. Supabase `users.model`로 서브에이전트 모델만 바꿀 수 있으며, 프록시 경로에선 게이트웨이가 이해하는 `model` id여야 합니다.
 - **시스템 프롬프트**: `extras.system_prompt`로 오케스트레이터 프롬프트 오버라이드
 - **에이전트**: Supabase `users` 테이블에 `is_agent=true`로 등록
   - `skills`: 쉼표 구분 스킬명 → 파일시스템 경로에서 SKILL.md 로딩

@@ -98,12 +98,67 @@ def _make_request_human_input_context_guard(
 ) -> Any:
     """Block orchestrator HITL until tenant mem0/memento/dmn_rule tools have been attempted (when configured)."""
 
+    def _looks_like_approval_or_sensitive_or_ambiguous(text: str) -> bool:
+        t = _normalize_text(text)
+        if not t:
+            return False
+        keywords = (
+            # 승인/결재/검토
+            "승인",
+            "결재",
+            "허가",
+            "검토",
+            "법무",
+            "법적",
+            "컴플라이언스",
+            "보안",
+            "리스크",
+            "권한",
+            "동의",
+            "서명",
+            # 민감정보/자격증명
+            "개인정보",
+            "pii",
+            "주민등록",
+            "여권",
+            "계좌",
+            "비밀번호",
+            "password",
+            "api key",
+            "apikey",
+            "token",
+            "secret",
+            "credential",
+            # 모호성/확정 필요
+            "모호",
+            "애매",
+            "불명확",
+            "확인 필요",
+            "choose",
+            "선택",
+        )
+        return any(k in t for k in keywords)
+
     def _guard(base_tool: Any, tool_input: Any) -> Any | None:
-        del tool_input
         if context_tool_tracker is None:
             return None
         if str(getattr(base_tool, "name", "") or "") != "request_human_input":
             return None
+        # 승인/민감/모호 작업은 컨텍스트 도구 선행 호출 여부와 무관하게 즉시 HITL을 허용한다.
+        # (잘못된 자율 진행이 리스크가 크거나, 인간 승인 자체가 목표인 경우)
+        try:
+            q = ""
+            c = ""
+            if isinstance(tool_input, dict):
+                args = tool_input.get("args") if isinstance(tool_input.get("args"), dict) else tool_input
+                if isinstance(args, dict):
+                    q = str(args.get("question") or "")
+                    c = str(args.get("context") or "")
+            if _looks_like_approval_or_sensitive_or_ambiguous(f"{q}\n{c}".strip()):
+                return None
+        except Exception:
+            # 가드는 보수적으로 동작해야 하므로 예외 시 차단 로직으로 진행
+            pass
         missing = _missing_context_for_hitl(context_tool_tracker)
         if not missing:
             return None
@@ -113,7 +168,8 @@ def _make_request_human_input_context_guard(
             "message": (
                 "테넌트에 연결된 지식·기억·규칙 도구(mem0/memento/dmn_rule)를 아직 호출하지 않았습니다. "
                 "먼저 task()로 적절한 서브에이전트에 위임하여 해당 도구들을 호출한 뒤, "
-                "그래도 부족할 때만 request_human_input 을 사용하세요."
+                "그 결과로도 확정할 수 없는 정보가 남을 때 request_human_input 을 사용하세요. "
+                "단, 승인/민감/모호 작업은 즉시 request_human_input 을 사용해도 됩니다."
             ),
             "requires_human": False,
         }

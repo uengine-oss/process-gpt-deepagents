@@ -220,7 +220,7 @@ def default_orchestrator_prompt() -> str:
         "`write_todos`·`write_pipeline_spec`은 기본적으로 선택적 메모/관찰용이며, **실행의 중심은 `task()`** 입니다. "
         "(HTTP 채팅에서 정책상 플랜 선행이 강제되는 경우는 예외.)\n\n"
         "매핑 시 근거가 없는 셀 값을 지어내지 말고, 빈칸·missing_reason·evidence_status를 남깁니다.\n\n"
-        "HITL: `request_human_input()`은 최후 수단입니다.\n\n"
+        "HITL: `request_human_input()`은 승인/민감/모호 등 **사람 판단이 필요한 경우에 호출**합니다(단순 정보 누락은 도구로 1회 이상 시도 후).\n\n"
         "산출물이 파일(xlsx 등)이면 샌드박스/업로드 도구로 **public URL**까지 확보하고, "
         "폼 출력이면 필수 키만 담은 **단일 JSON 객체**로 답합니다. "
         "**draft_file 등 파일 필드에는 .bpmn 입력 경로를 넣지 마세요.** 업로드된 산출물 URL만 사용합니다.\n"

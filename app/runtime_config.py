@@ -23,7 +23,6 @@ class ModelRoutingConfig:
     """Resolved model + routing mode for the current execution."""
 
     model_name: str
-    embedding_model_name: str | None
     route_mode: str  # "direct" | "proxy"
     openai_base_url: str | None
     proxy_api_key: str | None
@@ -38,7 +37,6 @@ def resolve_model_routing(
     extras: dict[str, Any] | None,
     *,
     default_model: str = "anthropic:claude-opus-4-6",
-    default_embedding_model: str | None = None,
     policy: str = "warn_fallback",
 ) -> ModelRoutingConfig:
     """Resolve model name and whether to use an OpenAI-compatible LLM proxy (LiteLLM, etc.)."""
@@ -46,8 +44,6 @@ def resolve_model_routing(
     payload = extras or {}
     # Environment model is the primary source of truth; extras.model is fallback only.
     model_name = str(os.environ.get("LLM_MODEL") or payload.get("model") or default_model)
-    embedding_model_env = (os.environ.get("LLM_EMBEDDING_MODEL") or "").strip()
-    embedding_model = embedding_model_env or default_embedding_model
 
     # Normalize short model names to an explicit provider prefix.
     if ":" not in model_name:
@@ -64,7 +60,6 @@ def resolve_model_routing(
         )
         return ModelRoutingConfig(
             model_name=model_name,
-            embedding_model_name=embedding_model,
             route_mode="proxy",
             openai_base_url=proxy_url.rstrip("/"),
             proxy_api_key=proxy_key,
@@ -81,7 +76,6 @@ def resolve_model_routing(
     logger.info("LLM routing resolved: mode=direct model=%s", model_name)
     return ModelRoutingConfig(
         model_name=model_name,
-        embedding_model_name=embedding_model,
         route_mode="direct",
         openai_base_url=None,
         proxy_api_key=None,
