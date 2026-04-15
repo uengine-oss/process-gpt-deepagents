@@ -36,9 +36,10 @@ services:
 
   # Builds from ./Dockerfile; CMD runs `python deepagents_server.py` (repo root copied to /app).
   deepagents:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    image: ghcr.io/uengine-oss/process-gpt-deepagents:latest
     container_name: deepagents
     ports:
       - "8888:8888"
@@ -47,12 +48,11 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - SKILLS_ROOT_DIR=/app/skills
-      # GitHub 카탈로그 스킬은 볼륨에 없을 수 있음 — sandbox_copy_mounted_skill 이 HTTP로 물리화할 때 사용
-      - PROCESSGPT_SKILLS_API_BASE_URL=http://claude-skills:8765
-      # .env 의 SUPABASE_URL(127.0.0.1) 대신 호스트 Supabase CLI API
-      - SUPABASE_URL=http://host.docker.internal:54321
       - DB_HOST=host.docker.internal
+      - PROCESSGPT_SKILLS_API_BASE_URL=http://host.docker.internal:8765
+      - SUPABASE_URL=http://host.docker.internal:54321
       - LLM_PROXY_URL=http://host.docker.internal:4000
+      - MEMENTO_RETRIEVE_URL=http://host.docker.internal:8005/retrieve
     env_file:
       - .env
     volumes:
