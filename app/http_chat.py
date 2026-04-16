@@ -94,9 +94,12 @@ def _format_workitem_query(message: str, request: ChatRequest) -> str:
     base: Dict[str, Any] = request.model_dump(exclude={"metadata"})
     base["metadata"] = meta
     input_obj: Dict[str, Any] = base
+    # NOTE: Attachment handling is enforced via runtime policy flags (routing/guardrails),
+    # not by injecting hardcoded instruction text into the model prompt here.
+    msg0 = (message or "").strip()
     return (
         "[Description]\nHTTP 채팅 요청\n\n"
-        f"[Instruction]\n{message.strip()}\n\n"
+        f"[Instruction]\n{msg0}\n\n"
         f"[InputData]\n{json.dumps(input_obj, ensure_ascii=False)}"
     )
 

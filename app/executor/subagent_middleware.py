@@ -41,6 +41,7 @@ def _create_subagent_event_middleware(
     structured_skill_handoff_by_job: dict[str, dict[str, Any]] | None = None,
     on_before_subagent_start: Any | None = None,
     planning_gate: dict[str, Any] | None = None,
+    route_gate: dict[str, Any] | None = None,
 ) -> tuple[Any | None, dict[str, Any]]:
     """Create middleware that emits task_started/task_completed around each subagent (task tool) run.
 
@@ -105,6 +106,39 @@ def _create_subagent_event_middleware(
             tool_name = getattr(getattr(request, "tool", None), "name", None)
             if tool_name != "task":
                 return await handler(request)
+
+            # Normalize subagent identifiers to reduce avoidable task() failures.
+            # Models often emit human-friendly names with spaces; our registry keys frequently use underscores.
+            try:
+                args0 = dict(_tool_call_args_from_request(request))
+                sub0 = args0.get("subagent_type") or args0.get("subagent_name")
+                if isinstance(sub0, str) and sub0.strip():
+                    normalized = sub0.strip().replace("-", "_").replace(" ", "_")
+                    if normalized != sub0:
+                        if "subagent_type" in args0:
+                            args0["subagent_type"] = normalized
+                        elif "subagent_name" in args0:
+                            args0["subagent_name"] = normalized
+                        request = _request_with_merged_tool_args(request, args0)
+            except Exception:
+                # Never break task execution due to normalization errors.
+                pass
+
+            # HTTP chat routing: task() is only allowed when route=needs_task.
+            if isinstance(route_gate, dict):
+                route = str(route_gate.get("route") or "").strip()
+                if route and route != "needs_task":
+                    return _blocked_task_tool_message(
+                        request,
+                        {
+                            "error": "task_not_allowed",
+                            "message": (
+                                f"현재 라우팅은 `{route}` 입니다. "
+                                "`task()`는 `needs_task` 라우팅에서만 허용됩니다."
+                            ),
+                            "requires_human": False,
+                        },
+                    )
 
             if planning_gate is not None and not (
                 planning_gate.get("saw_write_todos") or planning_gate.get("saw_write_pipeline_spec")

@@ -9,7 +9,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any
+from typing import Any, Mapping
 
 from typing_extensions import override
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -80,10 +80,13 @@ from app.executor.execution_state_validator import (
     validate_native_execution_contract,
 )
 from app.executor.input_assets import build_asset_inventory, collect_input_assets
-from app.executor.asset_role_resolver import resolve_asset_roles
+from app.executor.asset_role_resolver import format_pipeline_asset_roles_for_system_prompt, resolve_asset_roles
+from app.executor.compact_tool_result_middleware import create_compact_tool_result_middleware
+from app.executor.oss_channel_tool_call_middleware import create_oss_channel_tool_call_middleware
 from app.executor.pipeline_spec_middleware import create_pipeline_spec_middleware
 from app.executor.deep_required_root_gate_middleware import _create_deep_required_root_gate_middleware
 from app.executor.planning_middleware import _create_write_todos_planning_middleware
+from app.executor.http_chat_route_middleware import create_http_chat_route_middleware
 from app.executor.subagent_middleware import (
     _create_subagent_event_middleware,
     _emit_subagent_timeline_fallback,
@@ -138,6 +141,142 @@ def _truthy_env(name: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw in ("1", "true", "yes", "y", "on")
+
+
+# HTTP chat: work-assistant MCP tools on the *root* orchestrator must stay small.
+# OpenAI/LiteLLM counts tool *schemas* toward input tokens; dozens of MCP tools can exceed
+# small-context models (~21k tokens) even when the system prompt string is short.
+_HTTP_CHAT_WORK_ASSISTANT_SCHEMA_WEIGHT_BUDGET = 18_000
+_HTTP_CHAT_MAX_WORK_ASSISTANT_ROOT_TOOLS = 8
+
+
+def _is_work_assistant_mcp_tool_obj(obj: Any) -> bool:
+    srv = str(getattr(obj, "_mcp_server", "") or "").strip().lower().replace("_", "-")
+    return srv == "work-assistant" or srv.endswith("work-assistant")
+
+
+def _http_chat_tool_schema_weight(t: Any) -> int:
+    """Rough size proxy for a tool's contribution to the ChatCompletions payload."""
+    name = str(getattr(t, "name", "") or "")
+    desc = str(getattr(t, "description", "") or "")[:8000]
+    try:
+        if hasattr(t, "get_input_jsonschema"):
+            sch = t.get_input_jsonschema()
+            js = json.dumps(sch, ensure_ascii=False, separators=(",", ":"))
+        else:
+            js = ""
+    except Exception:
+        js = ""
+    return len(name) + len(desc) + len(js)
+
+
+def select_http_chat_root_work_assistant_tools(all_tools_list: list[Any] | None) -> list[Any]:
+    """Pick a bounded subset of work-assistant tools (smallest schemas first) for HTTP chat root."""
+    wa = [t for t in (all_tools_list or []) if _is_work_assistant_mcp_tool_obj(t)]
+    if not wa:
+        logger.info("http_chat root work-assistant tools: none available from tool loader")
+        return []
+    wa_sorted = sorted(wa, key=_http_chat_tool_schema_weight)
+    selected: list[Any] = []
+    total_w = 0
+    for t in wa_sorted:
+        w = _http_chat_tool_schema_weight(t)
+        if len(selected) >= _HTTP_CHAT_MAX_WORK_ASSISTANT_ROOT_TOOLS:
+            break
+        if selected and total_w + w > _HTTP_CHAT_WORK_ASSISTANT_SCHEMA_WEIGHT_BUDGET:
+            break
+        selected.append(t)
+        total_w += w
+    if not selected:
+        t0 = wa_sorted[0]
+        selected = [t0]
+        total_w = _http_chat_tool_schema_weight(t0)
+    logger.info(
+        "http_chat root work-assistant tools: selected=%d/%d schema_weight=%d budget=%d cap=%d names=%s",
+        len(selected),
+        len(wa),
+        total_w,
+        _HTTP_CHAT_WORK_ASSISTANT_SCHEMA_WEIGHT_BUDGET,
+        _HTTP_CHAT_MAX_WORK_ASSISTANT_ROOT_TOOLS,
+        [getattr(x, "name", type(x).__name__) for x in selected],
+    )
+    return selected
+
+
+def merge_http_chat_identity_into_work_assistant_args(
+    args: dict[str, Any],
+    *,
+    input_data: Mapping[str, Any] | dict[str, Any] | None,
+    row: Mapping[str, Any] | dict[str, Any] | None,
+    extras: Mapping[str, Any] | dict[str, Any] | None,
+    tenant_id: str | None,
+) -> dict[str, Any]:
+    """Fill work-assistant MCP tool args from HTTP chat InputData when the model omits them."""
+    out = dict(args)
+    idata = dict(input_data or {})
+    r = dict(row or {})
+    ex = dict(extras or {})
+    tid = (
+        str(tenant_id or "").strip()
+        or str(idata.get("tenant_id") or "").strip()
+        or str(r.get("tenant_id") or "").strip()
+    )
+    jwt = str(idata.get("user_jwt") or ex.get("user_jwt") or "").strip()
+    uid = str(idata.get("user_uid") or r.get("user_id") or ex.get("user_uid") or "").strip()
+    eml = str(idata.get("user_email") or "").strip()
+    if not eml:
+        ne = ex.get("notify_user_emails")
+        if isinstance(ne, list) and ne:
+            eml = str(ne[0] or "").strip()
+
+    def _set(key: str, val: str) -> None:
+        if not val:
+            return
+        cur = out.get(key)
+        if cur is None or (isinstance(cur, str) and not cur.strip()):
+            out[key] = val
+
+    _set("tenant_id", tid)
+    _set("user_jwt", jwt)
+    _set("user_uid", uid)
+    _set("user_email", eml)
+    # get_current_user 등 일부 도구는 email 파라미터를 사용한다.
+    _set("email", eml)
+    return out
+
+
+def make_http_chat_work_assistant_tool_input_augmenter(
+    *,
+    input_data: dict[str, Any],
+    row: dict[str, Any],
+    extras: dict[str, Any],
+    tenant_id: str | None,
+) -> Any:
+    """Return augmenter for _instrument_tools: merge chat identity into work-assistant tool calls."""
+
+    def _aug(base_tool: Any, tool_input: Any) -> Any:
+        if not _is_work_assistant_mcp_tool_obj(base_tool):
+            return tool_input
+        merged = _coerce_tool_input_dict(tool_input)
+        if not isinstance(merged, dict):
+            return tool_input
+        raw_args = merged.get("args")
+        if not isinstance(raw_args, dict):
+            raw_args = {}
+        else:
+            raw_args = dict(raw_args)
+        new_args = merge_http_chat_identity_into_work_assistant_args(
+            raw_args,
+            input_data=input_data,
+            row=row,
+            extras=extras,
+            tenant_id=tenant_id,
+        )
+        out = dict(merged)
+        out["args"] = new_args
+        return out
+
+    return _aug
 
 
 def _http_chat_tool_calls_summary(subagent_tool_log: dict[str, list[str]]) -> list[dict[str, Any]]:
@@ -775,7 +914,14 @@ class DeepAgentsExecutor(AgentExecutor):
             except Exception:
                 logger.exception("Failed to enqueue resume event", exc_info=True)
 
-        invoke_user_text = (query or "").strip()
+        # CRITICAL:
+        # - HTTP chat builds `query` as a work-item template that includes full `[InputData]` JSON.
+        # - Passing the full query to the model can explode tokens even when the user message is short.
+        # - For HTTP chat, use only the parsed `[Instruction]` as the model-facing user text.
+        if http_chat:
+            invoke_user_text = str(instruction or "").strip()
+        else:
+            invoke_user_text = (query or "").strip()
         if hitl_resume and hitl_resume.get("answer"):
             invoke_user_text = (
                 f"{invoke_user_text}\n\n"
@@ -1444,6 +1590,30 @@ class DeepAgentsExecutor(AgentExecutor):
             user_text=f"{user_text_for_lang} {description} {instruction}".strip(),
         )
         asset_inventory = build_asset_inventory(collected_assets)
+        # HTTP chat policy flags (avoid prompt injection; enforce via routing/guardrails).
+        http_chat_policy: dict[str, Any] = {}
+        try:
+            _has_assets = bool(
+                isinstance(asset_inventory, dict) and int(asset_inventory.get("total_count") or 0) > 0
+            )
+            http_chat_policy = {
+                "has_input_assets": _has_assets,
+            }
+            if http_chat:
+                extras["http_chat_policy"] = dict(http_chat_policy)
+        except Exception:
+            http_chat_policy = {}
+        # Prompt-size instrumentation: helps identify sudden growth from long URLs / many assets.
+        try:
+            roles_blob_preview = format_pipeline_asset_roles_for_system_prompt(pipeline_asset_roles or {})
+            logger.info(
+                "prompt_budget: assets=%d asset_roles_chars=%d asset_inventory_chars=%d",
+                len(collected_assets or []),
+                len(roles_blob_preview or ""),
+                len(json.dumps(asset_inventory or {}, ensure_ascii=False)),
+            )
+        except Exception:
+            logger.exception("prompt_budget instrumentation failed", exc_info=True)
         initial_pipeline_outputs: dict[str, Any] = {}
         if asset_inventory:
             initial_pipeline_outputs["asset_inventory"] = asset_inventory
@@ -1483,20 +1653,29 @@ class DeepAgentsExecutor(AgentExecutor):
             agents=agent_rows,
             feedback=feedback_summary,
             form_info=form_info,
+            http_chat=http_chat,
             tenant_id=tenant_id or None,
             output_language=output_language,
             hitl_resume=hitl_resume,
             pipeline_asset_roles=pipeline_asset_roles,
         )
+        try:
+            logger.info("prompt_budget: system_prompt_chars=%d", len(system_prompt or ""))
+        except Exception:
+            pass
         if http_chat:
             system_prompt = (
                 f"{system_prompt}\n\n"
                 "[HTTP_CHAT_EXECUTION_RULES]\n"
+                "- 먼저 `write_http_chat_route(route=...)`로 라우팅을 선언하라. "
+                "route는 `work_assistant_only` / `needs_task` / `ask_user_first` 중 하나다.\n"
                 "- **work-assistant MCP 도구만**으로 요청을 끝까지 처리할 수 있으면, `task()`로 서브에이전트에 위임하지 말고 해당 MCP 도구 호출로 해결하라.\n"
                 "- 반대로 **work-assistant MCP 도구만으로는** 목표를 달성할 수 없다고 판단되면(예: 공개 시세·일반 웹 조회, 스킬 스크립트 실행, 샌드박스·코드 실행, MCP에 없는 전용 작업), "
                 "반드시 `task()`를 호출해 적절한 서브에이전트에게 실행을 위임하라. 루트에서 MCP 밖 작업을 추측·빈 문서만 읽는 방식으로 대체하지 마라.\n"
                 "- `write_todos`/`write_pipeline_spec`는 '중간 계획 제출'일 뿐이다. 계획을 제출했다면 같은 실행(run) 안에서 바로 실행(task/도구 호출)로 이어가고, 실행 결과를 근거로 최종 답변을 합성하라.\n"
                 "- 실행형 요청에서는 '불가능하다/연동이 없다'고 단정하기 전에, 반드시 최소 1회 이상 **work-assistant MCP 도구** 또는 `task()` 호출을 시도하고(실패하면 그 실패 근거를) 남겨라.\n"
+                "- 토큰 한도를 위해 루트에 노출되는 work-assistant MCP 도구는 **일부만** 포함될 수 있다. "
+                "필요한 도구가 없거나 MCP만으로 부족하면 `needs_task`로 라우팅한 뒤 `write_todos`/`write_pipeline_spec` 제출 후 `task()`로 서브에이전트에 위임하라.\n"
                 "- 실행 결과(도구/서브에이전트 출력)를 근거로 최종 답변을 합성하라. 추측으로 채우지 마라.\n"
             )
 
@@ -1532,6 +1711,12 @@ class DeepAgentsExecutor(AgentExecutor):
             "planning_completed_emitted": False,
             "saw_task_delegation": False,
         }
+        route_progress: dict[str, Any] = {"route": "", "reason": ""}
+        # Policy-based default routing: when attachments/assets are present, preselect `needs_task`
+        # so the run can delegate immediately without relying on prompt-injected instructions.
+        if http_chat and bool(http_chat_policy.get("has_input_assets")):
+            route_progress["route"] = "needs_task"
+            route_progress["reason"] = "input_assets_present"
         pipeline_spec_mw = create_pipeline_spec_middleware(
             event_queue=event_queue,
             proc_inst_id=proc_inst_id,
@@ -1548,9 +1733,12 @@ class DeepAgentsExecutor(AgentExecutor):
             exec_ctx=exec_ctx,
             planning_gate=planning_progress,
         )
-        # HTTP 채팅에서는 task() 호출 전 플랜 제출을 강제한다.
-        # (MCP만으로 해결되는 요청은 task()를 호출하지 않으므로 영향 없음)
-        enforce_write_todos_planning = bool(http_chat)
+        http_chat_route_mw = None
+        if http_chat:
+            http_chat_route_mw = create_http_chat_route_middleware(route_gate=route_progress)
+        # HTTP chat: when input assets exist, allow direct delegation to avoid hallucination loops.
+        # For asset-free requests, keep the planning gate to prevent root from using non-MCP tools prematurely.
+        enforce_write_todos_planning = bool(http_chat and not bool(http_chat_policy.get("has_input_assets")))
 
         def _planning_completed_flag() -> bool:
             # write_todos / write_pipeline_spec 미들웨어도 같은 dict 를 갱신한다(단일 소스).
@@ -1588,15 +1776,19 @@ class DeepAgentsExecutor(AgentExecutor):
             subagent_skill_log=subagent_skill_log,
             on_before_subagent_start=_before_subagent_start_callback,
             planning_gate=planning_progress if enforce_write_todos_planning else None,
+            route_gate=route_progress if http_chat else None,
         )
         extra_middleware: list[Any] = [SubagentJobScopeMiddleware()]
         deep_gate_mw = None
         if http_chat:
             deep_gate_mw = _create_deep_required_root_gate_middleware(
                 planning_gate=planning_progress,
+                route_gate=route_progress,
             )
         if deep_gate_mw is not None:
             extra_middleware.append(deep_gate_mw)
+        if http_chat_route_mw is not None:
+            extra_middleware.append(http_chat_route_mw)
         if pipeline_spec_mw is not None:
             extra_middleware.append(pipeline_spec_mw)
         if write_todos_planning_mw is not None:
@@ -1604,21 +1796,49 @@ class DeepAgentsExecutor(AgentExecutor):
         if subagent_event_middleware is not None:
             extra_middleware.append(subagent_event_middleware)
 
+        # gpt-oss 등 입력 상한이 빡봉한 프록시 모델: 도구 결과가 다음 턴 컨텍스트를 터뜨리지 않도록 축약.
+        # deepagents는 루트 middleware= 를 서브에이전트 그래프로 전달하지 않으므로, 동일 인스턴스를 spec에도 붙인다.
+        compact_tr_mw = create_compact_tool_result_middleware(model_name=model_name)
+        if compact_tr_mw is not None:
+            extra_middleware.append(compact_tr_mw)
+            for sa in subagents:
+                chain = sa.get("middleware")
+                if isinstance(chain, list):
+                    chain.append(compact_tr_mw)
+                else:
+                    sa["middleware"] = [compact_tr_mw]
+
+        # gpt-oss(LiteLLM): 채널/텍스트 형태의 도구 호출을 AIMessage.tool_calls 로 정규화 (compact 다음 = 모델에 가장 가까운 쪽).
+        oss_norm_mw = create_oss_channel_tool_call_middleware(model_name=model_name)
+        if oss_norm_mw is not None:
+            extra_middleware.append(oss_norm_mw)
+            for sa in subagents:
+                chain = sa.get("middleware")
+                if isinstance(chain, list):
+                    chain.append(oss_norm_mw)
+                else:
+                    sa["middleware"] = [oss_norm_mw]
+
         # Root orchestrator should have access to the same tenant/MCP tools as subagents,
         # plus sandbox deliverable upload tools when the user requests file creation.
         root_tools_for_orchestrator: list[Any] = []
-        try:
-            root_tools_for_orchestrator.extend(all_tools or [])
-        except Exception:
-            root_tools_for_orchestrator = list(all_tools) if all_tools else []
-        try:
-            root_tools_for_orchestrator.extend(list(get_sandbox_tools()))
-        except Exception:
-            logger.exception("Failed to attach sandbox tools to root orchestrator", exc_info=True)
-        try:
-            root_tools_for_orchestrator.extend(list(get_skill_resolution_tools()))
-        except Exception:
-            logger.exception("Failed to attach skill resolution tools to root orchestrator", exc_info=True)
+        if http_chat:
+            # HTTP chat: keep root MCP exposure bounded (tool schemas dominate input tokens).
+            # Include only a subset of work-assistant tools; delegate heavy work via `task()`.
+            root_tools_for_orchestrator = select_http_chat_root_work_assistant_tools(all_tools)
+        else:
+            try:
+                root_tools_for_orchestrator.extend(all_tools or [])
+            except Exception:
+                root_tools_for_orchestrator = list(all_tools) if all_tools else []
+            try:
+                root_tools_for_orchestrator.extend(list(get_sandbox_tools()))
+            except Exception:
+                logger.exception("Failed to attach sandbox tools to root orchestrator", exc_info=True)
+            try:
+                root_tools_for_orchestrator.extend(list(get_skill_resolution_tools()))
+            except Exception:
+                logger.exception("Failed to attach skill resolution tools to root orchestrator", exc_info=True)
 
         # De-duplicate by tool name to avoid LangChain duplicate tool errors.
         deduped_root_tools: list[Any] = []
@@ -1708,7 +1928,16 @@ class DeepAgentsExecutor(AgentExecutor):
                 tool_result_hook=_domain_tool_result_hook,
                 exec_ctx=exec_ctx,
                 event_queue=event_queue,
-                tool_input_augmenter=None,
+                tool_input_augmenter=(
+                    make_http_chat_work_assistant_tool_input_augmenter(
+                        input_data=input_data if isinstance(input_data, dict) else {},
+                        row=row if isinstance(row, dict) else {},
+                        extras=extras if isinstance(extras, dict) else {},
+                        tenant_id=str(tenant_id or "").strip() or None,
+                    )
+                    if http_chat
+                    else None
+                ),
                 tool_call_guard=_root_orchestrator_tool_call_guard,
                 context_tool_tracker=context_tool_tracker,
             )
@@ -2059,6 +2288,11 @@ class DeepAgentsExecutor(AgentExecutor):
                     if t.strip():
                         raw_text = t
                         break
+        # gpt-oss 계열이 "tool call"을 텍스트 스캐폴딩으로 남기는 경우,
+        # 이를 최종 답변으로 오인하면 사용자가 `<|start|>assistant...` 같은 쓰레기 패턴을 보게 된다.
+        # 스트리밍 누적 텍스트/다른 메시지로 fallback 될 수 있게 여기서는 비워준다.
+        if (raw_text or "").lstrip().startswith("<|") and "to=functions." in (raw_text or ""):
+            raw_text = ""
         if not (raw_text or "").strip() and isinstance(result, dict):
             # Streaming path fallback: use the cumulative streamed assistant text captured in
             # `_ainvoke_or_stream_values` when the final state messages are not reliable.
@@ -2513,6 +2747,35 @@ class DeepAgentsExecutor(AgentExecutor):
                 )
             else:
                 chat_body = (final_text or "").strip()
+            # Guardrail (HTTP chat + attachments):
+            # If we detected input assets but the run produced zero tool usage,
+            # any "summary" is almost certainly hallucinated (file was never downloaded/read).
+            # In this case, fail fast with a message that acknowledges the received file metadata
+            # instead of returning fabricated numbers or asking the user to re-upload.
+            try:
+                has_assets = bool(asset_inventory and isinstance(asset_inventory, dict) and asset_inventory.get("total_count"))
+                any_tool_usage = bool(orchestrator_tool_log) or any(bool(v) for v in (subagent_tool_log or {}).values())
+                if (not has_form) and has_assets and (not any_tool_usage):
+                    assets0 = asset_inventory.get("assets") if isinstance(asset_inventory, dict) else None
+                    # Keep this short to avoid token blowups; include only the first few paths.
+                    paths: list[str] = []
+                    if isinstance(assets0, list):
+                        for a in assets0[:5]:
+                            if isinstance(a, dict):
+                                p = a.get("path")
+                                if isinstance(p, str) and p.strip():
+                                    paths.append(p.strip())
+                    received_hint = "\n".join(f"- {p}" for p in paths) if paths else "(경로 정보 없음)"
+                    chat_body = (
+                        "첨부파일 메타데이터는 전달되었지만, 이번 실행에서 파일을 다운로드/읽는 도구 실행이 0회라서 "
+                        "내용 기반 요약을 생성할 수 없습니다.\n\n"
+                        "수신한 파일(일부):\n"
+                        f"{received_hint}\n\n"
+                        "다시 시도할 때는 `write_http_chat_route(route=\"needs_task\")` → `write_todos` → `task(...)`로 "
+                        "첨부파일을 실제로 읽은 뒤, 그 근거로 요약을 작성해야 합니다."
+                    )
+            except Exception:
+                pass
             if not has_form and not (chat_body or "").strip():
                 # Prefer the actual streamed assistant text over a generic fallback message.
                 # This preserves partial answers even when the run fails to produce a final_text.

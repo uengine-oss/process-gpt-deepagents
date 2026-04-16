@@ -58,6 +58,7 @@ def _is_work_assistant_mcp_tool(base_tool: Any) -> bool:
 def _create_deep_required_root_gate_middleware(
     *,
     planning_gate: dict[str, Any],
+    route_gate: dict[str, Any] | None = None,
 ) -> Any | None:
     """플랜 제출 전·서브에이전트 위임 전에 루트 전용 도구(스킬/파일/샌드박스 등)를 막는다."""
     if AgentMiddleware is None:
@@ -69,6 +70,56 @@ def _create_deep_required_root_gate_middleware(
             tool_name = str(getattr(base_tool, "name", None) or "").strip()
             tc = _tool_call_as_dict(request)
             tool_call_id = str(tc.get("id") or "").strip()
+
+            # HTTP chat: require explicit routing declaration first.
+            route = ""
+            if isinstance(route_gate, dict):
+                route = str(route_gate.get("route") or "").strip()
+            if not route:
+                if tool_name in ("write_http_chat_route", "ask_user") or tool_name in _HITL_TOOL_NAMES:
+                    return await handler(request)
+                return _tool_message_json(
+                    {
+                        "error": "route_declaration_required",
+                        "message": (
+                            "HTTP 채팅에서는 먼저 `write_http_chat_route(route=...)`로 실행 라우팅을 선언해야 합니다. "
+                            "필요하면 `ask_user`로 의도를 확인하세요."
+                        ),
+                    },
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                )
+
+            # Route=work_assistant_only: only allow work-assistant MCP (and ask_user/HITL).
+            if route == "work_assistant_only":
+                if _is_work_assistant_mcp_tool(base_tool) or tool_name in ("ask_user", "write_http_chat_route"):
+                    return await handler(request)
+                if tool_name in _HITL_TOOL_NAMES:
+                    return await handler(request)
+                return _tool_message_json(
+                    {
+                        "error": "work_assistant_only",
+                        "message": (
+                            "이 요청은 `work_assistant_only` 라우팅으로 선언되었습니다. "
+                            "`task()` 및 MCP(work-assistant) 밖 도구 호출은 허용되지 않습니다."
+                        ),
+                    },
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                )
+
+            # Route=ask_user_first: must ask user first (or re-declare route).
+            if route == "ask_user_first":
+                if tool_name in ("ask_user", "write_http_chat_route") or tool_name in _HITL_TOOL_NAMES:
+                    return await handler(request)
+                return _tool_message_json(
+                    {
+                        "error": "ask_user_first",
+                        "message": "이 요청은 `ask_user_first` 라우팅입니다. 먼저 `ask_user`로 의도를 확인하세요.",
+                    },
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                )
 
             planned = bool(
                 planning_gate.get("saw_write_todos") or planning_gate.get("saw_write_pipeline_spec")

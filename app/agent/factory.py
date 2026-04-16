@@ -25,7 +25,7 @@ from app.runtime_config import ModelRoutingConfig
 logger = logging.getLogger(__name__)
 
 # Fallback if JSON formatting fails (aligned with asset_role_resolver budget).
-_MAX_ASSET_ROLES_FALLBACK_CHARS = 480_000
+_MAX_ASSET_ROLES_FALLBACK_CHARS = 80_000
 
 
 # OpenAI Chat Completions validation:
@@ -236,6 +236,7 @@ def build_orchestrator_system_prompt(
     agents: list[dict[str, Any]] | None,
     feedback: str | None,
     form_info: Mapping[str, Any] | None,
+    http_chat: bool = False,
     tenant_id: str | None = None,
     output_language: str | None = None,
     hitl_resume: Mapping[str, str] | None = None,
@@ -310,12 +311,15 @@ def build_orchestrator_system_prompt(
     agent_lines: list[str] = []
     for ag in agents or []:
         name = ag.get("alias") or ag.get("username") or ag.get("name") or str(ag.get("id"))
-        role = ag.get("role") or "Unspecified role"
-        skills = ag.get("skills") or ""
-        tools = ag.get("tools") or ""
-        agent_lines.append(
-            f"- Agent '{name}': role={role}, skills={skills or '(none)'}, tools={tools or '(none)'}"
-        )
+        if http_chat:
+            agent_lines.append(f"- {name}")
+        else:
+            role = ag.get("role") or "Unspecified role"
+            skills = ag.get("skills") or ""
+            tools = ag.get("tools") or ""
+            agent_lines.append(
+                f"- Agent '{name}': role={role}, skills={skills or '(none)'}, tools={tools or '(none)'}"
+            )
     if agent_lines:
         parts.append(
             "=== 섹션 2: 사용 가능한 서브에이전트/스킬(`task()`로 호출) ===\n"

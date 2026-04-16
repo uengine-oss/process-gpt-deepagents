@@ -37,6 +37,13 @@ def _path_or_url_from_obj(obj: dict[str, Any]) -> str:
     for k in (
         "fullPath",
         "full_path",
+        # Common chat/file payload shapes (Supabase / ProcessGPT UI)
+        "publicUrl",
+        "public_url",
+        "fileUrl",
+        "file_url",
+        "signedUrl",
+        "signed_url",
         "url",
         "href",
         "path",

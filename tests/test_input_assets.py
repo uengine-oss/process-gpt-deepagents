@@ -70,3 +70,19 @@ def test_collect_extra_assets_full_path_key():
     )
     assert len(out) == 1
     assert out[0]["path"] == "https://cdn.example/a.pdf"
+
+
+def test_collect_extra_assets_fileurl_publicurl_keys():
+    out = collect_input_assets(
+        input_data={},
+        extra_text="",
+        extra_assets=[
+            {"fileUrl": "https://storage.example/uploads/1.pdf"},
+            {"publicUrl": "https://storage.example/public/2.pdf"},
+        ],
+    )
+    paths = [x["path"] for x in out]
+    assert paths == [
+        "https://storage.example/uploads/1.pdf",
+        "https://storage.example/public/2.pdf",
+    ]

@@ -37,7 +37,15 @@ spec:
                   name: anthropic-secret
                   key: ANTHROPIC_API_KEY
             - name: LLM_MODEL
-              value: "anthropic:claude-opus-4-6"
+              value: "gpt-5"
+            - name: LLM_PROXY_URL
+              value: "http://litellm-proxy:4000"
+            - name: LLM_PROXY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-proxy-secret
+                  key: LLM_PROXY_API_KEY
+                  optional: true
             - name: SKILLS_ROOT_DIR
               value: "/app/skills"
             - name: SANDBOX_BASE_DIR

@@ -10,10 +10,13 @@ from typing import Any, Literal, Mapping
 
 logger = logging.getLogger(__name__)
 
-# System prompt budget for 섹션 1a (compact JSON). The previous 12k char cut dropped late assets (e.g. PDFs after BPMNs).
-_MAX_ASSET_ROLES_PROMPT_CHARS = 480_000
+# System prompt budget for 섹션 1a (compact JSON).
+#
+# NOTE: This blob is injected into the orchestrator system prompt. Keep it bounded to
+# avoid context overflow on smaller models (e.g. ~21k token gpt-oss variants).
+_MAX_ASSET_ROLES_PROMPT_CHARS = 80_000
 # If still over budget, shorten individual paths but keep every asset row.
-_PATH_SOFT_CAP = 1800
+_PATH_SOFT_CAP = 400
 
 AssetRole = Literal[
     "template_candidate",
