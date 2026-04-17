@@ -175,8 +175,23 @@ def _extract_plain_text(value: Any) -> str:
         return "\n".join(p for p in parts if p)
     if isinstance(value, dict):
         text = value.get("text") or value.get("content")
-        if isinstance(text, str):
+        if isinstance(text, str) and text.strip():
             return text
+        # 모델이 평문 대신 `{"output":{"status","result"}}` 만 반환하는 경우가 많다.
+        # 이 dict에는 `text`/`content` 키가 없어 기존 로직이 ""를 내고, 상위 fallback이
+        # Human(사용자 질문) 메시지를 최종 답으로 잘못 고르는 버그가 생긴다.
+        out = value.get("output")
+        if isinstance(out, dict):
+            r = out.get("result")
+            if isinstance(r, str) and r.strip():
+                return r
+            if isinstance(r, (dict, list)):
+                try:
+                    return json.dumps(r, ensure_ascii=False)
+                except Exception:
+                    return str(r)
+            if r is not None and str(r).strip():
+                return str(r)
     return ""
 
 

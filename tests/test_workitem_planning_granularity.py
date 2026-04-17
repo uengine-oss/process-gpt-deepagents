@@ -21,6 +21,23 @@ class TestNormalizedTodoEntries(unittest.TestCase):
         self.assertEqual(_join_todo_contents(raw), "a\nb")
 
 
+class TestExtractPlainTextOutputWrapper(unittest.TestCase):
+    def test_json_string_yields_result_prose(self) -> None:
+        from app.executor.workitem_text import _extract_plain_text
+
+        inner = "조직도 요약입니다.\n- 팀 A"
+        blob = json.dumps({"output": {"status": "SUCCESS", "result": inner}}, ensure_ascii=False)
+        self.assertEqual(_extract_plain_text(blob), inner)
+
+    def test_dict_with_output_result(self) -> None:
+        from app.executor.workitem_text import _extract_plain_text
+
+        self.assertEqual(
+            _extract_plain_text({"output": {"status": "SUCCESS", "result": "답"}}),
+            "답",
+        )
+
+
 class TestWorkitemEchoStreamCut(unittest.TestCase):
     def test_strips_template_then_answer(self) -> None:
         from app.executor.workitem_text import strip_leading_workitem_echo_for_sse

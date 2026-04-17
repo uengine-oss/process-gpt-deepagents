@@ -40,7 +40,7 @@ from app.sandbox.output_delivery import (
     sandbox_output_paths_discard_task,
     take_sandbox_output_paths_task,
 )
-from app.sandbox.tools import collect_open_workspace_paths_for_globs, get_sandbox_tools
+from app.sandbox.tools import collect_task_open_workspace_paths_for_globs, get_sandbox_tools
 from app.runtime_config import ModelRoutingConfig, resolve_model_routing
 from app.skills.resolution_tools import get_skill_resolution_tools
 from app.skills.volume_subagent_scope_middleware import SubagentJobScopeMiddleware
@@ -2283,6 +2283,9 @@ class DeepAgentsExecutor(AgentExecutor):
                 # Fallback: some runs end with ToolMessage/Command-like messages where the useful
                 # text is not on the last assistant turn. Pick the last non-empty content from any message.
                 for m in reversed(final_messages):
+                    role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+                    if str(role or "").lower() in ("user", "human"):
+                        continue
                     c = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
                     t = _extract_plain_text(c)
                     if t.strip():
@@ -2528,7 +2531,10 @@ class DeepAgentsExecutor(AgentExecutor):
             }
 
         tracked_paths = take_sandbox_output_paths_task(task_id)
-        scanned_paths = collect_open_workspace_paths_for_globs(default_artifact_globs())
+        # IMPORTANT: Restrict artifact scanning to sandbox workspaces used by this task.
+        # Previously we scanned *all* still-open workspaces, which could leak unrelated
+        # files (e.g. PDFs from prior requests) into the current chat response.
+        scanned_paths = collect_task_open_workspace_paths_for_globs(str(task_id), default_artifact_globs())
         loaded_files = collect_readable_artifacts(tracked_paths, extra_paths=scanned_paths)
         file_manifest = enqueue_sandbox_file_artifacts(
             event_queue,

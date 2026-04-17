@@ -8,6 +8,7 @@ import logging
 import mimetypes
 import os
 import shlex
+import threading
 import uuid
 import urllib.request
 from typing import Any
@@ -31,6 +32,44 @@ from app.sandbox.runtime import LocalSandboxRuntime, SandboxWorkspace
 
 _RUNTIME = LocalSandboxRuntime()
 _WORKSPACES: dict[str, SandboxWorkspace] = {}
+
+_ws_lock = threading.Lock()
+_WORKSPACE_IDS_BY_TASK: dict[str, set[str]] = {}
+
+
+def _current_task_id() -> str:
+    try:
+        tid = str(task_id_var.get() or "").strip()
+    except Exception:
+        tid = ""
+    return tid
+
+
+def _note_workspace_for_current_task(workspace_id: str) -> None:
+    tid = _current_task_id()
+    wid = str(workspace_id or "").strip()
+    if not tid or not wid:
+        return
+    with _ws_lock:
+        bucket = _WORKSPACE_IDS_BY_TASK.setdefault(tid, set())
+        bucket.add(wid)
+
+
+def take_task_workspace_ids(task_id: str) -> set[str]:
+    """Return workspace ids created/used by this task (without clearing)."""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return set()
+    with _ws_lock:
+        return set(_WORKSPACE_IDS_BY_TASK.get(tid, set()) or set())
+
+
+def discard_task_workspace_ids(task_id: str) -> None:
+    tid = str(task_id or "").strip()
+    if not tid:
+        return
+    with _ws_lock:
+        _WORKSPACE_IDS_BY_TASK.pop(tid, None)
 
 
 def _skills_http_api_base_candidates() -> list[str]:
@@ -178,10 +217,12 @@ def _get_or_create_workspace(
     """
     ws = _WORKSPACES.get(workspace_id)
     if ws is not None:
+        _note_workspace_for_current_task(ws.workspace_id)
         return ws
     effective_job = (fallback_job_id or workspace_id or "").strip() or str(uuid.uuid4())
     ws = _RUNTIME.create_workspace(job_id=effective_job, agent_name=agent_name)
     _WORKSPACES[ws.workspace_id] = ws
+    _note_workspace_for_current_task(ws.workspace_id)
     return ws
 
 
@@ -191,6 +232,7 @@ def sandbox_create(job_id: str = "", agent_name: str = "subagent") -> dict[str, 
     effective_job = job_id.strip() or str(uuid.uuid4())
     ws = _RUNTIME.create_workspace(job_id=effective_job, agent_name=agent_name)
     _WORKSPACES[ws.workspace_id] = ws
+    _note_workspace_for_current_task(ws.workspace_id)
     return {"workspace_id": ws.workspace_id, "path": ws.path, "job_id": ws.job_id}
 
 
@@ -537,6 +579,18 @@ def sandbox_cleanup(workspace_id: str, keep_on_failure: bool = False) -> dict[st
     _RUNTIME.cleanup(ws, keep_on_failure=keep_on_failure)
     if not keep_on_failure:
         _WORKSPACES.pop(workspace_id, None)
+        # Best-effort: remove from any task buckets.
+        try:
+            wid = str(workspace_id or "").strip()
+            if wid:
+                with _ws_lock:
+                    for tid, bucket in list(_WORKSPACE_IDS_BY_TASK.items()):
+                        if wid in bucket:
+                            bucket.discard(wid)
+                        if not bucket:
+                            _WORKSPACE_IDS_BY_TASK.pop(tid, None)
+        except Exception:
+            pass
     return {"workspace_id": workspace_id, "cleaned": not keep_on_failure}
 
 
@@ -562,6 +616,36 @@ def collect_open_workspace_paths_for_globs(globs: list[str]) -> list[str]:
                         out.append(p)
             except Exception:
                 logger.exception("collect_open_workspace_paths_for_globs failed | glob=%s", pat)
+    return sorted(out)
+
+
+def collect_task_open_workspace_paths_for_globs(task_id: str, globs: list[str]) -> list[str]:
+    """Like collect_open_workspace_paths_for_globs, but restricted to workspaces used by this task."""
+    tid = str(task_id or "").strip()
+    if not tid:
+        return []
+    if not globs:
+        return []
+    workspace_ids = take_task_workspace_ids(tid)
+    if not workspace_ids:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for wid in sorted(workspace_ids):
+        ws = _WORKSPACES.get(wid)
+        if ws is None:
+            continue
+        for g in globs:
+            pat = (g or "").strip()
+            if not pat:
+                continue
+            try:
+                for p in _RUNTIME.collect_artifacts(ws, [pat]):
+                    if p not in seen:
+                        seen.add(p)
+                        out.append(p)
+            except Exception:
+                logger.exception("collect_task_open_workspace_paths_for_globs failed | task_id=%s glob=%s", tid, pat)
     return sorted(out)
 
 
