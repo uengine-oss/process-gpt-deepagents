@@ -2534,7 +2534,12 @@ class DeepAgentsExecutor(AgentExecutor):
         # IMPORTANT: Restrict artifact scanning to sandbox workspaces used by this task.
         # Previously we scanned *all* still-open workspaces, which could leak unrelated
         # files (e.g. PDFs from prior requests) into the current chat response.
-        scanned_paths = collect_task_open_workspace_paths_for_globs(str(task_id), default_artifact_globs())
+        # NOTE: For HTTP chat we must not treat downloaded *input* files as deliverables.
+        # We therefore disable broad workspace glob scanning and only rely on explicitly
+        # tracked sandbox outputs (note_sandbox_tool_output_paths) and explicit upload tool outputs.
+        scanned_paths: list[str] = []
+        if not http_chat:
+            scanned_paths = collect_task_open_workspace_paths_for_globs(str(task_id), default_artifact_globs())
         loaded_files = collect_readable_artifacts(tracked_paths, extra_paths=scanned_paths)
         file_manifest = enqueue_sandbox_file_artifacts(
             event_queue,
@@ -2563,19 +2568,10 @@ class DeepAgentsExecutor(AgentExecutor):
                 if isinstance(f.get("public_url"), str) and str(f["public_url"]).strip()
             ]
             if not has_form:
-                names = ", ".join(str(f.get("name") or "") for f in combined_manifest if f.get("name"))
-                extra = (
-                    f"\n\n[첨부 파일] {len(combined_manifest)}개: {names}"
-                    if names
-                    else f"\n\n[첨부 파일] {len(combined_manifest)}개"
-                )
-                link_lines = [f"- {e['name']}: {e['public_url']}" for e in link_entries]
-                if link_lines:
-                    extra += "\n\n다운로드(공개 링크):\n" + "\n".join(link_lines)
-                final_text = (final_text or "") + extra
-                final_result_payload["output"]["result"] = final_text.strip()
-                final_event_result = final_text.strip()
-            elif link_entries:
+                # Do not automatically append download links to the user-facing text.
+                # Links (when present) remain available in structured payloads / deliverable manifests.
+                pass
+            elif link_entries and (not http_chat):
                 final_result_payload = dict(final_result_payload)
                 final_result_payload["file_download_links"] = link_entries
                 if isinstance(final_event_result, dict):

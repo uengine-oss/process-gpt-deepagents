@@ -17,9 +17,19 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from app.agent.subagents import load_agents_from_db, load_tenant_agents_for_chat
+from app.inputdata_parser import extract_inputdata_from_message, merge_inputdata_into_chat_payload
 from app.executor.workitem_text import strip_leading_workitem_echo_for_sse
 from app.output_utils import ensure_trailing_newline, unwrap_output_wrapper_result_text
-from app.database import get_tenant_mcp_config
+from app.database import (
+    a_insert_chat_attachments,
+    a_insert_chat_message,
+    a_update_chat_message,
+    a_update_chat_room_context,
+    a_update_chat_room_last_message,
+    a_upsert_chat_room_start,
+    build_initial_chat_room_context,
+    get_tenant_mcp_config,
+)
 from deepagents_executor import DeepAgentsExecutor, MissingSubagentsConfigurationError
 from processgpt_agent_sdk.utils import set_agent_model
 from processgpt_agent_utils.utils.context_manager import set_context
@@ -35,6 +45,7 @@ class ChatRequest(BaseModel):
     user_name: str = Field(default="", description="사용자 이름")
     user_jwt: str = Field(default="", description="사용자 JWT (MCP/도구 연동용)")
     conversation_id: Optional[str] = Field(default=None, description="대화 ID")
+    message_uuid: Optional[str] = Field(default=None, description="(멱등키) 사용자 메시지 UUID. 중복 전송 시 같은 값 재사용")
     file: Optional[Dict[str, Any]] = Field(default=None, description="첨부 파일(단일)")
     files: List[Dict[str, Any]] = Field(default_factory=list, description="첨부 파일(다중)")
     file_count: int = Field(default=0, description="첨부 파일 개수")
@@ -102,6 +113,216 @@ def _format_workitem_query(message: str, request: ChatRequest) -> str:
         f"[Instruction]\n{msg0}\n\n"
         f"[InputData]\n{json.dumps(input_obj, ensure_ascii=False)}"
     )
+
+
+def _iso_now_z() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _thread_id_from_request_metadata(request: ChatRequest) -> str | None:
+    md = request.metadata if isinstance(request.metadata, dict) else {}
+    v = md.get("thread_id")
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _message_uuid_from_request_metadata(request: ChatRequest) -> str | None:
+    # Prefer explicit top-level field (recommended).
+    v0 = getattr(request, "message_uuid", None)
+    if v0 is not None:
+        s0 = str(v0).strip()
+        if s0:
+            return s0
+    md = request.metadata if isinstance(request.metadata, dict) else {}
+    v = md.get("message_uuid") or md.get("messageUuid") or md.get("messageUUID")
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _json_safe(x: Any) -> Any:
+    try:
+        return json.loads(json.dumps(x, ensure_ascii=False, default=str))
+    except Exception:
+        return str(x)
+
+
+def _build_user_chat_message_obj(request: ChatRequest, *, message_uuid: str) -> dict[str, Any]:
+    file_obj = request.file if isinstance(request.file, dict) else None
+    files = request.files if isinstance(request.files, list) else []
+    return {
+        "name": (request.user_name or "").strip() or "",
+        "role": "user",
+        "uuid": message_uuid,
+        "email": (request.user_email or "").strip() or None,
+        "images": [],
+        "content": (request.message or "").strip(),
+        "pdfFile": file_obj,
+        "pdfFiles": files,
+        "userName": (request.user_name or "").strip() or "",
+        "timeStamp": _iso_now_z(),
+    }
+
+
+def _build_assistant_chat_message_obj_full(
+    *,
+    done_evt: dict[str, Any] | None,
+    run_meta: dict[str, Any],
+    message_uuid: str,
+) -> dict[str, Any]:
+    content = ""
+    if isinstance(done_evt, dict) and isinstance(done_evt.get("content"), str):
+        content = str(done_evt.get("content") or "")
+    tool_calls = run_meta.get("tool_calls") if isinstance(run_meta, dict) else None
+    streamed_tool_events = run_meta.get("streamed_tool_events") if isinstance(run_meta, dict) else None
+    agent_logs: list[dict[str, Any]] = []
+    if isinstance(streamed_tool_events, list):
+        for e in streamed_tool_events:
+            if not isinstance(e, dict):
+                continue
+            agent_logs.append(
+                {
+                    "ts": _iso_now_z(),
+                    "level": "info",
+                    "detail": _json_safe(e),
+                    "message": f"{e.get('type')}: {e.get('tool')}",
+                    "category": "tool",
+                    "namespace": [],
+                }
+            )
+    plan_steps: list[str] = []
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                nm = str(tc.get("tool") or tc.get("name") or "").strip()
+                if nm:
+                    plan_steps.append(f"tool: {nm}")
+    agent_plan = {"steps": plan_steps, "summary": plan_steps[0] if plan_steps else ""}
+
+    return {
+        "name": "Process GPT Agent",
+        "role": "assistant",
+        "uuid": message_uuid,
+        "email": "agent:process-gpt-agent",
+        "agentId": "process-gpt-agent",
+        "content": content,
+        "profile": "/images/chat-icon.png",
+        "userName": "Process GPT Agent",
+        "agentLogs": agent_logs,
+        "agentPlan": agent_plan,
+        "isLoading": False,
+        "timeStamp": _iso_now_z(),
+        "toolCalls": tool_calls if isinstance(tool_calls, list) else [],
+    }
+
+
+def _build_assistant_placeholder_message_obj(*, message_uuid: str) -> dict[str, Any]:
+    return {
+        "name": "Process GPT Agent",
+        "role": "assistant",
+        "uuid": message_uuid,
+        "email": "agent:process-gpt-agent",
+        "agentId": "process-gpt-agent",
+        "content": "",
+        "profile": "/images/chat-icon.png",
+        "userName": "Process GPT Agent",
+        "agentLogs": [],
+        "agentPlan": {"steps": [], "summary": ""},
+        "isLoading": True,
+        "timeStamp": _iso_now_z(),
+        "toolCalls": [],
+    }
+
+
+async def await_http_chat_stream_runner(task: asyncio.Task[Any]) -> None:
+    """SSE 소비 측 취소가 있어도 ``runner``(에이전트 실행·터미널 이벤트 큐 적재)가 끝까지 수행되게 한다."""
+    await asyncio.shield(task)
+
+
+def _build_http_stream_terminal_events(
+    *,
+    conv_id: str,
+    request: ChatRequest,
+    outcome: dict[str, Any],
+    token_count: int,
+    tool_event_count: int,
+    streamed_tool_events: list[dict[str, Any]],
+    streamed_token_parts: list[str],
+    token_preview_parts: list[str],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """``run_meta`` + ``done`` 페이로드(SSE ``data`` JSON)를 생성한다. ``/chat/stream`` runner·제너레이터가 공유."""
+    meta_payload: dict[str, Any] = {
+        "type": "run_meta",
+        "conversation_id": conv_id,
+        "counts": {
+            "tokens": token_count,
+            "tool_events": tool_event_count,
+        },
+        "streamed_tool_events": list(streamed_tool_events),
+        "tool_calls": [],
+        "skill_calls": [],
+        "todos": [],
+    }
+    try:
+        md0 = request.metadata or {}
+        todos0 = md0.get("todos") if isinstance(md0, dict) else None
+        if isinstance(todos0, list):
+            meta_payload["todos"] = todos0
+    except Exception:
+        pass
+    try:
+        if "response" in outcome:
+            r = outcome["response"]
+            tool_calls = getattr(r, "tool_calls", None)
+            skill_calls = getattr(r, "skill_calls", None)
+            if isinstance(tool_calls, list):
+                meta_payload["tool_calls"] = tool_calls
+            if isinstance(skill_calls, list):
+                meta_payload["skill_calls"] = skill_calls
+    except Exception:
+        logger.exception("run_meta extraction failed", exc_info=True)
+
+    done_evt: dict[str, Any] | None = None
+    if "http_error" in outcome:
+        done_err = json.dumps(outcome["http_error"], ensure_ascii=False)
+        done_evt = {
+            "type": "done",
+            "content": ensure_trailing_newline(done_err),
+        }
+    elif "error" in outcome:
+        done_evt = {
+            "type": "done",
+            "content": ensure_trailing_newline(str(outcome["error"])),
+        }
+    elif "response" in outcome:
+        r = outcome["response"]
+        done_text = ""
+        if hasattr(r, "response"):
+            done_text = str(getattr(r, "response") or "")
+        else:
+            done_text = str(r)
+        done_text = unwrap_output_wrapper_result_text(done_text).strip()
+        done_text = strip_leading_workitem_echo_for_sse(done_text).lstrip()
+        if not done_text:
+            streamed_full = "".join(streamed_token_parts).strip()
+            streamed_full = unwrap_output_wrapper_result_text(streamed_full).strip()
+            streamed_full = strip_leading_workitem_echo_for_sse(streamed_full).lstrip()
+            done_text = streamed_full or "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다."
+        done_text = ensure_trailing_newline(done_text)
+        done_evt = {"type": "done", "content": done_text}
+        logger.info(
+            "[http_chat] stream_done | conv_id=%s tenant_id=%s tokens=%d tool_events=%d preview=%r",
+            conv_id,
+            (request.tenant_id or "").strip(),
+            token_count,
+            tool_event_count,
+            "".join(token_preview_parts)[:240],
+        )
+
+    return meta_payload, done_evt
 
 
 def _normalized_agent_ids(request: ChatRequest) -> list[str]:
@@ -184,6 +405,18 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         if not tenant_id:
             raise HTTPException(status_code=400, detail="tenant_id가 필요합니다.")
         conv_id = (request.conversation_id or "").strip() or str(uuid.uuid4())
+        # Support clients that embed `[InputData] {json...}` inside `message`.
+        # Never fail the request due to parse errors: if parsing fails we keep the original message.
+        cleaned_msg, embedded_input = extract_inputdata_from_message(request.message or "")
+        if embedded_input is not None:
+            merged_payload = merge_inputdata_into_chat_payload(request.model_dump(), embedded_input)
+            try:
+                request = ChatRequest(**merged_payload)
+            except Exception:
+                # Should not happen often; never break chat due to InputData.
+                logger.exception("InputData payload rebuild failed (ignored)", exc_info=True)
+        # Keep the user-facing instruction clean (without the big JSON blob).
+        request = request.model_copy(update={"message": cleaned_msg})
         msg = (request.message or "").strip()
         logger.info(
             "[http_chat] request received | conv_id=%s tenant_id=%s stream=%s msg_len=%d",
@@ -312,7 +545,80 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             hj = _extract_bearer_jwt(http_request)
             if hj:
                 request = request.model_copy(update={"user_jwt": hj})
-        return await _run_chat(request, stream_emit=None, stream_event_emit=None)
+        conv_id = (request.conversation_id or "").strip() or str(uuid.uuid4())
+        tenant_id = (request.tenant_id or "").strip()
+        has_file = isinstance(request.file, dict) or (isinstance(request.files, list) and len(request.files) > 0)
+        msg_uuid0 = _message_uuid_from_request_metadata(request)
+        try:
+            await a_upsert_chat_room_start(
+                tenant_id=tenant_id,
+                room_id=conv_id,
+                participants=[
+                    {
+                        "id": (request.user_uid or "").strip() or None,
+                        "email": (request.user_email or "").strip() or None,
+                        "profile": "/images/defaultUser.png",
+                        "is_agent": None,
+                        "username": (request.user_name or "").strip() or None,
+                        "agent_type": None,
+                    },
+                    {
+                        "id": "process-gpt-agent",
+                        "email": None,
+                        "profile": "/images/chat-icon.png",
+                        "is_agent": True,
+                        "username": "Process GPT Agent",
+                        "agent_type": "agent",
+                    },
+                ],
+                room_name=(request.message or "").strip() or None,
+                primary_agent_id=None,
+                context=build_initial_chat_room_context(has_file=has_file),
+            )
+            await a_insert_chat_attachments(
+                tenant_id=tenant_id,
+                room_id=conv_id,
+                user_name=(request.user_name or "").strip(),
+                file=request.file if isinstance(request.file, dict) else None,
+                files=request.files if isinstance(request.files, list) else None,
+            )
+            user_msg_uuid = msg_uuid0 or str(uuid.uuid4())
+            await a_insert_chat_message(
+                tenant_id=tenant_id,
+                room_id=conv_id,
+                thread_id=_thread_id_from_request_metadata(request),
+                message_obj=_build_user_chat_message_obj(request, message_uuid=user_msg_uuid),
+                message_uuid=user_msg_uuid,
+            )
+        except Exception:
+            logger.exception("HTTP chat(/chat): start DB writes failed (continuing)", exc_info=True)
+
+        resp = await _run_chat(request.model_copy(update={"conversation_id": conv_id}), stream_emit=None, stream_event_emit=None)
+        try:
+            asst_uuid = str(uuid.uuid4())
+            done_evt = {"type": "done", "content": ensure_trailing_newline(str(resp.response or ""))}
+            run_meta = {
+                "type": "run_meta",
+                "conversation_id": conv_id,
+                "tool_calls": resp.tool_calls,
+                "skill_calls": resp.skill_calls,
+                "streamed_tool_events": [],
+            }
+            await a_insert_chat_message(
+                tenant_id=tenant_id,
+                room_id=conv_id,
+                thread_id=_thread_id_from_request_metadata(request),
+                message_obj=_build_assistant_chat_message_obj_full(done_evt=done_evt, run_meta=run_meta, message_uuid=asst_uuid),
+                message_uuid=asst_uuid,
+            )
+            await a_update_chat_room_last_message(
+                tenant_id=tenant_id,
+                room_id=conv_id,
+                message={"msg": str(resp.response or ""), "type": "text", "createdAt": _iso_now_z()},
+            )
+        except Exception:
+            logger.exception("HTTP chat(/chat): completion DB writes failed (ignored)", exc_info=True)
+        return resp
 
     @app.post("/chat/stream")
     async def chat_stream(http_request: Request, request: ChatRequest) -> EventSourceResponse:
@@ -324,10 +630,73 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         tool_event_count = 0
         token_preview_parts: list[str] = []
         streamed_token_parts: list[str] = []
-        streamed_tool_events: list[dict[str, Any]] = []
+        # runner의 run_meta·DB persist와 동기화(큐 소비 전에도 스냅샷 가능)
+        captured_tool_events: list[dict[str, Any]] = []
+
+        tenant_id = (request.tenant_id or "").strip()
+        has_file = isinstance(request.file, dict) or (isinstance(request.files, list) and len(request.files) > 0)
+        # 요청 시작 시점 DB 반영(방 보장 → 첨부 → user 메시지). 실패해도 채팅 실행은 계속.
+        msg_uuid0 = _message_uuid_from_request_metadata(request)
+        assistant_row_uuid: str | None = None
+        assistant_msg_obj: dict[str, Any] | None = None
+        last_assistant_db_flush_t = 0.0
+        try:
+            await a_upsert_chat_room_start(
+                tenant_id=tenant_id,
+                room_id=conv_id,
+                participants=[
+                    {
+                        "id": (request.user_uid or "").strip() or None,
+                        "email": (request.user_email or "").strip() or None,
+                        "profile": "/images/defaultUser.png",
+                        "is_agent": None,
+                        "username": (request.user_name or "").strip() or None,
+                        "agent_type": None,
+                    },
+                    {
+                        "id": "process-gpt-agent",
+                        "email": None,
+                        "profile": "/images/chat-icon.png",
+                        "is_agent": True,
+                        "username": "Process GPT Agent",
+                        "agent_type": "agent",
+                    },
+                ],
+                room_name=(request.message or "").strip() or None,
+                primary_agent_id=None,
+                context=build_initial_chat_room_context(has_file=has_file),
+            )
+            await a_insert_chat_attachments(
+                tenant_id=tenant_id,
+                room_id=conv_id,
+                user_name=(request.user_name or "").strip(),
+                file=request.file if isinstance(request.file, dict) else None,
+                files=request.files if isinstance(request.files, list) else None,
+            )
+            user_msg_uuid = msg_uuid0 or str(uuid.uuid4())
+            await a_insert_chat_message(
+                tenant_id=tenant_id,
+                room_id=conv_id,
+                thread_id=_thread_id_from_request_metadata(request),
+                message_obj=_build_user_chat_message_obj(request, message_uuid=user_msg_uuid),
+                message_uuid=user_msg_uuid,
+            )
+            # Assistant placeholder row: inserted first, then updated progressively.
+            assistant_row_uuid = str(uuid.uuid4())
+            assistant_msg_obj = _build_assistant_placeholder_message_obj(message_uuid=assistant_row_uuid)
+            await a_insert_chat_message(
+                tenant_id=tenant_id,
+                room_id=conv_id,
+                thread_id=_thread_id_from_request_metadata(request),
+                message_obj=assistant_msg_obj,
+                message_uuid=assistant_row_uuid,
+            )
+        except Exception:
+            logger.exception("HTTP chat: start DB writes failed (continuing)", exc_info=True)
 
         async def emit_token(delta: str) -> None:
             nonlocal token_count
+            nonlocal last_assistant_db_flush_t
             if not delta:
                 return
             token_count += 1
@@ -337,6 +706,24 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             # even when the graph fails to produce a usable ChatResponse.response.
             streamed_token_parts.append(delta)
             await q.put({"type": "token", "content": delta})
+            # Progressive DB update for assistant placeholder (best-effort, throttled).
+            if assistant_row_uuid and assistant_msg_obj is not None:
+                now_t = time.time()
+                if now_t - last_assistant_db_flush_t >= 0.4:
+                    last_assistant_db_flush_t = now_t
+                    try:
+                        assistant_msg_obj["content"] = "".join(streamed_token_parts)
+                        assistant_msg_obj["isLoading"] = True
+                        asyncio.create_task(
+                            a_update_chat_message(
+                                tenant_id=tenant_id,
+                                message_uuid=assistant_row_uuid,
+                                message_obj=assistant_msg_obj,
+                            )
+                        )
+                    except Exception:
+                        # Never break streaming due to DB update.
+                        pass
 
         def emit_tool_event(evt: dict[str, Any]) -> None:
             """tool_* 이벤트는 tool 스레드에서 호출될 수 있으므로 루프에 안전하게 전달."""
@@ -346,6 +733,10 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             et = str(evt.get("type") or "")
             if et in ("tool_start", "tool_end"):
                 tool_event_count += 1
+                try:
+                    captured_tool_events.append(dict(evt))
+                except Exception:
+                    pass
             # Cross-thread 안전: run_coroutine_threadsafe로 큐 put 보장.
             try:
                 asyncio.run_coroutine_threadsafe(q.put(evt), loop)
@@ -379,6 +770,70 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                 outcome["error"] = str(e)
                 logger.exception("HTTP chat stream runner failed")
             finally:
+                # 클라이언트가 먼저 끊겨도(SSE 취소) 터미널 이벤트를 큐에 넣어 runner 쪽에서 일관되게 마친다.
+                try:
+                    meta_payload, done_evt = _build_http_stream_terminal_events(
+                        conv_id=conv_id,
+                        request=request,
+                        outcome=outcome,
+                        token_count=token_count,
+                        tool_event_count=tool_event_count,
+                        streamed_tool_events=captured_tool_events,
+                        streamed_token_parts=streamed_token_parts,
+                        token_preview_parts=token_preview_parts,
+                    )
+                    await q.put(meta_payload)
+                    if done_evt is not None:
+                        await q.put(done_evt)
+                    # 완료 시점 DB 반영(assistant 메시지 + room last message).
+                    try:
+                        # Finalize the existing assistant placeholder row when available.
+                        if assistant_row_uuid:
+                            final_obj = _build_assistant_chat_message_obj_full(
+                                done_evt=done_evt,
+                                run_meta=meta_payload,
+                                message_uuid=assistant_row_uuid,
+                            )
+                            # Preserve any partial content if done_evt is empty.
+                            if (
+                                (not isinstance(done_evt, dict) or not str(done_evt.get("content") or "").strip())
+                                and assistant_msg_obj is not None
+                                and isinstance(assistant_msg_obj.get("content"), str)
+                            ):
+                                final_obj["content"] = assistant_msg_obj.get("content") or ""
+                            final_obj["isLoading"] = False
+                            await a_update_chat_message(
+                                tenant_id=(request.tenant_id or "").strip(),
+                                message_uuid=assistant_row_uuid,
+                                message_obj=final_obj,
+                            )
+                        else:
+                            asst_uuid = str(uuid.uuid4())
+                            await a_insert_chat_message(
+                                tenant_id=(request.tenant_id or "").strip(),
+                                room_id=conv_id,
+                                thread_id=_thread_id_from_request_metadata(request),
+                                message_obj=_build_assistant_chat_message_obj_full(
+                                    done_evt=done_evt,
+                                    run_meta=meta_payload,
+                                    message_uuid=asst_uuid,
+                                ),
+                                message_uuid=asst_uuid,
+                            )
+                        if isinstance(done_evt, dict) and isinstance(done_evt.get("content"), str):
+                            await a_update_chat_room_last_message(
+                                tenant_id=(request.tenant_id or "").strip(),
+                                room_id=conv_id,
+                                message={
+                                    "msg": str(done_evt.get("content") or ""),
+                                    "type": "text",
+                                    "createdAt": _iso_now_z(),
+                                },
+                            )
+                    except Exception:
+                        logger.exception("HTTP chat: completion DB writes failed (continuing)", exc_info=True)
+                except Exception:
+                    logger.exception("HTTP chat stream terminal enqueue failed", exc_info=True)
                 await q.put({"type": "_internal_done"})
 
         async def event_generator():
@@ -420,105 +875,37 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                     evt = await q.get()
                     if evt.get("type") == "_internal_done":
                         break
-                    # tool 이벤트는 종료 시 요약 저장용으로도 수집해둔다.
-                    et = str(evt.get("type") or "")
-                    if et in ("tool_start", "tool_end"):
-                        try:
-                            streamed_tool_events.append(evt)
-                        except Exception:
-                            pass
+                    try:
+                        await a_update_chat_room_context(
+                            tenant_id=tenant_id,
+                            room_id=conv_id,
+                            evt=evt,
+                            has_file=has_file,
+                        )
+                    except Exception:
+                        logger.exception("HTTP chat: context DB update failed (ignored)", exc_info=True)
                     _log_evt(evt)
                     yield {"data": json.dumps(evt, ensure_ascii=False)}
             finally:
-                await task
-            # 스트림 종료 직전: 누적 요약(run_meta). 실시간 예정 목록은 plan_tools / plan_skills / plan_todos.
-            meta_payload: dict[str, Any] = {
-                "type": "run_meta",
-                "conversation_id": conv_id,
-                "counts": {
-                    "tokens": token_count,
-                    "tool_events": tool_event_count,
-                },
-                # streamed tool_start/tool_end (원문)
-                "streamed_tool_events": streamed_tool_events,
-                # executor가 최종적으로 모아준 요약 (가능한 경우)
-                "tool_calls": [],
-                "skill_calls": [],
-                "todos": [],
-            }
-            # 요청자가 제공한 todos(기획/체크리스트)를 그대로 반영할 수 있게 한다.
-            try:
-                md0 = request.metadata or {}
-                todos0 = md0.get("todos") if isinstance(md0, dict) else None
-                if isinstance(todos0, list):
-                    meta_payload["todos"] = todos0
-            except Exception:
-                pass
-            try:
-                if "response" in outcome:
-                    r = outcome["response"]
-                    tool_calls = getattr(r, "tool_calls", None)
-                    skill_calls = getattr(r, "skill_calls", None)
-                    if isinstance(tool_calls, list):
-                        meta_payload["tool_calls"] = tool_calls
-                    if isinstance(skill_calls, list):
-                        meta_payload["skill_calls"] = skill_calls
-            except Exception:
-                logger.exception("run_meta extraction failed", exc_info=True)
-            _log_evt(meta_payload)
-            yield {"data": json.dumps(meta_payload, ensure_ascii=False)}
-            if "http_error" in outcome:
-                done_err = json.dumps(outcome["http_error"], ensure_ascii=False)
-                done_evt = {
-                    "type": "done",
-                    "content": ensure_trailing_newline(done_err),
-                }
-                _log_evt(done_evt)
-                yield {
-                    "data": json.dumps(
-                        done_evt,
-                        ensure_ascii=False,
-                    )
-                }
-            elif "error" in outcome:
-                done_evt = {
-                    "type": "done",
-                    "content": ensure_trailing_newline(str(outcome["error"])),
-                }
-                _log_evt(done_evt)
-                yield {
-                    "data": json.dumps(
-                        done_evt,
-                        ensure_ascii=False,
-                    )
-                }
-            elif "response" in outcome:
-                r = outcome["response"]
-                done_text = ""
-                if hasattr(r, "response"):
-                    done_text = str(getattr(r, "response") or "")
-                else:
-                    done_text = str(r)
-                done_text = unwrap_output_wrapper_result_text(done_text).strip()
-                done_text = strip_leading_workitem_echo_for_sse(done_text).lstrip()
-                if not done_text:
-                    # Prefer the actual streamed tokens over a generic fallback.
-                    streamed_full = "".join(streamed_token_parts).strip()
-                    streamed_full = unwrap_output_wrapper_result_text(streamed_full).strip()
-                    streamed_full = strip_leading_workitem_echo_for_sse(streamed_full).lstrip()
-                    done_text = streamed_full or "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다."
-                done_text = ensure_trailing_newline(done_text)
-                done_evt = {"type": "done", "content": done_text}
-                _log_evt(done_evt)
-                yield {"data": json.dumps(done_evt, ensure_ascii=False)}
-                logger.info(
-                    "[http_chat] stream_done | conv_id=%s tenant_id=%s tokens=%d tool_events=%d preview=%r",
-                    conv_id,
-                    (request.tenant_id or "").strip(),
-                    token_count,
-                    tool_event_count,
-                    "".join(token_preview_parts)[:240],
-                )
+                await await_http_chat_stream_runner(task)
+                # 연결이 먼저 끊기면 위 while이 돌지 않아, runner가 finally에서 넣은 run_meta/done이 큐에만 남는다.
+                while True:
+                    try:
+                        pending = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if pending.get("type") == "_internal_done":
+                        break
+                    try:
+                        await a_update_chat_room_context(
+                            tenant_id=tenant_id,
+                            room_id=conv_id,
+                            evt=pending,
+                            has_file=has_file,
+                        )
+                    except Exception:
+                        logger.exception("HTTP chat: context DB update (flush) failed (ignored)", exc_info=True)
+                    _log_evt(pending)
             try:
                 if sse_log_fp is not None:
                     sse_log_fp.close()

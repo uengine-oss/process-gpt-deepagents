@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 import logging
 import os
 import re
@@ -205,6 +207,513 @@ def release_consumer_if_cancelled(*, todo_id: str, consumer: str | None) -> bool
     except Exception:
         logger.exception("release_consumer_if_cancelled failed todo_id=%s", tid, exc_info=True)
         return False
+
+
+# --- HTTP chat persistence (chat_rooms/chats/chat_attachments) ---
+
+_CHAT_FILE_PATH_KEYS: tuple[str, ...] = (
+    "fullPath",
+    "full_path",
+    "publicUrl",
+    "public_url",
+    "fileUrl",
+    "file_url",
+    "signedUrl",
+    "signed_url",
+    "url",
+    "href",
+    "path",
+    "file_path",
+    "filePath",
+    "uri",
+    "src",
+    "location",
+)
+
+
+def _json_normalize(obj: Any) -> Any:
+    """Best-effort JSONB-safe normalization (never raises)."""
+    try:
+        return json.loads(json.dumps(obj, ensure_ascii=False, default=str))
+    except Exception:
+        logger.exception("JSON-normalize failed (ignored)", exc_info=True)
+        return obj
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _extract_file_name(file_obj: dict[str, Any]) -> str | None:
+    for k in ("fileName", "name", "filename", "file_name"):
+        v = file_obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _extract_file_path(file_obj: dict[str, Any]) -> str | None:
+    for k in _CHAT_FILE_PATH_KEYS:
+        v = file_obj.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def build_chat_attachment_rows(
+    *,
+    tenant_id: str,
+    chat_room_id: str,
+    user_name: str,
+    file: dict[str, Any] | None,
+    files: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Convert request file payloads into `chat_attachments` insert rows."""
+    tid = (tenant_id or "").strip()
+    rid = (chat_room_id or "").strip()
+    if not tid or not rid:
+        return []
+
+    out: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
+    if isinstance(file, dict):
+        items.append(file)
+    if isinstance(files, list):
+        items.extend([x for x in files if isinstance(x, dict)])
+
+    # Dedup by (file_path, file_name) best-effort.
+    seen: set[str] = set()
+    for f in items:
+        fname = _extract_file_name(f)
+        fpath = _extract_file_path(f)
+        key = f"{fpath or ''}||{fname or ''}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "id": str(uuid.uuid4()),
+                "file_name": fname,
+                "file_path": fpath,
+                "chat_room_id": rid,
+                "user_name": (user_name or "").strip() or None,
+                "tenant_id": tid,
+            }
+        )
+    return _json_normalize(out)
+
+
+def _merge_participants(existing: Any, incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    base: list[dict[str, Any]] = []
+    if isinstance(existing, list):
+        for x in existing:
+            if isinstance(x, dict):
+                base.append(dict(x))
+
+    def _pid(p: dict[str, Any]) -> str:
+        return str(p.get("id") or "").strip()
+
+    by_id: dict[str, dict[str, Any]] = {_pid(p): p for p in base if _pid(p)}
+    for p in incoming:
+        pid = _pid(p)
+        if pid and pid in by_id:
+            by_id[pid] = {**by_id[pid], **p}
+        elif pid:
+            by_id[pid] = dict(p)
+        else:
+            base.append(dict(p))
+
+    # Stable ordering: existing order first, then new ones by insertion.
+    out: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for p in base:
+        pid = _pid(p)
+        if pid and pid in by_id and pid not in seen_ids:
+            out.append(by_id[pid])
+            seen_ids.add(pid)
+        elif not pid:
+            out.append(p)
+    for pid, p in by_id.items():
+        if pid and pid not in seen_ids:
+            out.append(p)
+            seen_ids.add(pid)
+    return out
+
+
+def build_initial_chat_room_context(*, has_file: bool) -> dict[str, Any]:
+    # Follow the observed frontend shape.
+    return _json_normalize(
+        {
+            "todos": [],
+            "tools": [],
+            "skills": [],
+            # NOTE: keep the established production keys only.
+            "enabled": {"todos": False, "tools": True, "skills": False},
+            "updatedAt": _now_iso(),
+            "orchestration": "deepagents",
+        }
+    )
+
+
+def _tool_plan_to_context_tools(tools: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(tools, list):
+        return out
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("id") or "").strip()
+        name = str(t.get("name") or "").strip()
+        tool = str(t.get("tool") or "").strip()
+        disp = t.get("displayName") if isinstance(t.get("displayName"), str) else None
+        if disp is None and isinstance(t.get("display_name"), str):
+            disp = t.get("display_name")
+        disp = disp.strip() if isinstance(disp, str) and disp.strip() else ""
+        if not (tid or name or tool):
+            continue
+        out.append(
+            {
+                "id": tid or None,
+                "name": name,
+                "tool": tool,
+                "status": "planned",
+                "displayName": disp or name or tool,
+            }
+        )
+    return out
+
+
+def merge_chat_room_context_from_event(existing: Any, evt: dict[str, Any]) -> dict[str, Any] | None:
+    """Pure merge: take current `context` and one SSE event -> new context (or None if irrelevant)."""
+    if not isinstance(evt, dict):
+        return None
+    et = str(evt.get("type") or "").strip()
+    if et not in ("plan_tools", "plan_skills", "plan_todos", "tool_start", "tool_end"):
+        return None
+
+    ctx: dict[str, Any] = dict(existing) if isinstance(existing, dict) else build_initial_chat_room_context(has_file=False)
+    ctx.setdefault("todos", [])
+    ctx.setdefault("tools", [])
+    ctx.setdefault("skills", [])
+    ctx.setdefault("enabled", {"todos": False, "tools": True, "skills": False})
+    # Keep orchestration if present; do not force-inject for legacy rows.
+    if "orchestration" in ctx:
+        ctx["orchestration"] = str(ctx.get("orchestration") or "deepagents")
+    ctx["updatedAt"] = _now_iso()
+
+    # Upsert helpers
+    def upsert_list_by_id(lst: list[dict[str, Any]], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_id: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for x in lst:
+            if not isinstance(x, dict):
+                continue
+            xid = str(x.get("id") or "").strip()
+            if not xid:
+                continue
+            if xid not in by_id:
+                order.append(xid)
+            by_id[xid] = dict(x)
+        for x in items:
+            xid = str(x.get("id") or "").strip()
+            if not xid:
+                continue
+            if xid not in by_id:
+                order.append(xid)
+                by_id[xid] = dict(x)
+            else:
+                by_id[xid] = {**by_id[xid], **x}
+        return [by_id[i] for i in order if i in by_id]
+
+    if et == "plan_tools":
+        planned = _tool_plan_to_context_tools(evt.get("tools"))
+        cur_tools = ctx.get("tools") if isinstance(ctx.get("tools"), list) else []
+        cur_tools2 = [x for x in cur_tools if isinstance(x, dict)]
+        # Prefer id-based upsert; if missing ids, append.
+        with_ids = [x for x in planned if str(x.get("id") or "").strip()]
+        without_ids = [x for x in planned if not str(x.get("id") or "").strip()]
+        merged = upsert_list_by_id(cur_tools2, with_ids)
+        merged.extend(without_ids)
+        ctx["tools"] = merged
+        en = ctx.get("enabled") if isinstance(ctx.get("enabled"), dict) else {}
+        en = dict(en)
+        en["tools"] = True
+        ctx["enabled"] = en
+        return _json_normalize(ctx)
+
+    if et == "plan_skills":
+        skills = evt.get("skills")
+        if isinstance(skills, list):
+            cur = ctx.get("skills") if isinstance(ctx.get("skills"), list) else []
+            cur_s = [str(s).strip() for s in cur if isinstance(s, str) and str(s).strip()]
+            new_s = [str(s).strip() for s in skills if isinstance(s, str) and str(s).strip()]
+            ctx["skills"] = list(dict.fromkeys([*cur_s, *new_s]))
+            en = ctx.get("enabled") if isinstance(ctx.get("enabled"), dict) else {}
+            en = dict(en)
+            en["skills"] = bool(ctx["skills"])
+            ctx["enabled"] = en
+        return _json_normalize(ctx)
+
+    if et == "plan_todos":
+        todos = evt.get("todos")
+        if isinstance(todos, list):
+            ctx["todos"] = [x for x in todos if isinstance(x, dict)]
+            en = ctx.get("enabled") if isinstance(ctx.get("enabled"), dict) else {}
+            en = dict(en)
+            en["todos"] = bool(ctx["todos"])
+            ctx["enabled"] = en
+        return _json_normalize(ctx)
+
+    # tool_start/tool_end: best-effort map to tool status via tool id if present.
+    if et in ("tool_start", "tool_end"):
+        tool_name = str(evt.get("tool") or "").strip()
+        tool_obj = evt.get("input") if isinstance(evt.get("input"), dict) else {}
+        call_id = str(tool_obj.get("id") or "").strip()
+        status = "running" if et == "tool_start" else "done"
+        cur_tools = ctx.get("tools") if isinstance(ctx.get("tools"), list) else []
+        cur_tools2 = [x for x in cur_tools if isinstance(x, dict)]
+        updated = False
+        for x in cur_tools2:
+            xid = str(x.get("id") or "").strip()
+            if call_id and xid == call_id:
+                x["status"] = status
+                updated = True
+                break
+            # Fallback: match on tool name
+            if not call_id and tool_name and str(x.get("tool") or "").strip() == tool_name:
+                x["status"] = status
+                updated = True
+                break
+        if not updated and tool_name:
+            cur_tools2.append(
+                {
+                    "id": call_id or None,
+                    "name": str(tool_obj.get("name") or "").strip() or tool_name,
+                    "tool": tool_name,
+                    "status": status,
+                    "displayName": str(tool_obj.get("name") or "").strip() or tool_name,
+                }
+            )
+        ctx["tools"] = cur_tools2
+        en = ctx.get("enabled") if isinstance(ctx.get("enabled"), dict) else {}
+        en = dict(en)
+        en["tools"] = True
+        ctx["enabled"] = en
+        return _json_normalize(ctx)
+
+    return _json_normalize(ctx)
+
+
+def upsert_chat_room_start(
+    *,
+    tenant_id: str,
+    room_id: str,
+    participants: list[dict[str, Any]],
+    room_name: str | None,
+    primary_agent_id: str | None,
+    context: dict[str, Any],
+) -> None:
+    tid = (tenant_id or "").strip()
+    rid = (room_id or "").strip()
+    if not tid or not rid:
+        return
+    sb = get_supabase()
+    existing_resp = sb.table("chat_rooms").select("id,participants,name,primary_agent_id,context").eq("id", rid).execute()
+    existing = None
+    try:
+        rows = getattr(existing_resp, "data", None) or []
+        if rows and isinstance(rows, list) and isinstance(rows[0], dict):
+            existing = rows[0]
+    except Exception:
+        existing = None
+
+    merged_participants = _merge_participants(existing.get("participants") if isinstance(existing, dict) else None, participants)
+    name_final = (room_name or "").strip() or (str(existing.get("name") or "").strip() if isinstance(existing, dict) else "") or None
+    primary_final = (primary_agent_id or "").strip() or (
+        str(existing.get("primary_agent_id") or "").strip() if isinstance(existing, dict) else ""
+    ) or None
+    prev_ctx = existing.get("context") if isinstance(existing, dict) else None
+    ctx_final: dict[str, Any]
+    if isinstance(prev_ctx, dict):
+        ctx_final = {**prev_ctx, **(context if isinstance(context, dict) else {})}
+    else:
+        ctx_final = dict(context) if isinstance(context, dict) else build_initial_chat_room_context(has_file=False)
+    ctx_final = _json_normalize(ctx_final)
+
+    if isinstance(existing, dict) and existing.get("id"):
+        sb.table("chat_rooms").update(
+            {
+                "participants": _json_normalize(merged_participants),
+                "name": name_final,
+                "primary_agent_id": primary_final,
+                "context": ctx_final,
+                "tenant_id": tid,
+            }
+        ).eq("id", rid).execute()
+    else:
+        sb.table("chat_rooms").insert(
+            _json_normalize(
+                {
+                    "id": rid,
+                    "participants": merged_participants,
+                    "message": None,
+                    "name": name_final,
+                    "primary_agent_id": primary_final,
+                    "tenant_id": tid,
+                    "context": ctx_final,
+                }
+            )
+        ).execute()
+
+
+def update_chat_room_context(
+    *,
+    tenant_id: str,
+    room_id: str,
+    evt: dict[str, Any],
+    has_file: bool,
+) -> None:
+    tid = (tenant_id or "").strip()
+    rid = (room_id or "").strip()
+    if not tid or not rid:
+        return
+    sb = get_supabase()
+    existing_resp = sb.table("chat_rooms").select("id,context").eq("id", rid).execute()
+    existing = None
+    try:
+        rows = getattr(existing_resp, "data", None) or []
+        if rows and isinstance(rows, list) and isinstance(rows[0], dict):
+            existing = rows[0]
+    except Exception:
+        existing = None
+    prev_ctx = existing.get("context") if isinstance(existing, dict) else None
+    ctx0 = prev_ctx if isinstance(prev_ctx, dict) else build_initial_chat_room_context(has_file=has_file)
+    ctx1 = merge_chat_room_context_from_event(ctx0, evt)
+    if ctx1 is None:
+        return
+    sb.table("chat_rooms").update({"context": ctx1}).eq("id", rid).execute()
+
+
+def update_chat_room_last_message(
+    *,
+    tenant_id: str,
+    room_id: str,
+    message: dict[str, Any] | None,
+) -> None:
+    tid = (tenant_id or "").strip()
+    rid = (room_id or "").strip()
+    if not tid or not rid:
+        return
+    if not isinstance(message, dict):
+        return
+    sb = get_supabase()
+    sb.table("chat_rooms").update({"message": _json_normalize(message)}).eq("id", rid).execute()
+
+
+def insert_chat_message(
+    *,
+    tenant_id: str,
+    room_id: str,
+    thread_id: str | None,
+    message_obj: dict[str, Any],
+    message_uuid: str | None = None,
+) -> str:
+    tid = (tenant_id or "").strip()
+    rid = (room_id or "").strip()
+    if not tid or not rid:
+        return ""
+    sb = get_supabase()
+    uid = (message_uuid or "").strip() or str(uuid.uuid4())
+    row = _json_normalize(
+        {
+            "uuid": uid,
+            "id": rid,
+            "messages": message_obj,
+            "tenant_id": tid,
+            "thread_id": (thread_id or "").strip() or None,
+        }
+    )
+    sb.table("chats").insert(row).execute()
+    return uid
+
+
+def update_chat_message(
+    *,
+    tenant_id: str,
+    message_uuid: str,
+    message_obj: dict[str, Any],
+) -> None:
+    """Update an existing `chats` row's `messages` JSONB by uuid (best-effort)."""
+    tid = (tenant_id or "").strip()
+    mid = (message_uuid or "").strip()
+    if not tid or not mid:
+        return
+    if not isinstance(message_obj, dict):
+        return
+    sb = get_supabase()
+    sb.table("chats").update({"messages": _json_normalize(message_obj), "tenant_id": tid}).eq("uuid", mid).execute()
+
+
+def insert_chat_attachments(
+    *,
+    tenant_id: str,
+    room_id: str,
+    user_name: str,
+    file: dict[str, Any] | None,
+    files: list[dict[str, Any]] | None,
+) -> list[str]:
+    rows = build_chat_attachment_rows(
+        tenant_id=tenant_id,
+        chat_room_id=room_id,
+        user_name=user_name,
+        file=file,
+        files=files,
+    )
+    if not rows:
+        return []
+    sb = get_supabase()
+    sb.table("chat_attachments").insert(rows).execute()
+    ids: list[str] = []
+    for r in rows:
+        if isinstance(r, dict) and isinstance(r.get("id"), str):
+            ids.append(r["id"])
+    return ids
+
+
+async def a_upsert_chat_room_start(**kwargs: Any) -> None:
+    import asyncio
+
+    await asyncio.to_thread(upsert_chat_room_start, **kwargs)
+
+
+async def a_update_chat_room_context(**kwargs: Any) -> None:
+    import asyncio
+
+    await asyncio.to_thread(update_chat_room_context, **kwargs)
+
+
+async def a_update_chat_room_last_message(**kwargs: Any) -> None:
+    import asyncio
+
+    await asyncio.to_thread(update_chat_room_last_message, **kwargs)
+
+
+async def a_insert_chat_message(**kwargs: Any) -> str:
+    import asyncio
+
+    return await asyncio.to_thread(insert_chat_message, **kwargs)
+
+
+async def a_update_chat_message(**kwargs: Any) -> None:
+    import asyncio
+
+    await asyncio.to_thread(update_chat_message, **kwargs)
+
+
+async def a_insert_chat_attachments(**kwargs: Any) -> list[str]:
+    import asyncio
+
+    return await asyncio.to_thread(insert_chat_attachments, **kwargs)
 
 
 # --- Public Storage (Supabase Storage ``files`` bucket + public URLs) ---

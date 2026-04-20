@@ -213,3 +213,41 @@ create table public.tenants (
   skills text[] null,
   constraint tenants_pkey primary key (id)
 ) TABLESPACE pg_default;
+
+
+create table if not exists public.chat_rooms (
+    id text not null,
+    participants jsonb not null,
+    message jsonb null,
+    name text null,
+    primary_agent_id text null,
+    tenant_id text null default public.tenant_id(),
+    context jsonb null,
+    constraint chat_rooms_pkey primary key (id),
+    constraint chat_rooms_tenant_id_fkey foreign key (tenant_id) references tenants (id) on update cascade on delete cascade
+) tablespace pg_default;
+
+create table if not exists public.chats (
+    uuid text not null,
+    id text not null,
+    messages jsonb null,
+    tenant_id text null default public.tenant_id(),
+    thread_id text null,
+    constraint chats_pkey primary key (uuid),
+    constraint chats_tenant_id_fkey foreign key (tenant_id) references tenants (id) on update cascade on delete cascade
+) tablespace pg_default;
+
+create table if not exists public.chat_attachments (
+    id text not null,
+    file_name text null,
+    file_path text null,
+    chat_room_id text null,
+    user_name text null,
+    created_at timestamp with time zone not null default now(),
+    tenant_id text null,
+    constraint chat_attachments_pkey primary key (id),
+    constraint chat_attachments_chat_room_id_fkey foreign KEY (chat_room_id) references chat_rooms (id) on update CASCADE on delete CASCADE,
+    constraint chat_attachments_tenant_id_fkey foreign KEY (tenant_id) references tenants (id)
+) TABLESPACE pg_default;
+
+
