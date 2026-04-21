@@ -11,6 +11,7 @@ import time
 import uuid
 from typing import Any, Mapping
 
+from langgraph.types import Command
 from typing_extensions import override
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -96,6 +97,10 @@ from app.executor.tenant_context import (
     _mcp_config_without_blocked_servers,
     _prefetch_tenant_context_once,
     _truncate_text,
+)
+from app.executor.postgres_checkpointer import (
+    get_async_postgres_checkpointer,
+    resolve_checkpoint_thread_id,
 )
 from app.executor.tool_instrumentation import (
     _coerce_tool_output_for_tool_node,
@@ -609,7 +614,12 @@ def _llm_stream_text_piece(msg: Any) -> str:
     return _extract_plain_text(c) if c not in (None, "") else ""
 
 
-async def _iter_http_chat_astream_parts(orchestrator: Any, state_input: dict[str, Any]) -> Any:
+async def _iter_http_chat_astream_parts(
+    orchestrator: Any,
+    state_input: Any,
+    *,
+    run_config: dict[str, Any] | None = None,
+) -> Any:
     """LangGraph astream을 ``values`` + ``messages``(토큰)로 통합하거나, 불가 시 ``values``만.
 
     Yields: ``{"kind": "values"|"messages", "data": ..., "dual": bool}``
@@ -621,12 +631,16 @@ async def _iter_http_chat_astream_parts(orchestrator: Any, state_input: dict[str
         {"stream_mode": ["values", "messages"], "version": "v2"},
         {"stream_mode": ["values", "messages"]},
     ]
+    stream_kw: dict[str, Any] = {}
+    if run_config is not None:
+        stream_kw["config"] = run_config
+
     for attempt in attempts:
         received = 0
         yielded = False
         first_bad: Any | None = None
         try:
-            async for part in orchestrator.astream(state_input, **attempt):
+            async for part in orchestrator.astream(state_input, **attempt, **stream_kw):
                 received += 1
                 pairs = _coerce_langgraph_stream_chunk(part)
                 if not pairs:
@@ -658,25 +672,30 @@ async def _iter_http_chat_astream_parts(orchestrator: Any, state_input: dict[str
             logger.info("HTTP chat: astream attempt %s failed: %s", attempt, e)
             continue
 
-    async for state in orchestrator.astream(state_input, stream_mode="values"):
+    async for state in orchestrator.astream(state_input, stream_mode="values", **stream_kw):
         yield {"kind": "values", "data": state, "dual": False}
 
 
 async def _ainvoke_or_stream_values(
     orchestrator: Any,
-    state_input: dict[str, Any],
+    state_input: Any,
     *,
     stream_emit: Any | None,
     http_stream_event_emit: Any | None = None,
     plan_tools_by_name: dict[str, Any] | None = None,
+    run_config: dict[str, Any] | None = None,
 ) -> Any:
     """Run graph; HTTP 스트림은 가능하면 LLM 토큰(messages) + 상태(values), 아니면 values만.
 
     - ``messages`` 모드: 모델이 스트리밍을 지원하면 답변이 작은 청크로 ``stream_emit``에 전달된다.
     - ``values`` 모드: ``plan_*`` 이벤트 및(폴백 시) 노드 단위 텍스트 델타.
     """
+    invoke_kw: dict[str, Any] = {}
+    if run_config is not None:
+        invoke_kw["config"] = run_config
+
     if stream_emit is None:
-        return await orchestrator.ainvoke(state_input)
+        return await orchestrator.ainvoke(state_input, **invoke_kw)
     prev_stream_len = 0
     msg_cumulative = ""
     msg_streamable_emitted_len = 0
@@ -686,7 +705,9 @@ async def _ainvoke_or_stream_values(
     emitted_tool_plan_sigs: set[str] = set()
     last_todos_sig: str | None = None
 
-    async for item in _iter_http_chat_astream_parts(orchestrator, state_input):
+    async for item in _iter_http_chat_astream_parts(
+        orchestrator, state_input, run_config=run_config
+    ):
         if item.get("dual"):
             any_dual_stream = True
 
@@ -777,7 +798,7 @@ async def _ainvoke_or_stream_values(
         final_state["_http_chat_streamed_text"] = streamed_cumulative
 
     if final_state is None:
-        return await orchestrator.ainvoke(state_input)
+        return await orchestrator.ainvoke(state_input, **invoke_kw)
     return final_state
 
 
@@ -808,6 +829,7 @@ class DeepAgentsExecutor(AgentExecutor):
         row = context_data.get("row", {})
         extras = context_data.get("extras", {})
         http_chat = bool(extras.get("http_chat"))
+        checkpoint_thread_id = resolve_checkpoint_thread_id(http_chat=http_chat, row=row)
 
         proc_inst_id = row.get("root_proc_inst_id") or row.get("proc_inst_id") or ""
         task_id = str(row.get("id") or "")
@@ -854,6 +876,26 @@ class DeepAgentsExecutor(AgentExecutor):
                     len(human_response_answer),
                 )
 
+        checkpointer = await get_async_postgres_checkpointer()
+        human_answer_stripped = (
+            human_response_answer.strip()
+            if isinstance(human_response_answer, str) and human_response_answer.strip()
+            else ""
+        )
+        use_graph_resume = bool(
+            checkpointer is not None
+            and bool(checkpoint_thread_id)
+            and bool(human_answer_stripped)
+            and isinstance(run_state, dict)
+            and str(run_state.get("tool_name") or "") == "request_human_input"
+        )
+        if use_graph_resume:
+            logger.info(
+                "HITL checkpoint resume | thread_id=%s http_chat=%s",
+                checkpoint_thread_id,
+                http_chat,
+            )
+
         hitl_resume: dict[str, str] | None = None
 
         # Create or reuse execution context for this run.
@@ -874,6 +916,34 @@ class DeepAgentsExecutor(AgentExecutor):
             )
         job_uuid = exec_ctx.correlation_id
 
+        if use_graph_resume:
+            try:
+                _enqueue_status(
+                    event_queue,
+                    "task_working",
+                    {
+                        "resume_source": "checkpoint_graph_resume",
+                        "human_answer": human_answer_stripped,
+                        "checkpoint_thread_id": checkpoint_thread_id,
+                        "previous_interrupt_agent_path": run_state.get("agent_path")
+                        if isinstance(run_state, dict)
+                        else None,
+                        "previous_interrupt_tool_name": run_state.get("tool_name")
+                        if isinstance(run_state, dict)
+                        else None,
+                    },
+                    proc_inst_id,
+                    task_id,
+                    "action",
+                    job_id=job_uuid,
+                    exec_ctx=exec_ctx,
+                    logical_event_type="resume",
+                    phase="resume",
+                    agent_name=None,
+                )
+            except Exception:
+                logger.exception("Failed to enqueue checkpoint resume event", exc_info=True)
+
         # Parse work-item query into structured parts for downstream logic / HITL.
         parsed_query = parse_workitem_query(query or "")
         description = parsed_query.get("description") or ""
@@ -881,14 +951,15 @@ class DeepAgentsExecutor(AgentExecutor):
         input_data = parsed_query.get("input_data") or {}
 
         # Resume: if we have run_state and human_response, merge answer into input_data.
-        if isinstance(human_response_answer, str) and human_response_answer.strip():
+        # Graph-native interrupt(request_human_input) + AsyncPostgresSaver 는 Command(resume) 로 재개한다.
+        if human_answer_stripped and not use_graph_resume:
             pending_field = run_state.get("pending_field") or "human_response"
             input_data = dict(input_data)
-            input_data[pending_field] = human_response_answer.strip()
+            input_data[pending_field] = human_answer_stripped
             parsed_query["input_data"] = input_data
             hitl_resume = {
                 "field": str(pending_field),
-                "answer": human_response_answer.strip(),
+                "answer": human_answer_stripped,
             }
 
             # Emit a resume event for tracing via SDK EventQueue.
@@ -898,7 +969,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     "task_working",
                     {
                         "resume_source": "human_response",
-                        "human_answer": human_response_answer.strip(),
+                        "human_answer": human_answer_stripped,
                         "previous_interrupt_agent_path": run_state.get("agent_path"),
                         "previous_interrupt_tool_name": run_state.get("tool_name"),
                     },
@@ -1953,6 +2024,7 @@ class DeepAgentsExecutor(AgentExecutor):
             middleware=extra_middleware,
             skills=tenant_skill_sources_for_middleware(tenant_id or None),
             memory=tenant_memory_sources_for_middleware(tenant_id or None),
+            checkpointer=checkpointer,
             model_routing=routing_cfg,
         )
         logger.info(
@@ -2021,10 +2093,34 @@ class DeepAgentsExecutor(AgentExecutor):
 
             stream_emit = extras.get("_http_chat_stream_emit")
 
-            state_input: dict[str, Any] = {
-                "messages": [{"role": "user", "content": invoke_user_text}],
-                "pipeline_outputs": initial_pipeline_outputs,
-            }
+            run_config: dict[str, Any] | None = None
+            if checkpointer is not None and checkpoint_thread_id:
+                run_config = {"configurable": {"thread_id": checkpoint_thread_id}}
+
+            if use_graph_resume:
+                state_input: Any = Command(resume={"answer": human_answer_stripped})
+            else:
+                # HTTP chat: optionally inject recent room history as prior messages.
+                # The history is provided by the client via metadata.room_recent_history and
+                # parsed into extras["room_recent_messages"] in app/http_chat.py.
+                recent_msgs: list[dict[str, Any]] = []
+                if http_chat and isinstance(extras, dict):
+                    rm = extras.get("room_recent_messages")
+                    if isinstance(rm, list):
+                        for it in rm:
+                            if not isinstance(it, dict):
+                                continue
+                            role = str(it.get("role") or "").strip().lower()
+                            if role not in ("user", "assistant"):
+                                continue
+                            content = str(it.get("content") or "").strip()
+                            if not content:
+                                continue
+                            recent_msgs.append({"role": role, "content": content})
+                state_input = {
+                    "messages": [*recent_msgs, {"role": "user", "content": invoke_user_text}],
+                    "pipeline_outputs": initial_pipeline_outputs,
+                }
             result: Any = None
             strict_pipeline_violations: list[str] = []
 
@@ -2034,6 +2130,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 stream_emit=stream_emit,
                 http_stream_event_emit=http_stream_event_emit,
                 plan_tools_by_name=plan_tools_by_name,
+                run_config=run_config,
             )
             await _emit_planning_completed_if_ready(result)
             if not _planning_completed_flag():
@@ -2102,9 +2199,12 @@ class DeepAgentsExecutor(AgentExecutor):
                     pending_field,
                 )
                 sandbox_output_paths_discard_task(task_id)
+                rs_dup = dict(run_state) if isinstance(run_state, dict) else {}
+                if checkpoint_thread_id:
+                    rs_dup["checkpoint_thread_id"] = checkpoint_thread_id
                 return {
                     "status": "waiting_for_human",
-                    "run_state": run_state,
+                    "run_state": rs_dup,
                 }
             try:
                 hitl_job_id = str(uuid.uuid4())
@@ -2117,6 +2217,7 @@ class DeepAgentsExecutor(AgentExecutor):
                         "type": "text",
                         "options": choices,
                         "reason": decision.get("reason"),
+                        "checkpoint_thread_id": checkpoint_thread_id or None,
                         "tool_call_context": {
                             "job_id": hi.job_id,
                             "tool_name": hi.tool_name,
@@ -2136,20 +2237,23 @@ class DeepAgentsExecutor(AgentExecutor):
                 logger.exception("Failed to enqueue human_asked event from tool HITL", exc_info=True)
 
             sandbox_output_paths_discard_task(task_id)
+            rs_hitl = {
+                "reason": decision.get("reason") or "Tool requested human input.",
+                "pending_field": pending_field,
+                "correlation_id": exec_ctx.correlation_id,
+                "agent_path": interrupt_agent_path,
+                "tool_name": hi.tool_name,
+                "last_question": question,
+                "tool_call_context": {
+                    "job_id": hi.job_id,
+                    "tool_name": hi.tool_name,
+                },
+            }
+            if checkpoint_thread_id:
+                rs_hitl["checkpoint_thread_id"] = checkpoint_thread_id
             return {
                 "status": "waiting_for_human",
-                "run_state": {
-                    "reason": decision.get("reason") or "Tool requested human input.",
-                    "pending_field": pending_field,
-                    "correlation_id": exec_ctx.correlation_id,
-                    "agent_path": interrupt_agent_path,
-                    "tool_name": hi.tool_name,
-                    "last_question": question,
-                    "tool_call_context": {
-                        "job_id": hi.job_id,
-                        "tool_name": hi.tool_name,
-                    },
-                },
+                "run_state": rs_hitl,
             }
         except Exception:
             if not _planning_completed_flag():
@@ -2214,9 +2318,12 @@ class DeepAgentsExecutor(AgentExecutor):
                     task_id,
                 )
                 sandbox_output_paths_discard_task(task_id)
+                rs_dg = dict(run_state) if isinstance(run_state, dict) else {}
+                if checkpoint_thread_id:
+                    rs_dg["checkpoint_thread_id"] = checkpoint_thread_id
                 return {
                     "status": "waiting_for_human",
-                    "run_state": run_state,
+                    "run_state": rs_dg,
                 }
             hitl_agent_name = (
                 (exec_ctx.agent_path[-1] if exec_ctx.agent_path else None)
@@ -2233,6 +2340,7 @@ class DeepAgentsExecutor(AgentExecutor):
                         "type": "text",
                         "options": [],
                         "interrupt_payload": interrupt_payload,
+                        "checkpoint_thread_id": checkpoint_thread_id or None,
                     },
                     proc_inst_id,
                     task_id,
@@ -2250,20 +2358,23 @@ class DeepAgentsExecutor(AgentExecutor):
                 )
 
             sandbox_output_paths_discard_task(task_id)
+            rs_graph = {
+                "reason": "DeepAgents graph requested human input.",
+                "pending_field": pending_field,
+                "correlation_id": exec_ctx.correlation_id,
+                "agent_path": list(exec_ctx.agent_path),
+                "tool_name": "request_human_input",
+                "last_question": question,
+                "tool_call_context": {
+                    "job_id": hitl_job_id,
+                    "tool_name": "request_human_input",
+                },
+            }
+            if checkpoint_thread_id:
+                rs_graph["checkpoint_thread_id"] = checkpoint_thread_id
             return {
                 "status": "waiting_for_human",
-                "run_state": {
-                    "reason": "DeepAgents graph requested human input.",
-                    "pending_field": pending_field,
-                    "correlation_id": exec_ctx.correlation_id,
-                    "agent_path": list(exec_ctx.agent_path),
-                    "tool_name": "request_human_input",
-                    "last_question": question,
-                    "tool_call_context": {
-                        "job_id": hitl_job_id,
-                        "tool_name": "request_human_input",
-                    },
-                },
+                "run_state": rs_graph,
             }
 
         final_messages = result.get("messages", [])

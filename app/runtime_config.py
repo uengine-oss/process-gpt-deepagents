@@ -17,6 +17,56 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# LiteLLM UI / DB often stores ``provider/model``; LangChain ``init_chat_model`` expects ``provider:model``.
+# Only single-slash ``left/right`` forms are rewritten; multi-segment ids (e.g. Fireworks paths) are left as-is.
+_LITELLM_SLASH_PREFIX_TO_LANGCHAIN: dict[str, str] = {
+    "anthropic": "anthropic",
+    "azure": "azure_openai",
+    "bedrock": "bedrock",
+    "cohere": "cohere",
+    "deepseek": "deepseek",
+    "fireworks": "fireworks",
+    "gemini": "google_genai",
+    "google": "google_genai",
+    "groq": "groq",
+    "huggingface": "huggingface",
+    "litellm": "litellm",
+    "mistral": "mistralai",
+    "mistralai": "mistralai",
+    "nvidia": "nvidia",
+    "ollama": "ollama",
+    "openai": "openai",
+    "openrouter": "openrouter",
+    "perplexity": "perplexity",
+    "together": "together",
+    "vertex_ai": "google_vertexai",
+    "xai": "xai",
+}
+
+
+def normalize_litellm_slash_model_name(model: str | None) -> str | None:
+    """Map LiteLLM-style ``openai/gpt-4.1`` to LangChain-style ``openai:gpt-4.1`` when unambiguous.
+
+    Strings that already contain ``:``, or that have zero or more than one ``/``, are returned unchanged.
+    Unknown ``left`` segments (first path component) are also left unchanged.
+    """
+    if model is None:
+        return None
+    s = str(model).strip()
+    if not s or ":" in s or "/" not in s:
+        return s
+    if s.count("/") != 1:
+        return s
+    left, right = s.split("/", 1)
+    left_key = left.strip().lower().replace("-", "_")
+    right = right.strip()
+    if not left_key or not right:
+        return s
+    lc_provider = _LITELLM_SLASH_PREFIX_TO_LANGCHAIN.get(left_key)
+    if not lc_provider:
+        return s
+    return f"{lc_provider}:{right}"
+
 
 @dataclass(frozen=True)
 class ModelRoutingConfig:
@@ -44,6 +94,7 @@ def resolve_model_routing(
     payload = extras or {}
     # Environment model is the primary source of truth; extras.model is fallback only.
     model_name = str(os.environ.get("LLM_MODEL") or payload.get("model") or default_model)
+    model_name = normalize_litellm_slash_model_name(model_name.strip()) or model_name.strip()
 
     # Normalize short model names to an explicit provider prefix.
     if ":" not in model_name:

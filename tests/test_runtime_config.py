@@ -3,7 +3,32 @@ from __future__ import annotations
 import os
 import unittest
 
-from app.runtime_config import resolve_model_routing
+from app.runtime_config import normalize_litellm_slash_model_name, resolve_model_routing
+
+
+class NormalizeLitellmSlashModelNameTests(unittest.TestCase):
+    def test_openai_slash_to_colon(self) -> None:
+        self.assertEqual(normalize_litellm_slash_model_name("openai/gpt-4.1"), "openai:gpt-4.1")
+
+    def test_anthropic_slash(self) -> None:
+        self.assertEqual(
+            normalize_litellm_slash_model_name("anthropic/claude-sonnet-4-20250514"),
+            "anthropic:claude-sonnet-4-20250514",
+        )
+
+    def test_already_colon_unchanged(self) -> None:
+        self.assertEqual(normalize_litellm_slash_model_name("openai:gpt-4o"), "openai:gpt-4o")
+
+    def test_multi_slash_unchanged(self) -> None:
+        s = "accounts/fireworks/models/llama-v3p1-8b-instruct"
+        self.assertIs(normalize_litellm_slash_model_name(s), s)
+
+    def test_unknown_prefix_unchanged(self) -> None:
+        s = "custom-router/my-model"
+        self.assertIs(normalize_litellm_slash_model_name(s), s)
+
+    def test_none(self) -> None:
+        self.assertIsNone(normalize_litellm_slash_model_name(None))
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -86,6 +111,24 @@ class RuntimeConfigTests(unittest.TestCase):
         finally:
             if prev is not None:
                 os.environ["LLM_PROXY_URL"] = prev
+            if prev_model is not None:
+                os.environ["LLM_MODEL"] = prev_model
+
+    def test_resolve_normalizes_litellm_slash_in_payload(self) -> None:
+        prev_url = os.environ.pop("LLM_PROXY_URL", None)
+        prev_key = os.environ.pop("LLM_PROXY_API_KEY", None)
+        prev_openai = os.environ.pop("OPENAI_API_KEY", None)
+        prev_model = os.environ.pop("LLM_MODEL", None)
+        try:
+            cfg = resolve_model_routing({"model": "openai/gpt-4.1"})
+            self.assertEqual(cfg.model_name, "openai:gpt-4.1")
+        finally:
+            if prev_url is not None:
+                os.environ["LLM_PROXY_URL"] = prev_url
+            if prev_key is not None:
+                os.environ["LLM_PROXY_API_KEY"] = prev_key
+            if prev_openai is not None:
+                os.environ["OPENAI_API_KEY"] = prev_openai
             if prev_model is not None:
                 os.environ["LLM_MODEL"] = prev_model
 

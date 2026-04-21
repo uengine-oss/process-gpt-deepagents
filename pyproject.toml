@@ -22,6 +22,8 @@ dependencies = [
     "pytest>=8.0.0",
     "sse-starlette>=2.1.0",
     "uvicorn>=0.30.0",
+    "langgraph-checkpoint-postgres>=2.0.0",
+    "psycopg[binary]>=3.2",
 ]
 
 [tool.pytest.ini_options]

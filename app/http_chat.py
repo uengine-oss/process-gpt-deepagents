@@ -9,6 +9,7 @@ import logging
 import os
 import time
 import uuid
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from app.agent.subagents import load_agents_from_db, load_tenant_agents_for_chat
+from app.runtime_config import normalize_litellm_slash_model_name
 from app.inputdata_parser import extract_inputdata_from_message, merge_inputdata_into_chat_payload
 from app.executor.workitem_text import strip_leading_workitem_echo_for_sse
 from app.output_utils import ensure_trailing_newline, unwrap_output_wrapper_result_text
@@ -35,6 +37,75 @@ from processgpt_agent_sdk.utils import set_agent_model
 from processgpt_agent_utils.utils.context_manager import set_context
 
 logger = logging.getLogger(__name__)
+
+_ROOM_RECENT_HISTORY_LINE_RE = re.compile(
+    r"^\[(?P<role>user|assistant)\]"
+    r"(?:\[[^\]]*\])*"
+    r"\s*:\s*(?P<content>.*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_room_recent_history_to_messages(
+    history_text: str,
+    *,
+    max_messages: int = 24,
+    max_total_chars: int = 12000,
+) -> list[dict[str, str]]:
+    """Parse frontend-formatted room history string into LangChain-like message dicts.
+
+    Expected line format (examples):
+    - [user][홍길동]: 다시 시도
+    - [assistant][Process GPT Agent][agentId=...]: ...text...
+
+    Returns a list like: [{"role": "user"|"assistant", "content": "..."}]
+    """
+    raw = (history_text or "").strip()
+    if not raw:
+        return []
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    out: list[dict[str, str]] = []
+    total_chars = 0
+    last_role = ""
+    last_content = ""
+
+    for ln in lines:
+        m = _ROOM_RECENT_HISTORY_LINE_RE.match(ln)
+        if not m:
+            # Best-effort fallback: treat unknown lines as assistant context
+            role = "assistant"
+            content = ln
+        else:
+            role = (m.group("role") or "").strip().lower()
+            role = "assistant" if role != "user" else "user"
+            content = (m.group("content") or "").strip()
+
+        if not content:
+            continue
+
+        # Collapse exact duplicates (common in streaming DB flushes).
+        if role == last_role and content == last_content:
+            continue
+
+        piece_len = len(content)
+        if max_total_chars > 0 and total_chars + piece_len > max_total_chars:
+            remaining = max_total_chars - total_chars
+            if remaining <= 0:
+                break
+            content = content[:remaining].rstrip()
+            if not content:
+                break
+            piece_len = len(content)
+
+        out.append({"role": role, "content": content})
+        total_chars += piece_len
+        last_role, last_content = role, content
+
+        if max_messages > 0 and len(out) >= max_messages:
+            break
+
+    return out
 
 
 class ChatRequest(BaseModel):
@@ -65,6 +136,12 @@ class ChatResponse(BaseModel):
     status: str = Field(default="completed", description="completed | input_required")
     question: str = Field(default="", description="HITL 시 질문 텍스트")
     run_state: Optional[Dict[str, Any]] = Field(default=None, description="HITL 재개용 run_state")
+
+
+from app.ask_user_events import (
+    resolve_cached_run_state_for_question_id,
+    transform_input_required_to_ask_user_event,
+)
 
 
 def _build_effective_metadata(request: ChatRequest) -> Dict[str, Any]:
@@ -452,7 +529,50 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         }
         meta = request.metadata or {}
         if isinstance(meta.get("model"), str) and meta["model"].strip():
-            extras["model"] = meta["model"].strip()
+            extras["model"] = normalize_litellm_slash_model_name(meta["model"].strip()) or meta["model"].strip()
+        # HITL 재개: 클라이언트가 직전 `input_required` 응답의 run_state·답변을 metadata로 되돌려준다.
+        if isinstance(meta.get("run_state"), dict):
+            extras["run_state"] = dict(meta["run_state"])
+        hr_in = meta.get("human_response_answer")
+        if isinstance(hr_in, str) and hr_in.strip():
+            extras["human_response_answer"] = hr_in.strip()
+        # UI ask_user 응답(권장):
+        # - question_id(or correlation_id) 로 원 요청 매칭 가능해야 함
+        # - answer 는 최소 포함
+        # - approve_reject_with_edit 에서는 reason(optional) 허용
+        try:
+            ask_resp = meta.get("ask_user_response")
+            if not isinstance(ask_resp, dict):
+                # Also allow flat metadata {question_id, answer, reason}
+                if any(k in meta for k in ("question_id", "answer", "reason", "correlation_id")):
+                    ask_resp = meta
+            if isinstance(ask_resp, dict):
+                qid = str(ask_resp.get("question_id") or ask_resp.get("correlation_id") or "").strip()
+                ans = ask_resp.get("answer")
+                rs0 = ask_resp.get("run_state") if isinstance(ask_resp.get("run_state"), dict) else None
+                if rs0 is not None and "run_state" not in extras:
+                    extras["run_state"] = dict(rs0)
+                if qid and "run_state" not in extras:
+                    rs_cached = resolve_cached_run_state_for_question_id(qid)
+                    if isinstance(rs_cached, dict):
+                        extras["run_state"] = dict(rs_cached)
+                if isinstance(ans, str) and ans.strip() and "human_response_answer" not in extras:
+                    reason = ask_resp.get("reason")
+                    if isinstance(reason, str) and reason.strip():
+                        extras["human_response_answer"] = json.dumps(
+                            {"answer": ans.strip(), "reason": reason.strip()},
+                            ensure_ascii=False,
+                        )
+                    else:
+                        extras["human_response_answer"] = ans.strip()
+        except Exception:
+            # Never fail chat due to optional UI metadata.
+            logger.exception("HTTP chat: failed to parse ask_user_response metadata (ignored)", exc_info=True)
+        # 대화 맥락: 같은 방의 최근 대화 이력(문자열)을 messages[]로 파싱해 전달한다.
+        # (DeepAgentsExecutor가 이를 state_input["messages"]에 합칠 수 있도록 extras에 저장)
+        rrh = meta.get("room_recent_history")
+        if isinstance(rrh, str) and rrh.strip():
+            extras["room_recent_messages"] = parse_room_recent_history_to_messages(rrh)
 
         row: dict[str, Any] = {
             "id": conv_id,
@@ -772,6 +892,24 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             finally:
                 # 클라이언트가 먼저 끊겨도(SSE 취소) 터미널 이벤트를 큐에 넣어 runner 쪽에서 일관되게 마친다.
                 try:
+                    # HITL: streaming 경로에서도 input_required 상태를 노출한다.
+                    # - /chat(비스트리밍)은 ChatResponse(status/question/run_state)를 그대로 반환하지만
+                    #   /chat/stream은 done 텍스트만 내보내기 때문에 HITL이 가려질 수 있다.
+                    # - 따라서 별도 SSE 이벤트를 추가로 발행한다(호환성: 기존 클라이언트는 무시 가능).
+                    try:
+                        r0 = outcome.get("response")
+                        if isinstance(r0, ChatResponse) and str(r0.status or "") == "input_required":
+                            await q.put(
+                                {
+                                    "type": "input_required",
+                                    "conversation_id": conv_id,
+                                    "question": str(r0.question or ""),
+                                    "run_state": r0.run_state if isinstance(r0.run_state, dict) else None,
+                                }
+                            )
+                    except Exception:
+                        logger.exception("HTTP chat stream: failed to emit input_required event", exc_info=True)
+
                     meta_payload, done_evt = _build_http_stream_terminal_events(
                         conv_id=conv_id,
                         request=request,
@@ -875,6 +1013,14 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                     evt = await q.get()
                     if evt.get("type") == "_internal_done":
                         break
+                    # UI 호환: legacy `input_required` -> `ask_user` 변환.
+                    try:
+                        ask_evt = transform_input_required_to_ask_user_event(evt)
+                    except Exception:
+                        ask_evt = None
+                        logger.exception("HTTP chat stream: ask_user transform failed (ignored)", exc_info=True)
+                    if isinstance(ask_evt, dict):
+                        evt = ask_evt
                     try:
                         await a_update_chat_room_context(
                             tenant_id=tenant_id,
@@ -896,6 +1042,14 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                         break
                     if pending.get("type") == "_internal_done":
                         break
+                    # UI 호환: legacy `input_required` -> `ask_user` 변환.
+                    try:
+                        ask_evt = transform_input_required_to_ask_user_event(pending)
+                    except Exception:
+                        ask_evt = None
+                        logger.exception("HTTP chat stream: ask_user transform failed (flush, ignored)", exc_info=True)
+                    if isinstance(ask_evt, dict):
+                        pending = ask_evt
                     try:
                         await a_update_chat_room_context(
                             tenant_id=tenant_id,

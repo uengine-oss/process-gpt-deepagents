@@ -10,6 +10,7 @@ from typing import Any
 
 from app.database import get_supabase
 from app.execution_context import format_execution_clock_section
+from app.runtime_config import normalize_litellm_slash_model_name
 from app.sandbox.tools import get_sandbox_tools
 from app.skills.resolution_tools import get_skill_resolution_tools
 
@@ -437,7 +438,10 @@ def build_subagent_configs(
                     "agent_type": agent_type,
                 },
             }
-            model = row.get("model")
+            model_raw = row.get("model")
+            model: str | None = None
+            if model_raw is not None and str(model_raw).strip():
+                model = normalize_litellm_slash_model_name(str(model_raw).strip())
             if model:
                 subagent["model"] = model
                 try:
@@ -538,7 +542,10 @@ def build_subagent_configs(
             },
         }
 
-        model = row.get("model")
+        model_raw = row.get("model")
+        model: str | None = None
+        if model_raw is not None and str(model_raw).strip():
+            model = normalize_litellm_slash_model_name(str(model_raw).strip())
         if model:
             subagent["model"] = model
             try:

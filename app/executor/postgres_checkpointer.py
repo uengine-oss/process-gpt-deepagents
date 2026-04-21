@@ -1,0 +1,126 @@
+"""LangGraph Postgres 체크포인터 + thread id."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from dataclasses import dataclass
+from typing import Any, Mapping
+from urllib.parse import quote_plus
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class _LoopCheckpointerState:
+    pool: Any | None = None
+    saver: Any | None = None
+    init_lock: asyncio.Lock | None = None
+    init_failed: bool = False
+
+
+# Lock은 루프에 묶이므로 checkpointer 상태도 루프별로 둔다.
+_STATE_BY_LOOP: dict[int, _LoopCheckpointerState] = {}
+
+
+def _loop_key() -> int:
+    return id(asyncio.get_running_loop())
+
+
+def _get_state_for_current_loop() -> _LoopCheckpointerState:
+    key = _loop_key()
+    st = _STATE_BY_LOOP.get(key)
+    if st is None:
+        st = _LoopCheckpointerState()
+        _STATE_BY_LOOP[key] = st
+    if st.init_lock is None:
+        st.init_lock = asyncio.Lock()
+    return st
+
+
+def resolve_checkpoint_thread_id(*, http_chat: bool, row: Mapping[str, Any]) -> str:
+    """http_chat이면 conv 스레드, 아니면 todo 스레드."""
+    if http_chat:
+        for key in ("id", "proc_inst_id", "root_proc_inst_id"):
+            v = row.get(key)
+            if v is not None:
+                s = str(v).strip()
+                if s:
+                    return s
+        return ""
+    tid = row.get("id")
+    return str(tid).strip() if tid is not None else ""
+
+
+def checkpoint_postgres_uri() -> str:
+    """DB_* → postgresql:// DSN."""
+    host = (os.environ.get("DB_HOST") or "").strip()
+    name = (os.environ.get("DB_NAME") or "").strip()
+    if not host or not name:
+        return ""
+    user = (os.environ.get("DB_USER") or "postgres").strip() or "postgres"
+    raw_pw = os.environ.get("DB_PASSWORD")
+    password = "" if raw_pw is None else str(raw_pw)
+    port = (os.environ.get("DB_PORT") or "5432").strip() or "5432"
+    user_q = quote_plus(user)
+    if password:
+        auth = f"{user_q}:{quote_plus(password)}"
+    else:
+        auth = user_q
+    return f"postgresql://{auth}@{host}:{port}/{name}"
+
+
+async def get_async_postgres_checkpointer() -> Any | None:
+    """DB_* 있으면 AsyncPostgresSaver, 없으면 None."""
+    st = _get_state_for_current_loop()
+
+    uri = checkpoint_postgres_uri()
+    if not uri:
+        return None
+    if st.init_failed:
+        return None
+    if st.saver is not None:
+        return st.saver
+
+    assert st.init_lock is not None
+    async with st.init_lock:
+        if st.saver is not None:
+            return st.saver
+        if st.init_failed:
+            return None
+        try:
+            from psycopg.rows import dict_row
+            from psycopg_pool import AsyncConnectionPool
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        except Exception:
+            logger.exception("Postgres checkpointer imports failed")
+            st.init_failed = True
+            return None
+
+        pool = None
+        try:
+            pool = AsyncConnectionPool(
+                conninfo=uri,
+                kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+                min_size=1,
+                max_size=10,
+                open=False,
+                timeout=30.0,
+            )
+            await pool.open()
+            saver = AsyncPostgresSaver(pool)
+            await saver.setup()
+        except Exception:
+            logger.exception("AsyncPostgresSaver init/setup failed; HITL graph resume disabled")
+            st.init_failed = True
+            if pool is not None:
+                try:
+                    await pool.close()
+                except Exception:
+                    logger.exception("checkpoint pool close after failed init", exc_info=True)
+            return None
+
+        st.pool = pool
+        st.saver = saver
+        logger.info("AsyncPostgresSaver ready for LangGraph checkpointing")
+        return st.saver

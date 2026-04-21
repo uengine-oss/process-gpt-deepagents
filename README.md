@@ -56,6 +56,12 @@ A2A 이벤트 발행 (TaskStatusUpdateEvent / TaskArtifactUpdateEvent)
 | `ANTHROPIC_API_KEY` | 직접 Anthropic 호출(프록시 미사용·위 폴백 시). |
 | `OPENAI_API_KEY` | 프록시 키 대체(`LLM_PROXY_API_KEY` 없을 때). Mem0 등 로드되는 도구/SDK가 임베딩 등에 동일 변수를 읽는 경우 있음. |
 | `SANDBOX_BASE_DIR` | sandbox 워크스페이스 루트 경로 |
+| `DEEPAGENTS_FILE_LOGGING` | (선택) `on`이면 DB 이벤트 payload 파일 로그 훅 |
+| `DB_USER` | Postgres 사용자 (`processgpt_agent_utils`·LangGraph 체크포인트 공용 DSN) |
+| `DB_PASSWORD` | Postgres 비밀번호 |
+| `DB_HOST` | Postgres 호스트 |
+| `DB_PORT` | Postgres 포트(기본 `5432`) |
+| `DB_NAME` | Postgres DB 이름 |
 
 ## 설치
 
@@ -149,6 +155,7 @@ python3 -m pytest tests -q
 ### 4) HITL 인터럽트/재개 시나리오
 
 사전 조건:
+- `DB_HOST`·`DB_NAME` 등 Postgres(`DB_*`) 설정 시 LangGraph 체크포인트로 재개 가능
 - 승인/누락입력이 필요한 작업
 
 검증:
