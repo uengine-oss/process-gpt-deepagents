@@ -220,10 +220,18 @@ def default_orchestrator_prompt() -> str:
         "`write_todos`·`write_pipeline_spec`은 기본적으로 선택적 메모/관찰용이며, **실행의 중심은 `task()`** 입니다. "
         "(HTTP 채팅에서 정책상 플랜 선행이 강제되는 경우는 예외.)\n\n"
         "매핑 시 근거가 없는 셀 값을 지어내지 말고, 빈칸·missing_reason·evidence_status를 남깁니다.\n\n"
-        "HITL: `request_human_input()`은 승인/민감/모호 등 **사람 판단이 필요한 경우에 호출**합니다(단순 정보 누락은 도구로 1회 이상 시도 후).\n\n"
+        "HITL: `request_human_input()`은 승인/민감/모호 등 **사람 판단이 필요한 경우에 호출**합니다(단순 정보 누락은 도구로 1회 이상 시도 후).\n"
+        "- HTTP 채팅 UI는 HITL 시 `type: openui` SSE 이벤트를 렌더링한다.\n"
+        "- 따라서 HITL을 요청할 때는 **반드시** `openui_lang` 인자를 함께 제공해 UI를 정의하라.\n"
+        "- `openui_lang`은 OpenUI Lang만 포함해야 하며, 첫 줄은 `root = ...` 이어야 한다.\n"
+        "- `openui_lang`은 **클라이언트가 지원하는 함수형 DSL만** 사용해야 한다.\n"
+        "  - 첫 줄은 반드시 `root = Column()`\n"
+        "  - `Column()/RadioGroup()/TextArea()/TextInput()/Button()` 같은 호출 형태만 사용\n"
+        "  - `component ... { ... }` 형태(선언적 컴포넌트 DSL)는 사용 금지\n"
+        "- 컴포넌트 설계/문법은 테넌트 스킬 `openui`를 참고하라.\n\n"
         "산출물이 파일(xlsx 등)이면 샌드박스/업로드 도구로 **public URL**까지 확보하고, "
-        "폼 출력이면 필수 키만 담은 **단일 JSON 객체**로 답합니다. "
-        "**draft_file 등 파일 필드에는 .bpmn 입력 경로를 넣지 마세요.** 업로드된 산출물 URL만 사용합니다.\n"
+        "폼 출력이면 필수 키만 담은 **단일 JSON 객체**로 답합니다.\n"
+        "파일 필드에는 업로드된 산출물 URL만 사용합니다.\n"
     )
 
 

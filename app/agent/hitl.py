@@ -45,7 +45,7 @@ def extract_interrupt_payload(result: Dict[str, Any]) -> Optional[Dict[str, Any]
 
 
 @tool
-def request_human_input(question: str, context: str = "") -> str:
+def request_human_input(question: str, context: str = "", openui_lang: str = "") -> str:
     """사람 개입(HITL)이 필요할 때 호출하는 도구.
 
     이 도구는 아래 상황에서 **의도적으로 호출**되어야 한다.
@@ -64,8 +64,12 @@ def request_human_input(question: str, context: str = "") -> str:
     Args:
         question: 사람에게 물어볼 구체적인 질문 또는 요청.
         context: 결정을 돕기 위한 배경 설명(선택).
+        openui_lang: 채팅 UI가 렌더링할 OpenUI Lang(선택). 제공하는 경우 **OpenUI Lang만** 포함해야 한다.
     """
-    response = interrupt({"question": question, "context": context})
+    payload = {"question": question, "context": context}
+    if isinstance(openui_lang, str) and openui_lang.strip():
+        payload["openui_lang"] = openui_lang.strip()
+    response = interrupt(payload)
     if isinstance(response, dict):
         # 재개 시에는 dict 형태로 응답이 들어올 수 있으며,
         # 그 중 `answer` 필드를 우선 사용한다.

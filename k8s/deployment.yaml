@@ -62,6 +62,11 @@ spec:
                 secretKeyRef:
                   name: my-secrets
                   key: SERVICE_ROLE_KEY
+            - name: SUPABASE_ANON_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: my-secrets
+                  key: SUPABASE_KEY
             - name: SUPABASE_JWT_SECRET
               valueFrom:
                 secretKeyRef:

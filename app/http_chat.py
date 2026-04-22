@@ -136,11 +136,19 @@ class ChatResponse(BaseModel):
     status: str = Field(default="completed", description="completed | input_required")
     question: str = Field(default="", description="HITL 시 질문 텍스트")
     run_state: Optional[Dict[str, Any]] = Field(default=None, description="HITL 재개용 run_state")
+    openui_lang: Optional[str] = Field(
+        default=None,
+        description="HITL(input_required)일 때 사용할 OpenUI Lang 전문",
+    )
 
 
-from app.ask_user_events import (
+from app.hitl_events import (
     resolve_cached_run_state_for_question_id,
-    transform_input_required_to_ask_user_event,
+    resolve_context_text,
+)
+from app.openui_hitl_events import (
+    build_openui_lang_for_hitl,
+    expand_input_required_to_openui_hitl_events,
 )
 
 
@@ -543,6 +551,9 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         try:
             ask_resp = meta.get("ask_user_response")
             if not isinstance(ask_resp, dict):
+                ou = meta.get("openui_hitl_response")
+                ask_resp = ou if isinstance(ou, dict) else None
+            if not isinstance(ask_resp, dict):
                 # Also allow flat metadata {question_id, answer, reason}
                 if any(k in meta for k in ("question_id", "answer", "reason", "correlation_id")):
                     ask_resp = meta
@@ -633,6 +644,20 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                 int((time.time() - t0) * 1000),
                 len(qtext),
             )
+            # openui_lang은 딥 에이전트가 HITL 도구 호출 시 생성해 run_state로 내려주는 것이 기본이다.
+            # (없으면 최소 템플릿으로 fallback)
+            ctx_text = resolve_context_text(run_state=rs if isinstance(rs, dict) else None)
+            openui_lang = (
+                rs.get("openui_lang")
+                if isinstance(rs, dict) and isinstance(rs.get("openui_lang"), str)
+                else None
+            )
+            if not (openui_lang or "").strip():
+                openui_lang = build_openui_lang_for_hitl(
+                    question=qtext,
+                    context=ctx_text,
+                    run_state=rs if isinstance(rs, dict) else None,
+                )
             return ChatResponse(
                 response="",
                 conversation_id=conv_id,
@@ -641,6 +666,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                 status="input_required",
                 question=qtext,
                 run_state=rs if isinstance(rs, dict) else None,
+                openui_lang=openui_lang,
             )
 
         logger.info(
@@ -1013,14 +1039,20 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                     evt = await q.get()
                     if evt.get("type") == "_internal_done":
                         break
-                    # UI 호환: legacy `input_required` -> `ask_user` 변환.
-                    try:
-                        ask_evt = transform_input_required_to_ask_user_event(evt)
-                    except Exception:
-                        ask_evt = None
-                        logger.exception("HTTP chat stream: ask_user transform failed (ignored)", exc_info=True)
-                    if isinstance(ask_evt, dict):
-                        evt = ask_evt
+                    if str(evt.get("type") or "") == "input_required":
+                        for e in expand_input_required_to_openui_hitl_events(evt) or []:
+                            try:
+                                await a_update_chat_room_context(
+                                    tenant_id=tenant_id,
+                                    room_id=conv_id,
+                                    evt=e,
+                                    has_file=has_file,
+                                )
+                            except Exception:
+                                logger.exception("HTTP chat: context DB update failed (ignored)", exc_info=True)
+                            _log_evt(e)
+                            yield {"data": json.dumps(e, ensure_ascii=False)}
+                        continue
                     try:
                         await a_update_chat_room_context(
                             tenant_id=tenant_id,
@@ -1042,14 +1074,21 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                         break
                     if pending.get("type") == "_internal_done":
                         break
-                    # UI 호환: legacy `input_required` -> `ask_user` 변환.
-                    try:
-                        ask_evt = transform_input_required_to_ask_user_event(pending)
-                    except Exception:
-                        ask_evt = None
-                        logger.exception("HTTP chat stream: ask_user transform failed (flush, ignored)", exc_info=True)
-                    if isinstance(ask_evt, dict):
-                        pending = ask_evt
+                    if str(pending.get("type") or "") == "input_required":
+                        for e in expand_input_required_to_openui_hitl_events(pending) or []:
+                            try:
+                                await a_update_chat_room_context(
+                                    tenant_id=tenant_id,
+                                    room_id=conv_id,
+                                    evt=e,
+                                    has_file=has_file,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "HTTP chat: context DB update (flush) failed (ignored)", exc_info=True
+                                )
+                            _log_evt(e)
+                        continue
                     try:
                         await a_update_chat_room_context(
                             tenant_id=tenant_id,

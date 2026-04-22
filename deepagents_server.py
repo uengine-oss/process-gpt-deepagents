@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 logging.getLogger("deepagents_executor").setLevel(logging.INFO)
 logging.getLogger("app.database").setLevel(logging.INFO)
 
+os.environ["LANGSMITH_TRACING"] = "true"
+os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
     """Parse boolean-ish environment flags (default: False)."""

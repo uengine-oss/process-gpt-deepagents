@@ -1037,13 +1037,27 @@ class DeepAgentsExecutor(AgentExecutor):
             if "claude-skills" not in mcp_servers0:
                 mcp_servers0["claude-skills"] = {"url": _default_claude_skills_mcp_url()}
             if http_chat and "work-assistant" not in mcp_servers0:
+                # process-gpt-mcp는 Supabase로 사용자 JWT를 검증한다. HTTP 채팅 호스트와 동일 프로젝트의 URL/키가 필요하다.
+                # GKE 등에서는 SUPABASE_KEY(서비스 롤)만 두고 SUPABASE_ANON_KEY를 비워 두는 경우가 많아, anon 미설정 시 KEY로 폴백한다.
+                _sb_url = str(os.environ.get("SUPABASE_URL") or "").strip()
+                _sb_anon = str(os.environ.get("SUPABASE_ANON_KEY") or "").strip()
+                if not _sb_anon:
+                    _sb_anon = str(
+                        os.environ.get("SUPABASE_KEY")
+                        or os.environ.get("SERVICE_ROLE_KEY")
+                        or ""
+                    ).strip()
+                wa_env: dict[str, str] = {
+                    "SUPABASE_URL": _sb_url,
+                    "SUPABASE_ANON_KEY": _sb_anon,
+                }
+                _jwt_secret = str(os.environ.get("SUPABASE_JWT_SECRET") or "").strip()
+                if _jwt_secret:
+                    wa_env["SUPABASE_JWT_SECRET"] = _jwt_secret
                 mcp_servers0["work-assistant"] = {
                     "command": "uvx",
                     "args": ["process-gpt-mcp"],
-                    "env": {
-                        "SUPABASE_URL": str(os.environ.get("SUPABASE_URL") or ""),
-                        "SUPABASE_ANON_KEY": str(os.environ.get("SUPABASE_ANON_KEY") or ""),
-                    },
+                    "env": wa_env,
                 }
             mcp_cfg["mcpServers"] = mcp_servers0
         except Exception:
@@ -2307,6 +2321,11 @@ class DeepAgentsExecutor(AgentExecutor):
                 if isinstance(interrupt_payload, dict)
                 else None
             ) or "이 작업을 계속 진행하려면 사람이 추가 정보를 입력해야 합니다."
+            openui_lang = (
+                interrupt_payload.get("openui_lang")
+                if isinstance(interrupt_payload, dict)
+                else None
+            )
             pending_field = "human_response"
             if _is_duplicate_hitl_request(
                 run_state,
@@ -2370,6 +2389,8 @@ class DeepAgentsExecutor(AgentExecutor):
                     "tool_name": "request_human_input",
                 },
             }
+            if isinstance(openui_lang, str) and openui_lang.strip():
+                rs_graph["openui_lang"] = openui_lang.strip()
             if checkpoint_thread_id:
                 rs_graph["checkpoint_thread_id"] = checkpoint_thread_id
             return {
