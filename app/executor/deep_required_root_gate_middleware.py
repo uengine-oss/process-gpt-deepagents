@@ -83,14 +83,14 @@ def _create_deep_required_root_gate_middleware(
                         "error": "route_declaration_required",
                         "message": (
                             "HTTP 채팅에서는 먼저 `write_http_chat_route(route=...)`로 실행 라우팅을 선언해야 합니다. "
-                            "필요하면 `ask_user`로 의도를 확인하세요."
+                            "필요하면 `request_human_input`으로 의도를 확인하세요."
                         ),
                     },
                     tool_call_id=tool_call_id,
                     tool_name=tool_name,
                 )
 
-            # Route=work_assistant_only: only allow work-assistant MCP (and ask_user/HITL).
+            # Route=work_assistant_only: only allow work-assistant MCP (and HITL / route rewrite).
             if route == "work_assistant_only":
                 if _is_work_assistant_mcp_tool(base_tool) or tool_name in ("ask_user", "write_http_chat_route"):
                     return await handler(request)
@@ -115,7 +115,10 @@ def _create_deep_required_root_gate_middleware(
                 return _tool_message_json(
                     {
                         "error": "ask_user_first",
-                        "message": "이 요청은 `ask_user_first` 라우팅입니다. 먼저 `ask_user`로 의도를 확인하세요.",
+                        "message": (
+                            "이 요청은 `ask_user_first` 라우팅입니다. "
+                            "먼저 `request_human_input`으로 의도를 확인하세요."
+                        ),
                     },
                     tool_call_id=tool_call_id,
                     tool_name=tool_name,

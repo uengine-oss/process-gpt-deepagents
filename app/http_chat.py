@@ -149,6 +149,7 @@ from app.hitl_events import (
 from app.openui_hitl_events import (
     build_openui_lang_for_hitl,
     expand_input_required_to_openui_hitl_events,
+    run_state_without_openui_lang,
 )
 
 
@@ -252,15 +253,25 @@ def _build_user_chat_message_obj(request: ChatRequest, *, message_uuid: str) -> 
     }
 
 
+def _assistant_message_content_from_hitl(resp: "ChatResponse") -> str:
+    rs = resp.run_state if isinstance(resp.run_state, dict) else {}
+    return str(rs.get("last_question") or resp.question or "").strip()
+
+
 def _build_assistant_chat_message_obj_full(
     *,
     done_evt: dict[str, Any] | None,
     run_meta: dict[str, Any],
     message_uuid: str,
+    hitl_response: Optional["ChatResponse"] = None,
 ) -> dict[str, Any]:
-    content = ""
-    if isinstance(done_evt, dict) and isinstance(done_evt.get("content"), str):
-        content = str(done_evt.get("content") or "")
+    if hitl_response is not None and str(hitl_response.status or "") == "input_required":
+        content = _assistant_message_content_from_hitl(hitl_response)
+        done_evt = None
+    else:
+        content = ""
+        if isinstance(done_evt, dict) and isinstance(done_evt.get("content"), str):
+            content = str(done_evt.get("content") or "")
     tool_calls = run_meta.get("tool_calls") if isinstance(run_meta, dict) else None
     streamed_tool_events = run_meta.get("streamed_tool_events") if isinstance(run_meta, dict) else None
     agent_logs: list[dict[str, Any]] = []
@@ -287,7 +298,7 @@ def _build_assistant_chat_message_obj_full(
                     plan_steps.append(f"tool: {nm}")
     agent_plan = {"steps": plan_steps, "summary": plan_steps[0] if plan_steps else ""}
 
-    return {
+    row: dict[str, Any] = {
         "name": "Process GPT Agent",
         "role": "assistant",
         "uuid": message_uuid,
@@ -302,6 +313,14 @@ def _build_assistant_chat_message_obj_full(
         "timeStamp": _iso_now_z(),
         "toolCalls": tool_calls if isinstance(tool_calls, list) else [],
     }
+    if hitl_response is not None and str(hitl_response.status or "") == "input_required":
+        ol = (hitl_response.openui_lang or "").strip()
+        if ol:
+            row["openuiLang"] = ol
+        rs_hitl = hitl_response.run_state if isinstance(hitl_response.run_state, dict) else None
+        if rs_hitl:
+            row["runState"] = _json_safe(rs_hitl)
+    return row
 
 
 def _build_assistant_placeholder_message_obj(*, message_uuid: str) -> dict[str, Any]:
@@ -585,6 +604,24 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         if isinstance(rrh, str) and rrh.strip():
             extras["room_recent_messages"] = parse_room_recent_history_to_messages(rrh)
 
+        # HTTP chat token hygiene: provide a best-effort work-assistant tool allowlist hint.
+        # This reduces root tool schema exposure without adding extra model calls.
+        try:
+            norm = re.sub(r"\s+", " ", (msg or "").strip().lower())
+            allow: list[str] = []
+            if any(k in norm for k in ("조직도", "조직", "organization", "org tree", "orgtree")):
+                allow.append("get_organization")
+            if any(k in norm for k in ("프로세스 목록", "프로세스 리스트", "프로세스 list", "process list")):
+                allow.append("get_process_list")
+            if any(k in norm for k in ("인스턴스", "실행 목록", "todolist", "할 일", "todo")):
+                allow.extend(["get_instance_list", "get_todolist"])
+            if any(k in norm for k in ("프로세스 상세", "정의", "definition", "detail")):
+                allow.append("get_process_detail")
+            if allow:
+                extras["http_chat_work_assistant_allowlist"] = list(dict.fromkeys(allow))
+        except Exception:
+            logger.exception("http_chat allowlist hint generation failed (ignored)", exc_info=True)
+
         row: dict[str, Any] = {
             "id": conv_id,
             "query": _format_workitem_query(request.message, request),
@@ -647,17 +684,12 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             # openui_lang은 딥 에이전트가 HITL 도구 호출 시 생성해 run_state로 내려주는 것이 기본이다.
             # (없으면 최소 템플릿으로 fallback)
             ctx_text = resolve_context_text(run_state=rs if isinstance(rs, dict) else None)
-            openui_lang = (
-                rs.get("openui_lang")
-                if isinstance(rs, dict) and isinstance(rs.get("openui_lang"), str)
-                else None
+            openui_lang = build_openui_lang_for_hitl(
+                question=qtext,
+                context=ctx_text,
+                run_state=rs if isinstance(rs, dict) else None,
             )
-            if not (openui_lang or "").strip():
-                openui_lang = build_openui_lang_for_hitl(
-                    question=qtext,
-                    context=ctx_text,
-                    run_state=rs if isinstance(rs, dict) else None,
-                )
+            rs_out = run_state_without_openui_lang(rs if isinstance(rs, dict) else None)
             return ChatResponse(
                 response="",
                 conversation_id=conv_id,
@@ -665,7 +697,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                 skill_calls=[],
                 status="input_required",
                 question=qtext,
-                run_state=rs if isinstance(rs, dict) else None,
+                run_state=rs_out,
                 openui_lang=openui_lang,
             )
 
@@ -742,7 +774,6 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         resp = await _run_chat(request.model_copy(update={"conversation_id": conv_id}), stream_emit=None, stream_event_emit=None)
         try:
             asst_uuid = str(uuid.uuid4())
-            done_evt = {"type": "done", "content": ensure_trailing_newline(str(resp.response or ""))}
             run_meta = {
                 "type": "run_meta",
                 "conversation_id": conv_id,
@@ -750,18 +781,41 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                 "skill_calls": resp.skill_calls,
                 "streamed_tool_events": [],
             }
-            await a_insert_chat_message(
-                tenant_id=tenant_id,
-                room_id=conv_id,
-                thread_id=_thread_id_from_request_metadata(request),
-                message_obj=_build_assistant_chat_message_obj_full(done_evt=done_evt, run_meta=run_meta, message_uuid=asst_uuid),
-                message_uuid=asst_uuid,
-            )
-            await a_update_chat_room_last_message(
-                tenant_id=tenant_id,
-                room_id=conv_id,
-                message={"msg": str(resp.response or ""), "type": "text", "createdAt": _iso_now_z()},
-            )
+            if str(resp.status or "") == "input_required":
+                await a_insert_chat_message(
+                    tenant_id=tenant_id,
+                    room_id=conv_id,
+                    thread_id=_thread_id_from_request_metadata(request),
+                    message_obj=_build_assistant_chat_message_obj_full(
+                        done_evt=None,
+                        run_meta=run_meta,
+                        message_uuid=asst_uuid,
+                        hitl_response=resp,
+                    ),
+                    message_uuid=asst_uuid,
+                )
+                last_preview = _assistant_message_content_from_hitl(resp) or "입력이 필요합니다."
+                await a_update_chat_room_last_message(
+                    tenant_id=tenant_id,
+                    room_id=conv_id,
+                    message={"msg": last_preview, "type": "text", "createdAt": _iso_now_z()},
+                )
+            else:
+                done_evt = {"type": "done", "content": ensure_trailing_newline(str(resp.response or ""))}
+                await a_insert_chat_message(
+                    tenant_id=tenant_id,
+                    room_id=conv_id,
+                    thread_id=_thread_id_from_request_metadata(request),
+                    message_obj=_build_assistant_chat_message_obj_full(
+                        done_evt=done_evt, run_meta=run_meta, message_uuid=asst_uuid
+                    ),
+                    message_uuid=asst_uuid,
+                )
+                await a_update_chat_room_last_message(
+                    tenant_id=tenant_id,
+                    room_id=conv_id,
+                    message={"msg": str(resp.response or ""), "type": "text", "createdAt": _iso_now_z()},
+                )
         except Exception:
             logger.exception("HTTP chat(/chat): completion DB writes failed (ignored)", exc_info=True)
         return resp
@@ -918,6 +972,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
             finally:
                 # 클라이언트가 먼저 끊겨도(SSE 취소) 터미널 이벤트를 큐에 넣어 runner 쪽에서 일관되게 마친다.
                 try:
+                    hitl_input_required = False
                     # HITL: streaming 경로에서도 input_required 상태를 노출한다.
                     # - /chat(비스트리밍)은 ChatResponse(status/question/run_state)를 그대로 반환하지만
                     #   /chat/stream은 done 텍스트만 내보내기 때문에 HITL이 가려질 수 있다.
@@ -925,12 +980,19 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                     try:
                         r0 = outcome.get("response")
                         if isinstance(r0, ChatResponse) and str(r0.status or "") == "input_required":
+                            hitl_input_required = True
+                            ou_canonical = (r0.openui_lang or "").strip()
                             await q.put(
                                 {
                                     "type": "input_required",
                                     "conversation_id": conv_id,
                                     "question": str(r0.question or ""),
-                                    "run_state": r0.run_state if isinstance(r0.run_state, dict) else None,
+                                    "run_state": run_state_without_openui_lang(
+                                        r0.run_state if isinstance(r0.run_state, dict) else None
+                                    ),
+                                    # expand_input_required_to_openui_hitl_events: run_state에 원문이 없을 때
+                                    # DB/ChatResponse와 동일한 Lang으로 SSE end를 맞추기 위함
+                                    **({"openui_lang": ou_canonical} if ou_canonical else {}),
                                 }
                             )
                     except Exception:
@@ -946,25 +1008,39 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                         streamed_token_parts=streamed_token_parts,
                         token_preview_parts=token_preview_parts,
                     )
+                    # HITL(input_required) 케이스에서는 스트림 종료는 유지하되 done 이벤트는 발행하지 않는다.
+                    # (OpenUI HITL 이벤트 스트림이 별도로 내려가며, done은 클라이언트에서 "완료"로 오해될 수 있음)
+                    if hitl_input_required:
+                        done_evt = None
                     await q.put(meta_payload)
                     if done_evt is not None:
                         await q.put(done_evt)
                     # 완료 시점 DB 반영(assistant 메시지 + room last message).
                     try:
+                        r_db = outcome.get("response")
                         # Finalize the existing assistant placeholder row when available.
                         if assistant_row_uuid:
-                            final_obj = _build_assistant_chat_message_obj_full(
-                                done_evt=done_evt,
-                                run_meta=meta_payload,
-                                message_uuid=assistant_row_uuid,
-                            )
-                            # Preserve any partial content if done_evt is empty.
-                            if (
-                                (not isinstance(done_evt, dict) or not str(done_evt.get("content") or "").strip())
-                                and assistant_msg_obj is not None
-                                and isinstance(assistant_msg_obj.get("content"), str)
-                            ):
-                                final_obj["content"] = assistant_msg_obj.get("content") or ""
+                            if hitl_input_required and isinstance(r_db, ChatResponse):
+                                final_obj = _build_assistant_chat_message_obj_full(
+                                    done_evt=None,
+                                    run_meta=meta_payload,
+                                    message_uuid=assistant_row_uuid,
+                                    hitl_response=r_db,
+                                )
+                            else:
+                                final_obj = _build_assistant_chat_message_obj_full(
+                                    done_evt=done_evt,
+                                    run_meta=meta_payload,
+                                    message_uuid=assistant_row_uuid,
+                                )
+                            # Preserve streamed partial text only for normal completion (not HITL).
+                            if not hitl_input_required:
+                                if (
+                                    (not isinstance(done_evt, dict) or not str(done_evt.get("content") or "").strip())
+                                    and assistant_msg_obj is not None
+                                    and isinstance(assistant_msg_obj.get("content"), str)
+                                ):
+                                    final_obj["content"] = assistant_msg_obj.get("content") or ""
                             final_obj["isLoading"] = False
                             await a_update_chat_message(
                                 tenant_id=(request.tenant_id or "").strip(),
@@ -973,18 +1049,38 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                             )
                         else:
                             asst_uuid = str(uuid.uuid4())
+                            if hitl_input_required and isinstance(r_db, ChatResponse):
+                                msg_obj = _build_assistant_chat_message_obj_full(
+                                    done_evt=None,
+                                    run_meta=meta_payload,
+                                    message_uuid=asst_uuid,
+                                    hitl_response=r_db,
+                                )
+                            else:
+                                msg_obj = _build_assistant_chat_message_obj_full(
+                                    done_evt=done_evt,
+                                    run_meta=meta_payload,
+                                    message_uuid=asst_uuid,
+                                )
                             await a_insert_chat_message(
                                 tenant_id=(request.tenant_id or "").strip(),
                                 room_id=conv_id,
                                 thread_id=_thread_id_from_request_metadata(request),
-                                message_obj=_build_assistant_chat_message_obj_full(
-                                    done_evt=done_evt,
-                                    run_meta=meta_payload,
-                                    message_uuid=asst_uuid,
-                                ),
+                                message_obj=msg_obj,
                                 message_uuid=asst_uuid,
                             )
-                        if isinstance(done_evt, dict) and isinstance(done_evt.get("content"), str):
+                        if hitl_input_required and isinstance(r_db, ChatResponse):
+                            last_preview = _assistant_message_content_from_hitl(r_db) or "입력이 필요합니다."
+                            await a_update_chat_room_last_message(
+                                tenant_id=(request.tenant_id or "").strip(),
+                                room_id=conv_id,
+                                message={
+                                    "msg": last_preview,
+                                    "type": "text",
+                                    "createdAt": _iso_now_z(),
+                                },
+                            )
+                        elif isinstance(done_evt, dict) and isinstance(done_evt.get("content"), str):
                             await a_update_chat_room_last_message(
                                 tenant_id=(request.tenant_id or "").strip(),
                                 room_id=conv_id,

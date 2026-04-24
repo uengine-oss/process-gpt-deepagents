@@ -205,42 +205,6 @@ class ExecutorEventTests(unittest.TestCase):
         self.assertEqual(_classify_tenant_context_tool(T("dmn_rule", "dmn-rule")), "dmn_rule")
         self.assertIsNone(_classify_tenant_context_tool(T("list_skills", "claude-skills")))
 
-    def test_hitl_guard_requires_context_attempts(self) -> None:
-        try:
-            from deepagents_executor import _make_request_human_input_context_guard
-        except Exception as exc:  # pragma: no cover
-            self.skipTest(f"executor import unavailable: {exc}")
-            return
-
-        class T:
-            name = "request_human_input"
-
-        tracker = {"required_global": {"mem0", "memento"}, "attempted_global": set()}
-        guard = _make_request_human_input_context_guard(tracker)
-        blocked = guard(T(), {})
-        self.assertIsInstance(blocked, str)
-        self.assertIn("missing_context_tool_categories", blocked)
-
-    def test_hitl_guard_allows_immediate_for_approval_or_sensitive_or_ambiguous(self) -> None:
-        try:
-            from deepagents_executor import _make_request_human_input_context_guard
-        except Exception as exc:  # pragma: no cover
-            self.skipTest(f"executor import unavailable: {exc}")
-            return
-
-        class T:
-            name = "request_human_input"
-
-        tracker = {"required_global": {"mem0", "memento"}, "attempted_global": set()}
-        guard = _make_request_human_input_context_guard(tracker)
-        # Even if tenant context tools were not attempted, approval/sensitive/ambiguous cases should pass.
-        tool_call = {"name": "request_human_input", "args": {"question": "결재/승인이 필요합니다. 진행할까요?"}}
-        self.assertIsNone(guard(T(), tool_call))
-
-        tracker["attempted_global"].add("mem0")
-        tracker["attempted_global"].add("memento")
-        self.assertIsNone(guard(T(), {}))
-
     def test_duplicate_hitl_request_detection(self) -> None:
         try:
             from deepagents_executor import _is_duplicate_hitl_request

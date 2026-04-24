@@ -144,6 +144,7 @@ def create_pipeline_spec_middleware(
     job_uuid: str,
     exec_ctx: Any,
     planning_gate: dict[str, Any],
+    route_gate: dict[str, Any] | None = None,
 ) -> Any | None:
     """Returns middleware registering ``write_pipeline_spec`` and optional planning events."""
     if AgentMiddleware is None:
@@ -203,6 +204,19 @@ def create_pipeline_spec_middleware(
             request: ModelRequest[ContextT],
             handler: Any,
         ) -> Any:
+            # HTTP chat token hygiene:
+            # Do not inject planning-tool instructions unless we explicitly need multi-step execution.
+            try:
+                if isinstance(route_gate, dict):
+                    r0 = str(route_gate.get("route") or "").strip().lower().replace("-", "_")
+                    # If route is not decided yet, default to *not* injecting planning instructions.
+                    # This avoids bloating the very first routing call.
+                    if not r0:
+                        return await handler(request)
+                    if r0 != "needs_task":
+                        return await handler(request)
+            except Exception:
+                pass
             extra = (
                 "\n\n## `write_pipeline_spec`\n"
                 "Use `write_pipeline_spec` to submit the execution plan. "

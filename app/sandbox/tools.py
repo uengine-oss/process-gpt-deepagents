@@ -12,7 +12,7 @@ import threading
 import uuid
 import urllib.request
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse
 
 from processgpt_agent_utils.utils.context_manager import proc_inst_id_var, task_id_var
 
@@ -72,23 +72,31 @@ def discard_task_workspace_ids(task_id: str) -> None:
         _WORKSPACE_IDS_BY_TASK.pop(tid, None)
 
 
+def _skills_http_api_base_from_mcp_url(mcp_url: str) -> str:
+    """REST base for ``GET /skills/...`` derived from ``CLAUDE_SKILLS_MCP_URL`` (strip trailing ``/mcp`` path)."""
+    raw = (mcp_url or "").strip()
+    if not raw:
+        return "http://localhost:8765"
+    u = urlparse(raw)
+    if not u.scheme or not u.netloc:
+        return "http://localhost:8765"
+    path = (u.path or "").rstrip("/")
+    if path.endswith("/mcp"):
+        path = path[: -len("/mcp")].rstrip("/")
+    else:
+        path = ""
+    if path:
+        return urlunparse((u.scheme, u.netloc, path, "", "", "")).rstrip("/")
+    return f"{u.scheme}://{u.netloc}".rstrip("/")
+
+
 def _skills_http_api_base_candidates() -> list[str]:
     """Bases for claude-skills file API (GET /skills/<name>/files, .../files/<path>)."""
-    raw = (os.environ.get("PROCESSGPT_SKILLS_API_BASE_URL") or "").strip().rstrip("/")
-    out: list[str] = []
-    if raw:
-        out.append(raw)
-    # Local dev: skills server on host. In Docker Compose, set PROCESSGPT_SKILLS_API_BASE_URL instead.
-    fallback = "http://localhost:8765"
-    if fallback not in out:
-        out.append(fallback)
-    seen: set[str] = set()
-    uniq: list[str] = []
-    for b in out:
-        if b and b not in seen:
-            seen.add(b)
-            uniq.append(b)
-    return uniq
+    mcp = (os.environ.get("CLAUDE_SKILLS_MCP_URL") or "").strip()
+    if not mcp:
+        mcp = "http://localhost:8765/mcp"
+    base = _skills_http_api_base_from_mcp_url(mcp)
+    return [base] if base else ["http://localhost:8765"]
 
 
 def _decode_claude_skills_file_payload(body: bytes) -> bytes:
@@ -365,7 +373,7 @@ def sandbox_copy_mounted_skill(
     Tenant-uploaded skills live under ``<SKILLS_ROOT>/<tenant_id>/<skill_name>/`` on the Docker volume.
     GitHub/catalog skills from ``config.json`` (e.g. anthropics/skills) are often **not** mirrored to
     that path; they are still available via the claude-skills service. When the volume path is missing,
-    this tool tries ``PROCESSGPT_SKILLS_API_BASE_URL`` (see Docker Compose) and copies via
+    this tool derives the HTTP base from ``CLAUDE_SKILLS_MCP_URL`` (``.../mcp`` → same-origin API) and copies via
     ``GET /skills/<skill_name>/files`` + per-file fetches — same materialization idea as
     ``read_skill_document`` + ``sandbox_write_files``, but batched.
 
@@ -459,8 +467,8 @@ def sandbox_copy_mounted_skill(
             f"HTTP materialization from claude-skills was tried (bases: {bases}) but did not succeed."
         ),
         "hint": (
-            "Set PROCESSGPT_SKILLS_API_BASE_URL to the claude-skills service "
-            "(Docker Compose example: http://claude-skills:8765). "
+            "Set CLAUDE_SKILLS_MCP_URL to the streamable MCP endpoint "
+            "(e.g. http://127.0.0.1:8765/mcp; Docker host from container: http://host.docker.internal:8765/mcp). "
             "Alternatively use read_skill_document + sandbox_write_files for the same skill."
         ),
         "http_fallback_errors": http_errs[:6],

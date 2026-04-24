@@ -4,7 +4,7 @@ This middleware registers a tool that the root orchestrator must call early to d
 one of three execution routes:
 - work_assistant_only: finish using work-assistant MCP tools only (no task()).
 - needs_task: work-assistant MCP is insufficient; must delegate via task() (planning required).
-- ask_user_first: user intent is ambiguous; must ask_user first.
+- ask_user_first: user intent is ambiguous; must call request_human_input first.
 """
 
 from __future__ import annotations
@@ -46,13 +46,13 @@ class HttpChatRouteAgentState(AgentState[Any]):
 
 WRITE_HTTP_CHAT_ROUTE_DESCRIPTION = """Declare the HTTP chat execution route.
 
-You MUST call this tool before calling any other tools (except ask_user / request_human_input),
+You MUST call this tool before calling any other tools (except request_human_input),
 and before calling task().
 
 Allowed routes:
 - work_assistant_only: The user request can be completed using only work-assistant MCP tools.
 - needs_task: work-assistant MCP tools alone are insufficient; you will submit a plan and call task().
-- ask_user_first: The user intent is ambiguous; you will call ask_user first.
+- ask_user_first: The user intent is ambiguous; you will call request_human_input first.
 """
 
 
@@ -112,12 +112,19 @@ def create_http_chat_route_middleware(*, route_gate: dict[str, Any]) -> Any | No
 
         async def awrap_model_call(self, request: Any, handler: Any) -> Any:
             # Ensure the orchestrator sees the route tool in-system instructions.
+            # Token hygiene: once a route is already declared (or preselected by the executor),
+            # do not re-inject these instructions on every model turn.
+            try:
+                if isinstance(route_gate, dict) and str(route_gate.get("route") or "").strip():
+                    return await handler(request)
+            except Exception:
+                pass
             extra = (
                 "\n\n## `write_http_chat_route`\n"
                 "HTTP 채팅에서는 반드시 먼저 `write_http_chat_route(route=...)`로 라우팅을 선언하세요.\n"
                 "- work_assistant_only: work-assistant MCP만으로 완결 (task() 금지)\n"
                 "- needs_task: MCP만으로 불충분 → 계획 제출 후 task()\n"
-                "- ask_user_first: 의도/대상이 모호 → ask_user 먼저\n"
+                "- ask_user_first: 의도/대상이 모호 → request_human_input 먼저\n"
             )
             try:
                 sys_msg = getattr(request, "system_message", None)

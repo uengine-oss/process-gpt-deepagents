@@ -11,7 +11,6 @@ from .context import ExecutionContext
 from .exceptions import HitlInterrupt
 from .hitl_utils import (
     _extract_hitl_decision_from_output,
-    _missing_context_for_hitl,
     _record_context_tool_attempt,
     _should_defer_hitl_interrupt,
 )
@@ -363,18 +362,6 @@ def _instrument_tools(
                         decision = _log_finished(base_tool, job_id, effective_input, result, None)
                         if decision is not None:
                             would_defer = _should_defer_hitl_interrupt(decision)
-                            if (
-                                not would_defer
-                                and context_tool_tracker is not None
-                                and _missing_context_for_hitl(context_tool_tracker)
-                            ):
-                                logger.info(
-                                    "Deferring immediate HITL until tenant context tools are attempted | tool=%s job_id=%s missing=%s",
-                                    getattr(base_tool, "name", base_tool.__class__.__name__),
-                                    job_id,
-                                    sorted(_missing_context_for_hitl(context_tool_tracker)),
-                                )
-                                return _tool_node_safe_output(result, effective_input, base_tool)
                             if would_defer:
                                 logger.info(
                                     "Deferring HITL: returning requires_human tool result to model for more tool attempts | tool=%s job_id=%s",
@@ -427,18 +414,6 @@ def _instrument_tools(
                         decision = _log_finished(base_tool, job_id, effective_input, result, None)
                         if decision is not None:
                             would_defer = _should_defer_hitl_interrupt(decision)
-                            if (
-                                not would_defer
-                                and context_tool_tracker is not None
-                                and _missing_context_for_hitl(context_tool_tracker)
-                            ):
-                                logger.info(
-                                    "Deferring immediate HITL until tenant context tools are attempted | tool=%s job_id=%s missing=%s",
-                                    getattr(base_tool, "name", base_tool.__class__.__name__),
-                                    job_id,
-                                    sorted(_missing_context_for_hitl(context_tool_tracker)),
-                                )
-                                return _tool_node_safe_output(result, effective_input, base_tool)
                             if would_defer:
                                 logger.info(
                                     "Deferring HITL: returning requires_human tool result to model for more tool attempts | tool=%s job_id=%s",

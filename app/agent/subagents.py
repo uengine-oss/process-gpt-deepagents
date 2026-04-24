@@ -220,7 +220,12 @@ def _build_system_prompt(
     query: str = "",
     tenant_id: str | None = None,
 ) -> str:
-    """서브에이전트용 시스템 프롬프트(한글, 중복/충돌 정리 버전)."""
+    """서브에이전트용 시스템 프롬프트(한글, 토큰/충돌 최소화 버전).
+
+    NOTE:
+    - task() 위임(description)이 이미 목표/컨텍스트를 포함하므로, 여기서는 큰 워크아이템 q를 주입하지 않는다.
+    - 시스템 프롬프트는 '항상 필요한 규칙' + '짧은 우선순위' + '최소 실행 가드'만 제공한다.
+    """
     parts: list[str] = []
 
     name = (
@@ -234,10 +239,17 @@ def _build_system_prompt(
     persona = (agent_row.get("persona") or "").strip()
     goal = (agent_row.get("goal") or "").strip()
 
-    q = (query or "").strip()
     t_id = (tenant_id or "").strip() or "(unknown)"
     agent_skills = _parse_csv(agent_row.get("skills"))
     declared_tools = _parse_csv(agent_row.get("tools"))
+
+    # Short priority ladder to avoid confusion when multiple instructions exist.
+    parts.append("=== 우선순위(짧게) ===")
+    parts.append(
+        "- 1) task() 위임(description)의 지시/출력 형식을 최우선으로 따른다.\n"
+        "- 2) 스킬/문서/도구 사용법은 추정하지 말고, 문서/실행 결과로 검증한다.\n"
+        "- 3) 실행이 가능하면 실행하고(샌드박스), 불가하면 불가 사유와 다음 시도안을 짧게 보고한다."
+    )
 
     parts.append("=== 섹션 1: 역할/도메인 ===")
     parts.append(f"- 이름: {name}")
@@ -251,25 +263,23 @@ def _build_system_prompt(
 
     parts.append("\n" + format_execution_clock_section())
 
-    if q:
-        parts.append("\n=== 섹션 2: 현재 워크아이템 컨텍스트 ===")
-        parts.append(
-            "아래는 현재 워크아이템 쿼리([Description]/[Instruction]/[InputData])입니다. "
-            "당신의 역할과 직접 관련된 부분을 중심으로 행동을 결정하세요.\n"
-        )
-        parts.append(q)
+    parts.append("\n=== 섹션 2: 최소 컨텍스트 ===")
+    parts.append(
+        "- 워크아이템의 상세 컨텍스트([Description]/[Instruction]/[InputData])는 `task()` 위임(description)에서 제공됩니다.\n"
+        "- 이 시스템 프롬프트에는 큰 JSON/q를 재주입하지 않습니다(토큰 절감 목적).\n"
+        "- 더 많은 컨텍스트가 필요하면: 먼저 `mem0`/`memento`/`dmn_rule`로 확인하고, 그 다음 실행/조회로 검증하세요."
+    )
 
-    parts.append("\n=== 섹션 3: 테넌트/스킬 경로 ===")
+    parts.append("\n=== 섹션 3: 테넌트/스킬 경로(필수) ===")
     parts.append(f"- tenant_id: {t_id}")
     parts.append(f"- 스킬 루트(마운트 볼륨): \"{SKILLS_ROOT_DIR}/{{tenant_id}}/\"")
     parts.append("- 이 tenant_id를 사용해 스킬/문서 경로를 해석하세요(다른 tenant 경로 접근 금지).")
 
-    parts.append("\n=== 섹션 4: 실행 원칙(중요) ===")
+    parts.append("\n=== 섹션 4: 실행 원칙(핵심) ===")
     parts.append(
-        "- 이 작업은 **실행 우선**입니다. 가능한 경우 샌드박스에서 실제 실행을 수행하고, 결과(stdout/stderr, exit code)를 보고하세요.\n"
-        "- 스킬 스크립트가 있어도 기본은 **요청+InputData+스킬 문서를 반영한 태스크 전용 스크립트 합성 후 실행**입니다.\n"
-        "- 원본 스킬 스크립트의 직접 실행은 (a) 목적이 요청과 정확히 일치하고 (b) 입력이 이미 준비되어 있고 (c) 파라미터 변환이 불필요할 때만 허용됩니다.\n"
-        "- 오케스트레이터가 이번 `task()`를 **하나의 독립 산출**(예: 인벤토리 표, 파싱 JSON, 업로드된 파일 URL)로 정의했다면 범위를 넓히지 말고 그 산출만 완수하세요.\n"
+        "- 가능한 경우 샌드박스에서 **실제 실행**하고, stdout/stderr/exit_code로 근거를 남기세요.\n"
+        "- 스킬이 있으면: 문서 확인 → (필요 시) 물리화/복사 → 실행 순서를 지키세요.\n"
+        "- task()가 요구한 산출물 범위를 넘기지 마세요(독립 산출 1개면 1개만)."
     )
 
     parts.append("\n=== 섹션 4a: 지식/규칙/문서 도구(mem0/memento/dmn_rule) ===")
@@ -307,7 +317,7 @@ def _build_system_prompt(
             f"- \"{SKILLS_ROOT_DIR}/{{tenant_id}}/\" 아래를 탐색해 가장 관련 높은 스킬 폴더를 선택하세요."
         )
 
-    parts.append("\n=== 섹션 5: 보고 형식 ===")
+    parts.append("\n=== 섹션 5: 보고 형식(짧게) ===")
     parts.append(
         "- 오케스트레이터가 합성할 수 있게 **간결하고 검증 가능한 결과**를 반환하세요.\n"
         "- 실행이 있었다면: 사용한 도구/명령, exit code, stdout/stderr 핵심, 생성/수정된 파일(있다면) 요약을 포함하세요.\n"
@@ -349,6 +359,14 @@ def build_subagent_configs(
             server_to_tools.setdefault(server, []).append(t)
     sandbox_names = _sandbox_tool_names()
     skill_resolution_names = _skill_resolution_tool_names()
+
+    # Token hygiene: claude-skills MCP can expose a large tool schema set.
+    # For subagents, keep only the subset needed for deterministic skill resolution.
+    _ALLOWED_CLAUDE_SKILLS_TOOL_NAMES: set[str] = {
+        "list_skills",
+        "read_skill_document",
+        "find_helpful_skills",
+    }
 
     subagents: list[dict[str, Any]] = []
     for row in agent_rows:
@@ -405,16 +423,24 @@ def build_subagent_configs(
             if not _server_matches(str(server_key), wanted_servers_norm):
                 continue
             for t in tools:
+                # Reduce tool schema cost for claude-skills on subagents.
+                try:
+                    srv_norm = str(server_key or "").strip().lower().replace("_", "-")
+                except Exception:
+                    srv_norm = ""
+                if "claude-skills" in srv_norm:
+                    nm0 = str(getattr(t, "name", "") or "").strip()
+                    if nm0 and nm0 not in _ALLOWED_CLAUDE_SKILLS_TOOL_NAMES:
+                        continue
                 if id(t) not in seen_ids:
                     filtered_tools.append(t)
                     seen_ids.add(id(t))
 
-        # a2a 에이전트는 users.tools에 있는 도구만 사용한다.
+        # a2a 에이전트는 users.tools에 있는 도구만 사용한다(기존 동작 유지; variant 분리 금지).
         # 따라서 아래 "기본 도구" 부착 단계(로컬 3개/샌드박스/스킬 해석)는 모두 스킵한다.
         if is_a2a:
-            # a2a의 users.tools는 "도구명"이므로 tools_map에서 직접 매칭한다.
-            filtered_tools = []
-            seen_ids = set()
+            filtered_tools: list[Any] = []
+            seen_ids: set[int] = set()
             for tn in agent_tool_or_server_names:
                 t = tools_map.get(tn)
                 if t is None:
@@ -429,13 +455,14 @@ def build_subagent_configs(
 
             subagent: dict[str, Any] = {
                 "name": name,
-                "description": description,
+                "description": _build_description(row, str(display_name)),
                 "system_prompt": system_prompt,
                 "tools": filtered_tools,
                 "capabilities": {
                     "skills": list(declared_skill_names),
                     "tools": list(declared_tool_names),
                     "agent_type": agent_type,
+                    "agent_id": str(row.get("id") or ""),
                 },
             }
             model_raw = row.get("model")
@@ -509,7 +536,6 @@ def build_subagent_configs(
             )
 
         # 4차: 스킬 해석/볼륨 탐색 도구(find_helpful_skills 등과 별개)도 기본 포함한다.
-        # (요구사항에 제거 요청이 없으므로 기존 동작 유지)
         sr_added = 0
         if skill_resolution_names:
             for tn in sorted(skill_resolution_names):
@@ -539,6 +565,7 @@ def build_subagent_configs(
                 "skills": list(declared_skill_names),
                 "tools": list(declared_tool_names),
                 "agent_type": agent_type,
+                "agent_id": str(row.get("id") or ""),
             },
         }
 

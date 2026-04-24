@@ -49,7 +49,7 @@ services:
       - PYTHONUNBUFFERED=1
       - SKILLS_ROOT_DIR=/app/skills
       - DB_HOST=host.docker.internal
-      - PROCESSGPT_SKILLS_API_BASE_URL=http://host.docker.internal:8765
+      - CLAUDE_SKILLS_MCP_URL=http://host.docker.internal:8765/mcp
       - SUPABASE_URL=http://host.docker.internal:54321
       - MEMENTO_RETRIEVE_URL=http://host.docker.internal:8005/retrieve
     env_file:
