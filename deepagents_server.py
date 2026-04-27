@@ -48,8 +48,15 @@ logger = logging.getLogger(__name__)
 logging.getLogger("deepagents_executor").setLevel(logging.INFO)
 logging.getLogger("app.database").setLevel(logging.INFO)
 
-os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
+
+_env = (os.environ.get("ENV") or "").strip().lower()
+if _env == "local":
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
+else:
+    # 로컬이 아닌 환경에서는 코드에서 LangSmith를 강제로 활성화하지 않는다.
+    os.environ.pop("LANGSMITH_TRACING", None)
+    os.environ.pop("LANGSMITH_ENDPOINT", None)
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
     """Parse boolean-ish environment flags (default: False)."""
