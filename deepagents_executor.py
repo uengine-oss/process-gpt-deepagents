@@ -16,7 +16,7 @@ from typing_extensions import override
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 
-from app.database import get_latest_human_response
+from app.database import get_latest_human_response, get_supabase
 from app.agent.backend import (
     tenant_memory_sources_for_middleware,
     tenant_skill_sources_for_middleware,
@@ -94,6 +94,9 @@ from app.executor.prompt_sections_middleware import create_prompt_sections_middl
 from app.executor.subagent_prompt_sections import build_subagent_prompt_sections
 from app.executor.subagent_prompt_sections_middleware import create_subagent_prompt_sections_middleware
 from app.executor.token_hygiene_tool_result_middleware import create_token_hygiene_tool_result_middleware
+from app.executor.tool_result_projection_middleware import (
+    create_tool_result_projection_middleware_with_rules,
+)
 from app.executor.subagent_middleware import (
     _create_subagent_event_middleware,
     _emit_subagent_timeline_fallback,
@@ -844,6 +847,239 @@ def _subagent_tool_job_id_getter(default_jid: str):
     return _inner
 
 
+def _extract_activity_tools_skills_from_definition(
+    definition: Any,
+    *,
+    activity_id: str,
+) -> tuple[list[str], list[str]]:
+    """Best-effort extraction of tools/skills from proc_def_version.definition JSON.
+
+    New spec shape (expected):
+      definition.activities = [ { "id": "<activity_id>", "tools": [...], "skills": [...] }, ... ]
+    """
+    aid = (activity_id or "").strip()
+    if not aid:
+        return ([], [])
+    if not isinstance(definition, dict):
+        return ([], [])
+    activities = definition.get("activities")
+    if not isinstance(activities, list) or not activities:
+        return ([], [])
+
+    target: dict[str, Any] | None = None
+    for act in activities:
+        if not isinstance(act, dict):
+            continue
+        for key in ("id", "activity_id", "activityId", "key"):
+            if str(act.get(key) or "").strip() == aid:
+                target = act
+                break
+        if target is not None:
+            break
+    if target is None:
+        return ([], [])
+
+    def _as_str_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [s.strip() for s in value.split(",") if s.strip()]
+        if isinstance(value, list):
+            out: list[str] = []
+            for x in value:
+                s = str(x or "").strip()
+                if s:
+                    out.append(s)
+            return out
+        return []
+
+    tools = list(dict.fromkeys(_as_str_list(target.get("tools"))))
+    skills = list(dict.fromkeys(_as_str_list(target.get("skills"))))
+    return (tools, skills)
+
+
+def _load_proc_def_activity_capabilities(
+    *,
+    tenant_id: str,
+    proc_def_id: str,
+    activity_id: str,
+) -> tuple[list[str], list[str]]:
+    """Fetch proc_def.definition and extract activity.tools/skills (best-effort)."""
+    tid = (tenant_id or "").strip()
+    pdid = (proc_def_id or "").strip()
+    aid = (activity_id or "").strip()
+    if not (tid and pdid and aid):
+        return ([], [])
+    try:
+        resp = (
+            get_supabase()
+            .table("proc_def")
+            .select("definition")
+            .eq("tenant_id", tid)
+            .eq("id", pdid)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        logger.exception(
+            "proc_def lookup failed | tenant_id=%s proc_def_id=%s activity_id=%s",
+            tid,
+            pdid,
+            aid,
+            exc_info=True,
+        )
+        return ([], [])
+    rows = getattr(resp, "data", None)
+    if not isinstance(rows, list) or not rows:
+        return ([], [])
+    row0 = rows[0] if isinstance(rows[0], dict) else {}
+    definition = row0.get("definition") if isinstance(row0, dict) else None
+    return _extract_activity_tools_skills_from_definition(definition, activity_id=aid)
+
+
+def _build_fallback_activity_subagent(
+    *,
+    tenant_id: str,
+    tool_user_id: str,
+    all_tools: list[Any],
+    activity_tools: list[str],
+    activity_skills: list[str],
+) -> dict[str, Any] | None:
+    """Create a single subagent config from activity-specified tools/skills.
+
+    - Tool entries can be either tool names or MCP server keys.
+    - Token hygiene:
+      - If activity defines `tools`, build a **slim** toolset using only those MCP/tool entries.
+      - If activity does NOT define `tools` (skills-only), attach sandbox + skill-resolution tools.
+    """
+    if not activity_tools and not activity_skills:
+        return None
+
+    wanted_names = [str(x).strip() for x in (activity_tools or []) if str(x).strip()]
+    want_slim = bool(wanted_names)
+
+    merged_tools = list(all_tools)
+    if not want_slim:
+        # Skills-only fallback still needs local execution + skill resolution primitives.
+        merged_tools = merged_tools + list(get_sandbox_tools()) + list(get_skill_resolution_tools())
+    tools_by_name: dict[str, Any] = {str(getattr(t, "name", type(t).__name__)): t for t in merged_tools}
+
+    wanted_norm = {w.lower().replace("_", "-") for w in wanted_names}
+
+    picked: list[Any] = []
+    seen_ids: set[int] = set()
+
+    def _add_tool_obj(t: Any) -> None:
+        if t is None:
+            return
+        if id(t) in seen_ids:
+            return
+        picked.append(t)
+        seen_ids.add(id(t))
+
+    # 1) Exact tool name matches.
+    for n in wanted_names:
+        t = tools_by_name.get(n)
+        if t is not None:
+            _add_tool_obj(t)
+
+    # 2) MCP-server matches (treat each wanted name as possible server key).
+    for t in merged_tools:
+        srv = str(getattr(t, "_mcp_server", "") or "").strip()
+        if not srv:
+            continue
+        norm = srv.lower().replace("_", "-")
+        if norm in wanted_norm or any(norm.endswith(w) for w in wanted_norm):
+            _add_tool_obj(t)
+
+    if not want_slim:
+        # Best-effort include tenant context tools already loaded (if present).
+        for tn in ("mem0", "memento", "dmn_rule"):
+            base = tools_by_name.get(tn)
+            if base is not None:
+                _add_tool_obj(base)
+
+        # Always include sandbox tools & skill resolution tools.
+        for t in list(get_sandbox_tools()) + list(get_skill_resolution_tools()):
+            _add_tool_obj(t)
+
+    name = "업무 실행자"
+    sys_lines = [
+        "=== 역할 ===",
+        "- 당신은 프로세스 액티비티에 정의된 도구/스킬을 사용해 업무를 수행하는 실행 에이전트입니다.",
+        "- 결과는 간결하고 검증 가능한 형태(파일/JSON/근거)로 반환하세요.",
+    ]
+    if wanted_names:
+        sys_lines.append(f"- 액티비티 지정 도구: {', '.join(wanted_names)}")
+    if activity_skills:
+        sys_lines.append(f"- 액티비티 지정 스킬: {', '.join(activity_skills)}")
+    sys_lines.extend(
+        [
+            "",
+            "=== 우선순위 ===",
+            "- 1) task() 위임(description)의 지시/출력 형식을 최우선으로 따른다.",
+            "- 2) 스킬은 추정하지 말고, 필요한 경우 도구로 문서를 조회/로드한 뒤 사용한다.",
+            "- 3) 실행이 가능하면 실행(샌드박스)하고, 불가하면 근거와 다음 시도안을 보고한다.",
+        ]
+    )
+    system_prompt = "\n".join(sys_lines)
+
+    caps_tools = list(dict.fromkeys(wanted_names))
+    caps_skills = list(dict.fromkeys([str(x).strip() for x in (activity_skills or []) if str(x).strip()]))
+
+    return {
+        "name": name,
+        "description": f"Process activity fallback executor (tenant={tenant_id or '(unknown)'}, user={tool_user_id or '(unknown)'})",
+        "system_prompt": system_prompt,
+        "tools": picked,
+        "capabilities": {
+            "skills": caps_skills,
+            "tools": caps_tools,
+            "agent_type": "activity_fallback",
+            "agent_id": tool_user_id or "activity_fallback",
+        },
+    }
+
+
+def _select_tools_for_activity_tools(
+    *,
+    all_tools: list[Any],
+    activity_tools: list[str],
+) -> list[Any]:
+    """Select only tools matching activity-declared tool/server keys (token hygiene)."""
+    wanted_names = [str(x).strip() for x in (activity_tools or []) if str(x).strip()]
+    if not wanted_names:
+        return []
+    wanted_norm = {w.lower().replace("_", "-") for w in wanted_names}
+    tools_by_name: dict[str, Any] = {str(getattr(t, "name", type(t).__name__)): t for t in (all_tools or [])}
+
+    picked: list[Any] = []
+    seen_ids: set[int] = set()
+
+    def _add(t: Any) -> None:
+        if t is None:
+            return
+        if id(t) in seen_ids:
+            return
+        picked.append(t)
+        seen_ids.add(id(t))
+
+    # 1) Exact tool name matches.
+    for n in wanted_names:
+        _add(tools_by_name.get(n))
+
+    # 2) MCP-server matches (treat each wanted name as possible server key).
+    for t in all_tools or []:
+        srv = str(getattr(t, "_mcp_server", "") or "").strip()
+        if not srv:
+            continue
+        norm = srv.lower().replace("_", "-")
+        if norm in wanted_norm or any(norm.endswith(w) for w in wanted_norm):
+            _add(t)
+
+    return picked
+
+
 class DeepAgentsExecutor(AgentExecutor):
     """Runs todolist query via create_deep_agent(subagents); emits A2A Task*Events."""
 
@@ -1043,6 +1279,7 @@ class DeepAgentsExecutor(AgentExecutor):
 
         domain_agent_rows = extras.get("agents", []) or []
         all_tools: list[Any] = []
+        activity_fallback_tools: list[str] = []
         # Prefer agents[].id as tool user_id when available.
         first_agent_user_id = ""
         if isinstance(domain_agent_rows, list):
@@ -1151,6 +1388,7 @@ class DeepAgentsExecutor(AgentExecutor):
             list(mcp_servers.keys()) if isinstance(mcp_servers, dict) else [],
             mcp_request,
         )
+        tool_loader: TaggingSafeToolLoader | None = None
         try:
             # tenant_mcp 병합 설정 + claude-skills 명시 요청으로 Tier 2 MCP 도구 로드.
             # TaggingSafeToolLoader 가 각 MCP 툴에 _mcp_server 를 붙여 서브 에이전트 baseline 라우팅을 가능하게 함.
@@ -1259,13 +1497,86 @@ class DeepAgentsExecutor(AgentExecutor):
                 [getattr(t, "name", type(t).__name__) for t in sa_tools],
             )
         if not domain_agent_rows or not subagents_domain:
-            logger.error(
-                "Subagents are required: domain_agent_rows=%d subagents_domain=%d task_id=%s",
-                len(domain_agent_rows),
-                len(subagents_domain),
-                task_id,
+            # Extended spec: even if no explicit subagent is configured, the activity can define
+            # tools/skills to execute this work-item. If present, do NOT fail.
+            proc_def_id = str(row.get("proc_def_id") or "").strip()
+            activity_id = str(row.get("activity_id") or "").strip()
+            act_tools, act_skills = _load_proc_def_activity_capabilities(
+                tenant_id=str(tenant_id or ""),
+                proc_def_id=proc_def_id,
+                activity_id=activity_id,
             )
-            raise MissingSubagentsConfigurationError()
+            # If activity declares tools, ensure they're loaded (MCP adapters) before building fallback subagent.
+            if tool_loader is not None and act_tools:
+                try:
+                    existing_names = {
+                        str(getattr(t, "name", type(t).__name__)) for t in (all_tools or [])
+                    }
+                    wanted = [t for t in act_tools if t and t not in existing_names]
+                    if wanted:
+                        more = tool_loader.create_tools_from_names(tool_names=wanted, agent_type=None)
+                        more = _ensure_langchain_tools(list(more or []))
+                        # Preserve existing tool instances; append only new identities.
+                        seen_ids = {id(t) for t in (all_tools or [])}
+                        for t in more:
+                            if id(t) not in seen_ids:
+                                all_tools.append(t)
+                                seen_ids.add(id(t))
+                        logger.info(
+                            "액티비티 도구 추가 로드 완료 | task_id=%s requested=%d loaded=%d",
+                            task_id,
+                            len(wanted),
+                            len(more or []),
+                        )
+                except Exception:
+                    logger.exception(
+                        "액티비티 도구 추가 로드 실패(계속 진행) | task_id=%s tools=%s",
+                        task_id,
+                        act_tools,
+                        exc_info=True,
+                    )
+            fallback = _build_fallback_activity_subagent(
+                tenant_id=str(tenant_id or ""),
+                tool_user_id=str(tool_user_id or ""),
+                all_tools=all_tools,
+                activity_tools=act_tools,
+                activity_skills=act_skills,
+            )
+            if fallback is not None:
+                subagents = [fallback]
+                activity_fallback_tools = list(act_tools or [])
+                agent_rows = [
+                    {
+                        "id": tool_user_id or "activity_fallback",
+                        "alias": fallback.get("name"),
+                        "username": fallback.get("name"),
+                        "name": fallback.get("name"),
+                        "role": "업무 실행",
+                        "description": "프로세스 액티비티 정의 기반 폴백 실행자",
+                        "skills": ",".join(act_skills or []),
+                        "tools": ",".join(act_tools or []),
+                        "agent_type": "activity_fallback",
+                    }
+                ]
+                logger.info(
+                    "서브에이전트 폴백 활성화 | task_id=%s proc_def_id=%s activity_id=%s tools=%d skills=%d picked_tools=%d",
+                    task_id,
+                    proc_def_id or "(empty)",
+                    activity_id or "(empty)",
+                    len(act_tools),
+                    len(act_skills),
+                    len(fallback.get("tools") or []),
+                )
+            else:
+                logger.error(
+                    "Subagents are required (no activity fallback): domain_agent_rows=%d subagents_domain=%d task_id=%s proc_def_id=%s activity_id=%s",
+                    len(domain_agent_rows),
+                    len(subagents_domain),
+                    task_id,
+                    proc_def_id or "(empty)",
+                    activity_id or "(empty)",
+                )
+                raise MissingSubagentsConfigurationError()
 
         # 스킬 탐색 도우미 제거: discovery_job 기반 가드/관측 함수 제거.
 
@@ -2042,6 +2353,21 @@ class DeepAgentsExecutor(AgentExecutor):
                 else:
                     sa["middleware"] = [oss_norm_mw]
 
+        # Always-on projection: keep only necessary tool output fields for next turns.
+        # This runs before token_hygiene (truncate) so we prefer structured shrinking over blind cutting.
+        proj_rules = extras.get("tool_result_projection_rules") if isinstance(extras, dict) else None
+        proj_mw = create_tool_result_projection_middleware_with_rules(
+            rules=proj_rules if isinstance(proj_rules, dict) else None
+        )
+        if proj_mw is not None:
+            extra_middleware.append(proj_mw)
+            for sa in subagents:
+                chain = sa.get("middleware")
+                if isinstance(chain, list):
+                    chain.append(proj_mw)
+                else:
+                    sa["middleware"] = [proj_mw]
+
         # Always-on token hygiene: truncate known huge tool results (skill discovery/catalog dumps, sandbox stdout).
         # This is independent of model routing; it protects long-running task() loops from context bloat.
         th_mw = create_token_hygiene_tool_result_middleware(max_chars=12_000)
@@ -2071,18 +2397,27 @@ class DeepAgentsExecutor(AgentExecutor):
             else:
                 root_tools_for_orchestrator = select_http_chat_root_work_assistant_tools(all_tools)
         else:
-            try:
-                root_tools_for_orchestrator.extend(all_tools or [])
-            except Exception:
-                root_tools_for_orchestrator = list(all_tools) if all_tools else []
-            try:
-                root_tools_for_orchestrator.extend(list(get_sandbox_tools()))
-            except Exception:
-                logger.exception("Failed to attach sandbox tools to root orchestrator", exc_info=True)
-            try:
-                root_tools_for_orchestrator.extend(list(get_skill_resolution_tools()))
-            except Exception:
-                logger.exception("Failed to attach skill resolution tools to root orchestrator", exc_info=True)
+            # Token hygiene (process mode):
+            # If activity fallback declares tools, keep root tool schemas slim as well
+            # (even when the run completes without any task() delegation).
+            if activity_fallback_tools:
+                root_tools_for_orchestrator = _select_tools_for_activity_tools(
+                    all_tools=list(all_tools or []),
+                    activity_tools=activity_fallback_tools,
+                )
+            else:
+                try:
+                    root_tools_for_orchestrator.extend(all_tools or [])
+                except Exception:
+                    root_tools_for_orchestrator = list(all_tools) if all_tools else []
+                try:
+                    root_tools_for_orchestrator.extend(list(get_sandbox_tools()))
+                except Exception:
+                    logger.exception("Failed to attach sandbox tools to root orchestrator", exc_info=True)
+                try:
+                    root_tools_for_orchestrator.extend(list(get_skill_resolution_tools()))
+                except Exception:
+                    logger.exception("Failed to attach skill resolution tools to root orchestrator", exc_info=True)
 
         # De-duplicate by tool name to avoid LangChain duplicate tool errors.
         deduped_root_tools: list[Any] = []

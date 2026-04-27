@@ -110,12 +110,24 @@ def _format_pipeline_plan_message(spec: dict[str, Any]) -> str:
         if not isinstance(steps, list):
             return json.dumps(spec, ensure_ascii=False)[:8000]
         lines: list[str] = []
-        for s in steps:
+        for i, s in enumerate(steps):
             if not isinstance(s, dict):
                 continue
-            sid = str(s.get("id") or "").strip() or "?"
             kind = str(s.get("kind") or "").strip() or "?"
-            lines.append(f"- {sid}: {kind}")
+            name = str(s.get("name") or "").strip()
+            sid_raw = str(s.get("id") or "").strip()
+            # Many LLM-produced pipeline specs omit explicit ids. Avoid user-facing "?" placeholders.
+            if sid_raw:
+                step_label = sid_raw
+                detail = kind
+            else:
+                # Prefer semantic label; fall back to a stable positional label.
+                step_label = kind if kind != "?" else f"step_{i + 1}"
+                detail = name or ""
+            if detail:
+                lines.append(f"- {step_label}: {detail}")
+            else:
+                lines.append(f"- {step_label}")
         head = "파이프라인 스펙:\n" + "\n".join(lines)
         if len(head) > 8000:
             return head[:8000] + "…"
