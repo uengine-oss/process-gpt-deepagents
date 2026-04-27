@@ -347,7 +347,7 @@ async def run_todo_subagent_job(
         tools_for_worker,
         todo_id=task_id or None,
         proc_inst_id=proc_inst_id or None,
-        crew_type="action",
+        crew_type="deepagents",
         job_id_getter=_todo_job_id_getter(job_id),
         job_tool_log=job_tool_log,
         job_skill_log=job_skill_log,

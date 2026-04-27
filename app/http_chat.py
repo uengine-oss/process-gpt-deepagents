@@ -643,7 +643,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
         set_context(
             task_id=conv_id,
             proc_inst_id=conv_id,
-            crew_type="action",
+            crew_type="deepagents",
             users_email=extras.get("notify_user_emails", []),
         )
 

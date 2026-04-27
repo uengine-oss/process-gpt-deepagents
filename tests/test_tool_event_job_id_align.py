@@ -20,7 +20,7 @@ def test_align_subagent_maps_via_binding() -> None:
         event_queue=None,
         todo_id="t1",
         proc_inst_id="p1",
-        crew_type="action",
+        crew_type="deepagents",
         default_job_id="root-uuid",
         root_exec_ctx=None,
         subagent_name_to_job_id={"도메인에이전트": "sub-job-uuid"},
