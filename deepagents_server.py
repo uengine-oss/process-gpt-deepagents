@@ -302,7 +302,7 @@ class DeepAgentsServer(ProcessGPTAgentServer):
     async def run(self) -> None:
         """SDK 기본 폴링 + HITL 재개 보조 폴링을 함께 수행."""
         self.is_running = True
-        logger.info("\n\n🚀 DeepAgents Action Server START (agent=%s)\n", self.agent_orch)
+        logger.info("\n\n🚀 DeepAgents Server START (agent=%s)\n", self.agent_orch)
         initialize_db()
         await self._install_signal_handlers()
 

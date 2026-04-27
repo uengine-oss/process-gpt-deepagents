@@ -16,7 +16,7 @@ RUN apt-get update \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
-# 2) Node.js 20.x + Supabase MCP (parity with existing action servers)
+# 2) Node.js 20.x + Supabase MCP (parity with similar deployments)
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get update \
  && apt-get install -y --no-install-recommends nodejs \

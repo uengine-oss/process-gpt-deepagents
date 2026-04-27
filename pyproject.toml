@@ -1,5 +1,5 @@
 [project]
-name = "process-gpt-deepagents-action"
+name = "process-gpt-deepagents"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -12,7 +12,7 @@ dependencies = [
     "jsonschema>=4.22.0",
     "langchain>=1.0.0",
     "langchain-openai>=0.1.0",
-    "langgraph>=0.2.0",
+    "langgraph==1.0.10",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
     "supabase>=2.0.0",
