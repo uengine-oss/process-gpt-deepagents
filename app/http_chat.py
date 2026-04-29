@@ -236,6 +236,38 @@ def _json_safe(x: Any) -> Any:
         return str(x)
 
 
+_USER_MESSAGE_REDACTED = "[REDACTED_USER_MESSAGE]"
+
+
+def _sanitize_text_from_user_message(text: Any, *, user_message: str) -> Any:
+    if not isinstance(text, str):
+        return text
+    raw = (user_message or "").strip()
+    if not raw:
+        return text
+    out = text
+    if raw in out:
+        out = out.replace(raw, _USER_MESSAGE_REDACTED)
+    # 일부 경로는 개행/공백이 포함된 원문이 들어올 수 있어 보수적으로 추가 치환한다.
+    raw_nl = f"{raw}\n"
+    raw_crlf = f"{raw}\r\n"
+    if raw_nl in out:
+        out = out.replace(raw_nl, _USER_MESSAGE_REDACTED + "\n")
+    if raw_crlf in out:
+        out = out.replace(raw_crlf, _USER_MESSAGE_REDACTED + "\r\n")
+    return out
+
+
+def _sanitize_event_payload_user_message(payload: Any, *, user_message: str) -> Any:
+    if isinstance(payload, dict):
+        return {k: _sanitize_event_payload_user_message(v, user_message=user_message) for k, v in payload.items()}
+    if isinstance(payload, list):
+        return [_sanitize_event_payload_user_message(v, user_message=user_message) for v in payload]
+    if isinstance(payload, tuple):
+        return tuple(_sanitize_event_payload_user_message(v, user_message=user_message) for v in payload)
+    return _sanitize_text_from_user_message(payload, user_message=user_message)
+
+
 def _build_user_chat_message_obj(request: ChatRequest, *, message_uuid: str) -> dict[str, Any]:
     file_obj = request.file if isinstance(request.file, dict) else None
     files = request.files if isinstance(request.files, list) else []
@@ -389,17 +421,20 @@ def _build_http_stream_terminal_events(
     except Exception:
         logger.exception("run_meta extraction failed", exc_info=True)
 
+    user_message = (request.message or "").strip()
     done_evt: dict[str, Any] | None = None
     if "http_error" in outcome:
         done_err = json.dumps(outcome["http_error"], ensure_ascii=False)
+        done_err = _sanitize_text_from_user_message(done_err, user_message=user_message)
         done_evt = {
             "type": "done",
             "content": ensure_trailing_newline(done_err),
         }
     elif "error" in outcome:
+        err_txt = _sanitize_text_from_user_message(str(outcome["error"]), user_message=user_message)
         done_evt = {
             "type": "done",
-            "content": ensure_trailing_newline(str(outcome["error"])),
+            "content": ensure_trailing_newline(str(err_txt)),
         }
     elif "response" in outcome:
         r = outcome["response"]
@@ -410,10 +445,12 @@ def _build_http_stream_terminal_events(
             done_text = str(r)
         done_text = unwrap_output_wrapper_result_text(done_text).strip()
         done_text = strip_leading_workitem_echo_for_sse(done_text).lstrip()
+        done_text = _sanitize_text_from_user_message(done_text, user_message=user_message).strip()
         if not done_text:
             streamed_full = "".join(streamed_token_parts).strip()
             streamed_full = unwrap_output_wrapper_result_text(streamed_full).strip()
             streamed_full = strip_leading_workitem_echo_for_sse(streamed_full).lstrip()
+            streamed_full = _sanitize_text_from_user_message(streamed_full, user_message=user_message).strip()
             done_text = streamed_full or "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다."
         done_text = ensure_trailing_newline(done_text)
         done_evt = {"type": "done", "content": done_text}
@@ -425,6 +462,13 @@ def _build_http_stream_terminal_events(
             tool_event_count,
             "".join(token_preview_parts)[:240],
         )
+
+    meta_payload = _sanitize_event_payload_user_message(meta_payload, user_message=user_message)
+    if done_evt is not None:
+        done_evt = _sanitize_event_payload_user_message(done_evt, user_message=user_message)
+        content = str(done_evt.get("content") or "").strip()
+        if not content or content == _USER_MESSAGE_REDACTED:
+            done_evt["content"] = "요청 작업을 수행했지만 최종 답변을 생성하지 못했습니다.\n"
 
     return meta_payload, done_evt
 
@@ -1184,6 +1228,7 @@ def create_chat_app(executor: DeepAgentsExecutor) -> FastAPI:
                                     "HTTP chat: context DB update (flush) failed (ignored)", exc_info=True
                                 )
                             _log_evt(e)
+                            yield {"data": json.dumps(e, ensure_ascii=False)}
                         continue
                     try:
                         await a_update_chat_room_context(

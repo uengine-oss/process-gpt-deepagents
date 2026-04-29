@@ -620,7 +620,20 @@ def _coerce_langgraph_stream_chunk(part: Any) -> list[tuple[str, Any]]:
     if isinstance(part, dict):
         t = part.get("type")
         if t in ("values", "messages"):
-            return [(t, part.get("data"))]
+            data = part.get("data")
+            # LangGraph ``version=\"v2\"`` 스트림: ``interrupt()`` 페이로드가 ``data`` 안의
+            # ``__interrupt__``가 아니라 루트의 ``interrupts`` 튜플로만 내려온다.
+            # 여기서 떨어뜨리면 최종 state에 interrupt가 없어 HTTP 채팅이 completed/done으로
+            # 끝나고 OpenUI HITL SSE가 발행되지 않는다.
+            if t == "values" and isinstance(data, dict):
+                ir = part.get("interrupts")
+                if ir:
+                    data = dict(data)
+                    if isinstance(ir, (list, tuple)):
+                        data["__interrupt__"] = tuple(ir)
+                    else:
+                        data["__interrupt__"] = (ir,)
+            return [(t, data)]
         return []
     if isinstance(part, tuple):
         if len(part) == 2 and isinstance(part[0], str) and part[0] in ("values", "messages"):
