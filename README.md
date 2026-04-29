@@ -45,7 +45,7 @@ ProcessGPT 환경에서 LangChain **Deep Agents (deepagents)** 를 Middleware-Fi
   - `database.py`, `execution_context.py`, `runtime_config.py`, `output_utils.py`, `health_server.py`
   - `app/sandbox/` — 런타임·도구·산출물 전달(선택적 Supabase public Storage)
   - `app/skills/` — 스킬 탐색·해결·볼륨
-  - `app/tooling/` — `TaggingSafeToolLoader` (Memento는 `MEMENTO_RETRIEVE_URL` 설정 시)
+  - `app/tooling/` — `TaggingSafeToolLoader`
   - `app/agent/` — DeepAgent `factory`, `hitl`, `backend`, `subagents`
   - `app/executor/` — A2A 이벤트, 파이프라인, HITL, 토큰 하이진/툴 결과 프로젝션 등 실행 보조 모듈
 
@@ -105,7 +105,6 @@ curl -N -sS -X POST "http://localhost:8888/chat/stream" \
 | `SUPABASE_KEY` | Supabase 서비스 롤 키 |
 | `SUPABASE_PUBLIC_FILES_BUCKET` | (선택) public Storage 버킷명, 기본 `files` |
 | `DISABLE_SUPABASE_STORAGE_UPLOAD` | (선택) `1`/`true`/`yes`이면 산출물 public 업로드 비활성 |
-| `MEMENTO_RETRIEVE_URL` | (선택) Memento 검색 API 베이스 URL; 미설정 시 로컬 도구 로더는 Memento를 주입하지 않음 |
 | `SKILLS_ROOT_DIR` | 스킬 파일 루트 경로 (예: `/app/skills`) |
 | `LLM_MODEL` | 기본 LLM 모델명 (예: `anthropic:claude-opus-4-6`). 프록시 모드에서는 게이트웨이가 기대하는 `model` 문자열에 맞추세요(보통 `anthropic:` 뒤 접미사가 OpenAI 호환 요청에 전달됨). |
 | `LLM_PROXY_URL` | (선택) OpenAI 호환 게이트웨이 베이스 URL(`ChatOpenAI`의 `base_url` 그대로). 경로는 게이트웨이 문서대로. **URL만 있고 프록시 키가 없으면** 직접 Anthropic으로 폴백(`app/runtime_config.py`). |

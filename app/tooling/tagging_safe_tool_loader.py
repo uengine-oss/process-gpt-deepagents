@@ -16,19 +16,16 @@ logger = logging.getLogger(__name__)
 
 def _memento_retrieve_url() -> str | None:
     u = (os.environ.get("MEMENTO_RETRIEVE_URL") or "").strip().rstrip("/")
-    return u or None
+    return u or "http://memento-service:8005/retrieve"
 
 
 class _EnvMementoTool(MementoTool):
-    """MementoTool: GET URL from ``MEMENTO_RETRIEVE_URL`` only (no built-in default)."""
+    """MementoTool: GET URL from ``MEMENTO_RETRIEVE_URL`` with service default."""
 
     def _run(self, query: str) -> str:
         url = _memento_retrieve_url()
         if not url:
-            return (
-                "사내문서 검색(Memento)이 비활성화되어 있습니다. "
-                "환경 변수 MEMENTO_RETRIEVE_URL을 설정하세요."
-            )
+            return "사내문서 검색(Memento) URL이 비어 있습니다."
         logger.info("\n\n🔍 사내문서 검색 시작 | tenant_id=%s", self._tenant_id)
 
         try:
@@ -114,9 +111,6 @@ class TaggingSafeToolLoader(SafeToolLoader):
         try:
             if not self.tenant_id:
                 logger.info("⏭️ MementoTool 로드 생략: tenant_id 없음")
-                return []
-            if not _memento_retrieve_url():
-                logger.info("⏭️ MementoTool 로드 생략: MEMENTO_RETRIEVE_URL 미설정")
                 return []
             tool = _EnvMementoTool(
                 tenant_id=self.tenant_id,

@@ -50,8 +50,6 @@ spec:
               value: "/app/skills"
             - name: SANDBOX_BASE_DIR
               value: "/tmp"
-            - name: MEMENTO_RETRIEVE_URL
-              value: "http://localhost:8005/retrieve"
             - name: SUPABASE_URL
               valueFrom:
                 configMapKeyRef:

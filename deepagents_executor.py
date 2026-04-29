@@ -144,7 +144,7 @@ def _default_claude_skills_mcp_url() -> str:
     explicit = (os.environ.get(_ENV_CLAUDE_SKILLS_MCP_URL) or "").strip()
     if explicit:
         return explicit
-    return "http://localhost:8765/mcp"
+    return "http://claude-skills:8765/mcp"
 
 
 def _skills_mcp_base_env_configured() -> bool:
