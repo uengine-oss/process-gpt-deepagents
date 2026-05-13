@@ -12,6 +12,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import errno
+import socket
+
 from processgpt_agent_sdk.processgpt_agent_framework import (
     ProcessGPTAgentServer,
     ProcessGPTRequestContext,
@@ -37,7 +40,10 @@ from deepagents_executor import (
     DeepAgentsExecutor,
     MissingSubagentsConfigurationError,
 )
-from app.http_server import start_http_server
+from app.executor.event_queue_compat import ThreadsafeSyncEnqueueAdapter
+
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -262,45 +268,37 @@ class _TaskFileLogSession(contextlib.AbstractContextManager["_TaskFileLogSession
         return None
 
 
-class _ThreadSafeEventQueueProxy:
-    """Proxy that marshals enqueue_event calls onto the main asyncio loop.
+def _start_sdk_chat_sse_server(
+    server: ProcessGPTAgentServer,
+    *,
+    host: str = "0.0.0.0",
+    port: int = 8888,
+) -> None:
+    """Start SDK-provided chat SSE endpoint (/chat/stream).
 
-    SDK's ProcessGPTEventQueue.enqueue_event uses asyncio.create_task() internally.
-    When tools are executed via sync invoke() in a worker thread, enqueue_event may
-    be called from that thread, which has no running event loop → RuntimeError.
-    This proxy ensures enqueue_event always runs on the loop thread.
+    (Deprecated) Use the Starlette mount in `main()` instead.
     """
+    if not _port_available(host, port):
+        logger.warning("HTTP API port in use; skipping (host=%s port=%d)", host, port)
+        return
 
-    def __init__(self, inner: ProcessGPTEventQueue, loop: asyncio.AbstractEventLoop) -> None:
-        self._inner = inner
-        self._loop = loop
+    raise RuntimeError(
+        "_start_sdk_chat_sse_server is deprecated. Use Starlette + asyncio.gather(server.run(), uvicorn.serve()) "
+        "in main(), per SDK README."
+    )
 
-    def enqueue_event(self, event: Any) -> None:
-        # If we're already on the loop thread, call directly.
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
 
-        if running is self._loop:
-            self._inner.enqueue_event(event)
-            return
-
-        # Cross-thread: marshal onto the main loop thread.
-        def _call() -> None:
-            try:
-                self._inner.enqueue_event(event)
-            except Exception:
-                logger.exception("❌ 이벤트 enqueue 실패(루프 전달 후)", exc_info=True)
-
-        try:
-            self._loop.call_soon_threadsafe(_call)
-        except Exception:
-            logger.exception("❌ call_soon_threadsafe 실패", exc_info=True)
-
-    def task_done(self) -> None:
-        # task_done is called from the main async flow; keep it direct.
-        self._inner.task_done()
+def _port_available(host: str, port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, port))
+        return True
+    except OSError as e:
+        if getattr(e, "errno", None) in (errno.EADDRINUSE, 48):
+            return False
+        raise
+    finally:
+        sock.close()
 
 
 class DeepAgentsServer(ProcessGPTAgentServer):
@@ -399,10 +397,9 @@ class DeepAgentsServer(ProcessGPTAgentServer):
                 base_event_queue = ProcessGPTEventQueue(
                     str(task_id), self.agent_orch, row.get("proc_inst_id")
                 )
-                # Wrap with thread-safe proxy so tool events from worker threads
-                # don't crash with "no running event loop".
                 loop = asyncio.get_running_loop()
-                event_queue = _ThreadSafeEventQueueProxy(base_event_queue, loop)
+                # a2a-sdk>=1.0 makes enqueue_event async; our tooling uses sync calls.
+                event_queue = ThreadsafeSyncEnqueueAdapter(base_event_queue, loop)
                 logger.info("🧵 EventQueue 생성 완료 | task_id=%s", task_id)
                 result = await self.agent_executor.execute(context, event_queue)
                 logger.info(
@@ -474,21 +471,50 @@ class DeepAgentsServer(ProcessGPTAgentServer):
 
 
 async def main() -> None:
-    """메인 서버 실행 (FastAPI + SDK 폴링)."""
+    """메인 서버 실행 (SDK chat SSE + 폴링/HITL 재개)."""
     try:
         logger.info("🚀 DeepAgents Server 시작 중...")
         _log_skills_volume_inventory()
 
         executor = DeepAgentsExecutor()
-        start_http_server(executor, host="0.0.0.0", port=8888)
         server = DeepAgentsServer(
             agent_executor=executor,
             agent_type="deepagents",
         )
         server.polling_interval = 5
 
-        logger.info("✅ 서버 설정 완료, 폴링 시작...")
-        await server.run()
+        # SDK README style: mount SSE on Starlette and run both loops together.
+        import uvicorn
+
+        app = Starlette()
+
+        async def health(request):  # noqa: ARG001
+            return JSONResponse({"status": "ok"})
+
+        app.add_route("/health", health, methods=["GET"])
+        server.mount_chat_sse(app, path="/chat/stream")
+
+        host = "0.0.0.0"
+        port = 8888
+        uvicorn_server = uvicorn.Server(
+            uvicorn.Config(app, host=host, port=port, log_level="info", access_log=True)
+        )
+
+        logger.info("✅ 서버 설정 완료, 폴링+SSE 동시 시작...")
+        if _port_available(host, port):
+            await asyncio.gather(
+                server.run(),
+                uvicorn_server.serve(),
+            )
+        else:
+            # Uvicorn startup failure calls sys.exit(1); avoid taking down the poller.
+            logger.warning(
+                "SSE 포트가 이미 사용 중이라 HTTP(SSE) 서버를 건너뜁니다 (host=%s port=%d). "
+                "폴링 워커는 계속 실행됩니다.",
+                host,
+                port,
+            )
+            await server.run()
 
     except Exception as e:
         logger.error("❌ 서버 실행 중 오류 발생: %s", e, exc_info=True)

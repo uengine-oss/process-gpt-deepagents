@@ -3,7 +3,7 @@
 Wire contract (schema ``1.0``)
 -------------------------------
 
-Each SSE ``data`` line is one JSON object (existing /chat/stream rule).
+Each SSE ``data`` line is one JSON object (SDK /chat/stream contract).
 
 Legacy ``input_required`` is expanded into a short sequence.
 

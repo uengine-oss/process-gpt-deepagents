@@ -1,6 +1,6 @@
 """Truncate oversized tool results for narrow-context proxy models (e.g. gpt-oss via LiteLLM).
 
-**When it runs:** Same stack as 폴링 워크아이템 실행 — HTTP ``/chat`` 도 ``DeepAgentsExecutor.execute()`` 를
+**When it runs:** Same stack as 폴링 워크아이템 실행 — SDK chat(SSE)도 ``DeepAgentsExecutor.execute()`` 를
 호출하므로 별도 분기 없이 동일하게 적용된다.
 
 **Which model:** Resolved ``LLM_MODEL`` (또는 요청 ``metadata.model`` 이 extras에 들어간 값)의 프록시용 id가

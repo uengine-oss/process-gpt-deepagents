@@ -185,8 +185,7 @@ class ExecutorEventTests(unittest.TestCase):
             phase="planning",
         )
         self.assertEqual(len(q.events), 1)
-        self.assertEqual(q.events[0].status.state, TaskState.working)
-        self.assertFalse(q.events[0].final)
+        self.assertEqual(q.events[0].status.state, TaskState.TASK_STATE_WORKING)
 
     def test_classify_tenant_context_tool(self) -> None:
         try:

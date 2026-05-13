@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 def create_prompt_sections_middleware(
     *,
     sections: Mapping[str, str],
-    http_chat: bool,
+    is_chat: bool,
     route_gate: dict[str, Any] | None,
     planning_gate: dict[str, Any] | None,
     include_execution_clock: bool = True,
@@ -63,14 +63,14 @@ def create_prompt_sections_middleware(
             # - When delegating (task()) or route says needs_task: include multi-agent rules.
             route = _route()
             need_multi = (route == "needs_task") or _saw_task()
-            include_clock = bool(include_execution_clock) and not (http_chat and route == "work_assistant_only")
+            include_clock = bool(include_execution_clock) and not (is_chat and route == "work_assistant_only")
 
-            if http_chat and route == "work_assistant_only" and not need_multi:
+            if is_chat and route == "work_assistant_only" and not need_multi:
                 keys = ["base_compact", "lang", "sec1", "sec1b", "chat_output", "http_chat_rules_wa"]
-            elif http_chat and route == "ask_user_first" and not need_multi:
+            elif is_chat and route == "ask_user_first" and not need_multi:
                 # Do not inject chat_output here: it nudges plain-text "final answers" and fights HITL.
                 keys = ["base_identity", "lang", "sec1", "sec1b", "http_chat_rules_ask_user"]
-            elif http_chat and not need_multi:
+            elif is_chat and not need_multi:
                 keys = ["base_identity", "lang", "sec1", "sec1b", "chat_output", "http_chat_rules_generic"]
             elif need_multi:
                 keys = [

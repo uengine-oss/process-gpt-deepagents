@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import logging
@@ -16,7 +17,12 @@ from typing_extensions import override
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 
-from app.database import get_latest_human_response, get_supabase
+from app.database import (
+    a_update_chat_room_context,
+    a_upsert_chat_room_start,
+    get_latest_human_response,
+    get_supabase,
+)
 from app.agent.backend import (
     tenant_memory_sources_for_middleware,
     tenant_skill_sources_for_middleware,
@@ -66,6 +72,8 @@ from app.executor.a2a_events import (
     _enqueue_artifact,
     _enqueue_status,
     _ensure_required_root_task_started_fields,
+    bind_executor_asyncio_loop_for_enqueue,
+    reset_executor_asyncio_loop_for_enqueue,
 )
 from app.executor.context import ExecutionContext, _build_execution_evidence, build_event_payload
 from app.executor.exceptions import HitlInterrupt, MissingSubagentsConfigurationError
@@ -89,7 +97,6 @@ from app.executor.oss_channel_tool_call_middleware import create_oss_channel_too
 from app.executor.pipeline_spec_middleware import create_pipeline_spec_middleware
 from app.executor.deep_required_root_gate_middleware import _create_deep_required_root_gate_middleware
 from app.executor.planning_middleware import _create_write_todos_planning_middleware
-from app.executor.http_chat_route_middleware import create_http_chat_route_middleware
 from app.executor.prompt_sections_middleware import create_prompt_sections_middleware
 from app.executor.subagent_prompt_sections import build_subagent_prompt_sections
 from app.executor.subagent_prompt_sections_middleware import create_subagent_prompt_sections_middleware
@@ -102,6 +109,7 @@ from app.executor.subagent_middleware import (
     _emit_subagent_timeline_fallback,
     _reconcile_partial_subagent_task_completed,
 )
+from app.executor.domain_agent_mcp_prefetch import extend_mcp_request_with_domain_agent_declared_servers
 from app.executor.tenant_context import (
     _mcp_config_without_blocked_servers,
     _prefetch_tenant_context_once,
@@ -134,6 +142,51 @@ from app.executor.form_prefill import (
 
 logger = logging.getLogger(__name__)
 
+def _get_extras(context: RequestContext) -> dict[str, Any]:
+    try:
+        data = context.get_context_data() or {}
+    except Exception:
+        return {}
+    extras = data.get("extras")
+    return extras if isinstance(extras, dict) else {}
+
+
+def _is_chat_request(context: RequestContext) -> bool:
+    extras = _get_extras(context)
+    kind = extras.get("request_kind")
+    return isinstance(kind, str) and kind.strip().lower() == "chat"
+
+def _resolve_chat_room_id(extras: dict[str, Any], row: dict[str, Any]) -> str:
+    """Best-effort resolve stable chat room id (conversation_id) for chat persistence."""
+    for key in ("conversation_id", "room_id", "chat_room_id"):
+        v = extras.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    v2 = row.get("conversation_id")
+    if isinstance(v2, str) and v2.strip():
+        return v2.strip()
+    return ""
+
+
+async def _emit_chunk_text(context: RequestContext, text: str) -> bool:
+    extras = _get_extras(context)
+    streamer = extras.get("streamer")
+    send_text = getattr(streamer, "send_text", None)
+    if callable(send_text):
+        await send_text(text)
+        return True
+    return False
+
+
+async def _emit_chunk_json(context: RequestContext, payload: Any) -> bool:
+    extras = _get_extras(context)
+    streamer = extras.get("streamer")
+    send_json = getattr(streamer, "send_json", None)
+    if callable(send_json):
+        await send_json(payload)
+        return True
+    return False
+
 
 _ENV_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT = "DEEPAGENTS_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT"
 # Single skills endpoint knob: streamable MCP URL (HTTP file API base = same origin with trailing /mcp removed).
@@ -145,11 +198,6 @@ def _default_claude_skills_mcp_url() -> str:
     if explicit:
         return explicit
     return "http://claude-skills:8765/mcp"
-
-
-def _skills_mcp_base_env_configured() -> bool:
-    """True if CLAUDE_SKILLS_MCP_URL is set (not implicit localhost MCP default)."""
-    return bool((os.environ.get(_ENV_CLAUDE_SKILLS_MCP_URL) or "").strip())
 
 
 def _truthy_env(name: str, default: bool = False) -> bool:
@@ -167,8 +215,74 @@ _HTTP_CHAT_MAX_WORK_ASSISTANT_ROOT_TOOLS = 8
 
 
 def _is_work_assistant_mcp_tool_obj(obj: Any) -> bool:
+    """True when the tool was loaded from the work-assistant MCP server (see TaggingSafeToolLoader)."""
     srv = str(getattr(obj, "_mcp_server", "") or "").strip().lower().replace("_", "-")
     return srv == "work-assistant" or srv.endswith("work-assistant")
+
+
+def _identity_str(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    return str(val).strip()
+
+
+def _normalize_identity_field_key(key: str) -> str | None:
+    """Map request / metadata keys to canonical work-assistant arg names."""
+    k = str(key or "").strip()
+    if not k:
+        return None
+    lk = k.lower().replace("-", "_")
+    if lk in ("tenant_id", "tenantid"):
+        return "tenant_id"
+    if lk in (
+        "user_jwt",
+        "userjwt",
+        "jwt",
+        "authorization",
+        "access_token",
+        "accesstoken",
+        "id_token",
+        "idtoken",
+        "supabase_jwt",
+        "supabasejwt",
+    ):
+        return "user_jwt"
+    if lk in ("user_uid", "useruid", "uid"):
+        return "user_uid"
+    if lk in ("user_email", "useremail", "email"):
+        return "user_email"
+    return None
+
+
+def _gather_chat_identity_fields(
+    *,
+    input_data: Mapping[str, Any] | dict[str, Any] | None,
+    row: Mapping[str, Any] | dict[str, Any] | None,
+    extras: Mapping[str, Any] | dict[str, Any] | None,
+) -> dict[str, str]:
+    """Collect tenant_id / user_jwt / user_uid / user_email from row, extras, InputData, metadata."""
+    idata = dict(input_data or {})
+    ex = dict(extras or {})
+    if isinstance(ex.get("input_data"), dict):
+        # SDK/HTTP 클라이언트가 본문을 extras.input_data 로만 넣는 경우
+        idata = {**dict(ex["input_data"]), **idata}
+    blobs: list[dict[str, Any]] = [idata, ex, dict(row or {})]
+    for side in (idata.get("metadata"), ex.get("metadata")):
+        if isinstance(side, dict):
+            blobs.append(side)
+    out: dict[str, str] = {}
+    for blob in blobs:
+        for raw_k, raw_v in blob.items():
+            nk = _normalize_identity_field_key(str(raw_k))
+            if nk is None:
+                continue
+            s = _identity_str(raw_v)
+            if not s:
+                continue
+            out.setdefault(nk, s)
+    return out
 
 
 def _http_chat_tool_schema_weight(t: Any) -> int:
@@ -251,19 +365,28 @@ def merge_http_chat_identity_into_work_assistant_args(
     extras: Mapping[str, Any] | dict[str, Any] | None,
     tenant_id: str | None,
 ) -> dict[str, Any]:
-    """Fill work-assistant MCP tool args from HTTP chat InputData when the model omits them."""
+    """Fill work-assistant MCP tool args from chat request surfaces when the model omits them.
+
+    Note: LangSmith ``tool_calls`` on the LLM run often show the **raw model output** (nulls).
+    This merge runs at ``invoke`` time via ``tool_input_augmenter``; the MCP call uses ``out``.
+    """
     out = dict(args)
-    idata = dict(input_data or {})
+    fields = _gather_chat_identity_fields(input_data=input_data, row=row, extras=extras)
     r = dict(row or {})
     ex = dict(extras or {})
     tid = (
         str(tenant_id or "").strip()
-        or str(idata.get("tenant_id") or "").strip()
+        or fields.get("tenant_id", "")
         or str(r.get("tenant_id") or "").strip()
     )
-    jwt = str(idata.get("user_jwt") or ex.get("user_jwt") or "").strip()
-    uid = str(idata.get("user_uid") or r.get("user_id") or ex.get("user_uid") or "").strip()
-    eml = str(idata.get("user_email") or "").strip()
+    jwt = fields.get("user_jwt", "") or str(ex.get("user_jwt") or "").strip()
+    uid = (
+        fields.get("user_uid", "")
+        or str(r.get("user_id") or "").strip()
+        or str(r.get("user_uid") or "").strip()
+        or str(ex.get("user_uid") or "").strip()
+    )
+    eml = fields.get("user_email", "")
     if not eml:
         ne = ex.get("notify_user_emails")
         if isinstance(ne, list) and ne:
@@ -285,26 +408,52 @@ def merge_http_chat_identity_into_work_assistant_args(
     return out
 
 
+_TOOLCALL_ENVELOPE_KEYS = frozenset(
+    {"type", "id", "name", "tool_call_id", "index", "artifact"}
+)
+
+
 def make_http_chat_work_assistant_tool_input_augmenter(
     *,
     input_data: dict[str, Any],
     row: dict[str, Any],
     extras: dict[str, Any],
     tenant_id: str | None,
+    chat_identity_tool_ids: frozenset[int] | None = None,
 ) -> Any:
-    """Return augmenter for _instrument_tools: merge chat identity into work-assistant tool calls."""
+    """Return augmenter for _instrument_tools: merge chat identity into work-assistant tool calls.
+
+    ``chat_identity_tool_ids`` (object ids of the exact root tools mounted for this chat run) ensures
+    we merge even when ``_mcp_server`` uses a tenant-specific MCP key (e.g. ``process-gpt-mcp``)
+    that would not match ``_is_work_assistant_mcp_tool_obj``.
+    """
 
     def _aug(base_tool: Any, tool_input: Any) -> Any:
-        if not _is_work_assistant_mcp_tool_obj(base_tool):
+        in_chat_root = chat_identity_tool_ids is not None and id(base_tool) in chat_identity_tool_ids
+        if not in_chat_root and not _is_work_assistant_mcp_tool_obj(base_tool):
             return tool_input
         merged = _coerce_tool_input_dict(tool_input)
         if not isinstance(merged, dict):
             return tool_input
-        raw_args = merged.get("args")
-        if not isinstance(raw_args, dict):
-            raw_args = {}
+        # Some stacks pass OpenAI ``args`` as a JSON string instead of a dict.
+        _raw_args = merged.get("args")
+        if isinstance(_raw_args, str) and _raw_args.strip():
+            try:
+                _parsed_args = json.loads(_raw_args)
+                if isinstance(_parsed_args, dict):
+                    merged = dict(merged)
+                    merged["args"] = _parsed_args
+            except Exception:
+                pass
+        # LangGraph / OpenAI-style tool_call: {"type":"tool_call","args":{...},...}
+        # LangChain ToolNode often passes **flat** schema args: {"tenant_id": None, ...}
+        # If we only write merged["args"], flat inputs never get tenant_id/jwt (real bug).
+        if isinstance(merged.get("args"), dict):
+            raw_args = dict(merged["args"])
+            use_nested_args = True
         else:
-            raw_args = dict(raw_args)
+            raw_args = {k: v for k, v in merged.items() if k not in _TOOLCALL_ENVELOPE_KEYS}
+            use_nested_args = False
         new_args = merge_http_chat_identity_into_work_assistant_args(
             raw_args,
             input_data=input_data,
@@ -313,7 +462,10 @@ def make_http_chat_work_assistant_tool_input_augmenter(
             tenant_id=tenant_id,
         )
         out = dict(merged)
-        out["args"] = new_args
+        if use_nested_args:
+            out["args"] = new_args
+        else:
+            out.update(new_args)
         return out
 
     return _aug
@@ -572,12 +724,35 @@ def _plan_signature_for_tool_calls(tcs: list[dict[str, Any]]) -> str:
 
 
 def _emit_http_plan_event(http_stream_event_emit: Any, payload: dict[str, Any]) -> None:
+    _emit_http_stream_event(http_stream_event_emit, payload)
+
+
+def _emit_http_stream_event(http_stream_event_emit: Any, payload: dict[str, Any]) -> None:
+    """Emit a structured event to the chat SSE stream.
+
+    In legacy HTTP chat, the emitter was sync. In SDK chat mode we bind an **async**
+    emitter (awaits `streamer.send_json`). Many call-sites are synchronous guards/hooks,
+    so we must schedule the coroutine onto the running loop.
+    """
     if http_stream_event_emit is None:
         return
     try:
-        http_stream_event_emit(payload)
+        ret = http_stream_event_emit(payload)
+        if asyncio.iscoroutine(ret):
+            try:
+                asyncio.get_running_loop().create_task(ret)
+            except RuntimeError:
+                # No running loop (should be rare inside execute); drop silently to avoid crashing tool calls.
+                logger.warning(
+                    "Dropping http_chat stream event: no running loop | type=%s",
+                    payload.get("type"),
+                )
     except Exception:
-        logger.exception("http_chat plan event emit failed | type=%s", payload.get("type"), exc_info=True)
+        logger.exception(
+            "http_chat stream event emit failed | type=%s",
+            payload.get("type"),
+            exc_info=True,
+        )
 
 
 def _planned_skills_from_tool_call(tool_name: str, args: dict[str, Any]) -> list[str]:
@@ -1103,14 +1278,27 @@ class DeepAgentsExecutor(AgentExecutor):
         event_queue: EventQueue,
         exec_ctx: ExecutionContext | None = None,
     ) -> None:
+        tok = bind_executor_asyncio_loop_for_enqueue(asyncio.get_running_loop())
+        try:
+            await self._execute_impl(context, event_queue, exec_ctx)
+        finally:
+            reset_executor_asyncio_loop_for_enqueue(tok)
+
+    async def _execute_impl(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+        exec_ctx: ExecutionContext | None = None,
+    ) -> None:
         logger.info("DeepAgents 멀티 에이전트 실행 시작")
 
         query = context.get_user_input()
         context_data = context.get_context_data() or {}
         row = context_data.get("row", {})
         extras = context_data.get("extras", {})
-        http_chat = bool(extras.get("http_chat"))
-        checkpoint_thread_id = resolve_checkpoint_thread_id(http_chat=http_chat, row=row)
+        # Chat: SDK sets request_kind=chat (streamer in extras). One flag drives legacy HTTP parity.
+        is_chat = bool(_is_chat_request(context))
+        checkpoint_thread_id = resolve_checkpoint_thread_id(is_chat=is_chat, row=row)
 
         proc_inst_id = row.get("root_proc_inst_id") or row.get("proc_inst_id") or ""
         task_id = str(row.get("id") or "")
@@ -1126,6 +1314,62 @@ class DeepAgentsExecutor(AgentExecutor):
 
         logger.info("task_id=%s proc_inst_id=%s form_id=%s", task_id, proc_inst_id, form_id)
         sandbox_output_paths_begin_task(task_id)
+
+        # Chat (SSE): streaming callbacks + optional chat room persistence.
+        if is_chat and isinstance(extras, dict):
+            chat_room_id = _resolve_chat_room_id(extras, row if isinstance(row, dict) else {})
+            has_file = bool(proc_inst_sources)
+
+            # Ensure chat room exists (best-effort) so context updates have a target row.
+            if chat_room_id and tenant_id:
+                try:
+                    await a_upsert_chat_room_start(
+                        tenant_id=str(tenant_id),
+                        room_id=str(chat_room_id),
+                        participants=[],
+                        room_name=None,
+                        primary_agent_id=None,
+                        context=build_initial_chat_room_context(has_file=has_file),
+                    )
+                except Exception:
+                    logger.exception(
+                        "chat: upsert_chat_room_start failed; continuing | room_id=%s",
+                        chat_room_id,
+                        exc_info=True,
+                    )
+
+            async def _sdk_stream_emit(text: str) -> None:
+                try:
+                    await _emit_chunk_text(context, text)
+                except Exception:
+                    logger.exception("chat: chunk emit failed", exc_info=True)
+
+            async def _sdk_stream_event_emit(payload: dict[str, Any]) -> None:
+                try:
+                    await _emit_chunk_json(context, payload)
+                    # Persist tool/todo/skill timeline into chat_rooms.context for the UI.
+                    if chat_room_id and tenant_id and isinstance(payload, dict):
+                        et = str(payload.get("type") or "").strip()
+                        if et in ("plan_tools", "plan_skills", "plan_todos", "tool_start", "tool_end"):
+                            try:
+                                await a_update_chat_room_context(
+                                    tenant_id=str(tenant_id),
+                                    room_id=str(chat_room_id),
+                                    evt=payload,
+                                    has_file=has_file,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "chat: update_chat_room_context failed; continuing | room_id=%s type=%s",
+                                    chat_room_id,
+                                    et,
+                                    exc_info=True,
+                                )
+                except Exception:
+                    logger.exception("chat: json chunk emit failed", exc_info=True)
+
+            extras["_http_chat_stream_emit"] = _sdk_stream_emit
+            extras["_http_chat_stream_event_emit"] = _sdk_stream_event_emit
 
         # Prepare run_state / human_response before creating execution context.
         # SDK prepare_context() does not pass these in extras; restore from todolist.draft + events.
@@ -1172,9 +1416,9 @@ class DeepAgentsExecutor(AgentExecutor):
         )
         if use_graph_resume:
             logger.info(
-                "HITL checkpoint resume | thread_id=%s http_chat=%s",
+                "HITL checkpoint resume | thread_id=%s is_chat=%s",
                 checkpoint_thread_id,
-                http_chat,
+                is_chat,
             )
 
         hitl_resume: dict[str, str] | None = None
@@ -1215,7 +1459,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     },
                     proc_inst_id,
                     task_id,
-                    "action",
+                    "deepagents",
                     job_id=job_uuid,
                     exec_ctx=exec_ctx,
                     logical_event_type="resume",
@@ -1256,7 +1500,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     },
                     proc_inst_id,
                     task_id,
-                    "action",
+                    "deepagents",
                     job_id=job_uuid,
                     exec_ctx=exec_ctx,
                     logical_event_type="resume",
@@ -1266,12 +1510,9 @@ class DeepAgentsExecutor(AgentExecutor):
             except Exception:
                 logger.exception("Failed to enqueue resume event", exc_info=True)
 
-        # CRITICAL:
-        # - HTTP chat builds `query` as a work-item template that includes full `[InputData]` JSON.
-        # - Passing the full query to the model can explode tokens even when the user message is short.
-        # - For HTTP chat, use only the parsed `[Instruction]` as the model-facing user text.
-        if http_chat:
-            invoke_user_text = str(instruction or "").strip()
+        # Chat: prefer Instruction from work-item template (HTTP parity); fall back to raw query for plain SDK text.
+        if is_chat:
+            invoke_user_text = str(instruction or "").strip() or (query or "").strip()
         else:
             invoke_user_text = (query or "").strip()
         if hitl_resume and hitl_resume.get("answer"):
@@ -1308,7 +1549,7 @@ class DeepAgentsExecutor(AgentExecutor):
         http_stream_event_emit = extras.get("_http_chat_stream_event_emit")
         mcp_cfg_raw = extras.get("tenant_mcp")
         mcp_cfg: dict[str, Any] = _mcp_config_without_blocked_servers(mcp_cfg_raw)
-        # Merge defaults: claude-skills (always, same shape as Cursor mcp.json) + work-assistant for HTTP chat only.
+        # Merge defaults: claude-skills (always) + work-assistant for any chat entrypoint (HTTP or SDK SSE).
         try:
             mcp_cfg = dict(mcp_cfg or {})
             mcp_servers0 = mcp_cfg.get("mcpServers")
@@ -1316,19 +1557,20 @@ class DeepAgentsExecutor(AgentExecutor):
                 mcp_servers0 = {}
             else:
                 mcp_servers0 = dict(mcp_servers0)
+            # claude-skills HTTP URL: always align with _default_claude_skills_mcp_url()
+            # (env CLAUDE_SKILLS_MCP_URL or compose default). Process mode often merges tenants.mcp
+            # from Supabase with cluster-only hostnames; when env is set we must override that entry
+            # (previously only missing keys were filled, so DB URL won and broke local runs).
             _cs_mcp_url = _default_claude_skills_mcp_url()
-            if not _skills_mcp_base_env_configured():
-                # tenants.mcp 에 K8s/Compose 용 호스트가 있어도, 베이스 미설정이면 로컬 폴백 URL로 덮어쓴다(stdio MCP 는 유지).
-                _existing_cs = mcp_servers0.get("claude-skills")
-                if isinstance(_existing_cs, dict) and _existing_cs.get("command"):
-                    pass
-                elif isinstance(_existing_cs, dict):
-                    mcp_servers0["claude-skills"] = {**_existing_cs, "url": _cs_mcp_url}
-                else:
-                    mcp_servers0["claude-skills"] = {"url": _cs_mcp_url}
-            elif "claude-skills" not in mcp_servers0:
+            _existing_cs = mcp_servers0.get("claude-skills")
+            if isinstance(_existing_cs, dict) and _existing_cs.get("command"):
+                # stdio MCP: do not inject HTTP url.
+                pass
+            elif isinstance(_existing_cs, dict):
+                mcp_servers0["claude-skills"] = {**_existing_cs, "url": _cs_mcp_url}
+            else:
                 mcp_servers0["claude-skills"] = {"url": _cs_mcp_url}
-            if http_chat and "work-assistant" not in mcp_servers0:
+            if is_chat and "work-assistant" not in mcp_servers0:
                 # process-gpt-mcp는 Supabase로 사용자 JWT를 검증한다. HTTP 채팅 호스트와 동일 프로젝트의 URL/키가 필요하다.
                 # GKE 등에서는 SUPABASE_KEY(서비스 롤)만 두고 SUPABASE_ANON_KEY를 비워 두는 경우가 많아, anon 미설정 시 KEY로 폴백한다.
                 _sb_url = str(os.environ.get("SUPABASE_URL") or "").strip()
@@ -1356,21 +1598,22 @@ class DeepAgentsExecutor(AgentExecutor):
             logger.exception("Failed to inject default MCP servers (claude-skills / work-assistant); continuing", exc_info=True)
         mcp_servers = mcp_cfg.get("mcpServers") or {}
 
-        # NOTE: HTTP chat defaults to disabling tenant context preflight for TTFT/stability.
-        enable_tenant_context_preflight = (not http_chat) or _truthy_env(
+        # NOTE: Chat modes default to disabling tenant context preflight for TTFT/stability.
+        enable_tenant_context_preflight = (not is_chat) or _truthy_env(
             _ENV_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT, default=False
         )
         local_tenant_context_tool_names = ("mem0", "memento", "dmn_rule") if enable_tenant_context_preflight else ()
         # MCP servers to request.
-        desired_mcp_servers = (
-            ("claude-skills", "work-assistant")
-            if http_chat
-            else ("claude-skills",)
-        )
+        # Process mode intentionally does NOT auto-connect all tenant MCP servers.
+        # We keep this minimal and let activity/subagent capabilities decide what to load.
+        desired_mcp_servers = ("claude-skills", "work-assistant") if is_chat else ("claude-skills",)
+
         resolved_server_keys: dict[str, list[str]] = {name: [] for name in desired_mcp_servers}
         if isinstance(mcp_servers, dict):
             for key in mcp_servers:
                 raw = str(key).strip()
+                if not raw:
+                    continue
                 normalized = raw.lower().replace("_", "-")
                 for canonical in desired_mcp_servers:
                     if normalized == canonical or normalized.endswith(canonical):
@@ -1394,6 +1637,11 @@ class DeepAgentsExecutor(AgentExecutor):
             for candidate in [*resolved_server_keys.get(canonical, []), canonical]:
                 if candidate and candidate not in mcp_request:
                     mcp_request.append(candidate)
+        extend_mcp_request_with_domain_agent_declared_servers(
+            mcp_request,
+            mcp_servers=mcp_servers,
+            domain_agent_rows=domain_agent_rows,
+        )
         logger.info(
             "테넌트 연결 도구 로드 준비 | task_id=%s tenant_id=%s mcp_servers=%s request=%s",
             task_id,
@@ -1481,8 +1729,6 @@ class DeepAgentsExecutor(AgentExecutor):
             len(domain_agent_rows),
             len(allowed_skill_names),
         )
-
-        # 스킬 탐색 도우미 제거: 쿼리 기반 슬러그 힌트/중앙 allowlist 로깅을 수행하지 않는다.
 
         subagents_domain = build_subagent_configs(
             domain_agent_rows,
@@ -1581,17 +1827,29 @@ class DeepAgentsExecutor(AgentExecutor):
                     len(fallback.get("tools") or []),
                 )
             else:
-                logger.error(
-                    "Subagents are required (no activity fallback): domain_agent_rows=%d subagents_domain=%d task_id=%s proc_def_id=%s activity_id=%s",
-                    len(domain_agent_rows),
-                    len(subagents_domain),
-                    task_id,
-                    proc_def_id or "(empty)",
-                    activity_id or "(empty)",
-                )
-                raise MissingSubagentsConfigurationError()
-
-        # 스킬 탐색 도우미 제거: discovery_job 기반 가드/관측 함수 제거.
+                # Chat mode: allow running without any subagents.
+                # - HTTP chat (legacy) and SDK chat both represent "single-agent chat" entrypoints.
+                # - In this mode, the root orchestrator should still run (with its tools) even when
+                #   there is no domain agent configured and the process/activity doesn't define a fallback.
+                if is_chat:
+                    logger.info(
+                        "서브에이전트 없이 채팅 모드로 계속 진행 | task_id=%s proc_def_id=%s activity_id=%s",
+                        task_id,
+                        proc_def_id or "(empty)",
+                        activity_id or "(empty)",
+                    )
+                    subagents = []
+                    agent_rows = []
+                else:
+                    logger.error(
+                        "Subagents are required (no activity fallback): domain_agent_rows=%d subagents_domain=%d task_id=%s proc_def_id=%s activity_id=%s",
+                        len(domain_agent_rows),
+                        len(subagents_domain),
+                        task_id,
+                        proc_def_id or "(empty)",
+                        activity_id or "(empty)",
+                    )
+                    raise MissingSubagentsConfigurationError()
 
         def _domain_tool_result_hook(
             *,
@@ -1635,7 +1893,7 @@ class DeepAgentsExecutor(AgentExecutor):
                             payload["output"] = {"content": str(tool_output)}
                         else:
                             payload["output"] = {"content": str(tool_output)}
-                    http_stream_event_emit(payload)
+                    _emit_http_stream_event(http_stream_event_emit, payload)
             except Exception:
                 logger.exception("http_chat tool_end emit failed", exc_info=True)
 
@@ -1869,12 +2127,13 @@ class DeepAgentsExecutor(AgentExecutor):
                                     )
                             except Exception:
                                 logger.exception("http_chat plan_tools emit failed; continuing", exc_info=True)
-                            http_stream_event_emit(
+                            _emit_http_stream_event(
+                                http_stream_event_emit,
                                 {
                                     "type": "tool_start",
                                     "tool": http_chat_tool_display_name(base_tool, tool_name),
                                     "input": _coerce_tool_input_dict(tool_input) or tool_input,
-                                }
+                                },
                             )
                     except Exception:
                         logger.exception("http_chat tool_start emit failed", exc_info=True)
@@ -2062,7 +2321,7 @@ class DeepAgentsExecutor(AgentExecutor):
             user_text=f"{user_text_for_lang} {description} {instruction}".strip(),
         )
         asset_inventory = build_asset_inventory(collected_assets)
-        # HTTP chat policy flags (avoid prompt injection; enforce via routing/guardrails).
+        # Chat policy flags (avoid prompt injection; enforce via routing/guardrails).
         http_chat_policy: dict[str, Any] = {}
         try:
             _has_assets = bool(
@@ -2071,7 +2330,7 @@ class DeepAgentsExecutor(AgentExecutor):
             http_chat_policy = {
                 "has_input_assets": _has_assets,
             }
-            if http_chat:
+            if is_chat:
                 extras["http_chat_policy"] = dict(http_chat_policy)
         except Exception:
             http_chat_policy = {}
@@ -2118,14 +2377,14 @@ class DeepAgentsExecutor(AgentExecutor):
         except Exception:
             _inv_blob, _state_contract = "{}", "{}"
         # Decide route hint early (used for compact prompts).
-        http_chat_has_assets = bool(http_chat and bool(http_chat_policy.get("has_input_assets")))
+        http_chat_has_assets = bool(is_chat and bool(http_chat_policy.get("has_input_assets")))
         route_hint = ""
-        if http_chat:
+        if is_chat:
             route_hint = "needs_task" if http_chat_has_assets else "work_assistant_only"
 
         base_rules = (
             compact_orchestrator_prompt_for_work_assistant_only()
-            if http_chat and route_hint == "work_assistant_only"
+            if is_chat and route_hint == "work_assistant_only"
             else default_orchestrator_prompt()
         )
 
@@ -2150,7 +2409,7 @@ class DeepAgentsExecutor(AgentExecutor):
             },
             proc_inst_id,
             task_id,
-            "action",
+            "deepagents",
             job_id=job_uuid,
             exec_ctx=exec_ctx,
             logical_event_type="agent_started",
@@ -2170,9 +2429,14 @@ class DeepAgentsExecutor(AgentExecutor):
             "saw_task_delegation": False,
         }
         route_progress: dict[str, Any] = {"route": "", "reason": ""}
-        # Policy-based default routing: when attachments/assets are present, preselect `needs_task`
-        # so the run can delegate immediately without relying on prompt-injected instructions.
-        if http_chat and bool(http_chat_policy.get("has_input_assets")):
+        # Policy-based default routing:
+        # - 프로세스 모드에서도 서브에이전트가 있으면 "반드시 위임" 정책을 위해 needs_task로 둔다.
+        #   (PromptSectionsMiddleware가 멀티에이전트 규칙을 주입하도록 하여 task() 호출을 유도)
+        # - HTTP 채팅에서는 입력 자산이 있을 때도 needs_task를 선점한다.
+        if subagent_contexts:
+            route_progress["route"] = "needs_task"
+            route_progress["reason"] = "subagents_present"
+        elif is_chat and bool(http_chat_policy.get("has_input_assets")):
             route_progress["route"] = "needs_task"
             route_progress["reason"] = "input_assets_present"
         pipeline_spec_mw = create_pipeline_spec_middleware(
@@ -2182,7 +2446,7 @@ class DeepAgentsExecutor(AgentExecutor):
             job_uuid=job_uuid,
             exec_ctx=exec_ctx,
             planning_gate=planning_progress,
-            route_gate=route_progress if http_chat else None,
+            route_gate=route_progress,
         )
         write_todos_planning_mw = _create_write_todos_planning_middleware(
             event_queue=event_queue,
@@ -2193,11 +2457,9 @@ class DeepAgentsExecutor(AgentExecutor):
             planning_gate=planning_progress,
         )
         http_chat_route_mw = None
-        if http_chat:
-            http_chat_route_mw = create_http_chat_route_middleware(route_gate=route_progress)
         # HTTP chat: when input assets exist, allow direct delegation to avoid hallucination loops.
         # For asset-free requests, keep the planning gate to prevent root from using non-MCP tools prematurely.
-        enforce_write_todos_planning = bool(http_chat and not bool(http_chat_policy.get("has_input_assets")))
+        enforce_write_todos_planning = bool(is_chat and not bool(http_chat_policy.get("has_input_assets")))
 
         def _planning_completed_flag() -> bool:
             # write_todos / write_pipeline_spec 미들웨어도 같은 dict 를 갱신한다(단일 소스).
@@ -2213,7 +2475,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 {"message": message},
                 proc_inst_id,
                 task_id,
-                "action",
+                "deepagents",
                 job_id=job_uuid,
                 exec_ctx=exec_ctx,
                 logical_event_type="agent_finished",
@@ -2235,7 +2497,7 @@ class DeepAgentsExecutor(AgentExecutor):
             subagent_skill_log=subagent_skill_log,
             on_before_subagent_start=_before_subagent_start_callback,
             planning_gate=planning_progress if enforce_write_todos_planning else None,
-            route_gate=route_progress if http_chat else None,
+            route_gate=route_progress,
         )
         extra_middleware: list[Any] = [SubagentJobScopeMiddleware()]
         # Per-step prompt composition: inject only the sections needed for the current step.
@@ -2246,7 +2508,7 @@ class DeepAgentsExecutor(AgentExecutor):
             agents=agent_rows,
             feedback=feedback_summary,
             form_info=form_info,
-            http_chat=http_chat,
+            is_chat=is_chat,
             http_chat_route=route_hint or None,
             tenant_id=tenant_id or None,
             output_language=output_language,
@@ -2255,8 +2517,8 @@ class DeepAgentsExecutor(AgentExecutor):
         )
         psmw = create_prompt_sections_middleware(
             sections=prompt_sections,
-            http_chat=http_chat,
-            route_gate=route_progress if http_chat else None,
+            is_chat=is_chat,
+            route_gate=route_progress,
             planning_gate=planning_progress,
             include_execution_clock=bool(
                 any(
@@ -2327,7 +2589,7 @@ class DeepAgentsExecutor(AgentExecutor):
         except Exception:
             logger.exception("Failed to attach subagent prompt sections middleware; continuing", exc_info=True)
         deep_gate_mw = None
-        if http_chat:
+        if is_chat:
             deep_gate_mw = _create_deep_required_root_gate_middleware(
                 planning_gate=planning_progress,
                 route_gate=route_progress,
@@ -2396,8 +2658,8 @@ class DeepAgentsExecutor(AgentExecutor):
         # Root orchestrator should have access to the same tenant/MCP tools as subagents,
         # plus sandbox deliverable upload tools when the user requests file creation.
         root_tools_for_orchestrator: list[Any] = []
-        if http_chat:
-            # HTTP chat: keep root MCP exposure bounded (tool schemas dominate input tokens).
+        if is_chat:
+            # Chat (HTTP or SDK SSE): keep root MCP exposure bounded (tool schemas dominate input tokens).
             # Include only a subset of work-assistant tools; delegate heavy work via `task()`.
             hinted = extras.get("http_chat_work_assistant_allowlist")
             allowlist = hinted if isinstance(hinted, list) else None
@@ -2498,12 +2760,13 @@ class DeepAgentsExecutor(AgentExecutor):
                 try:
                     if http_stream_event_emit is not None:
                         _emit_http_plan_for_tool_start(base_tool, tool_name, tool_input)
-                        http_stream_event_emit(
+                        _emit_http_stream_event(
+                            http_stream_event_emit,
                             {
                                 "type": "tool_start",
                                 "tool": http_chat_tool_display_name(base_tool, tool_name),
                                 "input": _coerce_tool_input_dict(tool_input) or tool_input,
-                            }
+                            },
                         )
                 except Exception:
                     logger.exception("http_chat root orchestrator tool_start emit failed", exc_info=True)
@@ -2526,8 +2789,9 @@ class DeepAgentsExecutor(AgentExecutor):
                         row=row if isinstance(row, dict) else {},
                         extras=extras if isinstance(extras, dict) else {},
                         tenant_id=str(tenant_id or "").strip() or None,
+                        chat_identity_tool_ids=frozenset(id(t) for t in deduped_root_tools),
                     )
-                    if http_chat
+                    if is_chat
                     else None
                 ),
                 tool_call_guard=_root_orchestrator_tool_call_guard,
@@ -2621,11 +2885,11 @@ class DeepAgentsExecutor(AgentExecutor):
             if use_graph_resume:
                 state_input: Any = Command(resume={"answer": human_answer_stripped})
             else:
-                # HTTP chat: optionally inject recent room history as prior messages.
+                # Chat: optionally inject recent room history as prior messages.
                 # The history is provided by the client via metadata.room_recent_history and
-                # parsed into extras["room_recent_messages"] in app/http_chat.py.
+                # legacy parsing: extras["room_recent_messages"] used to be populated by the removed HTTP chat stack.
                 recent_msgs: list[dict[str, Any]] = []
-                if http_chat and isinstance(extras, dict):
+                if is_chat and isinstance(extras, dict):
                     rm = extras.get("room_recent_messages")
                     if isinstance(rm, list):
                         for it in rm:
@@ -2949,6 +3213,19 @@ class DeepAgentsExecutor(AgentExecutor):
             # `_ainvoke_or_stream_values` when the final state messages are not reliable.
             raw_text = str(result.get("_http_chat_streamed_text") or "")
 
+        # 강제 위임 정책:
+        # 서브에이전트가 구성되어 있는 런에서는 루트 오케스트레이터가 직접 최종 답변으로 끝내지 않는다.
+        # (즉, 최소 1회 이상 task() 위임이 발생해야 한다.)
+        if subagent_contexts and not bool(planning_progress.get("saw_task_delegation")):
+            raw_text = (
+                "서브에이전트가 구성되어 있으므로 루트 오케스트레이터가 직접 작업을 완료할 수 없습니다.\n"
+                "반드시 다음 순서로 진행해야 합니다.\n\n"
+                "1) (HTTP 채팅인 경우) `write_http_chat_route(route=\"needs_task\")`\n"
+                "2) `write_todos` 또는 `write_pipeline_spec`로 계획 제출\n"
+                "3) `task(...)`로 서브에이전트에 위임하여 실제 실행/조회 수행\n\n"
+                "현재 실행에서는 `task()` 위임이 감지되지 않아 실패로 처리합니다."
+            )
+
         # 미들웨어가 실제 task()를 감싸지 못한 런타임만 fallback으로 started/completed를 발행.
         # (fallback 내부에서 asyncio.sleep(1.2)로 최종 이벤트와 DB 시각 정렬을 분리한다.)
         if not subagent_event_state.get("saw_task_call"):
@@ -3182,11 +3459,11 @@ class DeepAgentsExecutor(AgentExecutor):
         # IMPORTANT: Restrict artifact scanning to sandbox workspaces used by this task.
         # Previously we scanned *all* still-open workspaces, which could leak unrelated
         # files (e.g. PDFs from prior requests) into the current chat response.
-        # NOTE: For HTTP chat we must not treat downloaded *input* files as deliverables.
+        # NOTE: For chat we must not treat downloaded *input* files as deliverables.
         # We therefore disable broad workspace glob scanning and only rely on explicitly
         # tracked sandbox outputs (note_sandbox_tool_output_paths) and explicit upload tool outputs.
         scanned_paths: list[str] = []
-        if not http_chat:
+        if not is_chat:
             scanned_paths = collect_task_open_workspace_paths_for_globs(str(task_id), default_artifact_globs())
         loaded_files = collect_readable_artifacts(tracked_paths, extra_paths=scanned_paths)
         file_manifest = enqueue_sandbox_file_artifacts(
@@ -3219,7 +3496,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 # Do not automatically append download links to the user-facing text.
                 # Links (when present) remain available in structured payloads / deliverable manifests.
                 pass
-            elif link_entries and (not http_chat):
+            elif link_entries and (not is_chat):
                 final_result_payload = dict(final_result_payload)
                 final_result_payload["file_download_links"] = link_entries
                 if isinstance(final_event_result, dict):
@@ -3374,6 +3651,13 @@ class DeepAgentsExecutor(AgentExecutor):
                     "_meta": wrapped_result,
                 }
 
+        # SDK chat(SSE) contract: final response should be a terminal artifact with the plain text.
+        # The SDK ChatEventQueue uses this artifact text as the `done` content.
+        if is_chat:
+            artifact_payload = (final_text or "").strip() or unwrap_output_wrapper_result_text(
+                str(raw_text or "")
+            ).strip()
+
         _enqueue_artifact(
             event_queue,
             name="deepagents_action_result",
@@ -3388,7 +3672,7 @@ class DeepAgentsExecutor(AgentExecutor):
 
         logger.info("DeepAgents 멀티 에이전트 실행 완료")
         result_box = extras.get("_http_chat_result_box")
-        if http_chat and isinstance(result_box, dict):
+        if is_chat and isinstance(result_box, dict):
             if has_form:
                 chat_body = (
                     json.dumps(pure_form_data, ensure_ascii=False)

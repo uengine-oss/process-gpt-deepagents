@@ -1,79 +1,63 @@
 # ProcessGPT DeepAgents Server
 
-ProcessGPT 환경에서 LangChain **Deep Agents (deepagents)** 를 Middleware-First로 돌리는 서버입니다. 단일 실행 그래프 안에서 planning(todo), 서브에이전트 위임, 스킬·MCP 도구, 샌드박스 실행 등을 묶어 처리합니다.
+ProcessGPT 환경에서 LangChain **Deep Agents (deepagents)** 를 Middleware-First로 돌리는 서버입니다. 단일 그래프 안에서 planning(todo), 서브에이전트 위임(`task()`), 스킬·MCP·샌드박스, HITL 등을 묶어 처리합니다.
 
-동일한 `DeepAgentsExecutor` 위에 **두 가지 진입 방식**이 있습니다.
+## 실행 흐름 (아키텍처)
 
-| 모드 | 진입점 | 용도 |
-|------|--------|------|
-| **프로세스 모드** | `deepagents_server.py` → ProcessGPT Agent SDK **폴링** | 할 일(todolist) 행이 들어오면 실행하고 **A2A 이벤트**를 SDK/DB로 전달 |
-| **채팅 모드** | 같은 프로세스의 **HTTP API** (`app/http_server.py` → `app/http_chat.py`) | 대화형 요청을 **JSON 응답** 또는 **SSE 스트리밍**으로 처리(선택적으로 Supabase에 채팅 메시지 반영) |
-
-## 아키텍처
+`process-gpt-agent-sdk`가 `RequestContext`와 이벤트 싱크를 준비한 뒤, 아래 실행 계층으로 넘깁니다.
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │         DeepAgentsExecutor          │
-                    │  (공통: 모델 라우팅, MCP/스킬/샌드박스, │
-                    │   미들웨어 체인, HITL 체크포인트 등)   │
-                    └─────────────────────────────────────┘
-                                        ▲
-              ┌─────────────────────────┴─────────────────────────┐
-              │                                                   │
-   ProcessGPTRequestContext                              SimpleChatContext
-   (SDK가 준비한 row + extras)                    (row.tool=http_chat, extras.http_chat=True)
-              │                                                   │
-              ▼                                                   ▼
-   ProcessGPTAgentServer 폴링                    FastAPI: /health, /chat, /chat/stream
-   (deepagents_server.py)                              (포트 8888, uvicorn 스레드)
-              │                                                   │
-              ▼                                                   ▼
-   ProcessGPTEventQueue → DB 이벤트                  NoopEventQueue (A2A 큐 없음)
-   TaskStatus / Artifact …                           토큰·도구 이벤트 → SSE 또는 JSON 응답
+process-gpt-agent-sdk              DeepAgentsExecutor · 그래프 런타임
+(RequestContext, EventQueue)                 │
+        │                                      ▼
+        └────────────────────────► DeepAgentsExecutor.execute()
+                                              │
+                                              ▼
+                              build_runtime_agent() → 컴파일된 LangGraph 그래프
+                              (deepagents + 미들웨어 + 서브에이전트 + 체크포인터)
 ```
 
-- **프로세스 모드**: SDK가 `polling_pending_todos` 등으로 작업 행을 넘기면 `DeepAgentsServer.process_todolist_item` → `executor.execute(context, event_queue)`로 이어지고, 결과는 기존 ProcessGPT 파이프라인이 기대하는 이벤트 스키마로 나갑니다.
-- **채팅 모드**: `extras["http_chat"]=True` 로 분기되어 라우팅 게이트(`write_http_chat_route` 등), 루트 도구 축소(work-assistant 위주), **스트리밍 시** 토큰/도구 이벤트를 콜백으로 넘겨 SSE에 실습니다. HITL이 필요하면 `status=input_required`와 `run_state`를 돌려주고, 재요청 시 `metadata`에 답변·`run_state`를 넣어 이어갈 수 있습니다.
+## 딥 에이전트와 서브에이전트 구성
+
+- **런타임 생성**: `app/agent/factory.py`의 `build_runtime_agent`가 `deepagents.create_deep_agent`로 **단일** 컴파일 그래프를 만듭니다. `create_deep_agent`가 이미 `TodoListMiddleware`, `FilesystemMiddleware`, `SubAgentMiddleware` 등을 넣으므로 **같은 미들웨어를 바깥에서 한 번 더 붙이면 중복 오류**가 납니다.
+- **오케스트레이터 도구**: HITL용 `request_human_input` 등은 `get_hitl_tools()`로 묶이고, 테넌트/작업별 루트 MCP·로컬 도구·추가 미들웨어가 여기에 합쳐집니다. 백엔드는 `make_deepagent_backend_factory()` (`app/agent/backend.py`).
+- **서브에이전트 정의**: `app/agent/subagents.py`가 Supabase `users` 중 `is_agent=true` 행을 읽어 `task()`에 넘길 스펙을 만듭니다. `skills`, `tools`, `persona`, `goal`, (선택) `model` 등이 시스템 프롬프트·도구 구성에 반영됩니다.
+- **도구·MCP 티어(요지)**: 서브에이전트 기본 MCP 등은 모듈 상수·주석(`DEFAULT_MCP_SERVER_NAMES`, work-assistant는 루트 전용 등)에 정리되어 있습니다. 샌드박스는 `get_sandbox_tools()`와 연동됩니다.
+
+모델/프록시/프롬프트 오버라이드는 아래 **커스터마이징**을 참고하세요.
+
+## Human-in-the-loop (HITL)과 재개
+
+역할을 **그래프 안**과 **실행기(오케스트레이션) 쪽**으로 나누면 다음과 같습니다.
+
+1. **그래프 안** (`app/agent/hitl.py`): `request_human_input` 도구가 LangGraph `interrupt(...)`를 호출해 실행을 멈춥니다. 결과 dict에서 interrupt 페이로드를 꺼낼 때는 `extract_interrupt_payload()`를 씁니다.
+2. **실행기** (`deepagents_executor.py`, `app/executor/*`): `human_asked` 등 이벤트 발행, `run_state` 조립, 재개 시 `human_response_answer`와의 매칭이 여기서 이뤄집니다. Postgres(`DB_*`)가 설정되면 **비동기 LangGraph 체크포인터**로 스레드 상태를 유지하고, `run_state` + 사용자 답(채팅은 보통 `metadata`로 보낸 값이 SDK를 거쳐 컨텍스트에 실림, todolist는 DB의 최신 human 응답 로드 등)이 맞으면 **그래프 resume** 경로를 탑니다.
+3. **todolist 경로** (`deepagents_server.py`, `app/database.py`): 인터럽트로 멈추면 `waiting_for_human`과 `run_state`를 `set_task_waiting_hitl` 등으로 남기고, 이후 **`claim_resumable_hitl_task`** 보조 폴링이 응답이 채워진 행을 다시 집어 같은 `execute()`로 넣습니다.
+4. **채팅 HTTP 경로**: 동일 실행기이나, 클라이언트는 이전 응답의 `run_state`와 사용자 답을 **`metadata`에 실어 다음 요청**으로 재개합니다(필드명은 SDK 스키마를 따릅니다).
 
 ## 구성
 
 - **루트 엔트리**
-  - `deepagents_server.py` — SDK 폴링 서버 + `start_http_server()`로 HTTP API 동시 기동
-  - `deepagents_executor.py` — 멀티 에이전트 실행기 (`AgentExecutor`)
+  - `deepagents_server.py` — `main()`에서 `DeepAgentsServer.run()`과 Uvicorn(기본 **8888**, `mount_chat_sse`)을 `asyncio.gather`로 함께 기동. 포트가 이미 쓰이면 HTTP만 생략하고 폴링은 유지
+  - `deepagents_executor.py` — `AgentExecutor` 구현체
 - **`app/`**
-  - `http_server.py`, `http_chat.py` — 채팅 REST/SSE (`ChatRequest` / `ChatResponse`)
   - `database.py`, `execution_context.py`, `runtime_config.py`, `output_utils.py`, `health_server.py`
   - `app/sandbox/` — 런타임·도구·산출물 전달(선택적 Supabase public Storage)
   - `app/skills/` — 스킬 탐색·해결·볼륨
   - `app/tooling/` — `TaggingSafeToolLoader`
-  - `app/agent/` — DeepAgent `factory`, `hitl`, `backend`, `subagents`
-  - `app/executor/` — A2A 이벤트, 파이프라인, HITL, 토큰 하이진/툴 결과 프로젝션 등 실행 보조 모듈
+  - `app/agent/` — `factory`, `hitl`, `backend`, `subagents`
+  - `app/executor/` — A2A 이벤트, 파이프라인, HITL 연동, 토큰/툴 결과 처리 등
 
-## 채팅 모드 사용 (요약)
+## SDK 연동·HTTP (참고)
 
-- **엔드포인트**
-  - `GET /health` — 헬스체크
-  - `POST /chat` — 비스트리밍; `ChatResponse` JSON
-  - `POST /chat/stream` — **SSE**(`EventSourceResponse`); `token` / `tool_*` / `run_meta` / `done` 등 이벤트
-- **필수**: `tenant_id`, 사용자 메시지 `message`. 테넌트에 `is_agent=true` 에이전트가 없으면 `agent_ids`로 지정해야 합니다.
-- **JWT**: 바디 `user_jwt` 또는 `Authorization: Bearer <jwt>` (MCP/업무 도구 연동에 사용).
-- **HITL 재개**: 이전 응답의 `run_state`·`human_response_answer` 또는 `ask_user_response` / `openui_hitl_response`를 `metadata`에 넣어 다시 호출합니다.
+바디 스키마·SSE 이벤트 이름 등 **세부 계약은 SDK 문서**가 정본입니다. 로컬에서 자주 쓰는 것만 적습니다.
 
-### 예시: 비스트리밍 `/chat`
+- `GET /health` — 헬스체크
+- `POST /chat/stream` — SSE(`mount_chat_sse`). `tenant_id`, `message` 필수. JWT는 바디 `user_jwt` 또는 `Authorization: Bearer`. 테넌트에 에이전트가 없으면 SDK 스키마대로 `agent_ids` 등을 지정
+- HITL 후 재호출: `run_state`, `human_response_answer` 또는 `ask_user_response` / `openui_hitl_response`를 `metadata`에 포함
+- 프로세스 할 일: SDK가 row를 넘기면 `ProcessGPTRequestContext.prepare_context()` 이후 동일 `execute()`
 
-```bash
-curl -sS -X POST "http://localhost:8888/chat" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "YOUR_TENANT_ID",
-    "message": "우리 테넌트의 프로세스 목록을 간단히 요약해 줘.",
-    "user_email": "user@example.com",
-    "user_uid": "user-uid-optional",
-    "metadata": { "model": "anthropic/claude-sonnet-4-20250514" }
-  }' | jq .
-```
-
-### 예시: 스트리밍 `/chat/stream` (SSE)
+### 예시: `/chat/stream` (curl)
 
 ```bash
 curl -N -sS -X POST "http://localhost:8888/chat/stream" \
@@ -87,15 +71,7 @@ curl -N -sS -X POST "http://localhost:8888/chat/stream" \
   }'
 ```
 
-클라이언트는 `text/event-stream` 줄 단위로 `data: {json}` 형태의 이벤트를 읽으면 됩니다.
-
-## 프로세스 모드 사용 (요약)
-
-1. `deepagents_server.py` 실행 후 SDK가 DB에서 pending 할 일을 가져옵니다.
-2. `ProcessGPTRequestContext.prepare_context()` 뒤 `DeepAgentsExecutor.execute`가 호출됩니다.
-3. 결과는 **A2A 이벤트**(상태 업데이트·아티팩트 등)로 기록되며, HITL이면 `waiting_for_human` + `run_state` 저장 후 재개 폴링 경로로 이어질 수 있습니다.
-
-로컬에서 프로세스 플로만 빠르게 보려면 기존처럼 서버를 띄운 뒤 SDK/대시보드 쪽에서 할 일을 enqueue 하는 방식이 일반적입니다.
+클라이언트는 `text/event-stream`의 `event: metadata` / `event: message` 등을 읽으면 됩니다(페이로드는 JSON).
 
 ## 환경변수
 
@@ -150,19 +126,14 @@ docker run --rm -p 8888:8888 \
 
 ## 런타임 입력/출력
 
-- **프로세스 모드**: SDK `RequestContext` (get_user_input, get_context_data → row, extras) → A2A 이벤트 → SDK/DB
-- **채팅 모드**: `ChatRequest` JSON → `ChatResponse` 또는 SSE 이벤트 스트림; (설정 시) Supabase 채팅 테이블에 메시지 upsert
+입력은 SDK가 만든 **`RequestContext`**(row·extras·메타데이터)이고, 출력은 **`DeepAgentsExecutor`**가 이벤트 큐/SSE 쪽으로 전달합니다. 채팅 JSON 필드명·SSE 프레임·프로세스 이벤트 스키마는 **SDK가 정의**하고, 그 위에서 그래프 실행과 HITL·체크포인트·A2A 페이로드 조립은 본 서버 코드가 담당합니다.
 
 ## 커스터마이징
 
 - **모델**: 채팅은 `metadata.model`, 프로세스는 `extras.model` 우선, 없으면 `LLM_MODEL` 사용(기본 `anthropic:claude-opus-4-6`)
 - **프록시(OpenAI 호환 게이트웨이)**: `LLM_MODEL`·`LLM_PROXY_URL`·`LLM_PROXY_API_KEY` 다음에 `ANTHROPIC_API_KEY`·`OPENAI_API_KEY`를 두는 것을 권장(`.env.example`과 동일). `LLM_PROXY_URL` + (`LLM_PROXY_API_KEY` 또는 `OPENAI_API_KEY`)가 있으면 `langchain_openai.ChatOpenAI`로 붙고, **URL만 있고 둘 다 없으면** `resolve_model_routing`이 직접 Anthropic으로 폴백합니다. `LLM_PROXY_URL`은 가공하지 않습니다. Supabase `users.model`로 서브에이전트 모델만 바꿀 수 있으며, 프록시 경로에선 게이트웨이가 이해하는 `model` id여야 합니다.
 - **시스템 프롬프트**: `extras.system_prompt`로 오케스트레이터 프롬프트 오버라이드
-- **에이전트**: Supabase `users` 테이블에 `is_agent=true`로 등록
-  - `skills`: 쉼표 구분 스킬명 → 파일시스템 경로에서 SKILL.md 로딩
-  - `tools`: 쉼표 구분 도구명 → 에이전트별 자동 필터링 + sandbox 도구 결합
-  - `persona` + `goal`: 서브에이전트 시스템 프롬프트 자동 구성
-  - `model`: 서브에이전트별 모델 오버라이드 가능
+- **서브에이전트·도구·스킬**: Supabase `users`(`is_agent=true`) 등은 위 **「딥 에이전트와 서브에이전트 구성」**절과 `app/agent/subagents.py`를 참고하세요.
 
 ## 테스트
 
@@ -175,6 +146,7 @@ python3 -m pytest tests -q
 - sandbox 런타임/도구 동작
 - factory의 단일 runtime agent 생성
 - executor 이벤트 payload 기본 구조
+- (선택) HITL·체크포인트 재개
 
 ## 통합 검증 시나리오
 
@@ -236,11 +208,11 @@ python3 -m pytest tests -q
 합격 기준:
 - 기존 대시보드/컨슈머 파싱 오류 없음
 
-### 6) HTTP 채팅(선택)
+### 6) SDK HTTP 채팅 SSE(선택)
 
 검증:
 1. `GET /health` → `{"status":"ok"}`
-2. `POST /chat` 또는 `/chat/stream`으로 테넌트·메시지 전송
+2. `POST /chat/stream`으로 테넌트·메시지 전송
 3. (스트리밍) `token` 이벤트 후 `done` 또는 HITL 시 `input_required` 이벤트 확인
 
 합격 기준:

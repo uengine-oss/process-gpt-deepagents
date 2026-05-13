@@ -296,7 +296,7 @@ async def run_todo_subagent_job(
             },
             proc_inst_id,
             task_id,
-            "action",
+            "deepagents",
             job_id=job_id,
             exec_ctx=sub_exec_ctx,
             logical_event_type="agent_started",

@@ -38,9 +38,9 @@ def _get_state_for_current_loop() -> _LoopCheckpointerState:
     return st
 
 
-def resolve_checkpoint_thread_id(*, http_chat: bool, row: Mapping[str, Any]) -> str:
-    """http_chat이면 conv 스레드, 아니면 todo 스레드."""
-    if http_chat:
+def resolve_checkpoint_thread_id(*, is_chat: bool, row: Mapping[str, Any]) -> str:
+    """채팅이면 conv 스레드, 아니면 todo 스레드."""
+    if is_chat:
         for key in ("id", "proc_inst_id", "root_proc_inst_id"):
             v = row.get(key)
             if v is not None:

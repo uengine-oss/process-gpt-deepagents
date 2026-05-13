@@ -167,8 +167,7 @@ def enqueue_sandbox_file_artifacts(
         return []
     manifest: list[dict[str, Any]] = []
     try:
-        from a2a.types import FilePart, FileWithBytes, Part, TaskArtifactUpdateEvent
-        from a2a.utils import new_artifact
+        from a2a.types import Artifact, Part, TaskArtifactUpdateEvent
     except Exception:
         logger.exception("a2a types unavailable; cannot emit file artifacts")
         return []
@@ -200,31 +199,29 @@ def enqueue_sandbox_file_artifacts(
                 )
         except Exception:
             logger.exception("Unexpected error during storage upload | name=%s", safe_name)
-        try:
-            b64 = base64.standard_b64encode(raw).decode("ascii")
-        except Exception:
-            logger.exception("base64 encode failed | name=%s", safe_name)
-            continue
-        artifact = new_artifact(
-            [
-                Part(
-                    root=FilePart(
-                        file=FileWithBytes(bytes=b64, mime_type=mime, name=safe_name),
-                    )
-                )
-            ],
+        artifact = Artifact(
             name=safe_name,
             description="Sandbox generated file",
+            parts=[
+                Part(
+                    raw=raw,
+                    filename=safe_name,
+                    media_type=mime or "",
+                )
+            ],
         )
         try:
-            eq.enqueue_event(
+            from app.executor.a2a_events import schedule_async_event_queue_coroutine
+
+            ret = eq.enqueue_event(
                 TaskArtifactUpdateEvent(
                     artifact=artifact,
-                    lastChunk=True,
-                    contextId=proc_inst_id,
-                    taskId=task_id,
+                    last_chunk=True,
+                    context_id=proc_inst_id,
+                    task_id=task_id,
                 )
             )
+            schedule_async_event_queue_coroutine(ret)
         except Exception:
             logger.exception("Failed to enqueue file TaskArtifactUpdateEvent | name=%s", safe_name)
             continue

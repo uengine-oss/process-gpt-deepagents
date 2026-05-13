@@ -20,13 +20,14 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "supabase>=2.0.0",
     "typing-extensions>=4.8.0",
-    "process-gpt-agent-utils==0.3.3",
-    "process-gpt-agent-sdk==0.4.15",
+    "process-gpt-agent-utils==0.3.4",
+    "process-gpt-agent-sdk==0.4.19",
     "pytest>=8.0.0",
     "sse-starlette>=2.1.0",
     "uvicorn>=0.30.0",
     "langgraph-checkpoint-postgres>=2.0.0",
     "psycopg[binary]>=3.2",
+    "langsmith>=0.7.13",
 ]
 
 [tool.pytest.ini_options]

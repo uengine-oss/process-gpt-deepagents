@@ -128,7 +128,7 @@ def load_tenant_agents_for_chat(
     *,
     limit: int = 64,
 ) -> list[dict[str, Any]]:
-    """List agent rows (is_agent=true) for HTTP /chat when no explicit agent_ids are given."""
+    """List agent rows (is_agent=true) for SDK chat/SSE when no explicit agent_ids are given."""
     tid = (tenant_id or "").strip()
     if not tid:
         return []

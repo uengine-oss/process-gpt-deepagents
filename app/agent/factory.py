@@ -274,7 +274,7 @@ def build_orchestrator_prompt_sections(
     agents: list[dict[str, Any]] | None,
     feedback: str | None,
     form_info: Mapping[str, Any] | None,
-    http_chat: bool = False,
+    is_chat: bool = False,
     http_chat_route: str | None = None,
     tenant_id: str | None = None,
     output_language: str | None = None,
@@ -288,7 +288,7 @@ def build_orchestrator_prompt_sections(
     - Avoid adding global, long-lived rules into small sections unless they are truly required.
     """
     route_norm = (http_chat_route or "").strip().lower().replace("-", "_")
-    suppress_multi_agent_sections = bool(http_chat and route_norm == "work_assistant_only")
+    suppress_multi_agent_sections = bool(is_chat and route_norm == "work_assistant_only")
 
     desc = (description or "").strip()
     instr = (instruction or "").strip()
@@ -355,7 +355,7 @@ def build_orchestrator_prompt_sections(
     if not suppress_multi_agent_sections:
         for ag in agents or []:
             name = ag.get("alias") or ag.get("username") or ag.get("name") or str(ag.get("id"))
-            if http_chat:
+            if is_chat:
                 agent_lines.append(f"- {name}")
             else:
                 role = ag.get("role") or "Unspecified role"
@@ -490,7 +490,7 @@ def build_orchestrator_system_prompt(
     agents: list[dict[str, Any]] | None,
     feedback: str | None,
     form_info: Mapping[str, Any] | None,
-    http_chat: bool = False,
+    is_chat: bool = False,
     http_chat_route: str | None = None,
     tenant_id: str | None = None,
     output_language: str | None = None,
@@ -510,7 +510,7 @@ def build_orchestrator_system_prompt(
         agents=agents,
         feedback=feedback,
         form_info=form_info,
-        http_chat=http_chat,
+        is_chat=is_chat,
         http_chat_route=http_chat_route,
         tenant_id=tenant_id,
         output_language=output_language,
