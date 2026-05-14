@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ from app.database import (
     a_upsert_chat_room_start,
     get_latest_human_response,
     get_supabase,
+    build_initial_chat_room_context
 )
 from app.agent.backend import (
     tenant_memory_sources_for_middleware,
@@ -173,7 +175,9 @@ async def _emit_chunk_text(context: RequestContext, text: str) -> bool:
     streamer = extras.get("streamer")
     send_text = getattr(streamer, "send_text", None)
     if callable(send_text):
-        await send_text(text)
+        res = send_text(text)
+        if inspect.isawaitable(res):
+            await res
         return True
     return False
 
@@ -183,7 +187,9 @@ async def _emit_chunk_json(context: RequestContext, payload: Any) -> bool:
     streamer = extras.get("streamer")
     send_json = getattr(streamer, "send_json", None)
     if callable(send_json):
-        await send_json(payload)
+        res = send_json(payload)
+        if inspect.isawaitable(res):
+            await res
         return True
     return False
 
@@ -1279,17 +1285,6 @@ class DeepAgentsExecutor(AgentExecutor):
         exec_ctx: ExecutionContext | None = None,
     ) -> None:
         tok = bind_executor_asyncio_loop_for_enqueue(asyncio.get_running_loop())
-        try:
-            await self._execute_impl(context, event_queue, exec_ctx)
-        finally:
-            reset_executor_asyncio_loop_for_enqueue(tok)
-
-    async def _execute_impl(
-        self,
-        context: RequestContext,
-        event_queue: EventQueue,
-        exec_ctx: ExecutionContext | None = None,
-    ) -> None:
         logger.info("DeepAgents 멀티 에이전트 실행 시작")
 
         query = context.get_user_input()
@@ -1548,6 +1543,12 @@ class DeepAgentsExecutor(AgentExecutor):
         tool_user_id = str(raw_user_id).split(",")[0].strip() if raw_user_id else ""
         http_stream_event_emit = extras.get("_http_chat_stream_event_emit")
         mcp_cfg_raw = extras.get("tenant_mcp")
+        if not mcp_cfg_raw and tenant_id:
+            try:
+                from processgpt_agent_sdk.database import fetch_tenant_mcp
+                mcp_cfg_raw = await fetch_tenant_mcp(tenant_id)
+            except Exception as e:
+                logger.warning("채팅 모드 tenant_mcp 조회 실패: %s", str(e))
         mcp_cfg: dict[str, Any] = _mcp_config_without_blocked_servers(mcp_cfg_raw)
         # Merge defaults: claude-skills (always) + work-assistant for any chat entrypoint (HTTP or SDK SSE).
         try:
@@ -1702,6 +1703,8 @@ class DeepAgentsExecutor(AgentExecutor):
         allowed_skill_names: list[str] = []
         allowed_skill_names_by_agent: dict[str, list[str]] = {}
         seen_skill_names: set[str] = set()
+
+        # 1. Collect skills from domain agents (subagents)
         for ag in domain_agent_rows:
             if isinstance(ag, dict):
                 agent_name = (
@@ -1723,6 +1726,24 @@ class DeepAgentsExecutor(AgentExecutor):
             if agent_name and per_agent:
                 # Keep order stable and unique.
                 allowed_skill_names_by_agent[agent_name] = list(dict.fromkeys(per_agent))
+
+        # 2. Collect skills from the root agent (Deep Agent / orchestrator)
+        root_agent_name = (
+            row.get("alias")
+            or row.get("username")
+            or row.get("name")
+            or str(row.get("id"))
+        )
+        per_root = []
+        for sk in parse_skills_csv(row.get("skills") if isinstance(row, dict) else None):
+            n = sk.strip()
+            if n and n not in seen_skill_names:
+                seen_skill_names.add(n)
+                allowed_skill_names.append(n)
+            if n:
+                per_root.append(n)
+        if per_root:
+            allowed_skill_names_by_agent[root_agent_name] = list(dict.fromkeys(per_root))
         logger.info(
             "서브에이전트 구성 시작 | task_id=%s domain_agent_rows=%d allowed_skill_names=%d",
             task_id,
@@ -2078,6 +2099,19 @@ class DeepAgentsExecutor(AgentExecutor):
                             tk = 0
                         if tk <= 0 or tk > 3:
                             args["top_k"] = 3
+
+                        # (User requirement) Inject agent's profile skills into allowed_skill_names
+                        agent_skills = allowed_skill_names_by_agent.get(agent_name) or []
+                        if agent_skills:
+                            existing = args.get("allowed_skill_names") or []
+                            if isinstance(existing, str):
+                                existing = [s.strip() for s in existing.split(",") if s.strip()]
+                            elif not isinstance(existing, list):
+                                existing = []
+                            # Merge and unique
+                            merged_skills = list(dict.fromkeys(list(existing) + list(agent_skills)))
+                            args["allowed_skill_names"] = merged_skills
+
                         return merged
 
                     # 2) Fix common confusion: passing FS absolute paths to MCP doc readers.
@@ -2380,7 +2414,7 @@ class DeepAgentsExecutor(AgentExecutor):
         http_chat_has_assets = bool(is_chat and bool(http_chat_policy.get("has_input_assets")))
         route_hint = ""
         if is_chat:
-            route_hint = "needs_task" if http_chat_has_assets else "work_assistant_only"
+            route_hint = "needs_task" if (http_chat_has_assets or subagent_contexts) else "work_assistant_only"
 
         base_rules = (
             compact_orchestrator_prompt_for_work_assistant_only()
@@ -2439,6 +2473,12 @@ class DeepAgentsExecutor(AgentExecutor):
         elif is_chat and bool(http_chat_policy.get("has_input_assets")):
             route_progress["route"] = "needs_task"
             route_progress["reason"] = "input_assets_present"
+        elif is_chat:
+            # 서브 없음·입력 자산 없음: route_hint(work_assistant_only)와 동일하게 route_gate를 채운다.
+            # 비어 있으면 DeepRequiredRootGateMiddleware가 MCP·write_todos까지 막고,
+            # 제거된 write_http_chat_route로는 복구할 수 없어 품질이 붕괴된다.
+            route_progress["route"] = "work_assistant_only"
+            route_progress["reason"] = "chat_default_no_subagents_no_assets"
         pipeline_spec_mw = create_pipeline_spec_middleware(
             event_queue=event_queue,
             proc_inst_id=proc_inst_id,
@@ -2772,6 +2812,52 @@ class DeepAgentsExecutor(AgentExecutor):
                     logger.exception("http_chat root orchestrator tool_start emit failed", exc_info=True)
                 return None
 
+            # (User requirement) Inject root agent profile skills into find_helpful_skills calls.
+            _chat_aug = None
+            if is_chat:
+                _chat_aug = make_http_chat_work_assistant_tool_input_augmenter(
+                    input_data=input_data if isinstance(input_data, dict) else {},
+                    row=row if isinstance(row, dict) else {},
+                    extras=extras if isinstance(extras, dict) else {},
+                    tenant_id=str(tenant_id or "").strip() or None,
+                    chat_identity_tool_ids=frozenset(id(t) for t in deduped_root_tools),
+                )
+
+            def _root_orchestrator_tool_input_augmenter(base_tool: Any, tool_input: Any) -> Any:
+                tool_name = str(getattr(base_tool, "name", "") or "")
+
+                if tool_name == "find_helpful_skills":
+                    merged = _coerce_tool_input_dict(tool_input)
+                    if isinstance(merged, dict):
+                        args = merged.get("args") if isinstance(merged.get("args"), dict) else merged
+                        if isinstance(args, dict):
+                            # Token hygiene (consistent with subagents)
+                            if args.get("list_documents") is True:
+                                args["list_documents"] = False
+                            try:
+                                tk = int(args.get("top_k") or 0)
+                            except Exception:
+                                tk = 0
+                            if tk <= 0 or tk > 3:
+                                args["top_k"] = 3
+
+                            # Inject root agent's profile skills
+                            agent_skills = allowed_skill_names_by_agent.get(root_agent_name) or []
+                            if agent_skills:
+                                existing = args.get("allowed_skill_names") or []
+                                if isinstance(existing, str):
+                                    existing = [s.strip() for s in existing.split(",") if s.strip()]
+                                elif not isinstance(existing, list):
+                                    existing = []
+                                # Merge and unique
+                                merged_skills = list(dict.fromkeys(list(existing) + list(agent_skills)))
+                                args["allowed_skill_names"] = merged_skills
+                        tool_input = merged
+
+                if _chat_aug is not None:
+                    return _chat_aug(base_tool, tool_input)
+                return tool_input
+
             _instrument_tools(
                 deduped_root_tools,
                 todo_id=task_id or None,
@@ -2783,17 +2869,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 tool_result_hook=_domain_tool_result_hook,
                 exec_ctx=exec_ctx,
                 event_queue=event_queue,
-                tool_input_augmenter=(
-                    make_http_chat_work_assistant_tool_input_augmenter(
-                        input_data=input_data if isinstance(input_data, dict) else {},
-                        row=row if isinstance(row, dict) else {},
-                        extras=extras if isinstance(extras, dict) else {},
-                        tenant_id=str(tenant_id or "").strip() or None,
-                        chat_identity_tool_ids=frozenset(id(t) for t in deduped_root_tools),
-                    )
-                    if is_chat
-                    else None
-                ),
+                tool_input_augmenter=_root_orchestrator_tool_input_augmenter,
                 tool_call_guard=_root_orchestrator_tool_call_guard,
                 context_tool_tracker=context_tool_tracker,
             )
@@ -3151,6 +3227,19 @@ class DeepAgentsExecutor(AgentExecutor):
                     agent_name=hitl_agent_name,
                     status="ASKED",
                 )
+                try:
+                    _enqueue_artifact(
+                        event_queue,
+                        name="openui_request",
+                        description="OpenUI 인터럽트 요청",
+                        text=interrupt_payload,
+                        proc_inst_id=proc_inst_id,
+                        task_id=task_id,
+                        exec_ctx=exec_ctx,
+                    )
+                except Exception:
+                    logger.exception("Failed to enqueue openui event for HITL", exc_info=True)
+
             except Exception:
                 logger.exception(
                     "Failed to enqueue human_asked event from graph-level HITL", exc_info=True
@@ -3734,6 +3823,7 @@ class DeepAgentsExecutor(AgentExecutor):
             result_box["final_output"] = final_result_payload
             # (의도적으로) 요청 분류/케이스 분기 스냅샷은 남기지 않는다.
             # 정책은 도구 호출 게이트로만 강제한다.
+        reset_executor_asyncio_loop_for_enqueue(tok)
         return None
 
     @override
