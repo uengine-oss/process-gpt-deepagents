@@ -73,24 +73,44 @@ def create_prompt_sections_middleware(
             elif is_chat and not need_multi:
                 keys = ["base_identity", "lang", "sec1", "sec1b", "chat_output", "http_chat_rules_generic"]
             elif need_multi:
-                keys = [
-                    "base_identity",
-                    "base_task",
-                    "base_assets",
-                    "base_structured_outputs",
-                    "base_mapping",
-                    "base_hitl",
-                    "lang",
-                    "sec1",
-                    "sec1a",
-                    "sec1b",
-                    "sec2",
-                    "sec3",
-                    "sec4",
-                    "sec5",
-                    "sec5b",
-                    "sec6",
-                ]
+                if is_chat:
+                    keys = [
+                        "base_identity",
+                        "base_task",
+                        "base_assets",
+                        "base_mapping",
+                        "base_hitl",
+                        "lang",
+                        "sec1",
+                        "sec1a",
+                        "sec1b",
+                        "sec2",
+                        "sec3",
+                        "sec4",
+                        "sec5",
+                        "sec5b",
+                        "chat_output",
+                        "http_chat_rules_generic",
+                    ]
+                else:
+                    keys = [
+                        "base_identity",
+                        "base_task",
+                        "base_assets",
+                        "base_structured_outputs",
+                        "base_mapping",
+                        "base_hitl",
+                        "lang",
+                        "sec1",
+                        "sec1a",
+                        "sec1b",
+                        "sec2",
+                        "sec3",
+                        "sec4",
+                        "sec5",
+                        "sec5b",
+                        "sec6",
+                    ]
             else:
                 # process mode execution loop
                 keys = [

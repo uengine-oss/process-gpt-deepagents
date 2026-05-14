@@ -21,7 +21,7 @@ dependencies = [
     "supabase>=2.0.0",
     "typing-extensions>=4.8.0",
     "process-gpt-agent-utils==0.3.4",
-    "process-gpt-agent-sdk==0.4.19",
+    "process-gpt-agent-sdk==0.4.21",
     "pytest>=8.0.0",
     "sse-starlette>=2.1.0",
     "uvicorn>=0.30.0",

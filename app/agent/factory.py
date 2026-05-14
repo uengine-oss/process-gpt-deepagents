@@ -355,15 +355,12 @@ def build_orchestrator_prompt_sections(
     if not suppress_multi_agent_sections:
         for ag in agents or []:
             name = ag.get("alias") or ag.get("username") or ag.get("name") or str(ag.get("id"))
-            if is_chat:
-                agent_lines.append(f"- {name}")
-            else:
-                role = ag.get("role") or "Unspecified role"
-                skills = ag.get("skills") or ""
-                tools = ag.get("tools") or ""
-                agent_lines.append(
-                    f"- Agent '{name}': role={role}, skills={skills or '(none)'}, tools={tools or '(none)'}"
-                )
+            role = ag.get("role") or "Unspecified role"
+            skills = ag.get("skills") or ""
+            tools = ag.get("tools") or ""
+            agent_lines.append(
+                f"- Agent '{name}': role={role}, skills={skills or '(none)'}, tools={tools or '(none)'}"
+            )
         if agent_lines:
             sec2 = (
                 "=== 섹션 2: 사용 가능한 서브에이전트/스킬(`task()`로 호출) ===\n"
