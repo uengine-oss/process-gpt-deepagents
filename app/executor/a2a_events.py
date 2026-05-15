@@ -62,7 +62,7 @@ def schedule_async_event_queue_coroutine(coro: Any) -> None:
         pass
 
 
-def _enqueue_event_compat(eq: Any, event: Any) -> None:
+def enqueue_event(eq: Any, event: Any) -> None:
     """Call enqueue_event in both sync/async EventQueue implementations.
 
     - a2a-sdk>=1.0: enqueue_event is async
@@ -105,8 +105,7 @@ def _ensure_required_root_task_started_fields(payload: dict[str, Any], *, event_
         payload["agent_profile"] = "/images/chat-icon.png"
 
 
-def _enqueue_status(
-    eq: EventQueue,
+def new_status_update_event(
     event_type: str,
     data: dict[str, Any],
     proc_inst_id: str,
@@ -119,17 +118,12 @@ def _enqueue_status(
     phase: str | None = None,
     agent_name: str | None = None,
     status: str | None = None,
-) -> None:
-    """Emit a TaskStatusUpdateEvent (A2A standard).
-
-    a2a-sdk v1.0 uses protobuf types; use `a2a.helpers` constructors instead of
-    manually assembling protobuf objects.
-    """
+) -> Any:
+    """Create a TaskStatusUpdateEvent (A2A standard) but do not enqueue it yet."""
     effective_job_id = job_id or str(uuid.uuid4())
     logical = logical_event_type or ("agent_started" if event_type == "task_started" else "agent_finished")
     effective_phase = phase or "reasoning"
 
-    # 1) 우리가 원하는 평탄화 payload(메타+도메인)를 먼저 만든다.
     payload = build_event_payload(
         exec_ctx,
         logical_event_type=logical,
@@ -139,7 +133,6 @@ def _enqueue_status(
     )
     _ensure_required_root_task_started_fields(payload, event_type=event_type)
 
-    # 2) TaskState 매핑 (a2a-sdk v1.0 enum)
     if event_type == "human_asked":
         state = TaskState.TASK_STATE_INPUT_REQUIRED
     elif (
@@ -157,60 +150,69 @@ def _enqueue_status(
         "status": status,
         "job_id": effective_job_id,
     }
-    # Optional: expose our structured payload for SSE/chat streaming consumers.
-    # (SDK chat_mode may stream metadata JSON if the queue supports it.)
     metadata["payload"] = payload
 
+    md = Struct()
+    ParseDict(metadata, md)
+    evt = new_text_status_update_event(
+        task_id=str(task_id or ""),
+        context_id=str(proc_inst_id or ""),
+        state=state,
+        text=json.dumps(payload, ensure_ascii=False),
+    )
+    evt.metadata.CopyFrom(md)
+    return evt
+
+
+def enqueue_status_update(
+    eq: EventQueue,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """Create and enqueue a TaskStatusUpdateEvent."""
     try:
-        md = Struct()
-        ParseDict(metadata, md)
-        evt = new_text_status_update_event(
-            task_id=str(task_id or ""),
-            context_id=str(proc_inst_id or ""),
-            state=state,
-            # ProcessEventQueue persists `status.message` (not metadata). Put our payload JSON in text
-            # so the SDK can store it in `events.data` (and parse back to dict).
-            text=json.dumps(payload, ensure_ascii=False),
-        )
-        # protobuf Struct field: set after construction
-        evt.metadata.CopyFrom(md)
-        _enqueue_event_compat(
-            eq,
-            evt,
-        )
+        evt = new_status_update_event(*args, **kwargs)
+        enqueue_event(eq, evt)
     except Exception:
         logger.exception("Failed to enqueue TaskStatusUpdateEvent", exc_info=True)
 
 
-def _enqueue_artifact(
-    eq: EventQueue,
+def new_artifact_update_event(
     name: str,
     description: str,
     text: Any,
     proc_inst_id: str,
     task_id: str,
     *,
-    exec_ctx: ExecutionContext | None = None,  # exec_ctx는 현재 사용하지 않지만 시그니처 호환용
-) -> None:
-    """Emit a final TaskArtifactUpdateEvent (A2A standard)."""
+    exec_ctx: ExecutionContext | None = None,
+) -> Any:
+    """Create a TaskArtifactUpdateEvent (A2A standard) but do not enqueue it yet."""
     del exec_ctx  # unused
+    if not isinstance(text, str):
+        artifact_text = json.dumps(text, ensure_ascii=False)
+    else:
+        artifact_text = text
+    # a2a-sdk: new_text_artifact_update_event(task_id, context_id, name, text, ...)
+    # (no ``description`` kwarg; keep parameter for call-site compatibility.)
+    _ = description
+    return new_text_artifact_update_event(
+        task_id=str(task_id or ""),
+        context_id=str(proc_inst_id or ""),
+        name=name,
+        text=artifact_text,
+        last_chunk=True,
+    )
+
+
+def enqueue_artifact_update(
+    eq: EventQueue,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """Create and enqueue a TaskArtifactUpdateEvent."""
     try:
-        if not isinstance(text, str):
-            artifact_text = json.dumps(text, ensure_ascii=False)
-        else:
-            artifact_text = text
-        # a2a-sdk: new_text_artifact_update_event(task_id, context_id, name, text, ...)
-        # (no ``description`` kwarg; keep parameter for call-site compatibility.)
-        _ = description
-        _enqueue_event_compat(
-            eq,
-            new_text_artifact_update_event(
-                task_id=str(task_id or ""),
-                context_id=str(proc_inst_id or ""),
-                name=name,
-                text=artifact_text,
-                last_chunk=True,
-            ),
-        )
+        evt = new_artifact_update_event(*args, **kwargs)
+        enqueue_event(eq, evt)
     except Exception:
         logger.exception("Failed to enqueue TaskArtifactUpdateEvent", exc_info=True)
+

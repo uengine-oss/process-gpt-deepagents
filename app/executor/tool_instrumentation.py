@@ -6,7 +6,7 @@ import logging
 import uuid
 from typing import Any
 
-from .a2a_events import _enqueue_status
+from .a2a_events import enqueue_status_update
 from .context import ExecutionContext
 from .exceptions import HitlInterrupt
 from .hitl_utils import (
@@ -241,7 +241,7 @@ def _instrument_tools(
                 "mcp_server": getattr(base_tool, "_mcp_server", None),
                 "input": safe_input,
             }
-            _enqueue_status(
+            enqueue_status_update(
                 event_queue,
                 "tool_usage_started",
                 data,
@@ -284,7 +284,7 @@ def _instrument_tools(
             decision = _extract_hitl_decision_from_output(tool_output)
         try:
             if event_queue is not None:
-                _enqueue_status(
+                enqueue_status_update(
                     event_queue,
                     "tool_usage_finished",
                     data,

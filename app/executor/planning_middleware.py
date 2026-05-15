@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .a2a_events import _enqueue_status
+from .a2a_events import enqueue_status_update
 from .tool_calls import _json_safe, _tool_call_args_from_request
 from .workitem_text import _join_todo_contents
 
@@ -45,7 +45,7 @@ def _create_write_todos_planning_middleware(
                 # 루트 오케스트레이터 run과 동일한 job_id로 수집·표시 정합성 유지 (매 호출 uuid4 금지)
                 tool_call_job_id = str(job_uuid)
                 try:
-                    _enqueue_status(
+                    enqueue_status_update(
                         event_queue,
                         "tool_usage_started",
                         {
@@ -86,7 +86,7 @@ def _create_write_todos_planning_middleware(
                     if err_inner is not None:
                         finished_payload["error"] = str(err_inner)
                     try:
-                        _enqueue_status(
+                        enqueue_status_update(
                             event_queue,
                             "tool_usage_finished",
                             finished_payload,
@@ -125,7 +125,7 @@ def _create_write_todos_planning_middleware(
                 logger.exception("Failed to join todo contents from write_todos args", exc_info=True)
 
             try:
-                _enqueue_status(
+                enqueue_status_update(
                     event_queue,
                     "task_completed",
                     {"message": plan_message or "플래닝이 완료되었습니다."},

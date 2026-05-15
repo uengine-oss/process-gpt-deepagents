@@ -18,7 +18,7 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.types import Command
 from typing_extensions import NotRequired, TypedDict, override
 
-from app.executor.a2a_events import _enqueue_status
+from app.executor.a2a_events import enqueue_status_update
 from app.executor.pipeline_validator import validate_pipeline_spec
 
 logger = logging.getLogger(__name__)
@@ -293,7 +293,7 @@ def create_pipeline_spec_middleware(
                         plan_message = ""
                         if spec:
                             plan_message = _format_pipeline_plan_message(spec)
-                        _enqueue_status(
+                        enqueue_status_update(
                             event_queue,
                             "task_completed",
                             {"message": plan_message or "파이프라인 스펙이 확정되었습니다."},

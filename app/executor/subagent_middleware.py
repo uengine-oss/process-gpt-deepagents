@@ -12,7 +12,7 @@ from typing import Any
 from app.executor.pipeline_outputs_extract import merge_task_command_pipeline_outputs
 from app.skills.volume_tool_events import skill_volume_active_exec_ctx, skill_volume_active_job_id
 
-from .a2a_events import _enqueue_status
+from .a2a_events import enqueue_status_update
 from .context import ExecutionContext
 from .tool_calls import _request_with_merged_tool_args, _tool_call_args_from_request, _tool_call_as_dict
 from .workitem_text import _extract_plain_text
@@ -203,7 +203,7 @@ def _create_subagent_event_middleware(
             display_goal = _goal_for_task_started_event(
                 event_goal_pre_injection.strip() or str(ctx.get("goal") or "")
             )
-            _enqueue_status(
+            enqueue_status_update(
                 event_queue,
                 "task_started",
                 {
@@ -247,7 +247,7 @@ def _create_subagent_event_middleware(
                 )
                 if used_skills:
                     작업_텍스트 += f" | 참고/사용한 스킬: {', '.join(sorted(set(used_skills)))}"
-                _enqueue_status(
+                enqueue_status_update(
                     event_queue,
                     "task_completed",
                     {
@@ -267,7 +267,7 @@ def _create_subagent_event_middleware(
                     logger.exception("Failed to record subagent task_completed job_id", exc_info=True)
                 return merge_task_command_pipeline_outputs(result, str(subagent_type or ""))
             except Exception:
-                _enqueue_status(
+                enqueue_status_update(
                     event_queue,
                     "task_completed",
                     {
@@ -298,7 +298,7 @@ def _emit_subagent_task_started(
     exec_ctx: ExecutionContext | None,
     ctx: dict[str, Any],
 ) -> None:
-    _enqueue_status(
+    enqueue_status_update(
         event_queue,
         "task_started",
         {
@@ -341,7 +341,7 @@ def _emit_subagent_task_completed(
     if used_skills:
         작업_텍스트 += f" | 참고/사용한 스킬: {', '.join(sorted(set(used_skills)))}"
     done_message = message_override or f"서브 에이전트 '{ctx['name']}' 실행이 완료되었습니다."
-    _enqueue_status(
+    enqueue_status_update(
         event_queue,
         "task_completed",
         {

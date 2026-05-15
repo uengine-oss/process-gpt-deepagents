@@ -9,7 +9,7 @@ import re
 import uuid
 from typing import Any
 
-from app.executor.a2a_events import _enqueue_status
+from app.executor.a2a_events import enqueue_status_update
 from app.executor.context import ExecutionContext
 from app.executor.tool_instrumentation import _instrument_tools
 from app.executor.workitem_text import _extract_plain_text
@@ -285,7 +285,7 @@ async def run_todo_subagent_job(
     job_id = stable_jid or str(td.get("job_id") or "").strip() or str(uuid.uuid4())
     td["job_id"] = job_id
     try:
-        _enqueue_status(
+        enqueue_status_update(
             event_queue,
             "task_started",
             {
@@ -406,7 +406,7 @@ async def run_todo_subagent_job(
         td["status"] = "failed"
         results[tid] = {"status": "failed", "agent": sa_name, "error": str(err)}
         try:
-            _enqueue_status(
+            enqueue_status_update(
                 event_queue,
                 "task_completed",
                 {"message": f"{task_label} 실행 실패", "error": str(err), "name": sa_name},
@@ -497,7 +497,7 @@ async def run_todo_subagent_job(
                 results[tid]["size_bytes"] = out.get("size_bytes")
                 break
     try:
-        _enqueue_status(
+        enqueue_status_update(
             event_queue,
             "task_completed",
             {"message": f"{task_label} 실행 완료", "name": sa_name},

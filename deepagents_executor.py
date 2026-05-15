@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import inspect
 import json
 import logging
 import os
 import re
-import time
 import uuid
 from typing import Any, Mapping
 
@@ -33,7 +31,6 @@ from app.agent.factory import (
     base_orchestrator_identity_prompt,
     build_orchestrator,
     build_orchestrator_prompt_sections,
-    build_orchestrator_system_prompt,
     compact_orchestrator_prompt_for_work_assistant_only,
     default_orchestrator_prompt,
 )
@@ -71,9 +68,11 @@ from app.tooling.tagging_safe_tool_loader import TaggingSafeToolLoader
 from processgpt_agent_utils.utils.context_manager import set_context
 
 from app.executor.a2a_events import (
-    _enqueue_artifact,
-    _enqueue_status,
-    _ensure_required_root_task_started_fields,
+    enqueue_artifact_update,
+    enqueue_status_update,
+    enqueue_event,
+    new_artifact_update_event,
+    new_status_update_event,
     bind_executor_asyncio_loop_for_enqueue,
     reset_executor_asyncio_loop_for_enqueue,
 )
@@ -114,15 +113,12 @@ from app.executor.subagent_middleware import (
 from app.executor.domain_agent_mcp_prefetch import extend_mcp_request_with_domain_agent_declared_servers
 from app.executor.tenant_context import (
     _mcp_config_without_blocked_servers,
-    _prefetch_tenant_context_once,
-    _truncate_text,
 )
 from app.executor.postgres_checkpointer import (
     get_async_postgres_checkpointer,
     resolve_checkpoint_thread_id,
 )
 from app.executor.tool_instrumentation import (
-    _coerce_tool_output_for_tool_node,
     _instrument_tools,
     http_chat_tool_display_name,
 )
@@ -1438,7 +1434,7 @@ class DeepAgentsExecutor(AgentExecutor):
 
         if use_graph_resume:
             try:
-                _enqueue_status(
+                enqueue_status_update(
                     event_queue,
                     "task_working",
                     {
@@ -1484,7 +1480,7 @@ class DeepAgentsExecutor(AgentExecutor):
 
             # Emit a resume event for tracing via SDK EventQueue.
             try:
-                _enqueue_status(
+                enqueue_status_update(
                     event_queue,
                     "task_working",
                     {
@@ -2432,7 +2428,7 @@ class DeepAgentsExecutor(AgentExecutor):
 
         # NOTE: 루트(DeepAgent) task_started 는 서브에이전트 이벤트보다 먼저 발행되어야 한다.
         # (DB 인입 시점 기준으로 서브가 먼저 시작한 것처럼 보이는 문제 방지)
-        _enqueue_status(
+        enqueue_status_update(
             event_queue,
             "task_started",
             {
@@ -2509,7 +2505,7 @@ class DeepAgentsExecutor(AgentExecutor):
             """플랜 본문을 포착하지 못한 경우에도 planning 완료 이벤트를 보장한다."""
             if _planning_completed_flag():
                 return
-            _enqueue_status(
+            enqueue_status_update(
                 event_queue,
                 "task_completed",
                 {"message": message},
@@ -2937,7 +2933,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 if not plan_message and todos_state is None:
                     return
 
-                _enqueue_status(
+                enqueue_status_update(
                     event_queue,
                     "task_completed",
                     {"message": plan_message or "플래닝이 완료되었습니다."},
@@ -3078,7 +3074,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 }
             try:
                 hitl_job_id = str(uuid.uuid4())
-                _enqueue_status(
+                enqueue_status_update(
                     event_queue,
                     "human_asked",
                     {
@@ -3206,7 +3202,7 @@ class DeepAgentsExecutor(AgentExecutor):
             )
             try:
                 hitl_job_id = str(uuid.uuid4())
-                _enqueue_status(
+                enqueue_status_update(
                     event_queue,
                     "human_asked",
                     {
@@ -3228,15 +3224,20 @@ class DeepAgentsExecutor(AgentExecutor):
                     status="ASKED",
                 )
                 try:
-                    _enqueue_artifact(
-                        event_queue,
+                    context = interrupt_payload.get("context")
+                    interrupt_evt = new_artifact_update_event(
                         name="openui_request",
                         description="OpenUI 인터럽트 요청",
-                        text=interrupt_payload,
+                        text=context,
                         proc_inst_id=proc_inst_id,
                         task_id=task_id,
                         exec_ctx=exec_ctx,
                     )
+                    interrupt_evt.metadata.update({
+                        "question": question,
+                        **({"openuiLang": openui_lang} if openui_lang else {})
+                    })
+                    enqueue_event(event_queue, interrupt_evt)
                 except Exception:
                     logger.exception("Failed to enqueue openui event for HITL", exc_info=True)
 
@@ -3305,8 +3306,9 @@ class DeepAgentsExecutor(AgentExecutor):
         # 강제 위임 정책:
         # 서브에이전트가 구성되어 있는 런에서는 루트 오케스트레이터가 직접 최종 답변으로 끝내지 않는다.
         # (즉, 최소 1회 이상 task() 위임이 발생해야 한다.)
+        delegation_policy_violation: str | None = None
         if subagent_contexts and not bool(planning_progress.get("saw_task_delegation")):
-            raw_text = (
+            delegation_policy_violation = (
                 "서브에이전트가 구성되어 있으므로 루트 오케스트레이터가 직접 작업을 완료할 수 없습니다.\n"
                 "반드시 다음 순서로 진행해야 합니다.\n\n"
                 "1) (HTTP 채팅인 경우) `write_http_chat_route(route=\"needs_task\")`\n"
@@ -3461,11 +3463,15 @@ class DeepAgentsExecutor(AgentExecutor):
             except Exception:
                 logger.exception("Failed to render deterministic close-price sentence; continuing", exc_info=True)
 
-            result_status = "SUCCESS" if final_text else "Fail"
+            result_status = "SUCCESS" if (final_text and not delegation_policy_violation) else "Fail"
             final_result_payload = {
                 "output": {
                     "status": result_status,
-                    "result": final_text,
+                    "result": (
+                        delegation_policy_violation
+                        if (delegation_policy_violation and not is_chat)
+                        else final_text
+                    ),
                 },
             }
         else:
@@ -3620,13 +3626,14 @@ class DeepAgentsExecutor(AgentExecutor):
             for run in (execution_evidence.get("subagent_runs") or [])
         ) or bool(combined_manifest)
         if not has_execution_evidence:
+            evidence_error = (
+                "실행 증거(도구 호출/위임 결과)가 부족하여 결과를 확정할 수 없습니다. "
+                "반드시 최소 1회 이상 MCP 도구 호출 또는 `task()` 위임을 수행한 뒤 결과를 종합해 주세요."
+            )
             final_result_payload = {
                 "output": {
                     "status": "Fail",
-                    "result": (
-                        "실행 증거(도구 호출/위임 결과)가 부족하여 결과를 확정할 수 없습니다. "
-                        "반드시 최소 1회 이상 MCP 도구 호출 또는 `task()` 위임을 수행한 뒤 결과를 종합해 주세요."
-                    ),
+                    "result": (evidence_error if not is_chat else final_text),
                 }
             }
             wrapped_result["final_output"] = final_result_payload
@@ -3636,7 +3643,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 final_event_result = {
                     "status": "Fail",
                     "reason": "missing_execution_evidence",
-                    "result": final_event_result,
+                    "result": (evidence_error if not is_chat else final_event_result),
                 }
 
         _inv_mode = (os.environ.get("DEEPAGENTS_PIPELINE_INVARIANTS") or "log").strip().lower()
@@ -3679,7 +3686,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     wrapped_result["final_output"] = final_result_payload
 
         end_job = str(uuid.uuid4())
-        _enqueue_status(
+        enqueue_status_update(
             event_queue,
             "task_started",
             {
@@ -3694,7 +3701,7 @@ class DeepAgentsExecutor(AgentExecutor):
             phase="final",
             agent_name="최종 결과 작성자",
         )
-        _enqueue_status(
+        enqueue_status_update(
             event_queue,
             "task_completed",
             # NOTE: For crew_type='result' we want the event payload itself to be the deliverable.
@@ -3746,8 +3753,15 @@ class DeepAgentsExecutor(AgentExecutor):
             artifact_payload = (final_text or "").strip() or unwrap_output_wrapper_result_text(
                 str(raw_text or "")
             ).strip()
+            # 보안/UX: 서브에이전트 구성 위반 등의 기술적 에러 메시지가 채팅 본문에 절대 노출되지 않도록 강제 필터링
+            forbidden_start = "서브에이전트가 구성되어 있으므로"
+            if artifact_payload.startswith(forbidden_start):
+                artifact_payload = (
+                    "작업 수행을 위해 필요한 서브에이전트 위임이 발생하지 않았습니다. "
+                    "오케스트레이터의 실행 계획을 확인해 주세요."
+                )
 
-        _enqueue_artifact(
+        enqueue_artifact_update(
             event_queue,
             name="deepagents_action_result",
             description="DeepAgents 멀티 에이전트 실행 결과",
