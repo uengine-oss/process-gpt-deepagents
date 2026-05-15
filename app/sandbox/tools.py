@@ -206,9 +206,33 @@ def _materialize_skill_via_claude_skills_http(
 
 def _get_workspace(workspace_id: str) -> SandboxWorkspace:
     ws = _WORKSPACES.get(workspace_id)
-    if ws is None:
-        raise ValueError(f"Unknown sandbox workspace: {workspace_id}")
-    return ws
+    if ws is not None:
+        return ws
+
+    # Probe filesystem for multi-process / restart re-attachment.
+    # Workspace IDs are directory names in the sandbox base directory.
+    base = Path(_RUNTIME.base_dir)
+    probe = base / (workspace_id or "")
+    if workspace_id and probe.is_dir():
+        # Recover best-effort metadata from name: sbx_{agent}_{job}_...
+        agent_name = "recovered"
+        job_id = "recovered"
+        parts = workspace_id.split("_")
+        if len(parts) >= 4 and parts[0] == "sbx":
+            agent_name = parts[1]
+            job_id = parts[2]
+
+        ws = SandboxWorkspace(
+            workspace_id=workspace_id,
+            path=str(probe.resolve()),
+            job_id=job_id,
+            agent_name=agent_name,
+        )
+        _WORKSPACES[workspace_id] = ws
+        logger.info("Re-attached to sandbox workspace from disk: %s", workspace_id)
+        return ws
+
+    raise ValueError(f"Unknown sandbox workspace: {workspace_id}")
 
 
 def _get_or_create_workspace(
@@ -223,10 +247,13 @@ def _get_or_create_workspace(
     creates brittle behavior and prevents useful fallbacks. For write/run style
     tools we auto-create a workspace so the run can still proceed.
     """
-    ws = _WORKSPACES.get(workspace_id)
-    if ws is not None:
+    try:
+        ws = _get_workspace(workspace_id)
         _note_workspace_for_current_task(ws.workspace_id)
         return ws
+    except ValueError:
+        pass
+
     effective_job = (fallback_job_id or workspace_id or "").strip() or str(uuid.uuid4())
     ws = _RUNTIME.create_workspace(job_id=effective_job, agent_name=agent_name)
     _WORKSPACES[ws.workspace_id] = ws
