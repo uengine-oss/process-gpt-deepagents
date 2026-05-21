@@ -20,8 +20,8 @@ from app.database import (
     a_update_chat_room_context,
     a_upsert_chat_room_start,
     get_latest_human_response,
-    get_supabase,
-    build_initial_chat_room_context
+    build_initial_chat_room_context,
+    _load_proc_def_activity_capabilities
 )
 from app.agent.backend import (
     tenant_memory_sources_for_middleware,
@@ -62,6 +62,7 @@ from app.skills.volume_tool_events import (
 )
 from app.agent.subagents import (
     build_subagent_configs,
+    load_adhoc_agent_rows,
     parse_skills_csv,
 )
 from app.tooling.tagging_safe_tool_loader import TaggingSafeToolLoader
@@ -1037,96 +1038,6 @@ def _subagent_tool_job_id_getter(default_jid: str):
     return _inner
 
 
-def _extract_activity_tools_skills_from_definition(
-    definition: Any,
-    *,
-    activity_id: str,
-) -> tuple[list[str], list[str]]:
-    """Best-effort extraction of tools/skills from proc_def_version.definition JSON.
-
-    New spec shape (expected):
-      definition.activities = [ { "id": "<activity_id>", "tools": [...], "skills": [...] }, ... ]
-    """
-    aid = (activity_id or "").strip()
-    if not aid:
-        return ([], [])
-    if not isinstance(definition, dict):
-        return ([], [])
-    activities = definition.get("activities")
-    if not isinstance(activities, list) or not activities:
-        return ([], [])
-
-    target: dict[str, Any] | None = None
-    for act in activities:
-        if not isinstance(act, dict):
-            continue
-        for key in ("id", "activity_id", "activityId", "key"):
-            if str(act.get(key) or "").strip() == aid:
-                target = act
-                break
-        if target is not None:
-            break
-    if target is None:
-        return ([], [])
-
-    def _as_str_list(value: Any) -> list[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            return [s.strip() for s in value.split(",") if s.strip()]
-        if isinstance(value, list):
-            out: list[str] = []
-            for x in value:
-                s = str(x or "").strip()
-                if s:
-                    out.append(s)
-            return out
-        return []
-
-    tools = list(dict.fromkeys(_as_str_list(target.get("tools"))))
-    skills = list(dict.fromkeys(_as_str_list(target.get("skills"))))
-    return (tools, skills)
-
-
-def _load_proc_def_activity_capabilities(
-    *,
-    tenant_id: str,
-    proc_def_id: str,
-    activity_id: str,
-) -> tuple[list[str], list[str]]:
-    """Fetch proc_def.definition and extract activity.tools/skills (best-effort)."""
-    tid = (tenant_id or "").strip()
-    pdid = (proc_def_id or "").strip()
-    aid = (activity_id or "").strip()
-    if not (tid and pdid and aid):
-        return ([], [])
-    try:
-        resp = (
-            get_supabase()
-            .table("proc_def")
-            .select("definition")
-            .eq("tenant_id", tid)
-            .eq("id", pdid)
-            .limit(1)
-            .execute()
-        )
-    except Exception:
-        logger.exception(
-            "proc_def lookup failed | tenant_id=%s proc_def_id=%s activity_id=%s",
-            tid,
-            pdid,
-            aid,
-            exc_info=True,
-        )
-        return ([], [])
-    rows = getattr(resp, "data", None)
-    if not isinstance(rows, list) or not rows:
-        return ([], [])
-    row0 = rows[0] if isinstance(rows[0], dict) else {}
-    definition = row0.get("definition") if isinstance(row0, dict) else None
-    return _extract_activity_tools_skills_from_definition(definition, activity_id=aid)
-
-
 def _build_fallback_activity_subagent(
     *,
     tenant_id: str,
@@ -1184,10 +1095,9 @@ def _build_fallback_activity_subagent(
 
     if not want_slim:
         # Best-effort include tenant context tools already loaded (if present).
-        for tn in ("mem0", "memento", "dmn_rule"):
-            base = tools_by_name.get(tn)
-            if base is not None:
-                _add_tool_obj(base)
+        base = tools_by_name.get("memento")
+        if base is not None:
+            _add_tool_obj(base)
 
         # Always include sandbox tools & skill resolution tools.
         for t in list(get_sandbox_tools()) + list(get_skill_resolution_tools()):
@@ -1291,7 +1201,16 @@ class DeepAgentsExecutor(AgentExecutor):
         is_chat = bool(_is_chat_request(context))
         checkpoint_thread_id = resolve_checkpoint_thread_id(is_chat=is_chat, row=row)
 
-        proc_inst_id = row.get("root_proc_inst_id") or row.get("proc_inst_id") or ""
+        is_adhoc = False
+        if isinstance(row, dict):
+            adhoc_val = row.get("adhoc")
+            if adhoc_val is True or (isinstance(adhoc_val, str) and adhoc_val.lower() == "true"):
+                is_adhoc = True
+
+        if is_adhoc:
+            proc_inst_id = row.get("proc_inst_id") or ""
+        else:
+            proc_inst_id = row.get("root_proc_inst_id") or row.get("proc_inst_id") or ""
         task_id = str(row.get("id") or "")
         tenant_id = row.get("tenant_id") or ""
         form_id = extras.get("form_id")
@@ -1599,7 +1518,6 @@ class DeepAgentsExecutor(AgentExecutor):
         enable_tenant_context_preflight = (not is_chat) or _truthy_env(
             _ENV_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT, default=False
         )
-        local_tenant_context_tool_names = ("mem0", "memento", "dmn_rule") if enable_tenant_context_preflight else ()
         # MCP servers to request.
         # Process mode intentionally does NOT auto-connect all tenant MCP servers.
         # We keep this minimal and let activity/subagent capabilities decide what to load.
@@ -1625,11 +1543,10 @@ class DeepAgentsExecutor(AgentExecutor):
                         mcp_servers[canonical] = dict(cfg)
 
         # 로컬 컨텍스트 도구를 먼저 요청한 뒤, MCP(claude-skills 등)를 이어서 요청한다.
+        # memento는 채팅 모드 포함 항상 기본 도구로 로드한다(preflight 비활성화 여부와 무관).
         mcp_request: list[str] = []
-        if enable_tenant_context_preflight:
-            for name in local_tenant_context_tool_names:
-                if name not in mcp_request:
-                    mcp_request.append(name)
+        if enable_tenant_context_preflight or is_chat:
+            mcp_request.append("memento")
         for canonical in desired_mcp_servers:
             for candidate in [*resolved_server_keys.get(canonical, []), canonical]:
                 if candidate and candidate not in mcp_request:
@@ -1655,6 +1572,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 user_id=tool_user_id or None,
                 agent_name="작업 실행 기획자",
                 mcp_config=mcp_cfg,
+                allowed_local_tools=frozenset({"memento"}),
             )
             all_tools = tool_loader.create_tools_from_names(tool_names=mcp_request, agent_type=None)
             # CrewAI/MCP 툴을 LangChain BaseTool로 래핑하여 tool() 데코레이터 __name__ 오류 방지
@@ -1747,19 +1665,19 @@ class DeepAgentsExecutor(AgentExecutor):
             len(allowed_skill_names),
         )
 
+        if is_adhoc:
+            domain_agent_rows = load_adhoc_agent_rows(
+                task_id=task_id or None,
+                root_proc_inst_id=proc_inst_id or None,
+                tenant_id=tenant_id or None,
+            )
         subagents_domain = build_subagent_configs(
             domain_agent_rows,
             all_tools=all_tools,
-            query=invoke_user_text,
             tenant_id=tenant_id or None,
+            always_attach_local_tool_names=("memento",) if is_adhoc else None,
         )
-        # NOTE: domain-specific subagents must come from DB (dynamic). Do not append hard-coded
-        # pipeline-role subagents in code.
         subagents = list(subagents_domain)
-        # IMPORTANT:
-        # - `agent_rows` is used for orchestrator prompt sections (human-facing list of agents).
-        # - `subagents` may now include doc/exec variants per DB row (B안), so do NOT assume
-        #   len(agent_rows) == len(subagents) for instrumentation/event contexts.
         agent_rows = list(domain_agent_rows)
         logger.info("서브에이전트 구성 결과 | task_id=%s built_subagents=%d", task_id, len(subagents))
         for idx, sa in enumerate(subagents):
@@ -1772,7 +1690,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 len(sa_tools),
                 [getattr(t, "name", type(t).__name__) for t in sa_tools],
             )
-        if not domain_agent_rows or not subagents_domain:
+        if not subagents:
             # Extended spec: even if no explicit subagent is configured, the activity can define
             # tools/skills to execute this work-item. If present, do NOT fail.
             proc_def_id = str(row.get("proc_def_id") or "").strip()
@@ -2030,12 +1948,18 @@ class DeepAgentsExecutor(AgentExecutor):
         # 서브 에이전트별 메타데이터/ExecutionContext를 준비한다.
         # job_id는 task() 호출마다 동적으로 부여되며, 이벤트/툴 로깅은 미들웨어에서 스코프된다.
         for idx, row in enumerate(agent_rows):
-            agent_name = (
-                row.get("alias")
-                or row.get("username")
-                or row.get("name")
-                or str(row.get("id"))
-            )
+            # subagents[idx]["name"] is already processed through _openai_safe_agent_name,
+            # which is what the LLM sees and calls in task(subagent_type=...).
+            # name_to_context must be keyed by this exact name for middleware matching.
+            if idx < len(subagents):
+                agent_name = subagents[idx]["name"]
+            else:
+                agent_name = (
+                    row.get("alias")
+                    or row.get("username")
+                    or row.get("name")
+                    or str(row.get("id"))
+                )
             agent_role = row.get("role") or ""
             agent_goal = row.get("goal") or ""
             agent_profile = row.get("agent_profile") or "/images/chat-icon.png"
@@ -2298,6 +2222,8 @@ class DeepAgentsExecutor(AgentExecutor):
                     "agent_profile": agent_profile,
                     "agent_id": agent_id,
                     "exec_ctx": sub_exec_ctx,
+                    "subagent_proc_inst_id": row.get("proc_inst_id") or "",
+                    "form_fields_json": row.get("form_fields_json") or None,
                 }
             )
 
@@ -2707,6 +2633,12 @@ class DeepAgentsExecutor(AgentExecutor):
                     root_tools_for_orchestrator = select_http_chat_root_work_assistant_tools(all_tools)
             else:
                 root_tools_for_orchestrator = select_http_chat_root_work_assistant_tools(all_tools)
+            # memento는 채팅 모드 루트 오케스트레이터의 기본 도구로 항상 포함한다.
+            _chat_root_tool_names = {str(getattr(t, "name", "") or "") for t in root_tools_for_orchestrator}
+            for _t in (all_tools or []):
+                if str(getattr(_t, "name", "") or "").strip() == "memento" and "memento" not in _chat_root_tool_names:
+                    root_tools_for_orchestrator.append(_t)
+                    _chat_root_tool_names.add("memento")
         else:
             # Token hygiene (process mode):
             # If activity fallback declares tools, keep root tool schemas slim as well
@@ -3091,7 +3023,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     },
                     proc_inst_id,
                     task_id,
-                    "action",
+                    "deepagents",
                     job_id=hitl_job_id,
                     exec_ctx=exec_ctx,
                     logical_event_type="interrupt",
@@ -3215,7 +3147,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     },
                     proc_inst_id,
                     task_id,
-                    "action",
+                    "deepagents",
                     job_id=hitl_job_id,
                     exec_ctx=exec_ctx,
                     logical_event_type="interrupt",

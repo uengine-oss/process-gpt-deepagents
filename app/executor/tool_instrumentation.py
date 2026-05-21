@@ -92,7 +92,7 @@ def _instrument_tools(
     *,
     todo_id: str | None,
     proc_inst_id: str | None,
-    crew_type: str = "action",
+    crew_type: str = "deepagents",
     job_id_getter: callable | None = None,
     job_tool_log: dict[str, list[str]] | None = None,
     job_skill_log: dict[str, list[str]] | None = None,

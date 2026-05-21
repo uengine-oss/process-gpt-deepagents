@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import re
 from typing import Any
 
-from app.database import get_supabase
+from app.database import (
+    get_supabase,
+    get_adhoc_todolist_by_root_proc_inst,
+    get_form_def_fields_json,
+    _load_proc_def_activity_capabilities
+)
 from app.execution_context import format_execution_clock_section
 from app.runtime_config import normalize_litellm_slash_model_name
 from app.sandbox.tools import get_sandbox_tools
@@ -202,6 +208,22 @@ def hinted_skill_slugs_from_query(
     return out
 
 
+def _extract_bracketed_section(text: str, section_name: str) -> str:
+    """Extract the body of a bracketed section like [Instruction] from text."""
+    raw = (text or "").strip()
+    name = (section_name or "").strip()
+    if not raw or not name:
+        return ""
+
+    pattern = re.compile(
+        rf"(?ims)^\[{re.escape(name)}\]\s*(.*?)\s*(?=^\[[^\]]+\]\s*$|\Z)"
+    )
+    match = pattern.search(raw)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
 def _build_description(agent_row: dict[str, Any], name: str) -> str:
     """Build subagent description from row description, persona, and goal."""
     base = agent_row.get("description") or f"Agent: {name}"
@@ -217,7 +239,6 @@ def _build_description(agent_row: dict[str, Any], name: str) -> str:
 
 def _build_system_prompt(
     agent_row: dict[str, Any],
-    query: str = "",
     tenant_id: str | None = None,
 ) -> str:
     """서브에이전트용 시스템 프롬프트(한글, 토큰/충돌 최소화 버전).
@@ -317,13 +338,39 @@ def _build_system_prompt(
             f"- \"{SKILLS_ROOT_DIR}/{{tenant_id}}/\" 아래를 탐색해 가장 관련 높은 스킬 폴더를 선택하세요."
         )
 
-    parts.append("\n=== 섹션 5: 보고 형식(짧게) ===")
-    parts.append(
-        "- 오케스트레이터가 합성할 수 있게 **간결하고 검증 가능한 결과**를 반환하세요.\n"
-        "- 실행이 있었다면: 사용한 도구/명령, exit code, stdout/stderr 핵심, 생성/수정된 파일(있다면) 요약을 포함하세요.\n"
-        "- 조회/조사 성격이면: source, endpoint_or_series, as_of, value, unit 같은 증거 필드를 포함하세요.\n"
-        "- 실패 시에도 도구 출력(에러 메시지)을 숨기지 말고, 최소 1회 이상 오류 기반 보정 재시도 후 상태를 보고하세요.\n"
-    )
+    form_fields: list[dict[str, Any]] | None = agent_row.get("form_fields_json")
+    if isinstance(form_fields, list) and form_fields:
+        parts.append("\n=== 섹션 5: 출력 형식(필수 — 폼 JSON) ===")
+        parts.append(
+            "- 이 태스크의 **최종 출력은 반드시** 아래 폼 필드를 키로 하는 순수 JSON 객체여야 합니다.\n"
+            "- 추가 설명 텍스트 없이 JSON 블록만 반환하세요(마크다운 코드펜스 없이).\n"
+            "- 폼 필드 목록:"
+        )
+        for field in form_fields:
+            if not isinstance(field, dict):
+                continue
+            fid = str(field.get("id") or field.get("key") or field.get("name") or "").strip()
+            flabel = str(field.get("label") or field.get("title") or fid).strip()
+            ftype = str(field.get("type") or field.get("fieldType") or "string").strip()
+            required = field.get("required", False)
+            req_mark = " [필수]" if required else ""
+            parts.append(f"  - {fid} ({ftype}){req_mark}: {flabel}")
+        example_keys = [
+            str(f.get("id") or f.get("key") or f.get("name") or f"field_{i}").strip()
+            for i, f in enumerate(form_fields)
+            if isinstance(f, dict)
+        ]
+        if example_keys:
+            example = {k: "..." for k in example_keys if k}
+            parts.append(f"\n출력 예시:\n{json.dumps(example, ensure_ascii=False, indent=2)}")
+    else:
+        parts.append("\n=== 섹션 5: 보고 형식(짧게) ===")
+        parts.append(
+            "- 오케스트레이터가 합성할 수 있게 **간결하고 검증 가능한 결과**를 반환하세요.\n"
+            "- 실행이 있었다면: 사용한 도구/명령, exit code, stdout/stderr 핵심, 생성/수정된 파일(있다면) 요약을 포함하세요.\n"
+            "- 조회/조사 성격이면: source, endpoint_or_series, as_of, value, unit 같은 증거 필드를 포함하세요.\n"
+            "- 실패 시에도 도구 출력(에러 메시지)을 숨기지 말고, 최소 1회 이상 오류 기반 보정 재시도 후 상태를 보고하세요.\n"
+        )
 
     if declared_tools:
         parts.append("\n=== 섹션 6: 선언된 도구(참고) ===")
@@ -335,18 +382,18 @@ def _build_system_prompt(
 def build_subagent_configs(
     agent_rows: list[dict[str, Any]],
     all_tools: list[Any] | None = None,
-    query: str = "",
     tenant_id: str | None = None,
+    always_attach_local_tool_names: tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Build deepagents subagent dicts from DB rows.
 
-    all_tools defaults to [] (no MCP/process-gpt tool loading). query is the todolist
-    user request, included in each subagent system prompt. Assigned skill names are
+    all_tools defaults to [] (no MCP/process-gpt tool loading). Assigned skill names are
     passed in the prompt; subagents load skill content at runtime from mounted
     filesystem paths (tenant-scoped).
     """
     if all_tools is None:
         all_tools = []
+    local_tool_names = ALWAYS_ATTACH_LOCAL_TOOL_NAMES if always_attach_local_tool_names is None else always_attach_local_tool_names
     # NOTE:
     # 도구(MCP 클라이언트 포함)는 루트에서 1회 로드 후 서브에이전트가 재사용한다.
     # 서브에이전트에는 "요구사항에 맞는 최소 도구셋"만 필터링해서 붙인다.
@@ -376,7 +423,7 @@ def build_subagent_configs(
         fallback = str(row.get("id") or "agent")
         name = _openai_safe_agent_name(str(display_name), fallback=fallback)
         description = _build_description(row, display_name)
-        system_prompt = _build_system_prompt(row, query=query, tenant_id=tenant_id)
+        system_prompt = _build_system_prompt(row, tenant_id=tenant_id)
 
         agent_type = str(row.get("agent_type") or "").strip()
         is_a2a = agent_type.lower() == "a2a"
@@ -495,7 +542,7 @@ def build_subagent_configs(
         agent_uid = str(row.get("id") or "").strip()
         local_added = 0
         if agent_uid:
-            for tn in ALWAYS_ATTACH_LOCAL_TOOL_NAMES:
+            for tn in local_tool_names:
                 base = tools_map.get(tn)
                 if base is None:
                     continue
@@ -591,3 +638,116 @@ def build_subagent_configs(
         )
 
     return subagents
+
+
+def load_adhoc_agent_rows(
+    task_id: str | None = None,
+    root_proc_inst_id: str | None = None,
+    tenant_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Load adhoc todolist items and return agent_rows ready for build_subagent_configs."""
+    adhoc_items: list[dict[str, Any]] = []
+    if tenant_id and root_proc_inst_id:
+        try:
+            adhoc_items = get_adhoc_todolist_by_root_proc_inst(
+                tenant_id=tenant_id,
+                root_proc_inst_id=root_proc_inst_id,
+            )
+            logger.info("Found %d adhoc work items for proc_inst_id=%s", len(adhoc_items), root_proc_inst_id)
+        except Exception:
+            logger.exception("Failed to load adhoc work items | tenant_id=%s proc_inst_id=%s", tenant_id, root_proc_inst_id)
+
+    curr_task_id_str = str(task_id).strip() if task_id else ""
+    agent_rows: list[dict[str, Any]] = []
+
+    for item in adhoc_items:
+        item_id = str(item.get("id") or "").strip()
+        if curr_task_id_str and item_id == curr_task_id_str:
+            logger.info("Excluding current task item from subagents: id=%s", item_id)
+            continue
+
+        activity_id = str(item.get("activity_id") or "").strip()
+        proc_def_id = str(item.get("proc_def_id") or "").strip()
+        name = (item.get("activity_name") or "").strip() or activity_id or "unnamed_adhoc_subagent"
+        desc = (item.get("description") or "").strip() or f"Adhoc subagent for activity: {name}"
+
+        declared_tool_names: list[str] = []
+        declared_skill_names: list[str] = []
+        if tenant_id and proc_def_id and activity_id:
+            try:
+                declared_tool_names, declared_skill_names = _load_proc_def_activity_capabilities(
+                    tenant_id=tenant_id,
+                    proc_def_id=proc_def_id,
+                    activity_id=activity_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to load capabilities for activity_id=%s | tenant_id=%s proc_def_id=%s",
+                    activity_id,
+                    tenant_id,
+                    proc_def_id,
+                )
+
+        # Extract form output schema from tool column (e.g. "formHandler:<form-id>")
+        form_fields_json: list[dict[str, Any]] | None = None
+        tool_col = str(item.get("tool") or "").strip()
+        if tool_col.startswith("formHandler:"):
+            form_id = tool_col[len("formHandler:"):].strip()
+            if form_id:
+                try:
+                    form_fields_json = get_form_def_fields_json(form_id)
+                    if form_fields_json is not None:
+                        logger.info(
+                            "Loaded form fields for adhoc subagent | form_id=%s fields=%d item_id=%s",
+                            form_id,
+                            len(form_fields_json),
+                            item_id,
+                        )
+                    else:
+                        logger.warning("form_def not found for form_id=%s item_id=%s", form_id, item_id)
+                except Exception:
+                    logger.exception("Failed to load form_def fields | form_id=%s item_id=%s", form_id, item_id)
+
+        agent_rows.append({
+            "id": item_id,
+            "alias": name,
+            "role": name,
+            "description": desc,
+            "goal": _extract_bracketed_section(item.get("query") or "", "Instruction")
+            or (item.get("query") or ""),
+            "skills": ",".join(declared_skill_names),
+            "tools": ",".join(declared_tool_names),
+            "agent_type": "agent",
+            "proc_inst_id": str(item.get("proc_inst_id") or item.get("root_proc_inst_id") or "").strip(),
+            "form_fields_json": form_fields_json,
+        })
+        logger.info(
+            "Queued adhoc agent_row: name=%s tools=%s skills=%s",
+            name,
+            declared_tool_names,
+            declared_skill_names,
+        )
+
+    return agent_rows
+
+
+def build_adhoc_subagent_configs(
+    task_id: str | None = None,
+    root_proc_inst_id: str | None = None,
+    tenant_id: str | None = None,
+    all_tools: list[Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Thin wrapper: load_adhoc_agent_rows + build_subagent_configs."""
+    agent_rows = load_adhoc_agent_rows(
+        task_id=task_id,
+        root_proc_inst_id=root_proc_inst_id,
+        tenant_id=tenant_id,
+    )
+    if not agent_rows:
+        return []
+    return build_subagent_configs(
+        agent_rows,
+        all_tools=all_tools,
+        tenant_id=tenant_id,
+        always_attach_local_tool_names=("memento",),
+    )

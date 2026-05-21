@@ -798,3 +798,149 @@ def try_upload_bytes_to_public_files(
             object_path,
         )
         return None
+
+
+def get_proc_def_definition(tenant_id: str, proc_def_id: str) -> dict[str, Any] | None:
+    """Fetch the proc_def.definition dictionary for given tenant_id and proc_def_id."""
+    tid = (tenant_id or "").strip()
+    pdid = (proc_def_id or "").strip()
+    if not (tid and pdid):
+        return None
+    sb = get_supabase()
+    resp = (
+        sb.table("proc_def")
+        .select("definition")
+        .eq("tenant_id", tid)
+        .eq("id", pdid)
+        .limit(1)
+        .execute()
+    )
+    rows = getattr(resp, "data", None)
+    if not isinstance(rows, list) or not rows:
+        return None
+    row0 = rows[0]
+    if isinstance(row0, dict):
+        return row0.get("definition")
+    return None
+
+
+def get_adhoc_todolist_by_root_proc_inst(
+    *,
+    tenant_id: str,
+    root_proc_inst_id: str,
+) -> list[dict[str, Any]]:
+    """Query todolist table rows with matching tenant_id, root_proc_inst_id, and adhoc=True."""
+    tid = (tenant_id or "").strip()
+    rpid = (root_proc_inst_id or "").strip()
+    if not (tid and rpid):
+        return []
+    sb = get_supabase()
+    resp = (
+        sb.table("todolist")
+        .select("*")
+        .eq("tenant_id", tid)
+        .eq("root_proc_inst_id", rpid)
+        .eq("adhoc", True)
+        .execute()
+    )
+    return resp.data or []
+
+
+def _extract_activity_tools_skills_from_definition(
+    definition: Any,
+    *,
+    activity_id: str,
+) -> tuple[list[str], list[str]]:
+    """Best-effort extraction of tools/skills from proc_def_version.definition JSON.
+
+    New spec shape (expected):
+      definition.activities = [ { "id": "<activity_id>", "tools": [...], "skills": [...] }, ... ]
+    """
+    aid = (activity_id or "").strip()
+    if not aid:
+        return ([], [])
+    if not isinstance(definition, dict):
+        return ([], [])
+    activities = definition.get("activities")
+    if not isinstance(activities, list) or not activities:
+        return ([], [])
+
+    target: dict[str, Any] | None = None
+    for act in activities:
+        if not isinstance(act, dict):
+            continue
+        for key in ("id", "activity_id", "activityId", "key"):
+            if str(act.get(key) or "").strip() == aid:
+                target = act
+                break
+        if target is not None:
+            break
+    if target is None:
+        return ([], [])
+
+    def _as_str_list(value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [s.strip() for s in value.split(",") if s.strip()]
+        if isinstance(value, list):
+            out: list[str] = []
+            for x in value:
+                s = str(x or "").strip()
+                if s:
+                    out.append(s)
+            return out
+        return []
+
+    tools = list(dict.fromkeys(_as_str_list(target.get("tools"))))
+    skills = list(dict.fromkeys(_as_str_list(target.get("skills"))))
+    return (tools, skills)
+
+
+def get_form_def_fields_json(form_id: str) -> list[dict[str, Any]] | None:
+    """Fetch fields_json from the form_def table for the given form ID."""
+    fid = (form_id or "").strip()
+    if not fid:
+        return None
+    sb = get_supabase()
+    try:
+        resp = sb.table("form_def").select("fields_json").eq("id", fid).single().execute()
+    except Exception:
+        logger.exception("get_form_def_fields_json failed form_id=%s", fid, exc_info=True)
+        return None
+    row = getattr(resp, "data", None)
+    if not isinstance(row, dict):
+        return None
+    fields = row.get("fields_json")
+    if isinstance(fields, list):
+        return fields
+    return None
+
+
+def _load_proc_def_activity_capabilities(
+    *,
+    tenant_id: str,
+    proc_def_id: str,
+    activity_id: str,
+) -> tuple[list[str], list[str]]:
+    """Fetch proc_def.definition and extract activity.tools/skills (best-effort)."""
+    tid = (tenant_id or "").strip()
+    pdid = (proc_def_id or "").strip()
+    aid = (activity_id or "").strip()
+    if not (tid and pdid and aid):
+        return ([], [])
+    try:
+        definition = get_proc_def_definition(tid, pdid)
+    except Exception:
+        logger.exception(
+            "proc_def lookup failed | tenant_id=%s proc_def_id=%s activity_id=%s",
+            tid,
+            pdid,
+            aid,
+            exc_info=True,
+        )
+        return ([], [])
+    return _extract_activity_tools_skills_from_definition(definition, activity_id=aid)
+
+
+

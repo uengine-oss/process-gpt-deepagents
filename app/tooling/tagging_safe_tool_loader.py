@@ -104,7 +104,34 @@ class _EnvMementoTool(MementoTool):
 
 
 class TaggingSafeToolLoader(SafeToolLoader):
-    """Attach ``_mcp_server`` so build_subagent_configs can attach baseline claude-skills tools."""
+    """Attach ``_mcp_server`` so build_subagent_configs can attach baseline claude-skills tools.
+
+    ``allowed_local_tools``: if given, only the named local tools are loaded;
+    all others (_load_mem0, _load_dmn_rule, _load_human_asked, …) return [].
+    Pass ``frozenset({"memento"})`` to restrict the deep-agent to memento only.
+    """
+
+    def __init__(self, *args, allowed_local_tools: frozenset[str] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._allowed_local_tools = allowed_local_tools  # None means "allow all"
+
+    def _is_local_tool_allowed(self, name: str) -> bool:
+        return self._allowed_local_tools is None or name in self._allowed_local_tools
+
+    def _load_mem0(self) -> List:  # type: ignore[override]
+        if not self._is_local_tool_allowed("mem0"):
+            return []
+        return super()._load_mem0()
+
+    def _load_dmn_rule(self) -> List:  # type: ignore[override]
+        if not self._is_local_tool_allowed("dmn_rule"):
+            return []
+        return super()._load_dmn_rule()
+
+    def _load_human_asked(self) -> List:  # type: ignore[override]
+        if not self._is_local_tool_allowed("human_asked"):
+            return []
+        return super()._load_human_asked()
 
     def _load_memento(self) -> List:
         logger.debug("🔒 MementoTool(환경 URL) 로드 시작 | tenant_id=%s", self.tenant_id)

@@ -47,10 +47,10 @@ def build_subagent_prompt_sections(
         "- time_zone: local (server)\n"
     )
 
-    base_identity = "당신은 ProcessGPT의 도메인 실행 서브에이전트입니다."
+    base_identity = "당신은 실행 서브에이전트입니다."
 
     priorities = (
-        "=== 우선순위(짧게) ===\n"
+        "=== 우선순위 ===\n"
         "- 1) `task()` 위임(description)의 지시/출력 형식을 최우선으로 따른다.\n"
         "- 2) 추정 금지: 문서/실행 결과로 검증한다.\n"
         "- 3) 가능하면 실행(샌드박스)하고, 불가하면 사유+다음 시도안을 짧게 보고한다.\n"
@@ -90,7 +90,7 @@ def build_subagent_prompt_sections(
     )
 
     reporting = (
-        "=== 보고 형식(짧게) ===\n"
+        "=== 보고 형식 ===\n"
         "- 결과: 검증 가능한 값/근거 중심.\n"
         "- 실패: 오류 메시지 요약 + 1회 이상 보정 재시도 후 상태.\n"
     )

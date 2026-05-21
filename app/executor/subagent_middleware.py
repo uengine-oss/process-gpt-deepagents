@@ -13,6 +13,7 @@ from app.executor.pipeline_outputs_extract import merge_task_command_pipeline_ou
 from app.skills.volume_tool_events import skill_volume_active_exec_ctx, skill_volume_active_job_id
 
 from .a2a_events import enqueue_status_update
+from .adhoc_subagent_workitem_events import emit_subagent_workitem_events
 from .context import ExecutionContext
 from .tool_calls import _request_with_merged_tool_args, _tool_call_args_from_request, _tool_call_as_dict
 from .workitem_text import _extract_plain_text
@@ -223,23 +224,30 @@ def _create_subagent_event_middleware(
                 state["subagent_task_jobs_started"].add(job_id)
             except Exception:
                 logger.exception("Failed to record subagent task_started job_id", exc_info=True)
+            result: Any = None
+            exc_caught: Exception | None = None
+            tok_j = skill_volume_active_job_id.set(job_id)
+            tok_e = skill_volume_active_exec_ctx.set(ctx.get("exec_ctx"))
             try:
-                # Skill discovery must not "finish early". Retry until checklist is satisfied.
-                result = None
-                # Scope downstream tool events (skill volume + tool_usage) to this delegated task call.
-                tok_j = skill_volume_active_job_id.set(job_id)
-                tok_e = skill_volume_active_exec_ctx.set(ctx.get("exec_ctx"))
-                try:
-                    result = await handler(request)
-                finally:
-                    skill_volume_active_exec_ctx.reset(tok_e)
-                    skill_volume_active_job_id.reset(tok_j)
+                result = await handler(request)
+            except Exception as exc:
+                exc_caught = exc
+                logger.exception(
+                    "서브에이전트 실행 중 오류(계속 진행) | subagent=%s job_id=%s",
+                    ctx.get("name"),
+                    job_id,
+                    exc_info=True,
+                )
+            finally:
+                skill_volume_active_exec_ctx.reset(tok_e)
+                skill_volume_active_job_id.reset(tok_j)
 
-                if planning_gate is not None:
-                    planning_gate["saw_task_delegation"] = True
+            if exc_caught is None and planning_gate is not None:
+                planning_gate["saw_task_delegation"] = True
 
-                used_tools = subagent_tool_log.get(job_id, [])
-                used_skills = subagent_skill_log.get(job_id, [])
+            used_tools = subagent_tool_log.get(job_id, [])
+            used_skills = subagent_skill_log.get(job_id, [])
+            if exc_caught is None:
                 작업_텍스트 = (
                     f"다음 도구 호출을 통해 작업을 수행했습니다: {', '.join(sorted(set(used_tools)))}"
                     if used_tools
@@ -247,45 +255,44 @@ def _create_subagent_event_middleware(
                 )
                 if used_skills:
                     작업_텍스트 += f" | 참고/사용한 스킬: {', '.join(sorted(set(used_skills)))}"
-                enqueue_status_update(
-                    event_queue,
-                    "task_completed",
-                    {
-                        "수행한_작업": 작업_텍스트,
-                        "role": ctx.get("role"),
-                        "name": ctx.get("name"),
-                    },
-                    proc_inst_id,
-                    task_id,
-                    "deepagents",
-                    job_id=job_id,
-                    exec_ctx=ctx.get("exec_ctx"),
-                )
-                try:
-                    state["subagent_task_jobs_completed"].add(job_id)
-                except Exception:
-                    logger.exception("Failed to record subagent task_completed job_id", exc_info=True)
-                return merge_task_command_pipeline_outputs(result, str(subagent_type or ""))
+            else:
+                작업_텍스트 = f"작업 실행 중 오류가 발생했습니다: {exc_caught}"
+            enqueue_status_update(
+                event_queue,
+                "task_completed",
+                {
+                    "수행한_작업": 작업_텍스트,
+                    "role": ctx.get("role"),
+                    "name": ctx.get("name"),
+                },
+                proc_inst_id,
+                task_id,
+                "deepagents",
+                job_id=job_id,
+                exec_ctx=ctx.get("exec_ctx"),
+            )
+            try:
+                state["subagent_task_jobs_completed"].add(job_id)
             except Exception:
-                enqueue_status_update(
-                    event_queue,
-                    "task_completed",
-                    {
-                        "수행한_작업": "작업 실행 중 오류가 발생했습니다.",
-                        "role": ctx.get("role"),
-                        "name": ctx.get("name"),
-                    },
-                    proc_inst_id,
-                    task_id,
-                    "deepagents",
-                    job_id=job_id,
-                    exec_ctx=ctx.get("exec_ctx"),
+                logger.exception("Failed to record subagent task_completed job_id", exc_info=True)
+
+            emit_subagent_workitem_events(
+                event_queue,
+                sub_task_id=str(ctx.get("agent_id") or "").strip(),
+                sub_proc_inst_id=str(ctx.get("subagent_proc_inst_id") or "").strip(),
+                subagent_name=str(ctx.get("name") or ""),
+                exec_ctx=ctx.get("exec_ctx"),
+                result=result,
+                exc_caught=exc_caught,
+                form_fields_json=ctx.get("form_fields_json"),
+            )
+
+            if exc_caught is not None:
+                return _blocked_task_tool_message(
+                    request,
+                    {"error": type(exc_caught).__name__, "message": str(exc_caught), "subagent": ctx.get("name")},
                 )
-                try:
-                    state["subagent_task_jobs_completed"].add(job_id)
-                except Exception:
-                    logger.exception("Failed to record subagent task_completed job_id (error path)", exc_info=True)
-                raise
+            return merge_task_command_pipeline_outputs(result, str(subagent_type or ""))
 
     return SubagentEventMiddleware(), state
 

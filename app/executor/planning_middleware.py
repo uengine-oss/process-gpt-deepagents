@@ -55,7 +55,7 @@ def _create_write_todos_planning_middleware(
                         },
                         proc_inst_id,
                         task_id,
-                        "action",
+                        "deepagents",
                         job_id=tool_call_job_id,
                         exec_ctx=exec_ctx,
                         logical_event_type="tool_call",
@@ -92,7 +92,7 @@ def _create_write_todos_planning_middleware(
                             finished_payload,
                             proc_inst_id,
                             task_id,
-                            "action",
+                            "deepagents",
                             job_id=tool_call_job_id,
                             exec_ctx=exec_ctx,
                             logical_event_type="tool_result",
@@ -124,6 +124,26 @@ def _create_write_todos_planning_middleware(
             except Exception:
                 logger.exception("Failed to join todo contents from write_todos args", exc_info=True)
 
+            # Fallback: extract todos from the Command result when args yielded nothing.
+            # write_todos returns Command(update={"todos": [...], ...}) so the result
+            # always carries the authoritative list even if request.tool_call.args is
+            # unavailable (e.g. injected-arg stripping by the framework).
+            if not plan_message:
+                try:
+                    upd = getattr(result, "update", None)
+                    if isinstance(upd, dict):
+                        todos_from_result = upd.get("todos")
+                        if todos_from_result is not None:
+                            plan_message = _join_todo_contents(todos_from_result)
+                            if plan_message:
+                                logger.debug(
+                                    "write_todos plan_message extracted from Command result (args were empty)"
+                                )
+                except Exception:
+                    logger.exception(
+                        "Failed to join todo contents from write_todos result", exc_info=True
+                    )
+
             try:
                 enqueue_status_update(
                     event_queue,
@@ -131,7 +151,7 @@ def _create_write_todos_planning_middleware(
                     {"message": plan_message or "플래닝이 완료되었습니다."},
                     proc_inst_id,
                     task_id,
-                    "action",
+                    "deepagents",
                     job_id=job_uuid,
                     exec_ctx=exec_ctx,
                     logical_event_type="agent_finished",

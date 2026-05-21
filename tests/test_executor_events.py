@@ -181,7 +181,7 @@ class ExecutorEventTests(unittest.TestCase):
             {"message": "planning done"},
             "p1",
             "t1",
-            "action",
+            "deepagents",
             phase="planning",
         )
         self.assertEqual(len(q.events), 1)

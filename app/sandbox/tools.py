@@ -232,6 +232,47 @@ def _get_workspace(workspace_id: str) -> SandboxWorkspace:
         logger.info("Re-attached to sandbox workspace from disk: %s", workspace_id)
         return ws
 
+    # Search in-memory workspaces by job_id — LLMs sometimes pass the job_id they
+    # provided to sandbox_create instead of the returned workspace_id.
+    if workspace_id:
+        for existing_ws in list(_WORKSPACES.values()):
+            if existing_ws.job_id == workspace_id:
+                logger.info(
+                    "Resolved workspace by job_id=%s -> workspace_id=%s",
+                    workspace_id,
+                    existing_ws.workspace_id,
+                )
+                return existing_ws
+
+        # Scan the filesystem for a directory whose name embeds the job_id.
+        # sandbox_create uses prefix=f"sbx_{agent}_{job_id}_", so the directory
+        # name is sbx_{agent}_{job_id}_{random}.  Matching _{job_id}_ handles
+        # job_ids that contain underscores (e.g. "rca_pack_001").
+        pattern = f"_{workspace_id}_"
+        try:
+            for entry in base.iterdir():
+                if not entry.is_dir():
+                    continue
+                if pattern not in entry.name:
+                    continue
+                parts = entry.name.split("_")
+                agent_name = parts[1] if len(parts) >= 2 else "recovered"
+                recovered = SandboxWorkspace(
+                    workspace_id=entry.name,
+                    path=str(entry.resolve()),
+                    job_id=workspace_id,
+                    agent_name=agent_name,
+                )
+                _WORKSPACES[entry.name] = recovered
+                logger.info(
+                    "Re-attached sandbox workspace by job_id=%s: %s",
+                    workspace_id,
+                    entry.name,
+                )
+                return recovered
+        except Exception:
+            logger.exception("Filesystem scan for workspace by job_id failed: %s", workspace_id)
+
     raise ValueError(f"Unknown sandbox workspace: {workspace_id}")
 
 
