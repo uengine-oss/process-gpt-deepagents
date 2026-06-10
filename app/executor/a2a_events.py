@@ -121,8 +121,12 @@ def new_status_update_event(
 ) -> Any:
     """Create a TaskStatusUpdateEvent (A2A standard) but do not enqueue it yet."""
     effective_job_id = job_id or str(uuid.uuid4())
-    logical = logical_event_type or ("agent_started" if event_type == "task_started" else "agent_finished")
-    effective_phase = phase or "reasoning"
+    if crew_type == "result":
+        logical = logical_event_type
+        effective_phase = phase
+    else:
+        logical = logical_event_type or ("agent_started" if event_type == "task_started" else "agent_finished")
+        effective_phase = phase or "reasoning"
 
     payload = build_event_payload(
         exec_ctx,
@@ -132,6 +136,14 @@ def new_status_update_event(
         extra_data=data,
     )
     _ensure_required_root_task_started_fields(payload, event_type=event_type)
+
+    if crew_type == "result":
+        if logical_event_type is None and "logical_event_type" in payload:
+            payload.pop("logical_event_type", None)
+        if phase is None and "phase" in payload:
+            payload.pop("phase", None)
+        if agent_name is None and "agent_name" in payload:
+            payload.pop("agent_name", None)
 
     if event_type == "human_asked":
         state = TaskState.TASK_STATE_INPUT_REQUIRED
@@ -212,6 +224,9 @@ def enqueue_artifact_update(
     """Create and enqueue a TaskArtifactUpdateEvent."""
     try:
         evt = new_artifact_update_event(*args, **kwargs)
+        ParseDict({
+            "role": "assistant",
+        }, evt.metadata)
         enqueue_event(eq, evt)
     except Exception:
         logger.exception("Failed to enqueue TaskArtifactUpdateEvent", exc_info=True)

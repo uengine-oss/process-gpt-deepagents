@@ -90,30 +90,6 @@ def _create_deep_required_root_gate_middleware(
                     tool_name=tool_name,
                 )
 
-            # Route=work_assistant_only: work-assistant MCP + 플랜 메모(write_todos 등) + HITL / 라우트 재선언.
-            # (create_deep_agent 기본 write_todos는 오케스트레이션 추적용으로 WA 전용 정책과 충돌하지 않게 허용)
-            if route == "work_assistant_only":
-                if (
-                    _is_work_assistant_mcp_tool(base_tool)
-                    or tool_name in ("ask_user", "write_http_chat_route")
-                    or tool_name in _PLANNING_TOOL_NAMES
-                ):
-                    return await handler(request)
-                if tool_name in _HITL_TOOL_NAMES:
-                    return await handler(request)
-                return _tool_message_json(
-                    {
-                        "error": "work_assistant_only",
-                        "message": (
-                            "이 요청은 `work_assistant_only` 라우팅입니다. "
-                            "work-assistant MCP, `write_todos`/`write_pipeline_spec`(플랜 메모), HITL은 사용할 수 있습니다. "
-                            "`task()`·파일·샌드박스 등 그 밖 실행 도구는 허용되지 않습니다."
-                        ),
-                    },
-                    tool_call_id=tool_call_id,
-                    tool_name=tool_name,
-                )
-
             # Route=ask_user_first: must ask user first (or re-declare route).
             if route == "ask_user_first":
                 if tool_name in ("ask_user", "write_http_chat_route") or tool_name in _HITL_TOOL_NAMES:

@@ -1,8 +1,5 @@
-# claude-skills backend + deepagents (스킬 볼륨 공유).
-# - backend 는 제공하신 정의를 그대로 사용합니다. 빌드하려면 monorepo 의 packages/backend 를 두거나,
-#   backend 서비스에서 주석 처리된 image: ghcr.io/uengine-oss/claude-skills:latest 를 쓰세요.
-# - backend 의 ./config.example.json 바인드는 claude-skills 레포에 해당 파일이 있어야 합니다.
-# - deepagents 는 .env 가 필요합니다(.env.example 를 복사).
+# deepagents
+# - .env 가 필요합니다(.env.example 를 복사).
 # - 컨테이너 안에서는 localhost 가 호스트가 아니므로, Supabase CLI(호스트) 는 SUPABASE_URL 을
 #   host.docker.internal 로 덮어씁니다(.env 의 127.0.0.1 은 venv 용으로 유지).
 # - LLM 프록시(LiteLLM 등)를 호스트에서 띄운 경우 .env 의 LLM_PROXY_URL=http://localhost:4000 은
@@ -10,30 +7,6 @@
 #   LLM_PROXY_URL=http://host.docker.internal:4000 를 추가하거나 .env 를 위 호스트명으로 맞추세요.
 
 services:
-  claude-skills:
-    image: claude-skills-backend:latest 
-    container_name: claude-skills
-    ports:
-      - "8765:8765"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - SKILLS_STORAGE_PATH=/app/skills
-    volumes:
-      # Configuration file (read-only)
-      - ./config.example.json:/app/config.json:ro
-      
-      # Persistent storage for uploaded skills
-      # Required for skill uploads to persist across container restarts
-      - claude-skills-data:/app/skills
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health').read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 60s
-    restart: unless-stopped
-    command: ["--host", "0.0.0.0", "--port", "8765", "--config", "/app/config.json", "--verbose"]
-
   # Builds from ./Dockerfile; CMD runs `python deepagents_server.py` (repo root copied to /app).
   deepagents:
     # build:
@@ -48,25 +21,29 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - SKILLS_ROOT_DIR=/app/skills
+      - SKILL_CATALOG_DIR=/app/skill-catalog
+      # SKILL_REPO_URLS 는 기본값이 코드에 내장. 기본 레포를 교체/추가하려면 아래 주석 해제.
+      # - SKILL_REPO_URLS=https://github.com/anthropics/skills,https://github.com/K-Dense-AI/claude-scientific-skills
       - DB_HOST=host.docker.internal
-      - CLAUDE_SKILLS_MCP_URL=http://host.docker.internal:8765/mcp
       - SUPABASE_URL=http://host.docker.internal:54321
       - MEMENTO_RETRIEVE_URL=http://host.docker.internal:8005/retrieve
     env_file:
       - .env
     volumes:
-      - claude-skills-data:/app/skills
-    depends_on:
-      claude-skills:
-        condition: service_healthy
+      # Tenant-uploaded skills (persistent across restarts)
+      - skills-data:/app/skills
+      # GitHub-fetched catalog skills (persistent across restarts)
+      - skill-catalog-data:/app/skill-catalog
     restart: unless-stopped
 
 volumes:
-  # Named volume for persistent skill storage
-  # Ensures uploaded skills persist across container restarts and updates
-  claude-skills-data:
+  # Tenant-uploaded skills
+  skills-data:
+    driver: local
+  # GitHub catalog skills downloaded at startup
+  skill-catalog-data:
     driver: local
 
 networks:
   default:
-    name: claude-skills-network
+    name: deepagents-network

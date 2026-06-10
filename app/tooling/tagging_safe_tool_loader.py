@@ -104,7 +104,7 @@ class _EnvMementoTool(MementoTool):
 
 
 class TaggingSafeToolLoader(SafeToolLoader):
-    """Attach ``_mcp_server`` so build_subagent_configs can attach baseline claude-skills tools.
+    """Attach ``_mcp_server`` so build_subagent_configs can route MCP tools to subagents.
 
     ``allowed_local_tools``: if given, only the named local tools are loaded;
     all others (_load_mem0, _load_dmn_rule, _load_human_asked, …) return [].

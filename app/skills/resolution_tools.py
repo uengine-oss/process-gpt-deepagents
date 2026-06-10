@@ -52,11 +52,9 @@ def skill_volume_probe(tenant_id: str, skill_names_csv: str) -> str:
         "found_skill_md": found,
         "missing": missing,
         "tier1_any_hit": bool(found),
-        "catalog_note": (
-            "Skills from GitHub sources (list_skills / MCP) may not exist under "
-            "<skills_root>/<tenant_id>/<name>/ on the volume. "
-            "sandbox_copy_mounted_skill can still materialize them via claude-skills HTTP API "
-            "when PROCESSGPT_SKILLS_API_BASE_URL is set (e.g. http://claude-skills:8765 in Compose)."
+        "github_skills_note": (
+            "GitHub-sourced skills are pre-fetched to <skills_root>/<repo-slug>/<name>/ at invoke time. "
+            "Use read_skill_document + sandbox_write_files if additional script files are needed."
         ),
     }
     log_rec = {
@@ -81,7 +79,7 @@ def report_skill_resolution_tier(
 ) -> str:
     """Log Tier 1/2/3 progress for observability (structured JSON log line).
 
-    tier: 1=file volume, 2=MCP claude-skills, 3=sandbox code execution.
+    tier: 1=file volume, 2=MCP skill tools, 3=sandbox code execution.
     status: e.g. started, success, failed, skipped.
     """
     rec = {

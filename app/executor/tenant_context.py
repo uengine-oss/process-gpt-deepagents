@@ -13,7 +13,7 @@ from .hitl_utils import _classify_tenant_context_tool
 
 logger = logging.getLogger(__name__)
 
-_MCP_SERVER_KEYS_NEVER_LOAD: frozenset[str] = frozenset({"computer-use"})
+_MCP_SERVER_KEYS_NEVER_LOAD: frozenset[str] = frozenset({"computer-use", "claude-skills"})
 
 
 def _mcp_config_without_blocked_servers(raw: Any) -> dict[str, Any]:

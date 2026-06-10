@@ -19,7 +19,7 @@ class DomainAgentMcpPrefetchTests(unittest.TestCase):
     def test_extend_appends_matching_server_keys(self) -> None:
         from app.executor.domain_agent_mcp_prefetch import extend_mcp_request_with_domain_agent_declared_servers
 
-        req = ["mem0", "claude-skills"]
+        req = ["mem0"]
         extend_mcp_request_with_domain_agent_declared_servers(
             req,
             mcp_servers={"custom-mcp": {}},

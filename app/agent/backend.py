@@ -12,7 +12,6 @@ from app.skills.volume_backend_instrumentation import InstrumentingSkillVolumeBa
 if TYPE_CHECKING:
     from deepagents.backends.protocol import BackendFactory, BackendProtocol
 
-
 def skills_route_prefix(skills_root_dir: str | None = None) -> tuple[str, str]:
     """Return (absolute route prefix ending with '/', resolved root without trailing slash)."""
     root = (skills_root_dir or os.environ.get("SKILLS_ROOT_DIR") or "/app/skills").rstrip("/")
@@ -21,12 +20,18 @@ def skills_route_prefix(skills_root_dir: str | None = None) -> tuple[str, str]:
 
 
 def tenant_skill_sources_for_middleware(tenant_id: str | None) -> list[str] | None:
-    """Paths for create_deep_agent(skills=...) — tenant slice under the mounted skills route."""
-    tid = (tenant_id or "").strip().strip("/")
-    if not tid:
-        return None
+    """Paths for create_deep_agent(skills=...) — tenant volume slice + GitHub-fetched skills.
+
+    GitHub skills are pre-fetched to disk under SKILLS_ROOT_DIR/{repo-slug}/ at invoke time,
+    so the root route always includes them.
+    """
     route, _ = skills_route_prefix(skills_root_dir=None)
-    return [f"{route}{tid}/"]
+    tid = (tenant_id or "").strip().strip("/")
+    sources: list[str] = []
+    if tid:
+        sources.append(f"{route}{tid}/")
+    sources.append(route)
+    return sources
 
 
 def tenant_memory_sources_for_middleware(tenant_id: str | None) -> list[str] | None:
@@ -58,14 +63,16 @@ def make_deepagent_backend_factory(
 ) -> "BackendFactory":
     """Factory for DeepAgents: StateBackend by default, real FS under mounted skills root.
 
-    Without this, the default StateBackend keeps all paths in LangGraph state only,
-    so `ls`/`read_file` on `/app/skills/...` never sees Docker volume mounts.
-    """
+    Exposes one FilesystemBackend route for skills on the Docker volume (both tenant-uploaded
+    and GitHub-fetched skills written to SKILLS_ROOT_DIR at invoke time).
 
+    Without this, the default StateBackend keeps all paths in LangGraph state only,
+    so ``ls``/``read_file`` on ``<SKILLS_ROOT_DIR>/`` never sees Docker volume mounts.
+    """
     route, root = skills_route_prefix(skills_root_dir)
 
     def _factory(rt) -> "BackendProtocol":
-        fs = FilesystemBackend(root_dir=root, virtual_mode=True)
+        fs = FilesystemBackend(root_dir=root, virtual_mode=False)
         fs_instrumented = InstrumentingSkillVolumeBackend(fs, virtual_route_prefix=route)
         return CompositeBackend(default=StateBackend(rt), routes={route: fs_instrumented})
 

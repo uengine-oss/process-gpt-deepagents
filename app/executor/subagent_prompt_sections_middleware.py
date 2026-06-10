@@ -69,10 +69,14 @@ def create_subagent_prompt_sections_middleware(
         async def awrap_model_call(self, request: Any, handler: Any) -> Any:
             hints = _scan_recent_messages_for_hints(request)
             keys = [
-                "sub_base_identity",
+                "agent_identity",
                 "sub_priorities",
                 "sub_exec_policy",
                 "sub_tenant",
+                "sub_knowledge_tools",
+                "agent_skills",
+                "agent_output_format",
+                "agent_tools",
                 "sub_reporting",
             ]
             if hints.get("doc"):

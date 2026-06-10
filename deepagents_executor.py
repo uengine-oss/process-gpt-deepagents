@@ -31,7 +31,6 @@ from app.agent.factory import (
     base_orchestrator_identity_prompt,
     build_orchestrator,
     build_orchestrator_prompt_sections,
-    compact_orchestrator_prompt_for_work_assistant_only,
     default_orchestrator_prompt,
 )
 from app.execution_context import format_execution_clock_section
@@ -53,6 +52,8 @@ from app.sandbox.output_delivery import (
 from app.sandbox.tools import collect_task_open_workspace_paths_for_globs, get_sandbox_tools
 from app.runtime_config import ModelRoutingConfig, resolve_model_routing
 from app.skills.resolution_tools import get_skill_resolution_tools
+from app.skills.github_skill_fetcher import prefetch_github_skills
+from app.skills.catalog_tools import get_skill_tools
 from app.skills.volume_subagent_scope_middleware import SubagentJobScopeMiddleware
 from app.skills.volume_tool_events import (
     SkillVolumeToolEventBinding,
@@ -192,15 +193,6 @@ async def _emit_chunk_json(context: RequestContext, payload: Any) -> bool:
 
 
 _ENV_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT = "DEEPAGENTS_HTTP_CHAT_ENABLE_TENANT_CONTEXT_PREFLIGHT"
-# Single skills endpoint knob: streamable MCP URL (HTTP file API base = same origin with trailing /mcp removed).
-_ENV_CLAUDE_SKILLS_MCP_URL = "CLAUDE_SKILLS_MCP_URL"
-
-
-def _default_claude_skills_mcp_url() -> str:
-    explicit = (os.environ.get(_ENV_CLAUDE_SKILLS_MCP_URL) or "").strip()
-    if explicit:
-        return explicit
-    return "http://claude-skills:8765/mcp"
 
 
 def _truthy_env(name: str, default: bool = False) -> bool:
@@ -1192,6 +1184,10 @@ class DeepAgentsExecutor(AgentExecutor):
     ) -> None:
         tok = bind_executor_asyncio_loop_for_enqueue(asyncio.get_running_loop())
         logger.info("DeepAgents 멀티 에이전트 실행 시작")
+        try:
+            await prefetch_github_skills()
+        except Exception:
+            logger.exception("github-skills: failed to prefetch skills; continuing without GitHub skills")
 
         query = context.get_user_input()
         context_data = context.get_context_data() or {}
@@ -1465,7 +1461,7 @@ class DeepAgentsExecutor(AgentExecutor):
             except Exception as e:
                 logger.warning("채팅 모드 tenant_mcp 조회 실패: %s", str(e))
         mcp_cfg: dict[str, Any] = _mcp_config_without_blocked_servers(mcp_cfg_raw)
-        # Merge defaults: claude-skills (always) + work-assistant for any chat entrypoint (HTTP or SDK SSE).
+        # Merge defaults: work-assistant for any chat entrypoint (HTTP or SDK SSE).
         try:
             mcp_cfg = dict(mcp_cfg or {})
             mcp_servers0 = mcp_cfg.get("mcpServers")
@@ -1473,19 +1469,6 @@ class DeepAgentsExecutor(AgentExecutor):
                 mcp_servers0 = {}
             else:
                 mcp_servers0 = dict(mcp_servers0)
-            # claude-skills HTTP URL: always align with _default_claude_skills_mcp_url()
-            # (env CLAUDE_SKILLS_MCP_URL or compose default). Process mode often merges tenants.mcp
-            # from Supabase with cluster-only hostnames; when env is set we must override that entry
-            # (previously only missing keys were filled, so DB URL won and broke local runs).
-            _cs_mcp_url = _default_claude_skills_mcp_url()
-            _existing_cs = mcp_servers0.get("claude-skills")
-            if isinstance(_existing_cs, dict) and _existing_cs.get("command"):
-                # stdio MCP: do not inject HTTP url.
-                pass
-            elif isinstance(_existing_cs, dict):
-                mcp_servers0["claude-skills"] = {**_existing_cs, "url": _cs_mcp_url}
-            else:
-                mcp_servers0["claude-skills"] = {"url": _cs_mcp_url}
             if is_chat and "work-assistant" not in mcp_servers0:
                 # process-gpt-mcp는 Supabase로 사용자 JWT를 검증한다. HTTP 채팅 호스트와 동일 프로젝트의 URL/키가 필요하다.
                 # GKE 등에서는 SUPABASE_KEY(서비스 롤)만 두고 SUPABASE_ANON_KEY를 비워 두는 경우가 많아, anon 미설정 시 KEY로 폴백한다.
@@ -1511,7 +1494,7 @@ class DeepAgentsExecutor(AgentExecutor):
                 }
             mcp_cfg["mcpServers"] = mcp_servers0
         except Exception:
-            logger.exception("Failed to inject default MCP servers (claude-skills / work-assistant); continuing", exc_info=True)
+            logger.exception("Failed to inject default MCP servers (work-assistant); continuing", exc_info=True)
         mcp_servers = mcp_cfg.get("mcpServers") or {}
 
         # NOTE: Chat modes default to disabling tenant context preflight for TTFT/stability.
@@ -1521,7 +1504,7 @@ class DeepAgentsExecutor(AgentExecutor):
         # MCP servers to request.
         # Process mode intentionally does NOT auto-connect all tenant MCP servers.
         # We keep this minimal and let activity/subagent capabilities decide what to load.
-        desired_mcp_servers = ("claude-skills", "work-assistant") if is_chat else ("claude-skills",)
+        desired_mcp_servers = ("work-assistant",) if is_chat else ()
 
         resolved_server_keys: dict[str, list[str]] = {name: [] for name in desired_mcp_servers}
         if isinstance(mcp_servers, dict):
@@ -1542,7 +1525,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     if isinstance(cfg, dict):
                         mcp_servers[canonical] = dict(cfg)
 
-        # 로컬 컨텍스트 도구를 먼저 요청한 뒤, MCP(claude-skills 등)를 이어서 요청한다.
+        # 로컬 컨텍스트 도구를 먼저 요청한 뒤, MCP를 이어서 요청한다.
         # memento는 채팅 모드 포함 항상 기본 도구로 로드한다(preflight 비활성화 여부와 무관).
         mcp_request: list[str] = []
         if enable_tenant_context_preflight or is_chat:
@@ -1565,7 +1548,7 @@ class DeepAgentsExecutor(AgentExecutor):
         )
         tool_loader: TaggingSafeToolLoader | None = None
         try:
-            # tenant_mcp 병합 설정 + claude-skills 명시 요청으로 Tier 2 MCP 도구 로드.
+            # tenant_mcp 병합 설정으로 MCP 도구 로드.
             # TaggingSafeToolLoader 가 각 MCP 툴에 _mcp_server 를 붙여 서브 에이전트 baseline 라우팅을 가능하게 함.
             tool_loader = TaggingSafeToolLoader(
                 tenant_id=tenant_id or None,
@@ -1601,7 +1584,7 @@ class DeepAgentsExecutor(AgentExecutor):
         context_tool_tracker: dict[str, Any] = {"attempted_global": set()}
 
         # 서브 에이전트별 도구 호출은 각 서브 에이전트 전용 job_id로 분리된다.
-        # 루트 오케스트레이터(MCP claude-skills / chat 전용 work-assistant / worker 전용 process-gpt-mcp 등)는
+        # 루트 오케스트레이터(chat 전용 work-assistant / worker 전용 process-gpt-mcp 등)는
         # 별도 로그에 쌓은 뒤 HTTP 응답에서 합친다.
         orchestrator_tool_log: dict[str, list[str]] = {}
         subagent_tool_log: dict[str, list[str]] = {}
@@ -2045,7 +2028,6 @@ class DeepAgentsExecutor(AgentExecutor):
 
                 def _domain_tool_call_guard(base_tool: Any, tool_input: Any) -> Any | None:
                     tool_name = str(getattr(base_tool, "name", "") or "")
-                    server = str(getattr(base_tool, "_mcp_server", "") or "").lower()
 
                     # HTTP SSE: tool_start 이벤트 스트리밍(호출 직전).
                     try:
@@ -2167,15 +2149,15 @@ class DeepAgentsExecutor(AgentExecutor):
 
                         # NOTE: 과거 핸드오프 기반 required_env 강제는 제거됨.
 
-                    # Tier 2 (claude-skills MCP) is allowed only as fallback, after Tier 1 was attempted.
-                    is_skill_mcp = ("claude-skills" in server) or tool_name in (
+                    # Skill MCP tools are allowed only as fallback, after Tier 1 was attempted.
+                    is_skill_mcp = tool_name in (
                             "list_skills",
                             "read_skill_document",
                             "find_helpful_skills",
                         )
-                        # Allow domain to read skill docs anytime (handoff-driven), even without Tier1 probe.
+                    # Allow domain to read skill docs anytime (handoff-driven), even without Tier1 probe.
                     if tool_name == "read_skill_document":
-                            return None
+                        return None
                     if is_skill_mcp and not _effective_tier1_attempted():
                             return {
                                 "error": "tier1_required_before_fallback_skill_discovery",
@@ -2249,10 +2231,6 @@ class DeepAgentsExecutor(AgentExecutor):
         model_name = routing_cfg.model_name
 
         # 단일 DeepAgent 런타임(Planning + Delegation + Execution)
-        #
-        # Token hygiene:
-        # - work_assistant_only: use compact base rules to avoid repeating long system prompts each step
-        # - needs_task: use full orchestrator rules
         feedback_summary = extras.get("summarized_feedback") or ""
         form_fields = extras.get("form_fields")
         form_html = extras.get("form_html")
@@ -2332,17 +2310,8 @@ class DeepAgentsExecutor(AgentExecutor):
             )
         except Exception:
             _inv_blob, _state_contract = "{}", "{}"
-        # Decide route hint early (used for compact prompts).
         http_chat_has_assets = bool(is_chat and bool(http_chat_policy.get("has_input_assets")))
-        route_hint = ""
-        if is_chat:
-            route_hint = "needs_task" if (http_chat_has_assets or subagent_contexts) else "work_assistant_only"
-
-        base_rules = (
-            compact_orchestrator_prompt_for_work_assistant_only()
-            if is_chat and route_hint == "work_assistant_only"
-            else default_orchestrator_prompt()
-        )
+        base_rules = default_orchestrator_prompt()
 
         # Initial system_prompt should be minimal; per-step sections are injected by middleware.
         system_prompt = base_orchestrator_identity_prompt()
@@ -2396,10 +2365,7 @@ class DeepAgentsExecutor(AgentExecutor):
             route_progress["route"] = "needs_task"
             route_progress["reason"] = "input_assets_present"
         elif is_chat:
-            # 서브 없음·입력 자산 없음: route_hint(work_assistant_only)와 동일하게 route_gate를 채운다.
-            # 비어 있으면 DeepRequiredRootGateMiddleware가 MCP·write_todos까지 막고,
-            # 제거된 write_http_chat_route로는 복구할 수 없어 품질이 붕괴된다.
-            route_progress["route"] = "work_assistant_only"
+            route_progress["route"] = "needs_task"
             route_progress["reason"] = "chat_default_no_subagents_no_assets"
         pipeline_spec_mw = create_pipeline_spec_middleware(
             event_queue=event_queue,
@@ -2470,8 +2436,6 @@ class DeepAgentsExecutor(AgentExecutor):
             agents=agent_rows,
             feedback=feedback_summary,
             form_info=form_info,
-            is_chat=is_chat,
-            http_chat_route=route_hint or None,
             tenant_id=tenant_id or None,
             output_language=output_language,
             hitl_resume=hitl_resume,
@@ -2508,48 +2472,51 @@ class DeepAgentsExecutor(AgentExecutor):
         if psmw is not None:
             extra_middleware.append(psmw)
 
-        # Subagents: apply the same "sectioned system prompt" strategy.
+        # Subagents: build per-agent middleware so agent-specific sections (role, skills,
+        # form fields) are included alongside the shared sections.
         # NOTE: deepagents does not propagate root middleware into subagent graphs automatically.
-        try:
-            sub_sections = build_subagent_prompt_sections(
-                tenant_id=tenant_id or None,
-                skill_root_dir=str(os.environ.get("SKILLS_ROOT_DIR") or "/app/skills"),
-                output_language=output_language,
+        _include_clock = bool(
+            any(
+                k in (invoke_user_text or "")
+                for k in (
+                    "오늘",
+                    "어제",
+                    "전일",
+                    "이번주",
+                    "지난주",
+                    "이번 달",
+                    "지난달",
+                    "이번달",
+                    "지난 달",
+                    "yesterday",
+                    "today",
+                    "last week",
+                    "this week",
+                    "last month",
+                    "this month",
+                )
             )
-            sub_psmw = create_subagent_prompt_sections_middleware(
-                sections=sub_sections,
-                include_execution_clock=bool(
-                    any(
-                        k in (invoke_user_text or "")
-                        for k in (
-                            "오늘",
-                            "어제",
-                            "전일",
-                            "이번주",
-                            "지난주",
-                            "이번 달",
-                            "지난달",
-                            "이번달",
-                            "지난 달",
-                            "yesterday",
-                            "today",
-                            "last week",
-                            "this week",
-                            "last month",
-                            "this month",
-                        )
-                    )
-                ),
-            )
-            if sub_psmw is not None:
-                for sa in subagents:
+        )
+        for sa in subagents:
+            try:
+                sub_sections = build_subagent_prompt_sections(
+                    tenant_id=tenant_id or None,
+                    skill_root_dir=str(os.environ.get("SKILLS_ROOT_DIR") or "/app/skills"),
+                    output_language=output_language,
+                    agent_info=sa.pop("_agent_info", None),
+                )
+                sub_psmw = create_subagent_prompt_sections_middleware(
+                    sections=sub_sections,
+                    include_execution_clock=_include_clock,
+                )
+                if sub_psmw is not None:
                     chain = sa.get("middleware")
                     if isinstance(chain, list):
                         chain.append(sub_psmw)
                     else:
                         sa["middleware"] = [sub_psmw]
-        except Exception:
-            logger.exception("Failed to attach subagent prompt sections middleware; continuing", exc_info=True)
+            except Exception:
+                logger.exception("Failed to attach subagent prompt sections middleware for agent=%s; continuing", sa.get("name"), exc_info=True)
         deep_gate_mw = None
         if is_chat:
             deep_gate_mw = _create_deep_required_root_gate_middleware(
@@ -2661,6 +2628,10 @@ class DeepAgentsExecutor(AgentExecutor):
                     root_tools_for_orchestrator.extend(list(get_skill_resolution_tools()))
                 except Exception:
                     logger.exception("Failed to attach skill resolution tools to root orchestrator", exc_info=True)
+                try:
+                    root_tools_for_orchestrator.extend(list(get_skill_tools()))
+                except Exception:
+                    logger.exception("Failed to attach skill tools to root orchestrator", exc_info=True)
 
         # De-duplicate by tool name to avoid LangChain duplicate tool errors.
         deduped_root_tools: list[Any] = []
@@ -2919,6 +2890,7 @@ class DeepAgentsExecutor(AgentExecutor):
                     "messages": state_msgs,
                     "pipeline_outputs": initial_pipeline_outputs,
                 }
+
             result: Any = None
             strict_pipeline_violations: list[str] = []
 

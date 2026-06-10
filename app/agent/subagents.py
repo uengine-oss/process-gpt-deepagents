@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import os
 import re
@@ -15,16 +14,15 @@ from app.database import (
     get_form_def_fields_json,
     _load_proc_def_activity_capabilities
 )
-from app.execution_context import format_execution_clock_section
+from app.agent.backend import tenant_skill_sources_for_middleware
 from app.runtime_config import normalize_litellm_slash_model_name
 from app.sandbox.tools import get_sandbox_tools
 from app.skills.resolution_tools import get_skill_resolution_tools
 
 # Tier 2: MCP tools are attached to every subagent via DEFAULT_MCP_SERVER_NAMES
 # (when tenant_mcp includes that server). computer-use remains virtual (sandbox replaces shell).
-# NOTE: 서브에이전트는 기본적으로 claude-skills + (mem0/memento/dmn_rule)만 가진다.
-# work-assistant MCP는 "루트(딥 에이전트) 전용"으로 사용하며 서브에이전트에는 기본 부착하지 않는다.
-DEFAULT_MCP_SERVER_NAMES: tuple[str, ...] = ("claude-skills",)
+# NOTE: work-assistant MCP는 "루트(딥 에이전트) 전용"으로 사용하며 서브에이전트에는 기본 부착하지 않는다.
+DEFAULT_MCP_SERVER_NAMES: tuple[str, ...] = ()
 SKILLS_ROOT_DIR = (os.environ.get("SKILLS_ROOT_DIR") or "/app/skills").rstrip("/")
 VIRTUAL_TOOL_NAMES: set[str] = {"computer-use"}
 ALWAYS_ATTACH_LOCAL_TOOL_NAMES: tuple[str, ...] = ("mem0", "memento", "dmn_rule")
@@ -237,147 +235,6 @@ def _build_description(agent_row: dict[str, Any], name: str) -> str:
     return "\n\n".join(parts)
 
 
-def _build_system_prompt(
-    agent_row: dict[str, Any],
-    tenant_id: str | None = None,
-) -> str:
-    """서브에이전트용 시스템 프롬프트(한글, 토큰/충돌 최소화 버전).
-
-    NOTE:
-    - task() 위임(description)이 이미 목표/컨텍스트를 포함하므로, 여기서는 큰 워크아이템 q를 주입하지 않는다.
-    - 시스템 프롬프트는 '항상 필요한 규칙' + '짧은 우선순위' + '최소 실행 가드'만 제공한다.
-    """
-    parts: list[str] = []
-
-    name = (
-        agent_row.get("alias")
-        or agent_row.get("username")
-        or agent_row.get("name")
-        or str(agent_row.get("id"))
-    )
-    role = agent_row.get("role") or "역할 미지정"
-    base_desc = (agent_row.get("description") or "").strip()
-    persona = (agent_row.get("persona") or "").strip()
-    goal = (agent_row.get("goal") or "").strip()
-
-    t_id = (tenant_id or "").strip() or "(unknown)"
-    agent_skills = _parse_csv(agent_row.get("skills"))
-    declared_tools = _parse_csv(agent_row.get("tools"))
-
-    # Short priority ladder to avoid confusion when multiple instructions exist.
-    parts.append("=== 우선순위(짧게) ===")
-    parts.append(
-        "- 1) task() 위임(description)의 지시/출력 형식을 최우선으로 따른다.\n"
-        "- 2) 스킬/문서/도구 사용법은 추정하지 말고, 문서/실행 결과로 검증한다.\n"
-        "- 3) 실행이 가능하면 실행하고(샌드박스), 불가하면 불가 사유와 다음 시도안을 짧게 보고한다."
-    )
-
-    parts.append("=== 섹션 1: 역할/도메인 ===")
-    parts.append(f"- 이름: {name}")
-    parts.append(f"- 역할: {role}")
-    if base_desc:
-        parts.append(f"- 설명: {base_desc}")
-    if persona:
-        parts.append(f"- 페르소나: {persona}")
-    if goal:
-        parts.append(f"- 목표: {goal}")
-
-    parts.append("\n" + format_execution_clock_section())
-
-    parts.append("\n=== 섹션 2: 최소 컨텍스트 ===")
-    parts.append(
-        "- 워크아이템의 상세 컨텍스트([Description]/[Instruction]/[InputData])는 `task()` 위임(description)에서 제공됩니다.\n"
-        "- 이 시스템 프롬프트에는 큰 JSON/q를 재주입하지 않습니다(토큰 절감 목적).\n"
-        "- 더 많은 컨텍스트가 필요하면: 먼저 `mem0`/`memento`/`dmn_rule`로 확인하고, 그 다음 실행/조회로 검증하세요."
-    )
-
-    parts.append("\n=== 섹션 3: 테넌트/스킬 경로(필수) ===")
-    parts.append(f"- tenant_id: {t_id}")
-    parts.append(f"- 스킬 루트(마운트 볼륨): \"{SKILLS_ROOT_DIR}/{{tenant_id}}/\"")
-    parts.append("- 이 tenant_id를 사용해 스킬/문서 경로를 해석하세요(다른 tenant 경로 접근 금지).")
-
-    parts.append("\n=== 섹션 4: 실행 원칙(핵심) ===")
-    parts.append(
-        "- 가능한 경우 샌드박스에서 **실제 실행**하고, stdout/stderr/exit_code로 근거를 남기세요.\n"
-        "- 스킬이 있으면: 문서 확인 → (필요 시) 물리화/복사 → 실행 순서를 지키세요.\n"
-        "- task()가 요구한 산출물 범위를 넘기지 마세요(독립 산출 1개면 1개만)."
-    )
-
-    parts.append("\n=== 섹션 4a: 지식/규칙/문서 도구(mem0/memento/dmn_rule) ===")
-    parts.append(
-        "- `mem0`: 개인화/누적 지식(선호, 과거 실행 정보, 사용자가 저장한 자격 증명 등). "
-        "사람에게 묻기 전에 먼저 조회하는 것을 권장합니다.\n"
-        "- `dmn_rule`: 정책/결재/자격/라우팅 등 규칙 기반 의사결정이 필요한 경우 사용합니다.\n"
-        "- `memento`: **RAG**. 워크아이템·InputData·지시문에 **문서/파일 URL·스토리지 경로**가 있으면 추측하지 말고 "
-        "`memento`로 **적극 조회**해 근거(발췌·출처)를 확보하세요. 오케스트레이터가 `write_todos`로 배정한 \"문서 확인\" 단계는 여기서 수행합니다.\n"
-        "- pdf/xlsx/docx/pptx/csv/zip 등 **바이너리·복합 문서**는 `memento`만으로 부족할 수 있으므로, "
-        "할당 스킬(SKILL.md)·`read_file`/샌드박스(다운로드·파싱·추출 스크립트)를 조합해 **실제 내용을 읽은 뒤** 결론을 내세요.\n"
-        "- 위 도구들이 유의미하면 MCP/무거운 실행 전에 먼저 호출해 파라미터/리스크 결정을 보정하세요.\n"
-    )
-
-    parts.append("\n=== 섹션 4b: 스킬 해석 3티어(엄격한 순서) ===")
-    parts.append(
-        "- 티어1(볼륨/FS): `skill_volume_probe` → `ls/read_file/glob` → 필요 시 `sandbox_copy_mounted_skill`\n"
-        "- 티어2(claude-skills MCP): 티어1에서 파일 누락/빈 복사 등으로 실패했을 때만 MCP로 탐색/문서 확인\n"
-        "- 티어3(샌드박스 폴백): 티어1·2로 실행 가능한 스킬을 못 찾았지만 코드 실행이 필요한 경우, "
-        "`sandbox_write_and_run`로 태스크 전용 스크립트를 작성·실행\n"
-        "- 티어 전환 시 `report_skill_resolution_tier(1|2|3, started|success|failed, detail)`를 호출해 기록하세요.\n"
-    )
-
-    if agent_skills:
-        parts.append("\n=== 섹션 4c: 할당 스킬 ===")
-        parts.append(f"- 할당 스킬: {', '.join(agent_skills)}")
-        parts.append(
-            "- 기본 문서 경로 템플릿(경로를 발명하지 마세요): "
-            f"\"{SKILLS_ROOT_DIR}/{{tenant_id}}/{{skill_name}}/SKILL.md\""
-        )
-    else:
-        parts.append("\n=== 섹션 4c: 할당 스킬 ===")
-        parts.append("- 할당 스킬: (명시 없음)")
-        parts.append(
-            f"- \"{SKILLS_ROOT_DIR}/{{tenant_id}}/\" 아래를 탐색해 가장 관련 높은 스킬 폴더를 선택하세요."
-        )
-
-    form_fields: list[dict[str, Any]] | None = agent_row.get("form_fields_json")
-    if isinstance(form_fields, list) and form_fields:
-        parts.append("\n=== 섹션 5: 출력 형식(필수 — 폼 JSON) ===")
-        parts.append(
-            "- 이 태스크의 **최종 출력은 반드시** 아래 폼 필드를 키로 하는 순수 JSON 객체여야 합니다.\n"
-            "- 추가 설명 텍스트 없이 JSON 블록만 반환하세요(마크다운 코드펜스 없이).\n"
-            "- 폼 필드 목록:"
-        )
-        for field in form_fields:
-            if not isinstance(field, dict):
-                continue
-            fid = str(field.get("id") or field.get("key") or field.get("name") or "").strip()
-            flabel = str(field.get("label") or field.get("title") or fid).strip()
-            ftype = str(field.get("type") or field.get("fieldType") or "string").strip()
-            required = field.get("required", False)
-            req_mark = " [필수]" if required else ""
-            parts.append(f"  - {fid} ({ftype}){req_mark}: {flabel}")
-        example_keys = [
-            str(f.get("id") or f.get("key") or f.get("name") or f"field_{i}").strip()
-            for i, f in enumerate(form_fields)
-            if isinstance(f, dict)
-        ]
-        if example_keys:
-            example = {k: "..." for k in example_keys if k}
-            parts.append(f"\n출력 예시:\n{json.dumps(example, ensure_ascii=False, indent=2)}")
-    else:
-        parts.append("\n=== 섹션 5: 보고 형식(짧게) ===")
-        parts.append(
-            "- 오케스트레이터가 합성할 수 있게 **간결하고 검증 가능한 결과**를 반환하세요.\n"
-            "- 실행이 있었다면: 사용한 도구/명령, exit code, stdout/stderr 핵심, 생성/수정된 파일(있다면) 요약을 포함하세요.\n"
-            "- 조회/조사 성격이면: source, endpoint_or_series, as_of, value, unit 같은 증거 필드를 포함하세요.\n"
-            "- 실패 시에도 도구 출력(에러 메시지)을 숨기지 말고, 최소 1회 이상 오류 기반 보정 재시도 후 상태를 보고하세요.\n"
-        )
-
-    if declared_tools:
-        parts.append("\n=== 섹션 6: 선언된 도구(참고) ===")
-        parts.append("- " + ", ".join(declared_tools))
-
-    return "\n".join(parts)
-
 
 def build_subagent_configs(
     agent_rows: list[dict[str, Any]],
@@ -406,14 +263,7 @@ def build_subagent_configs(
             server_to_tools.setdefault(server, []).append(t)
     sandbox_names = _sandbox_tool_names()
     skill_resolution_names = _skill_resolution_tool_names()
-
-    # Token hygiene: claude-skills MCP can expose a large tool schema set.
-    # For subagents, keep only the subset needed for deterministic skill resolution.
-    _ALLOWED_CLAUDE_SKILLS_TOOL_NAMES: set[str] = {
-        "list_skills",
-        "read_skill_document",
-        "find_helpful_skills",
-    }
+    skill_sources = tenant_skill_sources_for_middleware(tenant_id)
 
     subagents: list[dict[str, Any]] = []
     for row in agent_rows:
@@ -423,7 +273,18 @@ def build_subagent_configs(
         fallback = str(row.get("id") or "agent")
         name = _openai_safe_agent_name(str(display_name), fallback=fallback)
         description = _build_description(row, display_name)
-        system_prompt = _build_system_prompt(row, tenant_id=tenant_id)
+        declared_skill_names_for_info = _parse_csv(row.get("skills"))
+        declared_tool_names_for_info = _parse_csv(row.get("tools"))
+        agent_info = {
+            "name": str(display_name),
+            "role": row.get("role") or "역할 미지정",
+            "description": (row.get("description") or "").strip(),
+            "persona": (row.get("persona") or "").strip(),
+            "goal": (row.get("goal") or "").strip(),
+            "skills": declared_skill_names_for_info,
+            "declared_tools": [t for t in declared_tool_names_for_info if t not in VIRTUAL_TOOL_NAMES],
+            "form_fields": row.get("form_fields_json"),
+        }
 
         agent_type = str(row.get("agent_type") or "").strip()
         is_a2a = agent_type.lower() == "a2a"
@@ -436,7 +297,7 @@ def build_subagent_configs(
         # computer-use 같은 가상 툴 이름은 무시한다.
         agent_tool_or_server_names = [t for t in declared_tool_names if t not in VIRTUAL_TOOL_NAMES]
         # 기본 정책:
-        # - 일반 서브에이전트: users.tools에 명시된 MCP 서버 + 기본 claude-skills
+        # - 일반 서브에이전트: users.tools에 명시된 MCP 서버
         # - a2a 서브에이전트: users.tools에 명시된 MCP 서버만 (그 외 모든 도구 부착 금지)
         wanted_servers_norm: set[str] = set()
         baseline_servers = [] if is_a2a else list(DEFAULT_MCP_SERVER_NAMES)
@@ -465,20 +326,11 @@ def build_subagent_configs(
                 return True
             return any(norm.endswith(w) for w in wanted_norm)
 
-        # 1차: MCP 서버 필터링 (users.tools + 기본 claude-skills)
+        # 1차: MCP 서버 필터링 (users.tools)
         for server_key, tools in server_to_tools.items():
             if not _server_matches(str(server_key), wanted_servers_norm):
                 continue
             for t in tools:
-                # Reduce tool schema cost for claude-skills on subagents.
-                try:
-                    srv_norm = str(server_key or "").strip().lower().replace("_", "-")
-                except Exception:
-                    srv_norm = ""
-                if "claude-skills" in srv_norm:
-                    nm0 = str(getattr(t, "name", "") or "").strip()
-                    if nm0 and nm0 not in _ALLOWED_CLAUDE_SKILLS_TOOL_NAMES:
-                        continue
                 if id(t) not in seen_ids:
                     filtered_tools.append(t)
                     seen_ids.add(id(t))
@@ -503,8 +355,10 @@ def build_subagent_configs(
             subagent: dict[str, Any] = {
                 "name": name,
                 "description": _build_description(row, str(display_name)),
-                "system_prompt": system_prompt,
+                "system_prompt": "",
+                "_agent_info": agent_info,
                 "tools": filtered_tools,
+                "skills": skill_sources,
                 "capabilities": {
                     "skills": list(declared_skill_names),
                     "tools": list(declared_tool_names),
@@ -604,8 +458,10 @@ def build_subagent_configs(
         subagent: dict[str, Any] = {
             "name": name,
             "description": description,
-            "system_prompt": system_prompt,
+            "system_prompt": "",
+            "_agent_info": agent_info,
             "tools": filtered_tools,
+            "skills": skill_sources,
             # Capability metadata: routing must NOT depend on agent name/role.
             # Use only DB-stored capabilities (skills/tools/model) + attached tool names.
             "capabilities": {

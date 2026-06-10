@@ -70,8 +70,8 @@ class ExecutionContext:
 def build_event_payload(
     exec_ctx: ExecutionContext | None,
     *,
-    logical_event_type: str,
-    phase: str,
+    logical_event_type: str | None = None,
+    phase: str | None = None,
     tool_name: str | None = None,
     requires_human: bool | None = None,
     input_schema: Any | None = None,
@@ -95,8 +95,10 @@ def build_event_payload(
         merged["agent_name"] = agent_name
 
     # 논리적 이벤트 타입 / 페이즈 정보
-    merged["logical_event_type"] = logical_event_type
-    merged["phase"] = phase
+    if logical_event_type is not None:
+        merged["logical_event_type"] = logical_event_type
+    if phase is not None:
+        merged["phase"] = phase
 
     # 선택적 필드들
     if tool_name is not None:

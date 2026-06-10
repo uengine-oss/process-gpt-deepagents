@@ -52,8 +52,7 @@ def emit_subagent_workitem_events(
             sub_task_id,
             "result",
             job_id=job_id,
-            exec_ctx=exec_ctx,
-            agent_name=subagent_name,
+            exec_ctx=exec_ctx
         )
     except Exception:
         logger.exception(
@@ -78,9 +77,7 @@ def emit_subagent_workitem_events(
             proc_inst_id=sub_proc_inst_id,
             task_id=sub_task_id,
             crew_type="result",
-            job_id=job_id,
-            exec_ctx=exec_ctx,
-            agent_name=subagent_name,
+            job_id=job_id
         )
     except Exception:
         logger.exception(

@@ -4,7 +4,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from app.sandbox.tools import (
     sandbox_cleanup,
@@ -77,65 +76,6 @@ class SandboxToolsTests(unittest.TestCase):
             )
             self.assertEqual(run_result["exit_code"], 0)
             self.assertIn("demo", run_result["stdout"])
-            self._call(sandbox_cleanup, {"workspace_id": ws_id, "keep_on_failure": False})
-
-    def test_copy_mounted_skill_http_fallback_when_volume_missing(self) -> None:
-        """GitHub/catalog skills: no FS dir, but claude-skills HTTP API can materialize."""
-        with tempfile.TemporaryDirectory() as tmp:
-            skills_root = Path(tmp) / "skills"
-            skills_root.mkdir(parents=True)
-
-            created = self._call(sandbox_create, {"job_id": "job_httpfb", "agent_name": "agentH"})
-            ws_id = created["workspace_id"]
-            list_payload = json.dumps(
-                {
-                    "skill_name": "remote_skill",
-                    "files": [{"path": "SKILL.md", "size": 10}],
-                    "count": 1,
-                },
-                ensure_ascii=False,
-            ).encode("utf-8")
-            file_payload = json.dumps(
-                {
-                    "skill_name": "remote_skill",
-                    "file_path": "SKILL.md",
-                    "type": "text",
-                    "content": "# remote skill\n",
-                },
-                ensure_ascii=False,
-            ).encode("utf-8")
-
-            def fake_http_get(url: str, *, timeout_s: float = 120.0) -> bytes:
-                u = url.rstrip("/")
-                if u.endswith("/remote_skill/files"):
-                    return list_payload
-                if "SKILL.md" in url and "/remote_skill/files/" in url:
-                    return file_payload
-                raise AssertionError(f"unexpected URL: {url!r}")
-
-            with patch("app.sandbox.tools._http_get_bytes", side_effect=fake_http_get):
-                with patch(
-                    "app.sandbox.tools._skills_http_api_base_candidates",
-                    return_value=["http://fake-skills:8765"],
-                ):
-                    copy_result = self._call(
-                        sandbox_copy_mounted_skill,
-                        {
-                            "workspace_id": ws_id,
-                            "tenant_id": "t_missing",
-                            "skill_name": "remote_skill",
-                            "skills_root": str(skills_root),
-                        },
-                    )
-            self.assertNotIn("error", copy_result or {})
-            self.assertEqual(copy_result.get("materialization"), "claude_skills_http_api")
-            self.assertIn("skill/SKILL.md", copy_result.get("copied_files", []))
-
-            read_result = self._call(
-                sandbox_read_workspace_files,
-                {"workspace_id": ws_id, "paths_csv": "skill/SKILL.md"},
-            )
-            self.assertIn("remote skill", read_result["files"].get("skill/SKILL.md", ""))
             self._call(sandbox_cleanup, {"workspace_id": ws_id, "keep_on_failure": False})
 
     def test_write_and_run_default_python(self) -> None:

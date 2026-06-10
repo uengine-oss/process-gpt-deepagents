@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import mimetypes
@@ -10,9 +9,7 @@ import os
 import shlex
 import threading
 import uuid
-import urllib.request
 from typing import Any
-from urllib.parse import quote, urlparse, urlunparse
 
 from processgpt_agent_utils.utils.context_manager import proc_inst_id_var, task_id_var
 
@@ -70,138 +67,6 @@ def discard_task_workspace_ids(task_id: str) -> None:
         return
     with _ws_lock:
         _WORKSPACE_IDS_BY_TASK.pop(tid, None)
-
-
-def _skills_http_api_base_from_mcp_url(mcp_url: str) -> str:
-    """REST base for ``GET /skills/...`` derived from ``CLAUDE_SKILLS_MCP_URL`` (strip trailing ``/mcp`` path)."""
-    raw = (mcp_url or "").strip()
-    if not raw:
-        return "http://localhost:8765"
-    u = urlparse(raw)
-    if not u.scheme or not u.netloc:
-        return "http://localhost:8765"
-    path = (u.path or "").rstrip("/")
-    if path.endswith("/mcp"):
-        path = path[: -len("/mcp")].rstrip("/")
-    else:
-        path = ""
-    if path:
-        return urlunparse((u.scheme, u.netloc, path, "", "", "")).rstrip("/")
-    return f"{u.scheme}://{u.netloc}".rstrip("/")
-
-
-def _skills_http_api_base_candidates() -> list[str]:
-    """Bases for claude-skills file API (GET /skills/<name>/files, .../files/<path>)."""
-    mcp = (os.environ.get("CLAUDE_SKILLS_MCP_URL") or "").strip()
-    if not mcp:
-        mcp = "http://localhost:8765/mcp"
-    base = _skills_http_api_base_from_mcp_url(mcp)
-    return [base] if base else ["http://localhost:8765"]
-
-
-def _decode_claude_skills_file_payload(body: bytes) -> bytes:
-    """claude-skills returns JSON {{type, content}} for text; raw bytes otherwise."""
-    if not body:
-        return body
-    try:
-        text = body.decode("utf-8")
-    except Exception:
-        return body
-    if not text.lstrip().startswith("{"):
-        return body
-    try:
-        d = json.loads(text)
-    except Exception:
-        return body
-    if not isinstance(d, dict):
-        return body
-    typ = d.get("type")
-    if typ == "text" and isinstance(d.get("content"), str):
-        return d["content"].encode("utf-8")
-    if typ == "binary" and isinstance(d.get("content"), str):
-        try:
-            return base64.b64decode(d["content"])
-        except Exception:
-            logger.exception("Failed base64 decode for claude-skills binary payload")
-            return body
-    return body
-
-
-def _http_get_bytes(url: str, *, timeout_s: float = 120.0) -> bytes:
-    req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return resp.read()
-
-
-def _materialize_skill_via_claude_skills_http(
-    ws: SandboxWorkspace,
-    *,
-    skill_name: str,
-    dest_subdir: str,
-    base_url: str,
-) -> dict[str, Any]:
-    """Copy all files for a catalog skill from claude-skills HTTP API into the workspace."""
-    skill = (skill_name or "").strip().strip("/")
-    if not skill or ".." in skill:
-        raise ValueError("invalid skill_name")
-    base = base_url.rstrip("/")
-    list_url = f"{base}/skills/{quote(skill, safe='')}/files"
-    raw_list = _http_get_bytes(list_url, timeout_s=60.0)
-    try:
-        meta = json.loads(raw_list.decode("utf-8"))
-    except Exception as e:
-        raise RuntimeError(f"skills API list not JSON: {list_url}") from e
-    if not isinstance(meta, dict):
-        raise RuntimeError(f"skills API list bad shape: {list_url}")
-    files = meta.get("files")
-    if not isinstance(files, list) or not files:
-        raise RuntimeError(f"skills API returned no files: {list_url}")
-
-    workspace_root = Path(ws.path).resolve()
-    dest_root = (workspace_root / (dest_subdir or "skill").strip("/")).resolve()
-    if workspace_root not in dest_root.parents and dest_root != workspace_root:
-        raise ValueError("dest_subdir escapes workspace")
-
-    copied: list[str] = []
-    skipped: list[str] = []
-    for ent in files:
-        if not isinstance(ent, dict):
-            continue
-        rel = str(ent.get("path") or "").strip().lstrip("/")
-        if not rel or ".." in Path(rel).parts:
-            skipped.append(rel or "(empty)")
-            continue
-        read_url = f"{base}/skills/{quote(skill, safe='')}/files/{quote(rel, safe='/')}"
-        try:
-            payload = _http_get_bytes(read_url, timeout_s=120.0)
-            out_bytes = _decode_claude_skills_file_payload(payload)
-        except Exception as e:
-            skipped.append(f"{rel}: {e}")
-            continue
-        dst = (dest_root / rel).resolve()
-        try:
-            dst.relative_to(dest_root)
-        except ValueError:
-            skipped.append(rel)
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_bytes(out_bytes)
-        rel_ws = dst.relative_to(workspace_root)
-        copied.append(rel_ws.as_posix())
-
-    if not copied:
-        raise RuntimeError(
-            f"claude-skills API listed {len(files)} file(s) but none could be written "
-            f"(base={base_url!r}, skipped={skipped[:8]})"
-        )
-    return {
-        "source": list_url,
-        "dest": str(dest_root),
-        "copied_files": sorted(copied),
-        "materialization": "claude_skills_http_api",
-        "skills_api_base": base,
-        "skill_name": skill,
-    }
 
 
 def _get_workspace(workspace_id: str) -> SandboxWorkspace:
@@ -436,15 +301,9 @@ def sandbox_copy_mounted_skill(
     dest_subdir: str = "skill",
     skills_root: str = "",
 ) -> dict[str, Any]:
-    """Copy skill files into the sandbox: Tier 1 = shared volume, Tier 1b = claude-skills HTTP API.
+    """Copy skill files from the shared volume into the sandbox workspace.
 
     Tenant-uploaded skills live under ``<SKILLS_ROOT>/<tenant_id>/<skill_name>/`` on the Docker volume.
-    GitHub/catalog skills from ``config.json`` (e.g. anthropics/skills) are often **not** mirrored to
-    that path; they are still available via the claude-skills service. When the volume path is missing,
-    this tool derives the HTTP base from ``CLAUDE_SKILLS_MCP_URL`` (``.../mcp`` → same-origin API) and copies via
-    ``GET /skills/<skill_name>/files`` + per-file fetches — same materialization idea as
-    ``read_skill_document`` + ``sandbox_write_files``, but batched.
-
     Optional ``skills_root`` overrides env ``SKILLS_ROOT_DIR`` (default ``/app/skills``).
     """
     ws = _get_or_create_workspace(workspace_id, fallback_job_id="copy_skill", agent_name="subagent")
@@ -486,6 +345,7 @@ def sandbox_copy_mounted_skill(
             ),
         }
 
+    # Tier 1: tenant volume search (explicit root / SKILLS_ROOT_DIR / /app/skills)
     root = ""
     for base in uniq:
         probe = Path(base).resolve() / tenant / skill
@@ -502,44 +362,17 @@ def sandbox_copy_mounted_skill(
         )
 
     tried_vol = ", ".join(uniq) if uniq else "(none)"
-    http_errs: list[str] = []
-    for api_base in _skills_http_api_base_candidates():
-        try:
-            out = _materialize_skill_via_claude_skills_http(
-                ws,
-                skill_name=skill,
-                dest_subdir=dest_subdir or "skill",
-                base_url=api_base,
-            )
-            if out.get("copied_files"):
-                return out
-        except Exception as e:
-            http_errs.append(f"{api_base}: {e}")
-            logger.info(
-                "sandbox_copy_mounted_skill HTTP fallback miss | skill=%r api_base=%r err=%s",
-                skill,
-                api_base,
-                e,
-            )
-
     dest_preview = str((Path(ws.path).resolve() / (dest_subdir or "skill").strip("/")).resolve())
-    bases = ", ".join(_skills_http_api_base_candidates()) or "(none)"
     return {
         "source": None,
         "dest": dest_preview,
         "copied_files": [],
-        "error": "skill_not_on_volume_or_api",
+        "error": "skill_not_on_volume",
         "message": (
             f"No volume directory {tenant!r}/{skill!r} under skills roots [{tried_vol}]. "
-            f"GitHub/catalog skills are not always synced to the shared volume. "
-            f"HTTP materialization from claude-skills was tried (bases: {bases}) but did not succeed."
+            "Skill may not be synced to the shared volume."
         ),
-        "hint": (
-            "Set CLAUDE_SKILLS_MCP_URL to the streamable MCP endpoint "
-            "(e.g. http://127.0.0.1:8765/mcp; Docker host from container: http://host.docker.internal:8765/mcp). "
-            "Alternatively use read_skill_document + sandbox_write_files for the same skill."
-        ),
-        "http_fallback_errors": http_errs[:6],
+        "hint": "Use read_skill_document + sandbox_write_files to materialize the skill.",
     }
 
 

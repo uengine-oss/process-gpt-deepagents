@@ -14,6 +14,7 @@ import re
 from typing import Any, Mapping, Sequence
 
 from deepagents import create_deep_agent
+from deepagents.middleware.skills import SkillsMiddleware
 from langgraph.graph.state import CompiledStateGraph
 
 from app.agent.backend import make_deepagent_backend_factory
@@ -164,6 +165,15 @@ def build_runtime_agent(
     except Exception:
         logger.exception("Failed to attach OpenAI name sanitization middleware; continuing", exc_info=True)
 
+    # SkillsMiddleware is appended AFTER the caller's middleware (e.g. PromptSectionsMiddleware)
+    # so it runs closer to the model in the chain. This ensures skills are injected into the
+    # system message AFTER PromptSectionsMiddleware replaces it with per-step sections, not before.
+    # If passed via create_deep_agent(skills=...), SkillsMiddleware lands at index 1 (outermost)
+    # and its skills injection gets overwritten by PromptSectionsMiddleware further down the chain.
+    backend_factory = make_deepagent_backend_factory()
+    if skills:
+        middleware_list.append(SkillsMiddleware(backend=backend_factory, sources=skills))
+
     model_arg = _model_argument_for_deep_agent(model_name=model_name, model_routing=model_routing)
     agent = create_deep_agent(
         model=model_arg,
@@ -171,8 +181,8 @@ def build_runtime_agent(
         system_prompt=effective_prompt,
         subagents=subagents or [],
         middleware=middleware_list,
-        backend=make_deepagent_backend_factory(),
-        skills=skills if skills else None,
+        backend=backend_factory,
+        skills=None,
         memory=memory if memory else None,
         checkpointer=checkpointer,
         store=store,
@@ -188,13 +198,15 @@ def build_runtime_agent(
             )
     _mode = (model_routing.route_mode if model_routing else "direct") or "direct"
     logger.info(
-        "Runtime agent created: routing=%s model=%s subagents=%d tools=%d extra_middleware=%d memory_sources=%d",
+        "Runtime agent created: routing=%s model=%s subagents=%d tools=%d extra_middleware=%d memory_sources=%d skill_sources=%d skill_paths=%s",
         _mode,
         model_name,
         len(subagents or []),
         len(root_tools),
         len(middleware_list),
         len(memory or []),
+        len(skills or []),
+        skills or [],
     )
     return agent
 
@@ -252,19 +264,6 @@ def base_orchestrator_hitl_prompt() -> str:
     return "HITL: `request_human_input()`은 승인/민감/모호 등 **사람 판단이 필요한 경우에만** 호출하세요."
 
 
-def compact_orchestrator_prompt_for_work_assistant_only() -> str:
-    """Compact prompt used for HTTP chat work_assistant_only routing.
-
-    Goal: minimize repeated system prompt cost across tool-call steps.
-    """
-    return (
-        "당신은 ProcessGPT 오케스트레이터입니다.\n"
-        "- 이 실행은 `work_assistant_only` 라우팅입니다.\n"
-        "- `task()`를 호출하지 말고, 가능한 한 **work-assistant MCP 도구**만으로 목표를 달성하세요.\n"
-        "- MCP만으로 부족하면 `write_http_chat_route(route='needs_task')`로 승격하고 그때부터 필요한 규칙을 따르세요.\n"
-        "- 최종 출력은 요구된 래퍼(JSON output/result 규칙)를 지키며, 본문 텍스트는 반드시 한글로 작성하세요.\n"
-    )
-
 
 def build_orchestrator_prompt_sections(
     *,
@@ -274,8 +273,6 @@ def build_orchestrator_prompt_sections(
     agents: list[dict[str, Any]] | None,
     feedback: str | None,
     form_info: Mapping[str, Any] | None,
-    is_chat: bool = False,
-    http_chat_route: str | None = None,
     tenant_id: str | None = None,
     output_language: str | None = None,
     hitl_resume: Mapping[str, str] | None = None,
@@ -287,9 +284,6 @@ def build_orchestrator_prompt_sections(
     - These sections are designed to be recombined per model-call step.
     - Avoid adding global, long-lived rules into small sections unless they are truly required.
     """
-    route_norm = (http_chat_route or "").strip().lower().replace("-", "_")
-    suppress_multi_agent_sections = bool(is_chat and route_norm == "work_assistant_only")
-
     desc = (description or "").strip()
     instr = (instruction or "").strip()
     idata = input_data or {}
@@ -352,23 +346,22 @@ def build_orchestrator_prompt_sections(
 
     sec2 = ""
     agent_lines: list[str] = []
-    if not suppress_multi_agent_sections:
-        for ag in agents or []:
-            name = ag.get("alias") or ag.get("username") or ag.get("name") or str(ag.get("id"))
-            role = ag.get("role") or "Unspecified role"
-            skills = ag.get("skills") or ""
-            tools = ag.get("tools") or ""
-            agent_lines.append(
-                f"- Agent '{name}': role={role}, skills={skills or '(none)'}, tools={tools or '(none)'}"
-            )
-        if agent_lines:
-            sec2 = (
-                "=== 섹션 2: 사용 가능한 서브에이전트/스킬(`task()`로 호출) ===\n"
-                "아래 이름의 서브에이전트를 **`task(subagent_type=...)`** 로 호출해 도메인 실행을 수행합니다.\n"
-                "- 도메인 작업은 직접 흉내 내지 말고 반드시 적합한 에이전트에 위임합니다.\n"
-                + "\n".join(agent_lines)
-                + "\n"
-            )
+    for ag in agents or []:
+        name = ag.get("alias") or ag.get("username") or ag.get("name") or str(ag.get("id"))
+        role = ag.get("role") or "Unspecified role"
+        skills = ag.get("skills") or ""
+        tools = ag.get("tools") or ""
+        agent_lines.append(
+            f"- Agent '{name}': role={role}, skills={skills or '(none)'}, tools={tools or '(none)'}"
+        )
+    if agent_lines:
+        sec2 = (
+            "=== 섹션 2: 사용 가능한 서브에이전트/스킬(`task()`로 호출) ===\n"
+            "아래 이름의 서브에이전트를 **`task(subagent_type=...)`** 로 호출해 도메인 실행을 수행합니다.\n"
+            "- 도메인 작업은 직접 흉내 내지 말고 반드시 적합한 에이전트에 위임합니다.\n"
+            + "\n".join(agent_lines)
+            + "\n"
+        )
 
     fb = (feedback or "").strip()
     has_feedback = bool(fb)
@@ -396,21 +389,18 @@ def build_orchestrator_prompt_sections(
                 "- HTML 폼 정의가 제공되었습니다. 기대 출력(예: report/slide/multidata 섹션 등)을 설명할 때 타입/구조 힌트로 활용하세요.\n"
             )
 
-    sec5 = ""
-    sec5b = ""
-    if not suppress_multi_agent_sections:
-        sec5 = (
-            "=== 섹션 5: 멀티 에이전트 실행 규칙 ===\n"
-            "- 단계별로 **`task()`** 를 호출해 서브에이전트를 실행하고, 반환·도구 로그를 근거로 다음 호출을 결정합니다.\n"
-            "- `write_pipeline_spec` / `write_todos`는 선택 메모일 뿐이며, 이들만으로 실행을 기대하지 마세요.\n"
-            "- 다수 파일이 있어도 **검증 가능한 덩어리**(인벤토리, 스키마 JSON, 매핑 표) 단위로 나누어 위임합니다.\n"
-            "- 양식/템플릿 의도: 템플릿 PDF 구조 추출 → BPMN/참고 문서 사실 추출 → 매핑 → xlsx 렌더 → 업로드 순을 `task()` 체인으로 수행합니다.\n"
-            "- 조사/조회는 source, endpoint_or_series, as_of, value, unit 등 증거 필드를 요구합니다.\n"
-        )
-        sec5b = (
-            "=== 섹션 5b: 스킬 파일 누락 시 샌드박스 대체 실행 ===\n"
-            "- API/Sheets/스크립트 작업은 “스킬 파일이 없다”로 끝내지 말고, 담당 서브에이전트에게 샌드박스/대체 실행을 지시합니다.\n"
-        )
+    sec5 = (
+        "=== 섹션 5: 멀티 에이전트 실행 규칙 ===\n"
+        "- 단계별로 **`task()`** 를 호출해 서브에이전트를 실행하고, 반환·도구 로그를 근거로 다음 호출을 결정합니다.\n"
+        "- `write_pipeline_spec` / `write_todos`는 선택 메모일 뿐이며, 이들만으로 실행을 기대하지 마세요.\n"
+        "- 다수 파일이 있어도 **검증 가능한 덩어리**(인벤토리, 스키마 JSON, 매핑 표) 단위로 나누어 위임합니다.\n"
+        "- 양식/템플릿 의도: 템플릿 PDF 구조 추출 → BPMN/참고 문서 사실 추출 → 매핑 → xlsx 렌더 → 업로드 순을 `task()` 체인으로 수행합니다.\n"
+        "- 조사/조회는 source, endpoint_or_series, as_of, value, unit 등 증거 필드를 요구합니다.\n"
+    )
+    sec5b = (
+        "=== 섹션 5b: 스킬 파일 누락 시 샌드박스 대체 실행 ===\n"
+        '- API/Sheets/스크립트 작업은 "스킬 파일이 없다"로 끝내지 말고, 담당 서브에이전트에게 샌드박스/대체 실행을 지시합니다.\n'
+    )
 
     sec6 = (
         "=== 섹션 6: 최종 출력 형식 요구사항 ===\n"
@@ -431,7 +421,6 @@ def build_orchestrator_prompt_sections(
     )
 
     return {
-        "base_compact": compact_orchestrator_prompt_for_work_assistant_only().strip(),
         # base_full is intentionally short; step-specific rules are selected by middleware.
         "base_full": base_orchestrator_identity_prompt().strip(),
         "base_identity": base_orchestrator_identity_prompt().strip(),
@@ -452,14 +441,9 @@ def build_orchestrator_prompt_sections(
         "sec5b": sec5b.strip(),
         "sec6": sec6.strip(),
         "chat_output": chat_output.strip(),
-        "http_chat_rules_wa": (
-            "[HTTP_CHAT_EXECUTION_RULES]\n"
-            "- 현재 라우팅은 `work_assistant_only` 입니다. work-assistant MCP만 사용하세요.\n"
-            "- MCP만으로 부족하면 `write_http_chat_route(route='needs_task')`로 승격하세요.\n"
-        ).strip(),
         "http_chat_rules_generic": (
             "[HTTP_CHAT_EXECUTION_RULES]\n"
-            "- 라우팅은 `work_assistant_only`/`needs_task`/`ask_user_first` 중 하나입니다.\n"
+            "- 라우팅은 `needs_task`/`ask_user_first` 중 하나입니다.\n"
             "- MCP만으로 부족하면 `needs_task`로 라우팅 후 계획 제출(write_todos/pipeline_spec) 뒤 task()로 위임하세요.\n"
             "- 의도 확인이 필요하면 `ask_user_first`로 선언한 뒤 **`request_human_input` 도구만** 사용하세요(일반 텍스트로만 질문 나열 금지).\n"
         ).strip(),
@@ -487,8 +471,6 @@ def build_orchestrator_system_prompt(
     agents: list[dict[str, Any]] | None,
     feedback: str | None,
     form_info: Mapping[str, Any] | None,
-    is_chat: bool = False,
-    http_chat_route: str | None = None,
     tenant_id: str | None = None,
     output_language: str | None = None,
     hitl_resume: Mapping[str, str] | None = None,
@@ -507,8 +489,6 @@ def build_orchestrator_system_prompt(
         agents=agents,
         feedback=feedback,
         form_info=form_info,
-        is_chat=is_chat,
-        http_chat_route=http_chat_route,
         tenant_id=tenant_id,
         output_language=output_language,
         hitl_resume=hitl_resume,

@@ -167,3 +167,38 @@ class LocalSandboxRuntime:
             copied.append(rel_ws.as_posix())
         return {"source": str(source), "dest": str(dest_root), "copied_files": sorted(copied)}
 
+    def copy_skill_tree_from_path(
+        self,
+        workspace: SandboxWorkspace,
+        *,
+        source_path: str,
+        dest_subdir: str = "skill",
+    ) -> dict[str, Any]:
+        """Copy a skill directory from an arbitrary absolute path into the sandbox workspace.
+
+        Used for GitHub-fetched skills written to SKILLS_ROOT_DIR without a tenant prefix.
+        """
+        source = Path(source_path).resolve()
+        if not source.exists():
+            return {"source": str(source), "copied_files": [], "error": "source_missing"}
+        if not source.is_dir():
+            return {"source": str(source), "copied_files": [], "error": "source_not_dir"}
+
+        workspace_root = Path(workspace.path).resolve()
+        dest_root = (workspace_root / dest_subdir.strip("/")).resolve()
+        if workspace_root not in dest_root.parents and dest_root != workspace_root:
+            raise ValueError("dest_subdir escapes workspace")
+        dest_root.mkdir(parents=True, exist_ok=True)
+
+        copied: list[str] = []
+        for src_file in source.rglob("*"):
+            if not src_file.is_file():
+                continue
+            rel_to_skill = src_file.relative_to(source)
+            dst = dest_root / rel_to_skill
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dst)
+            rel_ws = dst.relative_to(workspace_root)
+            copied.append(rel_ws.as_posix())
+        return {"source": str(source), "dest": str(dest_root), "copied_files": sorted(copied)}
+

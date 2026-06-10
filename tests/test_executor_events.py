@@ -202,7 +202,7 @@ class ExecutorEventTests(unittest.TestCase):
         self.assertEqual(_classify_tenant_context_tool(T("search", "mem0")), "mem0")
         self.assertEqual(_classify_tenant_context_tool(T("x", "org-memento")), "memento")
         self.assertEqual(_classify_tenant_context_tool(T("dmn_rule", "dmn-rule")), "dmn_rule")
-        self.assertIsNone(_classify_tenant_context_tool(T("list_skills", "claude-skills")))
+        self.assertIsNone(_classify_tenant_context_tool(T("list_skills", "some-mcp")))
 
     def test_duplicate_hitl_request_detection(self) -> None:
         try:
@@ -243,6 +243,54 @@ class ExecutorEventTests(unittest.TestCase):
         self.assertEqual(out.content, "hello")
         self.assertEqual(out.tool_call_id, "call-abc")
         self.assertEqual(out.name, "request_human_input")
+
+    def test_new_status_update_event_crew_type_result_omits_unspecified_fields(self) -> None:
+        try:
+            from app.executor.a2a_events import new_status_update_event
+            from app.executor.context import ExecutionContext
+        except Exception as exc:
+            self.skipTest(f"imports unavailable: {exc}")
+            return
+
+        # Case 1: crew_type is 'result', unspecified logical_event_type, phase, agent_name
+        ctx = ExecutionContext(
+            correlation_id="c1",
+            agent_path=["test_agent"],
+            task_id="t1",
+            proc_inst_id="p1",
+        )
+        evt = new_status_update_event(
+            event_type="task_started",
+            data={"message": "hello"},
+            proc_inst_id="p1",
+            task_id="t1",
+            crew_type="result",
+            exec_ctx=ctx,
+        )
+        from google.protobuf.json_format import MessageToDict
+        meta = MessageToDict(evt.metadata)
+        payload = meta.get("payload", {})
+        self.assertNotIn("logical_event_type", payload)
+        self.assertNotIn("phase", payload)
+        self.assertNotIn("agent_name", payload)
+
+        # Case 2: crew_type is 'result', but they are explicitly provided
+        evt_explicit = new_status_update_event(
+            event_type="task_started",
+            data={"message": "hello"},
+            proc_inst_id="p1",
+            task_id="t1",
+            crew_type="result",
+            exec_ctx=ctx,
+            logical_event_type="custom_started",
+            phase="custom_phase",
+            agent_name="custom_agent",
+        )
+        meta_explicit = MessageToDict(evt_explicit.metadata)
+        payload_explicit = meta_explicit.get("payload", {})
+        self.assertEqual(payload_explicit.get("logical_event_type"), "custom_started")
+        self.assertEqual(payload_explicit.get("phase"), "custom_phase")
+        self.assertEqual(payload_explicit.get("agent_name"), "custom_agent")
 
 
 if __name__ == "__main__":
