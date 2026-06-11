@@ -16,6 +16,7 @@ import atexit
 import io
 import logging
 import os
+import re
 import tarfile
 import threading
 from pathlib import Path
@@ -34,6 +35,19 @@ logger = logging.getLogger(__name__)
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "python:3.13-slim")
 _CONTAINER_WORKSPACE = "/workspace"
 _MAX_OUTPUT_BYTES = 100_000
+
+# "bash: line 1: curl: command not found" 또는 "sh: jq: not found" 에서 커맨드명 추출
+_CMD_NOT_FOUND_RE = re.compile(
+    r"(?:bash|sh|zsh|dash)(?:: line \d+)?: (\S+): (?:command not found|not found)"
+)
+
+# 커맨드명과 apt 패키지명이 다른 경우
+_PACKAGE_OVERRIDES: dict[str, str] = {
+    "python": "python3",
+    "pip": "python3-pip",
+    "pip3": "python3-pip",
+    "node": "nodejs",
+}
 
 _registry: dict[str, "DockerSandboxBackend"] = {}
 _registry_lock = threading.Lock()
@@ -146,34 +160,52 @@ class DockerSandboxBackend(BaseSandbox):
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         container = self._ensure_container()
         _timeout = timeout or 180
-        holder: dict = {}
 
-        def _run() -> None:
-            exit_code, output = container.exec_run(
-                ["bash", "-c", command],
-                workdir=_CONTAINER_WORKSPACE,
-                demux=False,
+        def _exec(cmd: str) -> tuple[int, str]:
+            holder: dict = {}
+
+            def _run() -> None:
+                # Don't pass workdir= to exec_run: on macOS + Colima/Docker Desktop,
+                # runc resolves the bind-mount target back to the host path and
+                # raises "current working directory is outside of container mount
+                # namespace root". cd inside bash bypasses that OCI-level check.
+                wrapped = f"cd {_CONTAINER_WORKSPACE} && ( {cmd} )"
+                exit_code, output = container.exec_run(
+                    ["bash", "-c", wrapped],
+                    demux=False,
+                )
+                holder["exit_code"] = exit_code
+                holder["output"] = (output or b"").decode("utf-8", errors="replace")
+
+            thread = threading.Thread(target=_run, daemon=True)
+            thread.start()
+            thread.join(_timeout)
+
+            if thread.is_alive():
+                return 124, f"ERROR: command timed out after {_timeout}s"
+            return holder.get("exit_code") or 0, holder.get("output", "")
+
+        exit_code, out = _exec(command)
+
+        # 커맨드를 찾을 수 없는 경우 apt-get으로 자동 설치 후 1회 재시도
+        match = _CMD_NOT_FOUND_RE.search(out)
+        if match:
+            missing = match.group(1)
+            pkg = _PACKAGE_OVERRIDES.get(missing, missing)
+            logger.info("auto-installing missing command %r (package=%r)", missing, pkg)
+            install_cmd = (
+                "DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -1 "
+                f"&& apt-get install -y -qq --no-install-recommends {pkg} 2>&1 | tail -3"
             )
-            holder["exit_code"] = exit_code
-            holder["output"] = (output or b"").decode("utf-8", errors="replace")
+            container.exec_run(["bash", "-c", install_cmd], demux=False)
+            exit_code, out = _exec(command)
 
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        thread.join(_timeout)
-
-        if thread.is_alive():
-            return ExecuteResponse(
-                output=f"ERROR: command timed out after {_timeout}s",
-                exit_code=124,
-            )
-
-        out = holder.get("output", "")
         truncated = len(out) > _MAX_OUTPUT_BYTES
         if truncated:
             out = out[:_MAX_OUTPUT_BYTES] + "\n...[truncated]"
         return ExecuteResponse(
             output=out,
-            exit_code=holder.get("exit_code") or 0,
+            exit_code=exit_code,
             truncated=truncated,
         )
 
