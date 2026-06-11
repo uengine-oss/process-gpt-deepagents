@@ -28,7 +28,13 @@ async def build_agent(
     middleware: list = None,
 ):
     tools = list(extra_tools or []) + get_hitl_tools()
-    backend = LocalShellBackend(root_dir=str(_BASE_DIR), virtual_mode=False, inherit_env=True)
+    # 요청 tenant_id 를 셸 백엔드 env 로 주입한다(정적 .env 가 아니라 요청별 런타임 값).
+    # inherit_env=True 면 os.environ 복사본에 이 env 를 덮어쓰므로, 요청마다 별도 백엔드라
+    # 동시성에 안전하다. 스킬 후처리 스크립트(run_postprocess.py)가 TENANT_ID 로 읽는다.
+    backend_env = {"TENANT_ID": tenant_id} if tenant_id else None
+    backend = LocalShellBackend(
+        root_dir=str(_BASE_DIR), virtual_mode=False, inherit_env=True, env=backend_env
+    )
     built_subagents = await _build_subagents(
         subagents_raw or [], tenant_id, tenant_mcp, backend=backend
     )
