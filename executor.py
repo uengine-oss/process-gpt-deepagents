@@ -174,7 +174,7 @@ class DeepAgentExecutor(AgentExecutor):
         await event_queue.enqueue_event(task_started_evt)
 
         checkpointer = await get_async_postgres_checkpointer()
-        checkpoint_thread_id = resolve_checkpoint_thread_id(is_chat=is_chat, row=row) or context_id
+        checkpoint_thread_id = chat_room_id if is_chat else (resolve_checkpoint_thread_id(is_chat=False, row=row) or chat_room_id)
 
         inputs, use_graph_resume = build_graph_inputs(
             user_message,

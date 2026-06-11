@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from langgraph.types import Command
+
+# [user][이름]: 또는 [assistant][이름][agentId=...]: 형식 파싱
+_MSG_RE = re.compile(r'\[(user|assistant)\](?:\[[^\]]*\])*:\s*')
 
 
 def build_user_message(
@@ -62,18 +66,54 @@ def resolve_chat_room_id(extras: dict[str, Any], row: dict[str, Any]) -> str:
     return ""
 
 
-def collect_recent_messages(extras: dict[str, Any]) -> list[dict[str, Any]]:
-    """extras에서 채팅 히스토리를 정규화해 반환한다."""
+def _parse_history_string(s: str) -> list[dict[str, Any]]:
+    """'[user][이름]: 내용' 형식의 문자열(또는 줄바꿈으로 연결된 여러 메시지)을 파싱한다."""
     result: list[dict[str, Any]] = []
-    for it in (extras.get("room_recent_history") or []):
-        if not isinstance(it, dict):
-            continue
-        role = str(it.get("role") or "").strip().lower()
-        if role not in ("user", "assistant"):
-            continue
-        content = str(it.get("content") or "").strip()
+    # 각 메시지 시작 위치를 찾아 분리
+    for m in re.finditer(
+        r'\[(user|assistant)\](?:\[[^\]]*\])*:\s*(.*?)(?=\n\[(?:user|assistant)\]|\Z)',
+        s,
+        re.DOTALL,
+    ):
+        role = m.group(1)
+        content = m.group(2).strip()
         if content:
             result.append({"role": role, "content": content})
+    return result
+
+
+def collect_recent_messages(extras: dict[str, Any]) -> list[dict[str, Any]]:
+    """extras에서 채팅 히스토리를 정규화해 반환한다.
+
+    metadata.room_recent_history 우선 조회.
+    값은 문자열, 문자열 리스트, 딕셔너리 리스트 모두 처리한다.
+    """
+    metadata = extras.get("metadata") or {}
+    raw = metadata.get("room_recent_history") or extras.get("room_recent_history") or []
+
+    # 단일 문자열: 전체 히스토리가 하나의 문자열로 온 경우
+    if isinstance(raw, str):
+        return _parse_history_string(raw)
+
+    result: list[dict[str, Any]] = []
+    for it in raw:
+        if isinstance(it, str):
+            # 문자열 리스트: 각 항목이 '[user][...]: 내용' 형식
+            m = _MSG_RE.match(it)
+            if m:
+                role = re.search(r'\[(user|assistant)\]', it)
+                if role:
+                    content = it[m.end():].strip()
+                    if content:
+                        result.append({"role": role.group(1), "content": content})
+        elif isinstance(it, dict):
+            # 딕셔너리 리스트 형식도 하위 호환 지원
+            role_str = str(it.get("role") or "").strip().lower()
+            if role_str not in ("user", "assistant"):
+                continue
+            content = str(it.get("content") or "").strip()
+            if content:
+                result.append({"role": role_str, "content": content})
     return result
 
 
