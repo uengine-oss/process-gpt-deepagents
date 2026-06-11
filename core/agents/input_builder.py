@@ -65,7 +65,7 @@ def resolve_chat_room_id(extras: dict[str, Any], row: dict[str, Any]) -> str:
 def collect_recent_messages(extras: dict[str, Any]) -> list[dict[str, Any]]:
     """extras에서 채팅 히스토리를 정규화해 반환한다."""
     result: list[dict[str, Any]] = []
-    for it in (extras.get("room_recent_messages") or []):
+    for it in (extras.get("room_recent_history") or []):
         if not isinstance(it, dict):
             continue
         role = str(it.get("role") or "").strip().lower()

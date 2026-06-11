@@ -63,7 +63,7 @@ def _get_lock() -> asyncio.Lock:
 
 
 def _resolve_skills_root() -> str:
-    _base = Path(__file__).parent.parent
+    _base = Path(__file__).parent.parent.parent
     raw = os.getenv("SKILLS_DIRS", str(_base / "skills"))
     first = raw.split(",")[0].strip() or str(_base / "skills")
     if not os.path.isabs(first):

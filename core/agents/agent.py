@@ -1,15 +1,19 @@
 from pathlib import Path
 
 from deepagents import create_deep_agent
-from deepagents.backends.local_shell import LocalShellBackend
 from langgraph.checkpoint.memory import MemorySaver
 
-from .hitl import get_hitl_tools
-from .model import _build_model
-from .skills import _get_skills
+from ..sandbox.docker_sandbox import get_or_create_sandbox
+from ..chat.hitl import get_hitl_tools
+from ..llm.model import _build_model
+from ..rag.tools import get_memento_tools
+from ..skills.skills import _get_skills
 from .subagents import _build_subagents
+from ..skills.tools import extract_document_structure, list_github_repos, publish_skill
 
-_BASE_DIR = Path(__file__).parent.parent
+_BASE_DIR = Path(__file__).parent.parent.parent
+_SKILLS_DIR = _BASE_DIR / "skills"
+_SKILLS_CONTAINER_MOUNT = "/skills"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant. "
@@ -26,10 +30,16 @@ async def build_agent(
     subagents_raw: list = None,
     tenant_mcp: dict | None = None,
     middleware: list = None,
+    static_subagents: list = None,
 ):
-    tools = list(extra_tools or []) + get_hitl_tools()
-    backend = LocalShellBackend(root_dir=str(_BASE_DIR), virtual_mode=False, inherit_env=True)
-    built_subagents = await _build_subagents(
+    tools = (
+        list(extra_tools or [])
+        + get_hitl_tools()
+        + get_memento_tools()
+        + [extract_document_structure, list_github_repos, publish_skill]
+    )
+    backend = get_or_create_sandbox(tenant_id, workspace_host=_BASE_DIR / "workspace", skills_host=_SKILLS_DIR)
+    built_subagents = list(static_subagents or []) + await _build_subagents(
         subagents_raw or [], tenant_id, tenant_mcp, backend=backend
     )
 
@@ -45,11 +55,20 @@ async def build_agent(
     else:
         final_prompt = system_prompt
 
+    host_skills = _get_skills(tenant_id) or []
+    container_skills = []
+    for p in host_skills:
+        try:
+            rel = Path(p).relative_to(_SKILLS_DIR)
+            container_skills.append(f"{_SKILLS_CONTAINER_MOUNT}/{rel}")
+        except ValueError:
+            container_skills.append(p)
+
     kwargs = dict(
         model=_build_model(),
         tools=tools,
         system_prompt=final_prompt,
-        skills=_get_skills(tenant_id),
+        skills=container_skills or None,
         backend=backend,
         checkpointer=checkpointer if checkpointer is not None else MemorySaver(),
     )

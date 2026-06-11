@@ -3,8 +3,8 @@ import re
 
 from deepagents import SubAgent
 
-from .mcp import _load_mcp_tools
-from .skills import FilteredSkillsMiddleware, _get_skills
+from ..llm.mcp import _load_mcp_tools
+from ..skills.skills import FilteredSkillsMiddleware, _get_skills
 
 logger = logging.getLogger(__name__)
 
