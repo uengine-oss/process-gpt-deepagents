@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .db import get_supabase
+from ..storage.db import get_supabase
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ def build_fallback_subagent(
 ) -> dict[str, Any] | None:
     """Build a SubAgent-compatible dict from activity-declared tools/skills.
 
-    The returned dict shape is understood by core.subagents._build_subagents:
+    The returned dict shape is understood by core.agents.subagents._build_subagents:
     - tools: CSV/list of MCP server names
     - skills: CSV of skill names
     """

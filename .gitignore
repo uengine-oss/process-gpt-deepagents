@@ -12,3 +12,8 @@ wheels/
 
 # Sensitive credentials
 credentials.json
+
+# Skills - only allow anthropics-skills
+skills/*
+!skills/anthropics-skills/
+

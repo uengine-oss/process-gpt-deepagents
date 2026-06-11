@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import Any
 
-from .db import get_supabase, json_normalize, now_iso
+from ..storage.db import get_supabase, json_normalize, now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,13 @@ def merge_chat_room_context_from_event(
     if et == "plan_todos":
         todos = evt.get("todos")
         if isinstance(todos, list):
-            ctx["todos"] = [x for x in todos if isinstance(x, dict)]
+            new_todos = [x for x in todos if isinstance(x, dict)]
+            cur_todos = [x for x in (ctx.get("todos") or []) if isinstance(x, dict)]
+            with_ids = [x for x in new_todos if str(x.get("id") or "").strip()]
+            without_ids = [x for x in new_todos if not str(x.get("id") or "").strip()]
+            merged_todos = _upsert_by_id(cur_todos, with_ids)
+            merged_todos.extend(without_ids)
+            ctx["todos"] = merged_todos
             en = dict(ctx.get("enabled") or {})
             en["todos"] = bool(ctx["todos"])
             ctx["enabled"] = en
@@ -207,7 +213,42 @@ def upsert_chat_room_start(
     ) or None
     prev_ctx = existing.get("context") if isinstance(existing, dict) else None
     if isinstance(prev_ctx, dict):
-        ctx_final: dict[str, Any] = {**prev_ctx, **(context if isinstance(context, dict) else {})}
+        new_ctx = context if isinstance(context, dict) else {}
+        ctx_final: dict[str, Any] = {**prev_ctx, **new_ctx}
+        for list_key in ("tools", "skills", "todos"):
+            prev_list = prev_ctx.get(list_key)
+            new_list = new_ctx.get(list_key)
+            if isinstance(prev_list, list) and isinstance(new_list, list):
+                if list_key == "skills":
+                    prev_s = [str(s).strip() for s in prev_list if str(s).strip()]
+                    new_s = [str(s).strip() for s in new_list if str(s).strip()]
+                    ctx_final[list_key] = list(dict.fromkeys([*prev_s, *new_s]))
+                else:
+                    def _upsert_lists(prev: list, new: list) -> list:
+                        by_id: dict[str, dict] = {}
+                        order: list[str] = []
+                        for x in prev:
+                            if not isinstance(x, dict):
+                                continue
+                            xid = str(x.get("id") or "").strip()
+                            if xid and xid not in by_id:
+                                order.append(xid)
+                            if xid:
+                                by_id[xid] = dict(x)
+                        no_id: list[dict] = []
+                        for x in new:
+                            if not isinstance(x, dict):
+                                continue
+                            xid = str(x.get("id") or "").strip()
+                            if not xid:
+                                no_id.append(x)
+                            elif xid in by_id:
+                                by_id[xid] = {**by_id[xid], **x}
+                            else:
+                                order.append(xid)
+                                by_id[xid] = dict(x)
+                        return [by_id[i] for i in order if i in by_id] + no_id
+                    ctx_final[list_key] = _upsert_lists(prev_list, new_list)
     else:
         ctx_final = dict(context) if isinstance(context, dict) else build_initial_chat_room_context()
     ctx_final = json_normalize(ctx_final)

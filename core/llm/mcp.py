@@ -58,15 +58,15 @@ async def _load_mcp_tools(server_names: list[str], tenant_mcp: dict) -> list:
         return []
 
 
-def ensure_work_assistant_mcp(tenant_mcp: dict, tenant_id: str = "") -> dict:
-    """SUPABASE_* 환경 변수가 있으면 work-assistant MCP를 mcpServers에 주입한다.
+def ensure_process_gpt_mcp(tenant_mcp: dict, tenant_id: str = "") -> dict:
+    """SUPABASE_* 환경 변수가 있으면 process-gpt-mcp MCP를 mcpServers에 주입한다.
 
-    이미 work-assistant가 있거나 SUPABASE_URL/KEY가 없으면 원본을 그대로 반환한다.
+    이미 process-gpt-mcp가 있거나 SUPABASE_URL/KEY가 없으면 원본을 그대로 반환한다.
     """
     if not isinstance(tenant_mcp, dict):
         tenant_mcp = {}
     mcp_servers = dict(tenant_mcp.get("mcpServers") or {})
-    if "work-assistant" in mcp_servers:
+    if "process-gpt-mcp" in mcp_servers:
         return tenant_mcp
 
     sb_url = os.environ.get("SUPABASE_URL", "").strip()
@@ -84,23 +84,23 @@ def ensure_work_assistant_mcp(tenant_mcp: dict, tenant_id: str = "") -> dict:
     if jwt_secret:
         wa_env["SUPABASE_JWT_SECRET"] = jwt_secret
 
-    mcp_servers["work-assistant"] = {
+    mcp_servers["process-gpt-mcp"] = {
         "command": "uvx",
         "args": ["process-gpt-mcp"],
         "env": wa_env,
     }
-    logger.info("work-assistant MCP 주입 | tenant_id=%s", tenant_id)
+    logger.info("process-gpt-mcp MCP 주입 | tenant_id=%s", tenant_id)
     return {**tenant_mcp, "mcpServers": mcp_servers}
 
 
 async def load_chat_root_tools(tenant_mcp: dict) -> list:
-    """채팅 모드 루트 오케스트레이터용 work-assistant 도구를 로드한다."""
-    if "work-assistant" not in (tenant_mcp.get("mcpServers") or {}):
+    """채팅 모드 루트 오케스트레이터용 process-gpt-mcp 도구를 로드한다."""
+    if "process-gpt-mcp" not in (tenant_mcp.get("mcpServers") or {}):
         return []
     try:
-        tools = await _load_mcp_tools(["work-assistant"], tenant_mcp)
-        logger.info("work-assistant 루트 도구: %d개", len(tools))
+        tools = await _load_mcp_tools(["process-gpt-mcp"], tenant_mcp)
+        logger.info("process-gpt-mcp 루트 도구: %d개", len(tools))
         return tools
     except Exception:
-        logger.warning("work-assistant 루트 도구 로드 실패", exc_info=True)
+        logger.warning("process-gpt-mcp 루트 도구 로드 실패", exc_info=True)
         return []

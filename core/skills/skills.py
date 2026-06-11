@@ -4,7 +4,7 @@ from pathlib import Path
 
 from deepagents.middleware.skills import SkillsMiddleware, SkillsStateUpdate
 
-_BASE_DIR = Path(__file__).parent.parent
+_BASE_DIR = Path(__file__).parent.parent.parent
 
 logger = logging.getLogger(__name__)
 

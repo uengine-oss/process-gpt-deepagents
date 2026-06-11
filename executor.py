@@ -20,27 +20,65 @@ from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Overwrite
 from typing_extensions import override
 
-from core.agent import build_agent
-from core.checkpointer import get_async_postgres_checkpointer, resolve_checkpoint_thread_id
-from core.hitl import extract_interrupt_payload, is_duplicate_hitl_request
-from core.input_builder import (
+from core.agents.agent import build_agent
+from core.storage.checkpointer import get_async_postgres_checkpointer, resolve_checkpoint_thread_id
+from core.chat.hitl import extract_interrupt_payload, is_duplicate_hitl_request
+from core.agents.input_builder import (
     build_graph_inputs,
     build_user_message,
     collect_recent_messages,
     resolve_chat_room_id,
 )
-from core.activity import build_fallback_subagent, load_activity_capabilities
-from core.chat_room import (
+from core.chat.activity import build_fallback_subagent, load_activity_capabilities
+from core.chat.chat_room import (
     a_update_chat_room_context,
     a_upsert_chat_room_start,
     build_initial_chat_room_context,
 )
-from core.mcp import ensure_work_assistant_mcp, load_chat_root_tools
-from core.github_skill_fetcher import prefetch_github_skills
-from core.output_utils import extract_final_text, extract_json_text
-from core.token_hygiene import ToolResultTruncationMiddleware
+from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
+from core.skills.github_skill_fetcher import prefetch_github_skills
+from core.utils.output_utils import extract_final_text, extract_json_text
+from core.llm.token_hygiene import ToolResultTruncationMiddleware
+from core.skills.skills import _get_skills
+from core.agents.skill_creator_subagents import build_skill_creator_subagents
+from core.skills.tools import _current_tenant_id as _skill_tenant_id
 
 logger = logging.getLogger(__name__)
+
+
+def _skills_from_tool_args(tool_args: dict) -> list[str]:
+    """Return skill names whose directory paths appear in any string value of tool_args."""
+    import os
+    from pathlib import Path
+
+    bases = _get_skills() or []
+    if not bases:
+        skills_root = os.getenv("SKILLS_DIRS", str(Path(__file__).parent / "skills"))
+        bases = [str(Path(skills_root).resolve())]
+
+    found: list[str] = []
+
+    def _scan(v: object) -> None:
+        if isinstance(v, dict):
+            for item in v.values():
+                _scan(item)
+        elif isinstance(v, list):
+            for item in v:
+                _scan(item)
+        elif isinstance(v, str):
+            for base in bases:
+                base = base.rstrip("/")
+                idx = v.find(base)
+                if idx == -1:
+                    continue
+                rest = v[idx + len(base):]
+                parts = [p for p in rest.split("/") if p]
+                # base is collection-level ({root}/{collection}), so parts[0] is skill name
+                if parts:
+                    found.append(parts[0])
+
+    _scan(tool_args)
+    return list(dict.fromkeys(found))
 
 
 class DeepAgentExecutor(AgentExecutor):
@@ -59,6 +97,7 @@ class DeepAgentExecutor(AgentExecutor):
         row = ctx_data.get("row", {})
 
         tenant_id = str(row.get("tenant_id") or extras.get("tenant_id") or "").strip()
+        _skill_tenant_id.set(tenant_id)
         agents = extras.get("agents", [])
         streamer = extras.get("streamer")
         form_id = extras.get("form_id")
@@ -83,11 +122,11 @@ class DeepAgentExecutor(AgentExecutor):
             except Exception:
                 logger.warning("tenant_mcp DB 조회 실패 | tenant_id=%s", tenant_id, exc_info=True)
 
-        is_chat = str(extras.get("request_kind") or "").strip().lower() == "chat"
+        is_chat = streamer is not None
         chat_room_id = resolve_chat_room_id(extras, row if isinstance(row, dict) else {})
 
         if is_chat:
-            tenant_mcp = ensure_work_assistant_mcp(tenant_mcp, tenant_id)
+            tenant_mcp = ensure_process_gpt_mcp(tenant_mcp, tenant_id)
         chat_root_tools = await load_chat_root_tools(tenant_mcp) if is_chat else []
 
         if is_chat and chat_room_id and tenant_id:
@@ -113,6 +152,8 @@ class DeepAgentExecutor(AgentExecutor):
         )
         recent_msgs = collect_recent_messages(extras) if is_chat else []
 
+        metadata = extras.get("metadata",{})
+
         await event_queue.enqueue_event(
             new_task(task_id=task_id, context_id=context_id, state=TaskState.TASK_STATE_SUBMITTED)
         )
@@ -133,7 +174,7 @@ class DeepAgentExecutor(AgentExecutor):
         await event_queue.enqueue_event(task_started_evt)
 
         checkpointer = await get_async_postgres_checkpointer()
-        checkpoint_thread_id = resolve_checkpoint_thread_id(is_chat=is_chat, row=row) or context_id
+        checkpoint_thread_id = chat_room_id if is_chat else (resolve_checkpoint_thread_id(is_chat=False, row=row) or chat_room_id)
 
         inputs, use_graph_resume = build_graph_inputs(
             user_message,
@@ -218,7 +259,24 @@ class DeepAgentExecutor(AgentExecutor):
             except Exception:
                 logger.warning("chat_room context update 실패 | type=%s", et, exc_info=True)
 
-        config = {"configurable": {"thread_id": checkpoint_thread_id}}
+        sources = extras.get("sources") or []
+        knowledge_doc_ids = [
+            s.get("file_id", "") for s in sources
+            if isinstance(s, dict) and s.get("file_id")
+        ]
+        if not knowledge_doc_ids:
+            knowledge_docs = (metadata or {}).get("knowledge_docs") or []
+            knowledge_doc_ids = [
+                d.get("id", "") for d in knowledge_docs
+                if isinstance(d, dict) and d.get("id")
+            ]
+        config = {
+            "configurable": {
+                "thread_id": checkpoint_thread_id,
+                "tenant_id": tenant_id,
+                "knowledge_doc_ids": knowledge_doc_ids,
+            }
+        }
         graph = await build_agent(
             tenant_id=tenant_id,
             checkpointer=checkpointer,
@@ -226,10 +284,13 @@ class DeepAgentExecutor(AgentExecutor):
             tenant_mcp=tenant_mcp,
             extra_tools=chat_root_tools,
             middleware=[ToolResultTruncationMiddleware()],
+            static_subagents=build_skill_creator_subagents(task_id=task_id),
         )
         active_tool_calls: dict[str, str] = {}
         full_response = ""
         final_state: dict[str, Any] = {}
+        ask_user_args: dict | None = None
+        _seen_msg_namespaces: dict[str, str] = {}
 
         try:
             async for stream_evt, data in graph.astream(
@@ -243,6 +304,12 @@ class DeepAgentExecutor(AgentExecutor):
                             if isinstance(b, dict) and b.get("type") == "text"
                         )
                         if text:
+                            msg_id = getattr(msg, "id", "") or ""
+                            if msg_id:
+                                ns = (_meta or {}).get("langgraph_checkpoint_ns", "") if isinstance(_meta, dict) else ""
+                                first_ns = _seen_msg_namespaces.setdefault(msg_id, ns)
+                                if first_ns != ns:
+                                    continue
                             full_response += text
                             await event_queue.enqueue_event(
                                 new_text_message(text=text, role=Role.ROLE_AGENT)
@@ -293,6 +360,31 @@ class DeepAgentExecutor(AgentExecutor):
                                         }
                                         await streamer.send_json(_pt_payload)
                                         asyncio.create_task(_update_chat_ctx(_pt_payload))
+
+                                        skill_names = _skills_from_tool_args(tool_args)
+                                        if skill_names:
+                                            _ps_payload = {"type": "plan_skills", "skills": skill_names}
+                                            await streamer.send_json(_ps_payload)
+                                            asyncio.create_task(_update_chat_ctx(_ps_payload))
+
+                                        if tool_name == "write_todos":
+                                            todos = tool_args.get("todos") if isinstance(tool_args, dict) else None
+                                            if isinstance(todos, list):
+                                                _ptd_payload = {"type": "plan_todos", "todos": todos}
+                                                await streamer.send_json(_ptd_payload)
+                                                asyncio.create_task(_update_chat_ctx(_ptd_payload))
+
+                                        if tool_name == "ask_user":
+                                            raw_suggestions = tool_args.get("suggestions", []) if isinstance(tool_args, dict) else []
+                                            if isinstance(raw_suggestions, str):
+                                                try:
+                                                    raw_suggestions = json.loads(raw_suggestions)
+                                                except (json.JSONDecodeError, ValueError):
+                                                    raw_suggestions = []
+                                            ask_user_args = {
+                                                "question": tool_args.get("question", "") if isinstance(tool_args, dict) else "",
+                                                "suggestions": raw_suggestions,
+                                            }
 
                             elif isinstance(msg, ToolMessage):
                                 tool_name = active_tool_calls.pop(
@@ -397,7 +489,12 @@ class DeepAgentExecutor(AgentExecutor):
             )
             await event_queue.enqueue_event(result_started_evt)
 
-            final_text = extract_json_text(raw_text) if form_id else raw_text
+            if ask_user_args is not None:
+                final_text = json.dumps(ask_user_args, ensure_ascii=False)
+            elif form_id:
+                final_text = extract_json_text(raw_text)
+            else:
+                final_text = raw_text
             result_done_evt = new_text_status_update_event(
                 task_id=task_id,
                 context_id=context_id,
@@ -436,6 +533,8 @@ class DeepAgentExecutor(AgentExecutor):
                     text=json.dumps({"error": str(e)}, ensure_ascii=False),
                 )
             )
+            if streamer:
+                await streamer.send_json({"type": "done", "content": f"{type(e).__name__}: {e}"})
 
         return None
 
