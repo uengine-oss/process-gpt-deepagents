@@ -23,11 +23,11 @@ def extract_interrupt_payload(result: Dict[str, Any]) -> Optional[Dict[str, Any]
         return {"raw": interrupts}
 
 
-class RequestHumanInputArgs(BaseModel):
+class AskUserArgs(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    question: str = Field(default="", description="사람에게 물어볼 구체적인 질문 또는 요청.")
-    context: str = Field(default="", description="결정을 돕기 위한 배경 설명(선택).")
+    question: str = Field(default="", description="사용자에게 물어볼 질문 또는 요청.")
+    context: str = Field(default="", description="결정을 돕기 위한 배경 설명 또는 선택지 목록(선택).")
 
     @model_validator(mode="before")
     @classmethod
@@ -45,7 +45,7 @@ class RequestHumanInputArgs(BaseModel):
         return out
 
     @model_validator(mode="after")
-    def _ensure_question(self) -> RequestHumanInputArgs:
+    def _ensure_question(self) -> AskUserArgs:
         if not (self.question or "").strip():
             object.__setattr__(
                 self,
@@ -55,7 +55,7 @@ class RequestHumanInputArgs(BaseModel):
         return self
 
 
-def _request_human_input_impl(question: str, context: str = "") -> str:
+def _ask_user_impl(question: str, context: str = "") -> str:
     payload = {"question": question, "context": context}
     response = interrupt(payload)
     if isinstance(response, dict):
@@ -63,21 +63,25 @@ def _request_human_input_impl(question: str, context: str = "") -> str:
     return str(response)
 
 
-request_human_input = StructuredTool.from_function(
-    func=_request_human_input_impl,
-    name="request_human_input",
+ask_user = StructuredTool.from_function(
+    func=_ask_user_impl,
+    name="ask_user",
     description=(
         "사람 개입(HITL)이 필요할 때 호출하는 도구. "
-        "명시적 인간 승인, 민감 정보 확인, 모호한 요청 명확화가 필요한 경우 사용한다. "
-        "내부에서 LangGraph interrupt()를 발생시켜 그래프 실행을 일시 중단한다."
+        "명시적 인간 승인, 민감 정보 확인, 모호한 요청 명확화, 선택지 제시 등 "
+        "모든 사용자 입력이 필요한 상황에서 사용한다. "
+        "context에 배경 설명이나 선택지를 포함할 수 있다. "
+        "내부에서 LangGraph interrupt()를 발생시켜 그래프 실행을 일시 중단한다. "
+        "단, GitHub 토큰·GitHub 인증 정보는 시스템이 자동으로 관리하므로 "
+        "이 도구로 요청하지 마세요."
     ),
-    args_schema=RequestHumanInputArgs,
+    args_schema=AskUserArgs,
     return_direct=False,
 )
 
 
 def get_hitl_tools() -> list[Any]:
-    return [request_human_input]
+    return [ask_user]
 
 
 # ---------------------------------------------------------------------------

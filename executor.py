@@ -97,6 +97,10 @@ class DeepAgentExecutor(AgentExecutor):
         row = ctx_data.get("row", {})
 
         tenant_id = str(row.get("tenant_id") or extras.get("tenant_id") or "").strip()
+        user_jwt = extras.get("user_jwt")
+        user_email = extras.get("user_email")
+        user_name = extras.get("user_name")
+
         _skill_tenant_id.set(tenant_id)
         agents = extras.get("agents", [])
         streamer = extras.get("streamer")
@@ -197,7 +201,7 @@ class DeepAgentExecutor(AgentExecutor):
         if human_answer_stripped:
             resume_run_state = {
                 "pending_field": run_state.get("pending_field") or "human_response",
-                "tool_name": run_state.get("tool_name") or "request_human_input",
+                "tool_name": run_state.get("tool_name") or "ask_user",
                 "last_question": run_state.get("last_question") or "",
                 "checkpoint_thread_id": checkpoint_thread_id or "",
                 "resume_source": "checkpoint_graph_resume" if use_graph_resume else "human_response",
@@ -285,16 +289,20 @@ class DeepAgentExecutor(AgentExecutor):
             extra_tools=chat_root_tools,
             middleware=[ToolResultTruncationMiddleware()],
             static_subagents=build_skill_creator_subagents(task_id=task_id),
+            user_context={
+                "user_jwt": user_jwt,
+                "user_email": user_email,
+                "user_name": user_name,
+            },
         )
         active_tool_calls: dict[str, str] = {}
         full_response = ""
         final_state: dict[str, Any] = {}
-        ask_user_args: dict | None = None
         _seen_msg_namespaces: dict[str, str] = {}
 
         try:
-            async for stream_evt, data in graph.astream(
-                inputs, config=config, stream_mode=["messages", "updates", "values"]
+            async for _ns, stream_evt, data in graph.astream(
+                inputs, config=config, stream_mode=["messages", "updates", "values"], subgraphs=True
             ):
                 if stream_evt == "messages":
                     msg, _meta = data
@@ -374,18 +382,6 @@ class DeepAgentExecutor(AgentExecutor):
                                                 await streamer.send_json(_ptd_payload)
                                                 asyncio.create_task(_update_chat_ctx(_ptd_payload))
 
-                                        if tool_name == "ask_user":
-                                            raw_suggestions = tool_args.get("suggestions", []) if isinstance(tool_args, dict) else []
-                                            if isinstance(raw_suggestions, str):
-                                                try:
-                                                    raw_suggestions = json.loads(raw_suggestions)
-                                                except (json.JSONDecodeError, ValueError):
-                                                    raw_suggestions = []
-                                            ask_user_args = {
-                                                "question": tool_args.get("question", "") if isinstance(tool_args, dict) else "",
-                                                "suggestions": raw_suggestions,
-                                            }
-
                             elif isinstance(msg, ToolMessage):
                                 tool_name = active_tool_calls.pop(
                                     msg.tool_call_id, getattr(msg, "name", "unknown")
@@ -411,7 +407,8 @@ class DeepAgentExecutor(AgentExecutor):
                                     asyncio.create_task(_update_chat_ctx(_te_payload))
 
                 elif stream_evt == "values" and isinstance(data, dict):
-                    final_state = data
+                    if not _ns:  # root graph only — ignore subagent intermediate states
+                        final_state = data
 
             raw_text = extract_final_text(final_state, streamed_fallback=full_response)
 
@@ -431,7 +428,7 @@ class DeepAgentExecutor(AgentExecutor):
 
                 new_run_state = {
                     "pending_field": pending_field,
-                    "tool_name": "request_human_input",
+                    "tool_name": "ask_user",
                     "last_question": question,
                     "checkpoint_thread_id": checkpoint_thread_id or "",
                 }
@@ -454,6 +451,16 @@ class DeepAgentExecutor(AgentExecutor):
                     hitl_evt.metadata,
                 )
                 await event_queue.enqueue_event(hitl_evt)
+                ae_text = f"{question}\n\n{context_text}"
+                artifact_evt = new_text_artifact_update_event(
+                    task_id=task_id,
+                    context_id=context_id,
+                    name="assistant_response",
+                    text=ae_text,
+                    last_chunk=True,
+                )
+                ParseDict({"role": "assistant"}, artifact_evt.metadata)
+                await event_queue.enqueue_event(artifact_evt)
                 return {"status": "waiting_for_human", "run_state": new_run_state}
 
             result_completed_evt = new_text_status_update_event(
@@ -489,9 +496,7 @@ class DeepAgentExecutor(AgentExecutor):
             )
             await event_queue.enqueue_event(result_started_evt)
 
-            if ask_user_args is not None:
-                final_text = json.dumps(ask_user_args, ensure_ascii=False)
-            elif form_id:
+            if form_id:
                 final_text = extract_json_text(raw_text)
             else:
                 final_text = raw_text
