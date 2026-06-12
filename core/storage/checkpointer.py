@@ -102,7 +102,7 @@ async def get_async_postgres_checkpointer() -> Any | None:
         try:
             pool = AsyncConnectionPool(
                 conninfo=uri,
-                kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+                kwargs={"autocommit": True, "prepare_threshold": None, "row_factory": dict_row},
                 min_size=1,
                 max_size=10,
                 open=False,

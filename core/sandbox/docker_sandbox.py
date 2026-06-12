@@ -19,6 +19,7 @@ import os
 import re
 import tarfile
 import threading
+import time
 from pathlib import Path
 
 import docker
@@ -103,8 +104,28 @@ class DockerSandboxBackend(BaseSandbox):
                     pass
                 self._container = None
 
-            self._container = self._start_container()
+            self._container = self._start_container_with_retry()
             return self._container
+
+    def _start_container_with_retry(
+        self, *, max_attempts: int = 10, initial_delay: float = 2.0
+    ) -> docker.models.containers.Container:
+        """dind가 아직 준비 중일 때 exponential backoff로 재시도한다."""
+        delay = initial_delay
+        for attempt in range(max_attempts):
+            try:
+                return self._start_container()
+            except docker.errors.DockerException as exc:
+                if attempt >= max_attempts - 1:
+                    raise
+                logger.warning(
+                    "Docker not ready (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt + 1, max_attempts, exc, delay,
+                )
+                time.sleep(delay)
+                delay = min(delay * 1.5, 30.0)
+                self._client = _get_docker_client()
+        raise RuntimeError("unreachable")
 
     def _start_container(self) -> docker.models.containers.Container:
         name = f"deepagent-sandbox-{self._tenant_id or 'shared'}"
