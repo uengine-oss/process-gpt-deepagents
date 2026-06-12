@@ -11,10 +11,9 @@ from a2a.server.events import EventQueue
 from a2a.helpers import (
     new_task,
     new_text_artifact_update_event,
-    new_text_message,
     new_text_status_update_event,
 )
-from a2a.types import Role, TaskState
+from a2a.types import TaskState
 from google.protobuf.json_format import ParseDict
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Overwrite
@@ -319,9 +318,6 @@ class DeepAgentExecutor(AgentExecutor):
                                 if first_ns != ns:
                                     continue
                             full_response += text
-                            await event_queue.enqueue_event(
-                                new_text_message(text=text, role=Role.ROLE_AGENT)
-                            )
                             if streamer:
                                 await streamer.send_json({"type": "token", "content": text})
 
