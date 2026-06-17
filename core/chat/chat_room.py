@@ -20,6 +20,72 @@ def build_initial_chat_room_context(*, has_file: bool = False) -> dict[str, Any]
     })
 
 
+class CtxAccumulator:
+    """In-memory accumulator for chat room context during a single streaming session.
+
+    Rules (per user spec):
+    - tools: append each tool_start in execution order; tool_end updates the last
+      matching "running" entry to "done" (root-agent tools appear in both the stream
+      handler and the ToolTrackingCallback — the first tool_start wins, subsequent
+      duplicates for the same tool while it is still "running" are skipped).
+    - skills: deduplicated list from plan_skills events.
+    - todos: list from plan_todos events.
+
+    A single DB write is performed after streaming ends via to_context().
+    """
+
+    def __init__(self) -> None:
+        self.tools: list[dict[str, Any]] = []
+        self.skills: list[str] = []
+        self.todos: list[dict[str, Any]] = []
+
+    def push(self, payload: dict) -> None:
+        et = str(payload.get("type") or "")
+        if et == "tool_start":
+            tool = str(payload.get("tool") or "").strip()
+            if not tool:
+                return
+            # Skip if this tool is already "running" (dedup callback vs stream handler)
+            if not any(
+                e.get("tool") == tool and e.get("status") == "running"
+                for e in self.tools
+            ):
+                self.tools.append({"tool": tool, "status": "running"})
+        elif et == "tool_end":
+            tool = str(payload.get("tool") or "").strip()
+            if not tool:
+                return
+            for entry in reversed(self.tools):
+                if entry.get("tool") == tool and entry.get("status") == "running":
+                    entry["status"] = "done"
+                    return
+            # No matching running entry (e.g. subagent tool_end without prior start)
+            self.tools.append({"tool": tool, "status": "done"})
+        elif et == "plan_skills":
+            for s in (payload.get("skills") or []):
+                s = str(s).strip()
+                if s and s not in self.skills:
+                    self.skills.append(s)
+        elif et == "plan_todos":
+            for t in (payload.get("todos") or []):
+                if isinstance(t, dict):
+                    self.todos.append(t)
+
+    def to_context(self) -> dict[str, Any]:
+        return json_normalize({
+            "tools": self.tools,
+            "skills": self.skills,
+            "todos": self.todos,
+            "enabled": {
+                "todos": bool(self.todos),
+                "tools": True,
+                "skills": bool(self.skills),
+            },
+            "updatedAt": now_iso(),
+            "orchestration": "deepagents",
+        })
+
+
 def _tool_plan_to_context_tools(tools: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if not isinstance(tools, list):
@@ -301,8 +367,26 @@ def update_chat_room_context(
     sb.table("chat_rooms").update({"context": ctx1}).eq("id", rid).execute()
 
 
+def set_chat_room_context(
+    *,
+    tenant_id: str,
+    room_id: str,
+    context: dict[str, Any],
+) -> None:
+    """Overwrite the chat_room context with the given dict — no read, no merge."""
+    tid = (tenant_id or "").strip()
+    rid = (room_id or "").strip()
+    if not tid or not rid:
+        return
+    get_supabase().table("chat_rooms").update({"context": context}).eq("id", rid).execute()
+
+
 async def a_upsert_chat_room_start(**kwargs: Any) -> None:
     await asyncio.to_thread(upsert_chat_room_start, **kwargs)
+
+
+async def a_set_chat_room_context(**kwargs: Any) -> None:
+    await asyncio.to_thread(set_chat_room_context, **kwargs)
 
 
 async def a_update_chat_room_context(**kwargs: Any) -> None:

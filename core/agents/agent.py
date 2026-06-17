@@ -13,12 +13,13 @@ from .subagents import _build_subagents
 from ..skills.tools import (
     checkout_to_workspace,
     extract_document_structure,
-    list_github_repos,
+    list_git_repos,
     publish_skill,
     _current_sandbox as _skill_sandbox,
     _current_user_name as _skill_user_name,
     _current_user_email as _skill_user_email,
 )
+from ..storage.storage import set_tenant_id as _set_storage_tenant_id
 
 _BASE_DIR = Path(__file__).parent.parent.parent
 _SKILLS_DIR = Path(os.getenv("SKILLS_HOST", str(_BASE_DIR / "skills")))
@@ -29,10 +30,10 @@ DEFAULT_SYSTEM_PROMPT = (
     "Use the available tools when needed to answer questions accurately. "
     "Reply in Korean unless the user writes in another language."
     "\n\n## 코드·스킬 작업 규칙\n"
-    "스킬이나 GitHub 레포지토리의 코드를 읽거나 수정·실행해야 할 때는 "
+    "스킬이나 Git 레포지토리의 코드를 읽거나 수정·실행해야 할 때는 "
     "**반드시 `checkout_to_workspace`를 먼저 호출**해 /workspace/ 로 가져온 뒤 작업하세요.\n"
     "- 스킬명이 /skills/ 에 있으면 자동으로 복사됩니다.\n"
-    "- 없으면 GitHub 레포를 자동으로 clone합니다.\n"
+    "- 없으면 설정된 Git 레포를 자동으로 clone합니다.\n"
     "이 판단은 모델이 자율적으로 내려야 합니다. "
     "어떤 경로를 써야 하는지 사용자에게 묻지 마세요."
 )
@@ -53,12 +54,13 @@ async def build_agent(
         list(extra_tools or [])
         + get_hitl_tools()
         + get_memento_tools()
-        + [checkout_to_workspace, extract_document_structure, list_github_repos, publish_skill]
+        + [checkout_to_workspace, extract_document_structure, list_git_repos, publish_skill]
     )
     backend = get_or_create_sandbox(tenant_id, workspace_host=_BASE_DIR / "workspace", skills_host=_SKILLS_DIR)
     _skill_sandbox.set(backend)
     _skill_user_name.set((user_context or {}).get("user_name") or "")
     _skill_user_email.set((user_context or {}).get("user_email") or "")
+    _set_storage_tenant_id(tenant_id)
     built_subagents = list(static_subagents or []) + await _build_subagents(
         subagents_raw or [], tenant_id, tenant_mcp, backend=backend
     )
@@ -78,8 +80,8 @@ async def build_agent(
         delegation_prompt = (
             f"\n\n## 서브에이전트 위임 규칙\n"
             f"현재 다음 서브에이전트가 구성되어 있습니다: {agent_names}\n"
-            f"사용자 요청은 반드시 적절한 서브에이전트에게 task() 툴로 위임해야 합니다. "
-            f"직접 답변하지 마세요."
+            f"요청이 서브에이전트의 역할·전문 영역에 해당하면 task() 툴로 위임하세요. "
+            f"서브에이전트의 역할과 무관한 일반 요청은 직접 처리하세요."
         )
         final_prompt = system_prompt + delegation_prompt
     else:

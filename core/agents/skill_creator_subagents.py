@@ -4,7 +4,7 @@ build_skill_creator_subagents()를 호출해 SubAgent 목록을 얻은 뒤
 build_agent(static_subagents=...) 로 전달한다.
 
 포함된 서브에이전트:
-  repo-scout      — skill 생성 전 GitHub에 동일 스킬이 있는지 탐색
+  repo-scout      — skill 생성 전 Git 레포에 동일 스킬이 있는지 탐색
   rule-extractor  — Supabase storage 문서를 60/40 분할해 규칙 추출
   test-runner     — eval 프롬프트를 스킬 유무에 따라 실행하고 출력 저장
   evaluator       — grader.md 지침으로 assertion 채점 및 grading.json 생성
@@ -19,7 +19,7 @@ from deepagents import SubAgent
 from ..skills.tools import (
     WORKSPACE_ROOT,
     extract_document_structure,
-    list_github_repos,
+    list_git_repos,
 )
 from ..storage.storage import download_file, upload_artifact, upload_directory
 
@@ -37,7 +37,7 @@ _REPO_SCOUT_SYSTEM = """\
 You are a **repository-scout sub-agent** in the skill-creator pipeline.
 You are invoked at the START of every skill creation request, before any rule
 extraction or skill drafting, to determine whether the requested skill already
-exists in GitHub.
+exists in the configured Git provider.
 
 ## Inputs from task description
 
@@ -48,7 +48,7 @@ exists in GitHub.
 
 ### Step 1 — List existing repos
 
-Call `list_github_repos()` (no arguments). It returns a JSON array of objects:
+Call `list_git_repos()` (no arguments). It returns a JSON array of objects:
 ```
 [{"name": "...", "description": "...", "html_url": "...", "updated_at": "...", "default_branch": "..."}, ...]
 ```
@@ -70,7 +70,7 @@ Output a single JSON block (no surrounding prose):
 {
   "decision": "CREATE_NEW" | "MODIFY_EXISTING" | "CREATE_BRANCH",
   "skill_name": "<suggested kebab-case repo/folder name>",
-  "existing_repo_url": "<GitHub URL or null>",
+  "existing_repo_url": "<repo URL or null>",
   "existing_repo_name": "<repo name or null>",
   "suggested_branch": "<branch name or null>",
   "reasoning": "<1-2 sentences explaining the decision>"
@@ -481,7 +481,7 @@ def build_skill_creator_subagents(
         "name": "repo-scout",
         "description": (
             "Triggered at the START of every skill creation request, before rule extraction "
-            "or drafting. Calls `list_github_repos` to retrieve all existing skill repos, "
+            "or drafting. Calls `list_git_repos` to retrieve all existing skill repos, "
             "then compares the requested skill against them by name and description. "
             "Returns a JSON recommendation: CREATE_NEW (no match found), "
             "MODIFY_EXISTING (update the current main version of a matching repo), or "
@@ -489,7 +489,7 @@ def build_skill_creator_subagents(
             "Always invoke this sub-agent first when the user asks to create or build a skill."
         ),
         "system_prompt": _REPO_SCOUT_SYSTEM,
-        "tools": [list_github_repos],
+        "tools": [list_git_repos],
     }
 
     rule_extractor: SubAgent = {

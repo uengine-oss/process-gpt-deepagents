@@ -20,3 +20,9 @@ skills/*
 workspace/
 
 .vscode/
+
+.agent/
+.claude/
+.codex/
+
+openspec/
