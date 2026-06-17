@@ -170,7 +170,12 @@ def _push_skill_sandbox(
     if code != 0:
         return f"ERROR git push: {out}"
 
-    return f"Published '{skill_name}' → {html_url}/tree/{branch}"
+    return (
+        f"Published '{skill_name}' → {html_url}/tree/{branch}\n\n"
+        f"REGISTER_PROMPT: 이 스킬을 테넌트 스킬로 등록하시겠습니까? "
+        f"등록하면 에이전트가 이 스킬을 즉시 사용할 수 있습니다. "
+        f"(repo_url: {html_url})"
+    )
 
 
 # ---------------------------------------------------------------------------

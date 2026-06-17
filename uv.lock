@@ -1515,6 +1515,7 @@ dependencies = [
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
     { name = "python-dotenv" },
+    { name = "python-multipart" },
     { name = "starlette" },
     { name = "uvicorn" },
 ]
@@ -1545,6 +1546,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "psycopg-pool", specifier = ">=3.2" },
     { name = "python-dotenv", specifier = "==1.2.2" },
+    { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "starlette", specifier = "==1.2.1" },
     { name = "uvicorn", specifier = "==0.49.0" },
 ]

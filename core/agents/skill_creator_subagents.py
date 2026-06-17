@@ -21,7 +21,7 @@ from ..skills.tools import (
     extract_document_structure,
     list_git_repos,
 )
-from ..storage.storage import download_file, upload_artifact, upload_directory
+from ..storage.storage import download_file
 
 _BASE_DIR = Path(__file__).parent.parent.parent
 
@@ -362,10 +362,6 @@ All evaluation artifacts live **inside the skill root directory**:
    {"executor_duration_seconds": <float>, "total_duration_seconds": <float>}
    ```
    Use the actual wall-clock time you spent.
-8. Upload the outputs directory to Supabase storage:
-     upload_directory(task_id, outputs_dir)
-   where `task_id` comes from your task description.
-
 ## Rules
 - Do the work — do not just explain what you would do.
 - Save ALL produced files to `outputs_dir`, not to other locations.
@@ -423,13 +419,10 @@ def _build_evaluator_system(skill_creator_path: Path) -> str:
 2. Grade each assertion against the outputs and transcript.
 3. Save `grading.json` to `grading_path` specified in your task description.
 4. Be objective, cite specific evidence, apply no partial credit.
-5. Upload `grading.json` to Supabase storage:
-     upload_artifact(task_id, grading_path)
-   where `task_id` comes from your task description.
 
 ## Generating the eval viewer (run immediately after grading)
 
-After saving and uploading grading.json, generate a static HTML viewer:
+After saving grading.json, generate a static HTML viewer:
 
 1. Run benchmark aggregation:
    ```
@@ -445,12 +438,7 @@ After saving and uploading grading.json, generate a static HTML viewer:
            "--static <ws>/viewer.html")
    ```
 
-3. Upload the viewer:
-   ```
-   upload_artifact(task_id, "<ws>/viewer.html")
-   ```
-
-4. Include the viewer download URL in your response to the main agent.
+3. Report the local path `<ws>/viewer.html` in your response to the main agent.
 """
     return _EVALUATOR_PREAMBLE + grader_instructions + task_suffix
 
@@ -522,7 +510,7 @@ def build_skill_creator_subagents(
             "so they run in parallel."
         ),
         "system_prompt": _TEST_RUNNER_SYSTEM,
-        "tools": [upload_directory],
+        "tools": [],
     }
 
     evaluator: SubAgent = {
@@ -533,7 +521,7 @@ def build_skill_creator_subagents(
             "Provide the outputs directory, assertions list, and target grading path."
         ),
         "system_prompt": _build_evaluator_system(sc_path),
-        "tools": [upload_artifact],
+        "tools": [],
     }
 
     return [repo_scout, rule_extractor, test_runner, evaluator]

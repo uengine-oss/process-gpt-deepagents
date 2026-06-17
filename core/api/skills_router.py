@@ -52,7 +52,8 @@ def _scan_collection(col_path: str) -> list[dict]:
         except OSError:
             meta = {}
         skills.append({
-            "name": meta.get("name") or entry.name,
+            "name": entry.name,
+            "display_name": meta.get("name") or entry.name,
             "description": meta.get("description", ""),
             "collection": collection_name,
             "license": meta.get("license", ""),
@@ -113,6 +114,16 @@ def _find_tenant_skill_dir(skill_name: str, tenant_id: str) -> Path | None:
 def _get_provider(tenant_id: str):
     from core.skills.git_providers.factory import get_provider
     return get_provider(tenant_id)
+
+
+def _save_tenant_skill(tenant_id: str, skill_name: str, owner_id: str) -> None:
+    """tenant_skills 테이블에 스킬 등록 정보를 저장한다. 에이전트 도구로 노출하지 않는다."""
+    from core.storage.db import get_supabase
+    get_supabase().table("tenant_skills").insert({
+        "tenant_id": tenant_id,
+        "skill_name": skill_name,
+        "owner_id": owner_id,
+    }).execute()
 
 
 async def list_skills(request: Request) -> JSONResponse:
@@ -183,12 +194,16 @@ async def list_skill_branches(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=400)
 
     try:
-        branches = await asyncio.to_thread(provider.list_branches, provider.username, skill_name)
+        branches, default_branch = await asyncio.gather(
+            asyncio.to_thread(provider.list_branches, provider.username, skill_name),
+            asyncio.to_thread(provider.detect_default_branch, provider.username, skill_name),
+        )
     except Exception as e:
         logger.exception("list_branches failed for skill=%s tenant=%s", skill_name, tenant_id)
         return JSONResponse({"error": str(e)}, status_code=500)
 
-    return JSONResponse({"branches": branches})
+    annotated = [{**b, "default": b["name"] == default_branch} for b in branches]
+    return JSONResponse({"branches": annotated, "default_branch": default_branch})
 
 
 async def merge_skill_pull_request(request: Request) -> JSONResponse:
@@ -543,6 +558,166 @@ async def create_skill_repo(request: Request) -> JSONResponse:
     })
 
 
+async def upload_skill(request: Request) -> JSONResponse:
+    """압축 파일(.skill, .zip)을 받아 테넌트 스킬 디렉토리에 압축 해제하여 스킬로 등록한다."""
+    import tempfile
+    from core.skills.upload_utils import (
+        FileTooLargeError,
+        check_extension,
+        check_size,
+        extract_archive,
+        find_skill_root,
+        get_tenant_skill_dest,
+        list_skill_files,
+        skill_name_from_filename,
+    )
+
+    try:
+        form = await request.form()
+    except Exception:
+        return JSONResponse({"error": "multipart/form-data parsing failed"}, status_code=400)
+
+    tenant_id = form.get("tenant_id", "")
+    if not tenant_id:
+        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+
+    upload = form.get("file")
+    if upload is None:
+        return JSONResponse({"error": "file is required"}, status_code=400)
+
+    filename = getattr(upload, "filename", None) or "upload.zip"
+
+    try:
+        check_extension(filename)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    content = await upload.read()
+    try:
+        check_size(len(content))
+    except FileTooLargeError as e:
+        return JSONResponse({"error": str(e)}, status_code=413)
+
+    skill_name_override = form.get("skill_name", "")
+
+    tmpdir = tempfile.mkdtemp(prefix="skill-upload-")
+    tmp_path = Path(tmpdir)
+    try:
+        try:
+            extract_archive(content, tmp_path)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+        skill_root = find_skill_root(tmp_path)
+        if skill_root is None:
+            return JSONResponse(
+                {"error": "SKILL.md not found in archive — not a valid skill package"},
+                status_code=422,
+            )
+
+        skill_name = (
+            skill_name_override.strip()
+            or (skill_root.name if skill_root != tmp_path else skill_name_from_filename(filename))
+        )
+
+        dest = get_tenant_skill_dest(tenant_id, skill_name)
+        if dest.exists():
+            return JSONResponse(
+                {"error": f"skill '{skill_name}' already exists for tenant '{tenant_id}'"},
+                status_code=409,
+            )
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(shutil.move, str(skill_root), str(dest))
+        files = list_skill_files(dest)
+        return JSONResponse({"registered": True, "skill_name": skill_name, "files": files}, status_code=201)
+    finally:
+        await asyncio.to_thread(shutil.rmtree, tmpdir, True)
+
+
+async def upload_skill_from_git(request: Request) -> JSONResponse:
+    """Git 레포지토리 URL을 받아 테넌트 스킬 디렉토리에 clone하여 스킬로 등록한다."""
+    import subprocess
+    import tempfile
+    from core.skills.upload_utils import (
+        clone_skill_repo,
+        find_skill_root,
+        get_tenant_skill_dest,
+        list_skill_files,
+        skill_name_from_url,
+        validate_url_scheme,
+    )
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    tenant_id = body.get("tenant_id", "")
+    repo_url = body.get("repo_url", "")
+    skill_name_override = body.get("skill_name", "")
+    owner_id = body.get("owner_id", "")
+
+    if not tenant_id:
+        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+    if not repo_url:
+        return JSONResponse({"error": "repo_url is required"}, status_code=400)
+    if not owner_id:
+        return JSONResponse({"error": "owner_id is required"}, status_code=400)
+
+    try:
+        validate_url_scheme(repo_url)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    skill_name = skill_name_override.strip() or skill_name_from_url(repo_url)
+
+    dest = get_tenant_skill_dest(tenant_id, skill_name)
+    if dest.exists():
+        return JSONResponse(
+            {"error": f"skill '{skill_name}' already exists for tenant '{tenant_id}'"},
+            status_code=409,
+        )
+
+    tmpdir = tempfile.mkdtemp(prefix="skill-git-clone-")
+    tmp_dest = Path(tmpdir) / skill_name
+    try:
+        try:
+            await asyncio.to_thread(clone_skill_repo, repo_url, tmp_dest)
+        except subprocess.TimeoutExpired:
+            return JSONResponse(
+                {"error": f"git clone timed out for {repo_url!r}"},
+                status_code=504,
+            )
+        except RuntimeError as e:
+            return JSONResponse({"error": str(e)}, status_code=502)
+
+        skill_root = find_skill_root(tmp_dest)
+        if skill_root is None:
+            return JSONResponse(
+                {"error": "SKILL.md not found in repository — not a valid skill"},
+                status_code=422,
+            )
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(shutil.move, str(skill_root), str(dest))
+        files = list_skill_files(dest)
+
+        try:
+            await asyncio.to_thread(_save_tenant_skill, tenant_id, skill_name, owner_id)
+        except Exception as e:
+            logger.error("tenant_skills 저장 실패 skill=%s tenant=%s: %s", skill_name, tenant_id, e)
+            await asyncio.to_thread(shutil.rmtree, str(dest), True)
+            return JSONResponse({"error": f"skill 등록 중 DB 저장 실패: {e}"}, status_code=500)
+
+        return JSONResponse(
+            {"registered": True, "skill_name": skill_name, "repo_url": repo_url, "files": files},
+            status_code=201,
+        )
+    finally:
+        await asyncio.to_thread(shutil.rmtree, tmpdir, True)
+
+
 async def create_skill_branch(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -743,6 +918,8 @@ async def get_skill_file(request: Request) -> JSONResponse:
 routes = [
     Route("/skills", list_skills, methods=["GET"]),
     Route("/skills-builtin", list_builtin_skills, methods=["GET"]),
+    Route("/skills/upload", upload_skill, methods=["POST"]),
+    Route("/skills/upload-from-git", upload_skill_from_git, methods=["POST"]),
     Route("/skills/{skill_name}", delete_skill, methods=["DELETE"]),
     Route("/skills/{skill_name}/repo", create_skill_repo, methods=["POST"]),
     Route("/skills/{skill_name}/sync", sync_skill, methods=["POST"]),

@@ -115,55 +115,70 @@ def get_download_url(task_id: str, remote_name: str) -> str:
         return f"ERROR: {exc}"
 
 
-@tool
-def upload_artifact(task_id: str, file_path: str, remote_name: str | None = None) -> str:
-    """Upload a single artifact file to Supabase storage under skills/{tenant_id}/{task_id}/.
+def upload_artifact(task_id: str, file_path: str | Path, file_data: bytes, remote_name: str | None = None) -> str:
+    """Upload a single artifact to Supabase storage under skills/{tenant_id}/{task_id}/.
+
+    Called by orchestrator code after agents finish — NOT exposed as an agent tool.
 
     Args:
         task_id:     Unique identifier for the current task or skill iteration.
-        file_path:   Absolute path to the local file to upload.
-                     Must be under the workspace root.
-        remote_name: Override the remote filename. Defaults to the local filename.
+        file_path:   Original file path (used for mime-type detection and default name).
+        file_data:   File contents as bytes.
+        remote_name: Override the remote filename. Defaults to the original filename.
 
     Returns:
-        The storage path and public download URL on success, or an error message.
+        The public download URL on success, or an error message.
     """
     try:
         tenant_id = _require_tenant_id()
-        path = Path(file_path).expanduser().resolve()
-        _validate_workspace_path(path, "file_path")
-        if not path.exists():
-            return f"ERROR: file not found: {file_path}"
-
+        path = Path(file_path)
         dest_name = remote_name or path.name
         storage_path = _storage_path(tenant_id, task_id, dest_name)
         mime_type, _ = mimetypes.guess_type(str(path))
         mime_type = mime_type or "application/octet-stream"
 
         client = get_storage_supabase()
-        with path.open("rb") as fh:
-            data = fh.read()
         client.storage.from_(_BUCKET).upload(
             path=storage_path,
-            file=data,
+            file=file_data,
             file_options={"content-type": mime_type, "upsert": "true"},
         )
-        download_url = client.storage.from_(_BUCKET).get_public_url(storage_path)
-        return f"Uploaded: {storage_path}\nDownload URL: [다운로드]({download_url})"
+        return client.storage.from_(_BUCKET).get_public_url(storage_path)
     except Exception as exc:
         return f"ERROR: {exc}"
 
 
-@tool
-def upload_directory(task_id: str, dir_path: str, pattern: str = "**/*") -> str:
-    """Upload all matching files from a local directory to Supabase storage.
+def upload_workspace_file(task_id: str, file_path: str | Path, remote_name: str | None = None) -> str:
+    """Read a workspace file and upload it to Supabase storage.
 
-    Each file is stored at skills/{tenant_id}/{task_id}/{relative_path_within_dir}.
+    Called by orchestrator code after agents finish — NOT exposed as an agent tool.
+
+    Args:
+        task_id:     Unique identifier for the current task or skill iteration.
+        file_path:   Absolute path to the local file (must be under workspace root).
+        remote_name: Override the remote filename. Defaults to the local filename.
+
+    Returns:
+        The public download URL on success, or an error message.
+    """
+    try:
+        path = Path(file_path).expanduser().resolve()
+        _validate_workspace_path(path, "file_path")
+        if not path.exists():
+            return f"ERROR: file not found: {file_path}"
+        return upload_artifact(task_id, path, path.read_bytes(), remote_name)
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
+def upload_workspace_directory(task_id: str, dir_path: str | Path, pattern: str = "**/*") -> str:
+    """Upload all matching files from a workspace directory to Supabase storage.
+
+    Called by orchestrator code after agents finish — NOT exposed as an agent tool.
 
     Args:
         task_id:  Unique identifier for the current task or skill iteration.
-        dir_path: Absolute path to the local directory to upload.
-                  Must be under the workspace root.
+        dir_path: Absolute path to the local directory (must be under workspace root).
         pattern:  Glob pattern relative to dir_path (default: all files recursively).
 
     Returns:
@@ -176,7 +191,6 @@ def upload_directory(task_id: str, dir_path: str, pattern: str = "**/*") -> str:
         if not base.is_dir():
             return f"ERROR: not a directory: {dir_path}"
 
-        client = get_storage_supabase()
         uploaded: list[str] = []
         errors: list[str] = []
 
@@ -184,18 +198,12 @@ def upload_directory(task_id: str, dir_path: str, pattern: str = "**/*") -> str:
             if not local_file.is_file():
                 continue
             rel = local_file.relative_to(base)
-            storage_path = _storage_path(tenant_id, task_id, str(rel))
-            mime_type, _ = mimetypes.guess_type(str(local_file))
-            mime_type = mime_type or "application/octet-stream"
             try:
-                with local_file.open("rb") as fh:
-                    data = fh.read()
-                client.storage.from_(_BUCKET).upload(
-                    path=storage_path,
-                    file=data,
-                    file_options={"content-type": mime_type, "upsert": "true"},
-                )
-                uploaded.append(storage_path)
+                url = upload_artifact(task_id, local_file, local_file.read_bytes(), str(rel))
+                if url.startswith("ERROR:"):
+                    errors.append(f"{rel}: {url}")
+                else:
+                    uploaded.append(_storage_path(tenant_id, task_id, str(rel)))
             except Exception as exc:
                 errors.append(f"{rel}: {exc}")
 
