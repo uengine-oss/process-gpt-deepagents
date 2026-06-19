@@ -84,11 +84,11 @@ def _scan_builtin_skills() -> list[dict]:
     return []
 
 
-def _find_skill_dir(skill_name: str, tenant_id: str = "") -> Path | None:
+def _find_skill_dir(skill_name: str, tenant_id: str = "", config_id: str = "") -> Path | None:
     """스킬 이름으로 디스크 상의 스킬 디렉토리를 반환한다. 없으면 None."""
     from core.skills.skills import _get_skills
 
-    collection_dirs = _get_skills(tenant_id) or []
+    collection_dirs = _get_skills(tenant_id, config_id) or []
     for col_path in collection_dirs:
         candidate = Path(col_path) / skill_name
         if candidate.is_dir() and (candidate / "SKILL.md").exists():
@@ -96,7 +96,7 @@ def _find_skill_dir(skill_name: str, tenant_id: str = "") -> Path | None:
     return None
 
 
-def _find_tenant_skill_dir(skill_name: str, tenant_id: str) -> Path | None:
+def _find_tenant_skill_dir(skill_name: str, tenant_id: str, config_id: str = "") -> Path | None:
     """테넌트 전용 컬렉션에서만 스킬 디렉토리를 반환한다. 없으면 None."""
     _BASE_DIR = Path(__file__).parent.parent.parent
     raw = os.getenv("SKILLS_DIRS", str(_BASE_DIR / "skills"))
@@ -105,10 +105,61 @@ def _find_tenant_skill_dir(skill_name: str, tenant_id: str) -> Path | None:
         if not p:
             continue
         root = str((_BASE_DIR / p).resolve()) if not os.path.isabs(p) else p.rstrip("/")
-        candidate = Path(root) / tenant_id / skill_name
-        if candidate.is_dir() and (candidate / "SKILL.md").exists():
-            return candidate
+        if config_id:
+            # Provider-keyed path first
+            candidate = Path(root) / tenant_id / config_id / skill_name
+            if candidate.is_dir() and (candidate / "SKILL.md").exists():
+                return candidate
+            # Local uploads fallback
+            candidate = Path(root) / tenant_id / "local" / skill_name
+            if candidate.is_dir() and (candidate / "SKILL.md").exists():
+                return candidate
+        else:
+            candidate = Path(root) / tenant_id / skill_name
+            if candidate.is_dir() and (candidate / "SKILL.md").exists():
+                return candidate
     return None
+
+
+def _get_provider_keyed_skill_root(tenant_id: str, config_id: str) -> Path:
+    """provider-keyed 스킬 컬렉션 디렉토리 경로를 반환한다 (존재 여부 무관)."""
+    _BASE_DIR = Path(__file__).parent.parent.parent
+    raw = os.getenv("SKILLS_DIRS", str(_BASE_DIR / "skills"))
+    first = raw.split(",")[0].strip() or str(_BASE_DIR / "skills")
+    root = Path(first) if os.path.isabs(first) else (_BASE_DIR / first).resolve()
+    return root / tenant_id / config_id
+
+
+async def _ensure_skill_synced(provider, skill_name: str, tenant_id: str) -> Path | None:
+    """원격 스킬을 provider-keyed 로컬 캐시로 fetch한다. 실패하면 None을 반환한다."""
+    config_id = provider.config_id
+    if not config_id:
+        return None
+
+    skill_dir = _get_provider_keyed_skill_root(tenant_id, config_id) / skill_name
+    owner = provider.username
+    try:
+        branch = await asyncio.to_thread(provider.detect_default_branch, owner, skill_name)
+        tree = await asyncio.to_thread(provider.list_repo_tree, owner, skill_name, branch)
+    except Exception as e:
+        logger.warning("_ensure_skill_synced: remote fetch 실패 skill=%s: %s", skill_name, e)
+        return None
+
+    await asyncio.to_thread(skill_dir.mkdir, **{"parents": True, "exist_ok": True})
+    for item in tree:
+        if item.get("type") != "blob":
+            continue
+        path = item["path"]
+        try:
+            raw_bytes = await asyncio.to_thread(provider.fetch_file, owner, skill_name, branch, path)
+            target = (skill_dir / path).resolve()
+            target.relative_to(skill_dir.resolve())
+            await asyncio.to_thread(target.parent.mkdir, **{"parents": True, "exist_ok": True})
+            await asyncio.to_thread(target.write_bytes, raw_bytes)
+        except Exception as e:
+            logger.warning("_ensure_skill_synced: 파일 fetch 실패 %s: %s", path, e)
+
+    return skill_dir if (skill_dir / "SKILL.md").exists() else None
 
 
 def _get_provider(tenant_id: str):
@@ -149,6 +200,8 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     content = body.get("content")
     message = body.get("message") or f"update {file_path}"
     branch = body.get("branch", "main")
+    author_name = body.get("author_name") or None
+    author_email = body.get("author_email") or None
 
     if not tenant_id:
         return JSONResponse({"error": "tenant_id is required"}, status_code=400)
@@ -162,13 +215,17 @@ async def commit_skill_file(request: Request) -> JSONResponse:
 
     try:
         result = await asyncio.to_thread(
-            provider.update_file, provider.username, skill_name, file_path, content, message, branch
+            provider.update_file, provider.username, skill_name, file_path, content, message, branch,
+            author_name, author_email,
         )
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
     if branch == "main":
-        skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id)
+        config_id = provider.config_id
+        skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
+        if skill_dir is None and config_id:
+            skill_dir = _get_provider_keyed_skill_root(tenant_id, config_id) / skill_name
         if skill_dir is not None:
             resolved_skill = skill_dir.resolve()
             target = (skill_dir / file_path).resolve()
@@ -241,9 +298,12 @@ async def merge_skill_pull_request(request: Request) -> JSONResponse:
     if auto_sync:
         try:
             owner = provider.username
+            config_id = provider.config_id
             branch = await asyncio.to_thread(provider.detect_default_branch, owner, skill_name)
             tree = await asyncio.to_thread(provider.list_repo_tree, owner, skill_name, branch)
-            skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id)
+            skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
+            if skill_dir is None:
+                skill_dir = _get_provider_keyed_skill_root(tenant_id, config_id) / skill_name if config_id else None
             if skill_dir is None:
                 from core.skills.skills import _get_skills
                 collection_dirs = await asyncio.to_thread(_get_skills, tenant_id)
@@ -312,6 +372,32 @@ async def create_skill_pull_request(request: Request) -> JSONResponse:
     return JSONResponse({"created": True, **result})
 
 
+async def get_pull_request_files(request: Request) -> JSONResponse:
+    skill_name = request.path_params["skill_name"]
+    try:
+        number = int(request.path_params["number"])
+    except (KeyError, ValueError):
+        return JSONResponse({"error": "invalid PR number"}, status_code=400)
+
+    tenant_id = request.query_params.get("tenant_id", "")
+    if not tenant_id:
+        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+
+    try:
+        provider = await asyncio.to_thread(_get_provider, tenant_id)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    try:
+        files = await asyncio.to_thread(
+            provider.get_pull_request_files, provider.username, skill_name, number
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    return JSONResponse({"files": files})
+
+
 async def list_skill_pull_requests(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     tenant_id = request.query_params.get("tenant_id", "")
@@ -368,7 +454,21 @@ async def list_skill_files(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     tenant_id = request.query_params.get("tenant_id", "")
 
-    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id)
+    config_id = ""
+    if tenant_id:
+        try:
+            provider = await asyncio.to_thread(_get_provider, tenant_id)
+            config_id = provider.config_id
+        except Exception:
+            pass
+
+    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
+    if skill_dir is None and config_id:
+        try:
+            provider = await asyncio.to_thread(_get_provider, tenant_id)
+            skill_dir = await _ensure_skill_synced(provider, skill_name, tenant_id)
+        except Exception:
+            pass
     if skill_dir is None:
         return JSONResponse({"error": f"skill '{skill_name}' not found"}, status_code=404)
 
@@ -402,8 +502,15 @@ async def delete_skill(request: Request) -> JSONResponse:
     if mode not in ("local", "repo"):
         return JSONResponse({"error": "mode must be 'local' or 'repo'"}, status_code=400)
 
+    try:
+        provider = await asyncio.to_thread(_get_provider, tenant_id)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    config_id = provider.config_id
+
     if mode == "local":
-        skill_dir = await asyncio.to_thread(_find_tenant_skill_dir, skill_name, tenant_id)
+        skill_dir = await asyncio.to_thread(_find_tenant_skill_dir, skill_name, tenant_id, config_id)
         if skill_dir is None:
             return JSONResponse(
                 {"error": f"skill '{skill_name}' not found in tenant '{tenant_id}'"}, status_code=404
@@ -416,16 +523,11 @@ async def delete_skill(request: Request) -> JSONResponse:
 
     # mode == "repo": Git provider로 원격 레포 삭제 후 로컬도 정리
     try:
-        provider = await asyncio.to_thread(_get_provider, tenant_id)
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-    try:
         await asyncio.to_thread(provider.delete_repo, provider.username, skill_name)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-    skill_dir = await asyncio.to_thread(_find_tenant_skill_dir, skill_name, tenant_id)
+    skill_dir = await asyncio.to_thread(_find_tenant_skill_dir, skill_name, tenant_id, config_id)
     if skill_dir is not None:
         try:
             await asyncio.to_thread(shutil.rmtree, skill_dir)
@@ -446,6 +548,8 @@ async def delete_skill_file(request: Request) -> JSONResponse:
     tenant_id = body.get("tenant_id", "")
     message = body.get("message") or f"delete {file_path}"
     branch = body.get("branch", "main")
+    author_name = body.get("author_name") or None
+    author_email = body.get("author_email") or None
 
     if not tenant_id:
         return JSONResponse({"error": "tenant_id is required"}, status_code=400)
@@ -457,7 +561,8 @@ async def delete_skill_file(request: Request) -> JSONResponse:
 
     try:
         result = await asyncio.to_thread(
-            provider.delete_file, provider.username, skill_name, file_path, message, branch
+            provider.delete_file, provider.username, skill_name, file_path, message, branch,
+            author_name, author_email,
         )
     except FileNotFoundError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
@@ -466,7 +571,8 @@ async def delete_skill_file(request: Request) -> JSONResponse:
 
     # main 브랜치 편집일 때만 로컬 디스크도 삭제 (path traversal 방지 포함)
     if branch == "main":
-        skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id)
+        config_id = provider.config_id
+        skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
         if skill_dir is not None:
             resolved_skill = skill_dir.resolve()
             target = (skill_dir / file_path).resolve()
@@ -516,8 +622,9 @@ async def create_skill_repo(request: Request) -> JSONResponse:
     except Exception:
         actual_owner = provider.username
 
-    # 로컬 스킬 파일을 원격에 push
-    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id)
+    # 로컬 스킬 파일을 원격에 push (local 업로드 또는 provider-keyed 캐시에서 찾음)
+    config_id = provider.config_id
+    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
     pushed: list[str] = []
     errors: list[str] = []
 
@@ -620,7 +727,7 @@ async def upload_skill(request: Request) -> JSONResponse:
             or (skill_root.name if skill_root != tmp_path else skill_name_from_filename(filename))
         )
 
-        dest = get_tenant_skill_dest(tenant_id, skill_name)
+        dest = get_tenant_skill_dest(tenant_id, skill_name, config_id="local")
         if dest.exists():
             return JSONResponse(
                 {"error": f"skill '{skill_name}' already exists for tenant '{tenant_id}'"},
@@ -672,7 +779,7 @@ async def upload_skill_from_git(request: Request) -> JSONResponse:
 
     skill_name = skill_name_override.strip() or skill_name_from_url(repo_url)
 
-    dest = get_tenant_skill_dest(tenant_id, skill_name)
+    dest = get_tenant_skill_dest(tenant_id, skill_name, config_id="local")
     if dest.exists():
         return JSONResponse(
             {"error": f"skill '{skill_name}' already exists for tenant '{tenant_id}'"},
@@ -752,9 +859,11 @@ async def create_skill_branch(request: Request) -> JSONResponse:
 async def list_remote_skill_files(request: Request) -> JSONResponse:
     """원격 Git 레포의 특정 브랜치 파일 목록을 반환한다 (로컬 디스크 미사용)."""
     skill_name = request.path_params["skill_name"]
-    branch = request.path_params["branch"]
+    branch = request.query_params.get("branch", "")
     tenant_id = request.query_params.get("tenant_id", "")
 
+    if not branch:
+        return JSONResponse({"error": "branch is required"}, status_code=400)
     if not tenant_id:
         return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
@@ -777,10 +886,12 @@ async def list_remote_skill_files(request: Request) -> JSONResponse:
 async def get_remote_skill_file(request: Request) -> JSONResponse:
     """원격 Git 레포의 특정 브랜치에서 파일 내용을 반환한다 (로컬 디스크 미사용)."""
     skill_name = request.path_params["skill_name"]
-    branch = request.path_params["branch"]
+    branch = request.query_params.get("branch", "")
     file_path = request.path_params["file_path"]
     tenant_id = request.query_params.get("tenant_id", "")
 
+    if not branch:
+        return JSONResponse({"error": "branch is required"}, status_code=400)
     if not tenant_id:
         return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
@@ -840,13 +951,17 @@ async def sync_skill(request: Request) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id)
+    config_id = provider.config_id
+    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
     if skill_dir is None:
-        from core.skills.skills import _get_skills
-        collection_dirs = await asyncio.to_thread(_get_skills, tenant_id)
-        if not collection_dirs:
-            return JSONResponse({"error": "no skills directory configured"}, status_code=500)
-        skill_dir = Path(collection_dirs[0]) / skill_name
+        if config_id:
+            skill_dir = _get_provider_keyed_skill_root(tenant_id, config_id) / skill_name
+        else:
+            from core.skills.skills import _get_skills
+            collection_dirs = await asyncio.to_thread(_get_skills, tenant_id)
+            if not collection_dirs:
+                return JSONResponse({"error": "no skills directory configured"}, status_code=500)
+            skill_dir = Path(collection_dirs[0]) / skill_name
 
     blob_paths = [item["path"] for item in tree if item.get("type") == "blob"]
 
@@ -878,7 +993,21 @@ async def get_skill_file(request: Request) -> JSONResponse:
     file_path = request.path_params["file_path"]
     tenant_id = request.query_params.get("tenant_id", "")
 
-    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id)
+    config_id = ""
+    if tenant_id:
+        try:
+            provider = await asyncio.to_thread(_get_provider, tenant_id)
+            config_id = provider.config_id
+        except Exception:
+            pass
+
+    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
+    if skill_dir is None and config_id:
+        try:
+            provider = await asyncio.to_thread(_get_provider, tenant_id)
+            skill_dir = await _ensure_skill_synced(provider, skill_name, tenant_id)
+        except Exception:
+            pass
     if skill_dir is None:
         return JSONResponse({"error": f"skill '{skill_name}' not found"}, status_code=404)
 
@@ -926,11 +1055,12 @@ routes = [
     Route("/skills/{skill_name}/commit", commit_skill_file, methods=["POST"]),
     Route("/skills/{skill_name}/branches", list_skill_branches, methods=["GET"]),
     Route("/skills/{skill_name}/branches", create_skill_branch, methods=["POST"]),
-    Route("/skills/{skill_name}/branches/{branch}/files", list_remote_skill_files, methods=["GET"]),
-    Route("/skills/{skill_name}/branches/{branch}/files/{file_path:path}", get_remote_skill_file, methods=["GET"]),
+    Route("/skills/{skill_name}/branches/files", list_remote_skill_files, methods=["GET"]),
+    Route("/skills/{skill_name}/branches/files/{file_path:path}", get_remote_skill_file, methods=["GET"]),
     Route("/skills/{skill_name}/commits", list_skill_commits, methods=["GET"]),
     Route("/skills/{skill_name}/pull-requests", list_skill_pull_requests, methods=["GET"]),
     Route("/skills/{skill_name}/pull-requests", create_skill_pull_request, methods=["POST"]),
+    Route("/skills/{skill_name}/pull-requests/{number:int}/files", get_pull_request_files, methods=["GET"]),
     Route("/skills/{skill_name}/pull-requests/{number:int}/merge", merge_skill_pull_request, methods=["POST"]),
     Route("/skills/{skill_name}/files", list_skill_files, methods=["GET"]),
     Route("/skills/{skill_name}/files/{file_path:path}", get_skill_file, methods=["GET"]),

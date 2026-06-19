@@ -12,6 +12,7 @@ class GitProvider(ABC):
         self.username = username
         self.token = token
         self.base_url = base_url
+        self.config_id: str = ""  # tenant_git_config.id; set by factory after construction
 
     # ------------------------------------------------------------------
     # 레포지토리 조회
@@ -95,6 +96,8 @@ class GitProvider(ABC):
         content: str,
         message: str,
         branch: str,
+        author_name: str | None = None,
+        author_email: str | None = None,
     ) -> dict:
         """파일을 생성하거나 업데이트하고 {sha, html_url}을 반환한다."""
 
@@ -106,6 +109,8 @@ class GitProvider(ABC):
         path: str,
         message: str,
         branch: str,
+        author_name: str | None = None,
+        author_email: str | None = None,
     ) -> dict:
         """파일을 삭제하고 커밋한다. {sha, html_url}을 반환한다."""
 
@@ -159,3 +164,12 @@ class GitProvider(ABC):
     @abstractmethod
     def delete_repo(self, owner: str, repo: str) -> None:
         """레포지토리를 삭제한다."""
+
+    @abstractmethod
+    def get_pull_request_files(self, owner: str, repo: str, number: int) -> list[dict]:
+        """PR/MR에서 변경된 파일 목록을 반환한다.
+
+        각 항목: {filename, status, additions, deletions, patch}
+          - status: "added" | "removed" | "modified" | "renamed"
+          - patch: unified diff 문자열 (바이너리 파일이면 빈 문자열)
+        """

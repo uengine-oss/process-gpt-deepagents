@@ -143,10 +143,14 @@ def list_skill_files(skill_dir: Path) -> list[str]:
     ]
 
 
-def get_tenant_skill_dest(tenant_id: str, skill_name: str) -> Path:
-    """Return the canonical destination path for a tenant skill."""
+def get_tenant_skill_dest(tenant_id: str, skill_name: str, config_id: str = "local") -> Path:
+    """Return the canonical destination path for a tenant skill.
+
+    config_id scopes the path to a specific git provider config (tenant_git_config.id)
+    or "local" for skills uploaded via ZIP / external git URL.
+    """
     _BASE_DIR = Path(__file__).parent.parent.parent
     raw = os.getenv("SKILLS_DIRS", str(_BASE_DIR / "skills"))
     first = raw.split(",")[0].strip() or str(_BASE_DIR / "skills")
     root = Path(first) if os.path.isabs(first) else (_BASE_DIR / first).resolve()
-    return root / tenant_id / skill_name
+    return root / tenant_id / config_id / skill_name

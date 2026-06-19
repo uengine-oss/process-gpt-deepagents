@@ -135,7 +135,15 @@ class GitHubProvider(GitProvider):
         ]
 
     def update_file(
-        self, owner: str, repo: str, path: str, content: str, message: str, branch: str
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        content: str,
+        message: str,
+        branch: str,
+        author_name: str | None = None,
+        author_email: str | None = None,
     ) -> dict:
         import base64
 
@@ -149,6 +157,8 @@ class GitHubProvider(GitProvider):
         body: dict = {"message": message, "content": encoded, "branch": branch}
         if existing.status_code == 200:
             body["sha"] = existing.json()["sha"]
+        if author_name and author_email:
+            body["author"] = {"name": author_name, "email": author_email}
         resp = httpx.put(
             f"{_API}/repos/{owner}/{repo}/contents/{path}",
             headers=self._headers(),
@@ -160,7 +170,14 @@ class GitHubProvider(GitProvider):
         return {"sha": data["content"]["sha"], "html_url": data["content"]["html_url"]}
 
     def delete_file(
-        self, owner: str, repo: str, path: str, message: str, branch: str
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        message: str,
+        branch: str,
+        author_name: str | None = None,
+        author_email: str | None = None,
     ) -> dict:
         existing = httpx.get(
             f"{_API}/repos/{owner}/{repo}/contents/{path}",
@@ -171,11 +188,14 @@ class GitHubProvider(GitProvider):
         if existing.status_code != 200:
             raise FileNotFoundError(f"파일 '{path}'을 찾을 수 없습니다.")
         sha = existing.json()["sha"]
+        body: dict = {"message": message, "sha": sha, "branch": branch}
+        if author_name and author_email:
+            body["author"] = {"name": author_name, "email": author_email}
         resp = httpx.request(
             "DELETE",
             f"{_API}/repos/{owner}/{repo}/contents/{path}",
             headers=self._headers(),
-            json={"message": message, "sha": sha, "branch": branch},
+            json=body,
             timeout=15,
         )
         resp.raise_for_status()
@@ -252,3 +272,22 @@ class GitHubProvider(GitProvider):
         )
         if resp.status_code != 204:
             raise RuntimeError(f"GitHub repo 삭제 실패: {resp.status_code} {resp.text[:200]}")
+
+    def get_pull_request_files(self, owner: str, repo: str, number: int) -> list[dict]:
+        resp = httpx.get(
+            f"{_API}/repos/{owner}/{repo}/pulls/{number}/files",
+            headers=self._headers(),
+            params={"per_page": 100},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return [
+            {
+                "filename": f["filename"],
+                "status": f["status"],
+                "additions": f["additions"],
+                "deletions": f["deletions"],
+                "patch": f.get("patch", ""),
+            }
+            for f in resp.json()
+        ]

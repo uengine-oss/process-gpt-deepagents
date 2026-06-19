@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 
@@ -5,6 +6,7 @@ from deepagents import SubAgent
 
 from ..llm.mcp import _load_mcp_tools
 from ..skills.skills import FilteredSkillsMiddleware, _get_skills
+from ..skills.git_providers.factory import get_provider as _get_git_provider
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +74,14 @@ async def _build_subagents(
         skill_names = _parse_csv(agent.get("skills"))
         extra_middleware = []
         if skill_names and backend:
-            collection_paths = _get_skills(tenant_id)
+            provider_config_id = ""
+            if tenant_id:
+                try:
+                    _git_provider = await asyncio.to_thread(_get_git_provider, tenant_id)
+                    provider_config_id = _git_provider.config_id
+                except Exception:
+                    pass
+            collection_paths = _get_skills(tenant_id, provider_config_id)
             logger.info("서브에이전트 '%s' 스킬 설정: names=%s collection=%s", name, skill_names, collection_paths)
             if collection_paths:
                 extra_middleware.append(

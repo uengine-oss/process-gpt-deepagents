@@ -9,25 +9,26 @@ _BASE_DIR = Path(__file__).parent.parent.parent
 logger = logging.getLogger(__name__)
 
 
-def _get_skills(tenant_id: str = "") -> list[str] | None:
+def _get_skills(tenant_id: str = "", provider_config_id: str = "") -> list[str] | None:
     """Return SkillsMiddleware source paths.
 
     Each returned path must be a directory whose immediate subdirectories are
     individual skills (each containing SKILL.md). This matches how SkillsMiddleware
     scans sources with a single non-recursive ls call.
 
-    Layout expected on disk:
+    Layout on disk (provider-keyed):
       {root}/
-        {collection}/          ← returned as a source (e.g. anthropics-skills, localhost)
-          {skill-name}/
-            SKILL.md
-        {tenant_id}/           ← returned first when tenant_id is given
-          {skill-name}/
-            SKILL.md
+        {collection}/                    ← global collections (e.g. anthropics-skills)
+          {skill-name}/SKILL.md
+        {tenant_id}/
+          {provider_config_id}/          ← provider-keyed skills (tenant_git_config.id)
+            {skill-name}/SKILL.md
+          local/                         ← skills uploaded via ZIP or external git URL
+            {skill-name}/SKILL.md
 
-    GitHub-fetched skills are written to {root}/{slug}/{skill-name}/SKILL.md by
-    github_skill_fetcher.prefetch_github_skills(), so {root}/{slug}/ is discovered
-    automatically here.
+    When provider_config_id is given the function returns the keyed path plus the
+    local-upload path. When omitted it falls back to the legacy flat {tenant_id}/
+    layout for backward compatibility.
     """
     raw = os.getenv("SKILLS_DIRS", str(_BASE_DIR / "skills"))
     seen: set[str] = set()
@@ -44,15 +45,23 @@ def _get_skills(tenant_id: str = "") -> list[str] | None:
             continue
         root = str((_BASE_DIR / p).resolve()) if not os.path.isabs(p) else p.rstrip("/")
 
-        # Tenant-specific collection first (skills uploaded for this tenant)
         if tenant_id:
-            tenant_path = f"{root}/{tenant_id}"
-            if Path(tenant_path).is_dir():
-                _add(tenant_path)
+            if provider_config_id:
+                # Provider-keyed: skills linked to this specific git config
+                keyed = f"{root}/{tenant_id}/{provider_config_id}"
+                if Path(keyed).is_dir():
+                    _add(keyed)
+                # Locally uploaded skills always included alongside provider skills
+                local = f"{root}/{tenant_id}/local"
+                if Path(local).is_dir():
+                    _add(local)
+            else:
+                # Legacy / no provider: flat {tenant_id}/ structure
+                tenant_path = f"{root}/{tenant_id}"
+                if Path(tenant_path).is_dir():
+                    _add(tenant_path)
 
-        # Discover all collection subdirectories under root.
-        # This picks up GitHub slugs (anthropics-skills/, etc.) and localhost/.
-        # Tenant dir is excluded to avoid double-adding it.
+        # Global collections (anthropics-skills, etc.) — exclude tenant dir
         try:
             for entry in sorted(Path(root).iterdir()):
                 if entry.is_dir() and entry.name != tenant_id:

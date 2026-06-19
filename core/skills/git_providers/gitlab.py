@@ -169,18 +169,30 @@ class GitLabProvider(GitProvider):
         ]
 
     def update_file(
-        self, owner: str, repo: str, path: str, content: str, message: str, branch: str
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        content: str,
+        message: str,
+        branch: str,
+        author_name: str | None = None,
+        author_email: str | None = None,
     ) -> dict:
         import base64
 
         encoded_project = quote(f"{owner}/{repo}", safe="")
         encoded_path = quote(path, safe="")
-        body = {
+        body: dict = {
             "branch": branch,
             "content": base64.b64encode(content.encode()).decode(),
             "commit_message": message,
             "encoding": "base64",
         }
+        if author_name:
+            body["author_name"] = author_name
+        if author_email:
+            body["author_email"] = author_email
         existing = httpx.get(
             f"{self._api}/projects/{encoded_project}/repository/files/{encoded_path}",
             headers=self._headers(),
@@ -202,7 +214,14 @@ class GitLabProvider(GitProvider):
         }
 
     def delete_file(
-        self, owner: str, repo: str, path: str, message: str, branch: str
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        message: str,
+        branch: str,
+        author_name: str | None = None,
+        author_email: str | None = None,
     ) -> dict:
         encoded_project = quote(f"{owner}/{repo}", safe="")
         encoded_path = quote(path, safe="")
@@ -214,11 +233,16 @@ class GitLabProvider(GitProvider):
         )
         if existing.status_code != 200:
             raise FileNotFoundError(f"파일 '{path}'을 찾을 수 없습니다.")
+        body: dict = {"branch": branch, "commit_message": message}
+        if author_name:
+            body["author_name"] = author_name
+        if author_email:
+            body["author_email"] = author_email
         resp = httpx.request(
             "DELETE",
             f"{self._api}/projects/{encoded_project}/repository/files/{encoded_path}",
             headers=self._headers(),
-            json={"branch": branch, "commit_message": message},
+            json=body,
             timeout=15,
         )
         resp.raise_for_status()
@@ -305,3 +329,35 @@ class GitLabProvider(GitProvider):
         )
         if resp.status_code not in (202, 204):
             raise RuntimeError(f"GitLab 프로젝트 삭제 실패: {resp.status_code} {resp.text[:200]}")
+
+    def get_pull_request_files(self, owner: str, repo: str, number: int) -> list[dict]:
+        encoded = quote(f"{owner}/{repo}", safe="")
+        resp = httpx.get(
+            f"{self._api}/projects/{encoded}/merge_requests/{number}/changes",
+            headers=self._headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        changes = resp.json().get("changes") or []
+        result = []
+        for c in changes:
+            if c.get("new_file"):
+                status = "added"
+            elif c.get("deleted_file"):
+                status = "removed"
+            elif c.get("renamed_file"):
+                status = "renamed"
+            else:
+                status = "modified"
+            filename = c.get("new_path") or c.get("old_path", "")
+            patch = c.get("diff", "")
+            additions = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
+            deletions = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
+            result.append({
+                "filename": filename,
+                "status": status,
+                "additions": additions,
+                "deletions": deletions,
+                "patch": patch,
+            })
+        return result

@@ -8,7 +8,10 @@ from ..sandbox.docker_sandbox import get_or_create_sandbox
 from ..chat.hitl import get_hitl_tools
 from ..llm.model import _build_model
 from ..rag.tools import get_memento_tools
+import asyncio
+
 from ..skills.skills import _get_skills
+from ..skills.git_providers.factory import get_provider as _get_git_provider
 from .subagents import _build_subagents
 from ..skills.tools import (
     checkout_to_workspace,
@@ -87,7 +90,15 @@ async def build_agent(
     else:
         final_prompt = system_prompt
 
-    host_skills = _get_skills(tenant_id) or []
+    provider_config_id = ""
+    if tenant_id:
+        try:
+            _git_provider = await asyncio.to_thread(_get_git_provider, tenant_id)
+            provider_config_id = _git_provider.config_id
+        except Exception:
+            pass
+
+    host_skills = _get_skills(tenant_id, provider_config_id) or []
     container_skills = []
     for p in host_skills:
         try:

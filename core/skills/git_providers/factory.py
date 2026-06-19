@@ -28,7 +28,7 @@ def get_provider(tenant_id: str) -> GitProvider:
     # is_default=true 우선, 없으면 첫 번째 레코드 사용
     resp = (
         sb.table("tenant_git_config")
-        .select("provider, base_url, username, token")
+        .select("id, provider, base_url, username, token")
         .eq("tenant_id", tenant_id)
         .eq("is_default", True)
         .limit(1)
@@ -39,7 +39,7 @@ def get_provider(tenant_id: str) -> GitProvider:
     if not rows:
         resp = (
             sb.table("tenant_git_config")
-            .select("provider, base_url, username, token")
+            .select("id, provider, base_url, username, token")
             .eq("tenant_id", tenant_id)
             .limit(1)
             .execute()
@@ -54,12 +54,14 @@ def get_provider(tenant_id: str) -> GitProvider:
         )
 
     cfg = rows[0]
-    return _build_provider(
+    provider = _build_provider(
         provider=cfg["provider"],
         username=cfg["username"],
         token=cfg["token"],
         base_url=cfg.get("base_url"),
     )
+    provider.config_id = str(cfg["id"])
+    return provider
 
 
 def get_provider_from_url(url: str) -> GitProvider:
