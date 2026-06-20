@@ -1,6 +1,20 @@
+import os
+import sys
+
+# --- Windows cp949 회피: 전체 프로세스를 Python UTF-8 모드로 강제 ---
+# Windows 기본 로케일(cp949)에서는 MCP stdio 서브프로세스 stdout(UTF-8 JSON-RPC)·
+# 파일 IO 등을 디코드할 때 "'cp949' codec can't decode byte 0xe2 ..." 오류가 난다.
+# UTF-8 모드(-X utf8)가 아니면, 같은 인자에 -X utf8 을 붙여 자식 프로세스로 재실행하고
+# 그 종료코드를 그대로 전파한다. (execv 대신 subprocess: uv run / Windows 에서 안전)
+if os.name == "nt" and sys.flags.utf8_mode == 0:
+    import subprocess
+
+    os.environ["PYTHONUTF8"] = "1"
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    sys.exit(subprocess.call([sys.executable, "-X", "utf8", *sys.argv]))
+
 import asyncio
 import logging
-import os
 
 import uvicorn
 from dotenv import load_dotenv

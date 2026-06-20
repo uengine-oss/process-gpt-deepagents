@@ -5,6 +5,14 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# MCP 로드 후 임시로 제거할 도구 이름들.
+# (bpmn-process-generation 스킬 흐름과 충돌하므로 비활성화)
+_DISABLED_MCP_TOOLS: set[str] = {
+    # 지금 연결하려는 bpmn-process-generation 스킬로 대체되므로 비활성화.
+    "create_consulting_process_workitem",
+    "create_pdf2bpmn_workitem",
+}
+
 
 def _mcp_connection_config(server_config: dict) -> dict:
     """tenant_mcp mcpServers 항목을 langchain-mcp-adapters Connection 형식으로 변환."""
@@ -51,6 +59,13 @@ async def _load_mcp_tools(server_names: list[str], tenant_mcp: dict) -> list:
     client = MultiServerMCPClient(connections)
     try:
         tools = await client.get_tools()
+        # 로드 후 비활성 도구 임시 제거
+        if _DISABLED_MCP_TOOLS:
+            before = len(tools)
+            tools = [t for t in tools if getattr(t, "name", "") not in _DISABLED_MCP_TOOLS]
+            removed = before - len(tools)
+            if removed:
+                logger.info("MCP 도구 임시 제거: %d개 %s", removed, sorted(_DISABLED_MCP_TOOLS))
         logger.info("MCP tools 로드 완료: %s → %d개", list(connections), len(tools))
         return tools
     except Exception as e:

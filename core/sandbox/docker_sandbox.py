@@ -7,7 +7,10 @@ tenant_id 당 하나의 컨테이너를 재사용하며, atexit 훅으로 프로
   - {workspace_host}/  →  /workspace  (read-write)
   - {skills_host}/     →  /skills     (read-only, optional)
 
-환경변수는 호스트에서 상속하지 않는다.
+환경변수는 호스트 전체를 상속하지 않고, 스킬 후처리(저장/검증)에 필요한
+**화이트리스트(_FORWARD_ENV_KEYS)만** 컨테이너로 전달한다. 또한 요청이 들어온
+tenant 로 `TENANT_ID` 를 자동 세팅하고, 로컬(127.0.0.1/localhost) Supabase·완료엔진
+주소는 컨테이너에서 닿도록 host.docker.internal 로 치환한다.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import os
 import re
 import tarfile
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import docker
 import docker.errors
@@ -35,6 +38,45 @@ logger = logging.getLogger(__name__)
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "python:3.13-slim")
 _CONTAINER_WORKSPACE = "/workspace"
 _MAX_OUTPUT_BYTES = 100_000
+
+# 컨테이너로 전달할 호스트 env 화이트리스트.
+# bpmn-process-generation-skill 후처리(scripts/run_postprocess.py)의 저장/검증에 필요.
+_FORWARD_ENV_KEYS = (
+    # Supabase (core/db.py 와 동일 변수명)
+    "SUPABASE_URL", "SUPABASE_KEY_URL", "SERVICE_ROLE_KEY", "SUPABASE_KEY", "SUPABASE_ANON_KEY",
+    # LLM (core/model.py 와 동일 변수명) — 검증 자동교정용
+    "LLM_MODEL", "LLM_PROXY_URL", "LLM_PROXY_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    # 실행 검증 엔진 + 튜닝
+    "COMPLETION_ENGINE_URL",
+    "PDF2BPMN_VALIDATION_MAX_ITERS",
+    "PDF2BPMN_VALIDATION_ADVANCE_TIMEOUT",
+    "PDF2BPMN_VALIDATION_CLEANUP",
+)
+
+_HOST_GATEWAY = "host.docker.internal"
+# 컨테이너 내부에서 호스트 로컬 서비스에 닿게 하려면 loopback 주소를 치환해야 한다.
+_LOOPBACK_URL_KEYS = ("SUPABASE_URL", "SUPABASE_KEY_URL", "COMPLETION_ENGINE_URL")
+
+
+def _rewrite_loopback(url: str) -> str:
+    if not url:
+        return url
+    return url.replace("127.0.0.1", _HOST_GATEWAY).replace("localhost", _HOST_GATEWAY)
+
+
+def _build_container_env(tenant_id: str) -> dict[str, str]:
+    """화이트리스트 host env + 요청 tenant 자동주입(TENANT_ID) + loopback 치환."""
+    env: dict[str, str] = {}
+    for k in _FORWARD_ENV_KEYS:
+        v = os.environ.get(k)
+        if v:
+            env[k] = v
+    for url_key in _LOOPBACK_URL_KEYS:
+        if env.get(url_key):
+            env[url_key] = _rewrite_loopback(env[url_key])
+    # 요청이 들어온 tenant 로 자동 세팅 (스킬 scripts 가 --tenant 없이 TENANT_ID 로 읽는다)
+    env["TENANT_ID"] = tenant_id or ""
+    return env
 
 # "bash: line 1: curl: command not found" 또는 "sh: jq: not found" 에서 커맨드명 추출
 _CMD_NOT_FOUND_RE = re.compile(
@@ -84,6 +126,9 @@ class DockerSandboxBackend(BaseSandbox):
         self._container: docker.models.containers.Container | None = None
         self._lock = threading.Lock()
         self._client: docker.DockerClient | None = None
+        # bpmn-process-generation-skill 저장(run_postprocess)에 필요한 supabase 패키지를
+        # 샌드박스(python:3.13-slim)에 1회 보장 설치했는지 플래그(프로세스 단위).
+        self._deps_ensured = False
 
     # ------------------------------------------------------------------
     # 컨테이너 생명주기
@@ -132,6 +177,8 @@ class DockerSandboxBackend(BaseSandbox):
             auto_remove=True,
             volumes=volumes,
             working_dir=_CONTAINER_WORKSPACE,
+            environment=_build_container_env(self._tenant_id),
+            extra_hosts={_HOST_GATEWAY: "host-gateway"},
             mem_limit="512m",
             cpu_period=100_000,
             cpu_quota=50_000,  # 50% of one CPU core
@@ -157,8 +204,25 @@ class DockerSandboxBackend(BaseSandbox):
     def id(self) -> str:
         return f"docker-{self._tenant_id or 'shared'}"
 
+    def _ensure_deps(self, container: "docker.models.containers.Container") -> None:
+        """저장 스크립트(run_postprocess)가 쓰는 supabase/httpx 를 샌드박스에 1회 보장 설치.
+
+        기본 이미지(python:3.13-slim)에는 supabase 가 없어, 모델이 pip install 을 빠뜨리면
+        저장이 'supabase 패키지 없음' 으로 실패한다. import 가드로 이미 있으면 즉시 통과(빠름),
+        없으면 설치한다(최초 1회 ~10여초). 프로세스 단위로 1회만 시도한다.
+        """
+        if self._deps_ensured:
+            return
+        try:
+            check = "python -c 'import supabase' 2>/dev/null || pip install -q supabase httpx"
+            container.exec_run(["bash", "-c", check], demux=False)
+        except Exception:
+            logger.warning("sandbox 의존성(supabase) 보장 설치 실패 — 저장 시 재시도 필요", exc_info=True)
+        self._deps_ensured = True
+
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         container = self._ensure_container()
+        self._ensure_deps(container)
         _timeout = timeout or 180
 
         def _exec(cmd: str) -> tuple[int, str]:
@@ -169,7 +233,11 @@ class DockerSandboxBackend(BaseSandbox):
                 # runc resolves the bind-mount target back to the host path and
                 # raises "current working directory is outside of container mount
                 # namespace root". cd inside bash bypasses that OCI-level check.
-                wrapped = f"cd {_CONTAINER_WORKSPACE} && ( {cmd} )"
+                #
+                # 서브셸 여는/닫는 괄호는 반드시 **각자 자기 줄**에 둔다. cmd 와 같은 줄에
+                # ` )` 를 붙이면, cmd 가 heredoc(<<'JSON' ... JSON)으로 끝날 때 닫는 구분자
+                # 줄이 "JSON )" 로 오염돼 heredoc 이 깨진다(bash: here-document ... wanted `JSON').
+                wrapped = f"cd {_CONTAINER_WORKSPACE} && (\n{cmd}\n)"
                 exit_code, output = container.exec_run(
                     ["bash", "-c", wrapped],
                     demux=False,
@@ -214,11 +282,15 @@ class DockerSandboxBackend(BaseSandbox):
         responses: list[FileUploadResponse] = []
         for path, content in files:
             try:
-                parent = str(Path(path).parent)
+                # 컨테이너는 항상 Linux 이므로 POSIX 경로(슬래시)로 다룬다.
+                # (Windows 호스트에서 Path(...) 를 쓰면 '\workspace' 처럼 백슬래시가 되어
+                #  put_archive 가 404 'Could not find \workspace' 로 실패한다.)
+                posix = PurePosixPath(path)
+                parent = str(posix.parent)
                 container.exec_run(["mkdir", "-p", parent])
                 buf = io.BytesIO()
                 with tarfile.open(fileobj=buf, mode="w") as tar:
-                    info = tarfile.TarInfo(name=Path(path).name)
+                    info = tarfile.TarInfo(name=posix.name)
                     info.size = len(content)
                     tar.addfile(info, io.BytesIO(content))
                 buf.seek(0)

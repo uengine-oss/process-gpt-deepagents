@@ -17,3 +17,5 @@ credentials.json
 skills/*
 !skills/anthropics-skills/
 
+workspace/
+.claude/

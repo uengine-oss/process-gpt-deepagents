@@ -125,6 +125,7 @@ def build_graph_inputs(
     checkpointer: Any,
     checkpoint_thread_id: str,
     recent_messages: list[dict[str, Any]] | None = None,
+    has_checkpoint: bool = False,
 ) -> tuple[Any, bool]:
     """그래프 실행 입력과 use_graph_resume 플래그를 반환한다.
 
@@ -132,6 +133,11 @@ def build_graph_inputs(
         (inputs, use_graph_resume)
         - inputs: graph.astream()에 전달할 값
         - use_graph_resume: True이면 LangGraph Command(resume=) 경로
+
+    Args:
+        has_checkpoint: 이 thread_id 에 이미 누적된 체크포인트 상태가 있으면 True.
+            지속 체크포인터(공유 메모리/Postgres) 사용 시, 이미 누적된 대화에 또 history 를
+            주입하면 메시지가 중복되므로, 이 경우 새 사용자 메시지만 넘긴다.
     """
     use_graph_resume = bool(
         checkpointer is not None
@@ -152,6 +158,10 @@ def build_graph_inputs(
             "Use this to continue the task immediately; do not ask for the same information again."
         )
         return {"messages": [{"role": "user", "content": augmented}]}, False
+
+    # 이미 체크포인트에 대화가 누적돼 있으면 history 재주입 없이 새 메시지만 추가한다(중복 방지).
+    if has_checkpoint:
+        return {"messages": [{"role": "user", "content": user_message}]}, False
 
     history = list(recent_messages or [])
     if (

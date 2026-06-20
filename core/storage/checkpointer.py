@@ -39,6 +39,27 @@ def _get_state_for_current_loop() -> _LoopCheckpointerState:
     return st
 
 
+# 프로세스 전역 공유 인메모리 체크포인터.
+# Postgres(DB_*) 가 없을 때 HITL interrupt/resume 가 같은 서버 프로세스 안에서
+# 요청 간에 유지되도록 단일 InMemorySaver 인스턴스를 공유한다.
+# (uvicorn 단일 워커 가정 — 다중 워커/재시작 시 유실되므로 운영은 DB_* 권장.)
+_SHARED_MEMORY_SAVER: Any | None = None
+
+
+def get_shared_memory_checkpointer() -> Any:
+    """프로세스 전역 단일 InMemorySaver 를 반환한다 (요청 간 interrupt 체크포인트 유지)."""
+    global _SHARED_MEMORY_SAVER
+    if _SHARED_MEMORY_SAVER is None:
+        try:
+            from langgraph.checkpoint.memory import InMemorySaver
+            _SHARED_MEMORY_SAVER = InMemorySaver()
+        except Exception:
+            from langgraph.checkpoint.memory import MemorySaver
+            _SHARED_MEMORY_SAVER = MemorySaver()
+        logger.info("공유 InMemory 체크포인터 생성 (Postgres 미설정 — 프로세스 내 HITL resume 사용)")
+    return _SHARED_MEMORY_SAVER
+
+
 def resolve_checkpoint_thread_id(*, is_chat: bool, row: Mapping[str, Any]) -> str:
     """채팅이면 conv 스레드, 아니면 todo 스레드."""
     if is_chat:
