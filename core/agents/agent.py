@@ -14,14 +14,13 @@ from ..skills.skills import _get_skills
 from ..skills.git_providers.factory import get_provider as _get_git_provider
 from .subagents import _build_subagents
 from ..skills.tools import (
+    checkout_to_workspace,
     extract_document_structure,
-    list_github_repos,
+    list_git_repos,
     publish_skill,
     validate_process_definition,
     complete_process_generation,
     bpmn_container_base,
-    checkout_to_workspace,
-    list_git_repos,
     _current_sandbox as _skill_sandbox,
     _current_user_name as _skill_user_name,
     _current_user_email as _skill_user_email,
@@ -129,9 +128,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "    `{\"multi_process\": true, \"stage\": \"candidates\", \"processes\": [{\"name\": \"휴가 신청 프로세스\", \"skills\": [{\"label\": \"휴가신청서 작성 도우미\", \"desc\": \"...\"}], \"agents\": [{\"label\": \"...\", \"desc\": \"...\"}], \"dmn\": [{\"label\": \"...\", \"desc\": \"...\"}]}, {\"name\": \"성과급 신청 프로세스\", ...}]}`\n"
     "    응답은 `[프로세스명] 스킬: A, B / 에이전트: C / DMN: (없음)` 형식의 줄들로 온다. 각 프로세스별 선택을 해석해 **각 프로세스 폴더에** skill-creator 로 스킬 생성·agents.json·manifest.json 을 만든다.\n"
     "  · 그다음 폼/참조정보(3단계)·검증(4단계)도 모든 프로세스에 대해 진행하고, **complete_process_generation 은 마지막에 한 번만** 호출한다(모든 `process-*/` 폴더 자동 처리).\n"
-    "  ⚠️ 멀티 프로세스에서 1·2단계 `request_human_input` 은 위 JSON 으로 **각 한 번씩만** 호출한다(프로세스마다 따로 묻지 말 것)."
-    "Reply in Korean unless the user writes in another language."
-    "\n\n## 코드·스킬 작업 규칙\n"
+    "  ⚠️ 멀티 프로세스에서 1·2단계 `request_human_input` 은 위 JSON 으로 **각 한 번씩만** 호출한다(프로세스마다 따로 묻지 말 것).\n"
+    "\n## 코드·스킬 작업 규칙\n"
     "스킬이나 Git 레포지토리의 코드를 읽거나 수정·실행해야 할 때는 "
     "**반드시 `checkout_to_workspace`를 먼저 호출**해 /workspace/ 로 가져온 뒤 작업하세요.\n"
     "- 스킬명이 /skills/ 에 있으면 자동으로 복사됩니다.\n"
@@ -158,13 +156,12 @@ async def build_agent(
         + get_hitl_tools()
         + get_memento_tools()
         + [
-            checkout_to_workspace
+            checkout_to_workspace,
             extract_document_structure,
-            list_github_repos,
+            list_git_repos,
             publish_skill,
             validate_process_definition,
             complete_process_generation,
-            list_git_repos
         ]
     )
     backend = get_or_create_sandbox(tenant_id, workspace_host=_BASE_DIR / "workspace", skills_host=_SKILLS_DIR)
@@ -217,7 +214,6 @@ async def build_agent(
         f"`complete_process_generation` 은 인자 없이 호출하면 이 대화의 모든 `process-*/` 폴더를 자동으로 모아 처리한다."
     )
 
-    # host_skills = _get_skills(tenant_id) or []
     provider_config_id = ""
     if tenant_id:
         try:

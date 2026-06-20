@@ -14,7 +14,6 @@ from __future__ import annotations
 import contextvars
 import os
 import re
-import subprocess
 import shlex
 from pathlib import Path
 
@@ -46,6 +45,19 @@ _current_conversation_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _current_user_request: contextvars.ContextVar[str] = contextvars.ContextVar(
     "tools_user_request", default=""
 )
+# Docker sandbox 백엔드 — agent.py에서 set() 호출
+_current_sandbox: contextvars.ContextVar = contextvars.ContextVar(
+    "tools_sandbox", default=None
+)
+
+_CONTAINER_WORKSPACE = Path("/workspace")
+_CONTAINER_SKILLS = Path("/skills")
+
+# 임의 git 원격 URL 매칭 (http/https/ssh/git+ssh)
+_GIT_URL_RE = re.compile(
+    r"(?:https?://|git@|ssh://git@)([^/:]+)[/:]([^/\s]+)/([^/\s#?]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
 
 
 def _conv_slug(conv: str) -> str:
@@ -66,19 +78,6 @@ def _to_snake(s: str) -> str:
     if s and not s[0].isalpha():
         s = "n_" + s
     return s or "node"
-# Docker sandbox 백엔드 — agent.py에서 set() 호출
-_current_sandbox: contextvars.ContextVar = contextvars.ContextVar(
-    "tools_sandbox", default=None
-)
-
-_CONTAINER_WORKSPACE = Path("/workspace")
-_CONTAINER_SKILLS = Path("/skills")
-
-# 임의 git 원격 URL 매칭 (http/https/ssh/git+ssh)
-_GIT_URL_RE = re.compile(
-    r"(?:https?://|git@|ssh://git@)([^/:]+)[/:]([^/\s]+)/([^/\s#?]+?)(?:\.git)?/?$",
-    re.IGNORECASE,
-)
 
 
 def _substitute_ws(s: str) -> str:
@@ -153,6 +152,7 @@ def _ensure_skill_scripts_on_path() -> Path | None:
         _sys.path.insert(0, str(d))
     return d
 
+
 # ---------------------------------------------------------------------------
 # Sandbox 실행 헬퍼 (쓰기 작업 전용)
 # ---------------------------------------------------------------------------
@@ -222,50 +222,7 @@ def extract_document_structure(file_path: str) -> str:
 # Git 푸시 헬퍼 (sandbox 내부 실행)
 # ---------------------------------------------------------------------------
 
-def _get_github_creds() -> tuple[str, str]:
-    """tenant_oauth 테이블에서 현재 테넌트의 GitHub 자격증명을 반환한다."""
-    from ..storage.db import get_supabase
-
-    tenant_id = _current_tenant_id.get()
-    if not tenant_id:
-        raise ValueError("tenant_id가 설정되지 않았습니다.")
-
-    sb = get_supabase()
-    try:
-        resp = (
-            sb.table("tenant_oauth")
-            .select("github_username, github_token")
-            .eq("tenant_id", tenant_id)
-            .limit(1)
-            .execute()
-        )
-    except Exception as e:
-        # tenant_oauth 스키마 미비(컬럼/테이블 없음) 등 DB 오류는 '미연결' 로 흡수한다.
-        # (그대로 두면 postgrest APIError 가 호출부의 except ValueError 를 빠져나가
-        #  execute() 전체를 크래시시킨다.)
-        raise ValueError(
-            "GitHub 계정이 연결되지 않았습니다(또는 tenant_oauth 스키마 미설정). "
-            "설정에서 GitHub 계정을 연결해 주세요."
-        ) from e
-    rows = getattr(resp, "data", None) or []
-    if not rows or not rows[0].get("github_username") or not rows[0].get("github_token"):
-        raise ValueError(
-            "GitHub 계정이 연결되지 않았습니다. 설정에서 GitHub 계정을 연결해 주세요."
-        )
-    return rows[0]["github_username"], rows[0]["github_token"]
-
-
-def _github_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-
-
-def _git(cwd: Path, *args: str) -> tuple[int, str]:
-    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
-    return r.returncode, (r.stdout + r.stderr).strip()
-
-
 def _push_skill_sandbox(
-    src: Path,
     cwd: str,
     skill_name: str,
     branch: str,
@@ -1492,6 +1449,7 @@ def complete_process_generation() -> str:
         return ("ERROR: 처리할 process-definition.json 이 없습니다. "
                 "각 프로세스를 `.bpmn/<room>/process-<id>/process-definition.json` 으로 생성했는지 확인하세요.")
     return _json.dumps({"count": len(processes), "processes": processes}, ensure_ascii=False)
+
 
 # ---------------------------------------------------------------------------
 # 공개 툴

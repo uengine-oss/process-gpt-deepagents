@@ -46,7 +46,7 @@ from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _ski
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
-from core.skills.tools import _current_tenant_id as _skill_tenant_id
+# 우리 기능(프로세스 생성 HITL 캡처/이름도출)에서 사용하는 contextvar — incoming 에는 없으나 유지.
 from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
 
@@ -622,6 +622,7 @@ class DeepAgentExecutor(AgentExecutor):
         }
         graph = await build_agent(
             tenant_id=tenant_id,
+            conversation_id=chat_room_id or "",
             checkpointer=checkpointer,
             subagents_raw=agents,
             tenant_mcp=tenant_mcp,
@@ -647,18 +648,6 @@ class DeepAgentExecutor(AgentExecutor):
         complete_called = False
 
         try:
-            # build_agent 도 try 안에서 호출해 빌드 단계(모델/MCP/스킬 로드) 예외도
-            # 화면에 표시되게 한다(예외 시 아래 except 가 streamer error 를 보냄).
-            graph = await build_agent(
-                tenant_id=tenant_id,
-                conversation_id=chat_room_id or "",
-                checkpointer=checkpointer,
-                subagents_raw=agents,
-                tenant_mcp=tenant_mcp,
-                extra_tools=chat_root_tools,
-                middleware=[ToolResultTruncationMiddleware()],
-                static_subagents=build_skill_creator_subagents(task_id=task_id),
-            )
             async for _ns, stream_evt, data in graph.astream(
                 inputs, config=config, stream_mode=["messages", "updates", "values"], subgraphs=True
             ):
@@ -730,13 +719,9 @@ class DeepAgentExecutor(AgentExecutor):
                                         await streamer.send_json({
                                             "type": "plan_tools",
                                             "tools": [{"tool": tool_name, "name": tool_name, "args": tool_args}],
-                                        }
-                                        await streamer.send_json(_pt_payload)
-                                        asyncio.create_task(_update_chat_ctx(_pt_payload))
-
-                                        # 도구 호출 인자에서 결과를 잡아 프론트로 전달. 단
-                                        # `complete_process_generation` 은 검증된 도구 '출력'(tool_end)에서
-                                        # 잡으므로, 입력(arg)으로는 미리 카드를 띄우지 않는다(오탐 방지).
+                                        })
+                                        # 도구 호출 인자에서 출력계약을 잡아 프론트에 process_result 카드로 전달.
+                                        # complete_process_generation 은 검증된 '출력'(tool_end)에서 잡으므로 입력으로는 띄우지 않음.
                                         if not process_result_sent and tool_name not in ("complete_process_generation",):
                                             # tool_args 의 raw 문자열 값들(=execute command 의 heredoc JSON 등)을
                                             # 그대로 모아 스캔한다. json.dumps 로 감싸면 내부 JSON 이 escape 돼 못 잡는다.
@@ -757,7 +742,6 @@ class DeepAgentExecutor(AgentExecutor):
                                             if _pr_in is not None:
                                                 process_result_sent = True
                                                 await streamer.send_json({"type": "process_result", "data": _pr_in})
-
                                         skill_names = _skills_from_tool_args(tool_args)
                                         if skill_names:
                                             await streamer.send_json({"type": "plan_skills", "skills": skill_names})
@@ -867,7 +851,6 @@ class DeepAgentExecutor(AgentExecutor):
                     "last_question": question,
                     "checkpoint_thread_id": checkpoint_thread_id or "",
                 }
-
                 # 채팅 경로: ChatEventQueue 는 TaskStatusUpdateEvent(human_asked)를 무시하고,
                 # interrupt 후 done/error 가 없으면 SSE 가 끝나지 않아 프론트가 무한 대기한다.
                 # 그래서 질문/컨텍스트/run_state 를 담은 done 메시지를 streamer 로 보내 스트림을
