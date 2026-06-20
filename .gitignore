@@ -18,4 +18,11 @@ skills/*
 !skills/anthropics-skills/
 
 workspace/
+
+.vscode/
+
+.agent/
 .claude/
+.codex/
+
+openspec/

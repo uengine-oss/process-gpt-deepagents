@@ -16,3 +16,6 @@ process-gpt-agent-sdk[sse]==0.4.23
 psycopg[binary]>=3.1
 psycopg-pool>=3.2
 langgraph-checkpoint-postgres>=2.0
+python-docx>=1.1
+PyMuPDF>=1.24
+python-multipart>=0.0.9

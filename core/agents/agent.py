@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from deepagents import create_deep_agent
@@ -7,7 +8,10 @@ from ..sandbox.docker_sandbox import get_or_create_sandbox
 from ..chat.hitl import get_hitl_tools
 from ..llm.model import _build_model
 from ..rag.tools import get_memento_tools
+import asyncio
+
 from ..skills.skills import _get_skills
+from ..skills.git_providers.factory import get_provider as _get_git_provider
 from .subagents import _build_subagents
 from ..skills.tools import (
     extract_document_structure,
@@ -16,10 +20,16 @@ from ..skills.tools import (
     validate_process_definition,
     complete_process_generation,
     bpmn_container_base,
+    checkout_to_workspace,
+    list_git_repos,
+    _current_sandbox as _skill_sandbox,
+    _current_user_name as _skill_user_name,
+    _current_user_email as _skill_user_email,
 )
+from ..storage.storage import set_tenant_id as _set_storage_tenant_id
 
 _BASE_DIR = Path(__file__).parent.parent.parent
-_SKILLS_DIR = _BASE_DIR / "skills"
+_SKILLS_DIR = Path(os.getenv("SKILLS_HOST", str(_BASE_DIR / "skills")))
 _SKILLS_CONTAINER_MOUNT = "/skills"
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -120,6 +130,14 @@ DEFAULT_SYSTEM_PROMPT = (
     "    응답은 `[프로세스명] 스킬: A, B / 에이전트: C / DMN: (없음)` 형식의 줄들로 온다. 각 프로세스별 선택을 해석해 **각 프로세스 폴더에** skill-creator 로 스킬 생성·agents.json·manifest.json 을 만든다.\n"
     "  · 그다음 폼/참조정보(3단계)·검증(4단계)도 모든 프로세스에 대해 진행하고, **complete_process_generation 은 마지막에 한 번만** 호출한다(모든 `process-*/` 폴더 자동 처리).\n"
     "  ⚠️ 멀티 프로세스에서 1·2단계 `request_human_input` 은 위 JSON 으로 **각 한 번씩만** 호출한다(프로세스마다 따로 묻지 말 것)."
+    "Reply in Korean unless the user writes in another language."
+    "\n\n## 코드·스킬 작업 규칙\n"
+    "스킬이나 Git 레포지토리의 코드를 읽거나 수정·실행해야 할 때는 "
+    "**반드시 `checkout_to_workspace`를 먼저 호출**해 /workspace/ 로 가져온 뒤 작업하세요.\n"
+    "- 스킬명이 /skills/ 에 있으면 자동으로 복사됩니다.\n"
+    "- 없으면 설정된 Git 레포를 자동으로 clone합니다.\n"
+    "이 판단은 모델이 자율적으로 내려야 합니다. "
+    "어떤 경로를 써야 하는지 사용자에게 묻지 마세요."
 )
 
 
@@ -133,31 +151,48 @@ async def build_agent(
     middleware: list = None,
     static_subagents: list = None,
     conversation_id: str = "",
+    user_context: dict | None = None,
 ):
     tools = (
         list(extra_tools or [])
         + get_hitl_tools()
         + get_memento_tools()
         + [
+            checkout_to_workspace
             extract_document_structure,
             list_github_repos,
             publish_skill,
             validate_process_definition,
             complete_process_generation,
+            list_git_repos
         ]
     )
     backend = get_or_create_sandbox(tenant_id, workspace_host=_BASE_DIR / "workspace", skills_host=_SKILLS_DIR)
+    _skill_sandbox.set(backend)
+    _skill_user_name.set((user_context or {}).get("user_name") or "")
+    _skill_user_email.set((user_context or {}).get("user_email") or "")
+    _set_storage_tenant_id(tenant_id)
     built_subagents = list(static_subagents or []) + await _build_subagents(
         subagents_raw or [], tenant_id, tenant_mcp, backend=backend
     )
+
+    if user_context:
+        parts = ["\n\n## 현재 사용자 정보"]
+        if user_context.get("user_name"):
+            parts.append(f"- 이름: {user_context['user_name']}")
+        if user_context.get("user_email"):
+            parts.append(f"- 이메일: {user_context['user_email']}")
+        if user_context.get("user_jwt"):
+            parts.append(f"- JWT: {user_context['user_jwt']}")
+        system_prompt = system_prompt + "\n".join(parts)
 
     if built_subagents:
         agent_names = ", ".join(f"`{a['name']}`" for a in built_subagents)
         delegation_prompt = (
             f"\n\n## 서브에이전트 위임 규칙\n"
             f"현재 다음 서브에이전트가 구성되어 있습니다: {agent_names}\n"
-            f"사용자 요청은 반드시 적절한 서브에이전트에게 task() 툴로 위임해야 합니다. "
-            f"직접 답변하지 마세요."
+            f"요청이 서브에이전트의 역할·전문 영역에 해당하면 task() 툴로 위임하세요. "
+            f"서브에이전트의 역할과 무관한 일반 요청은 직접 처리하세요."
         )
         final_prompt = system_prompt + delegation_prompt
     else:
@@ -182,7 +217,16 @@ async def build_agent(
         f"`complete_process_generation` 은 인자 없이 호출하면 이 대화의 모든 `process-*/` 폴더를 자동으로 모아 처리한다."
     )
 
-    host_skills = _get_skills(tenant_id) or []
+    # host_skills = _get_skills(tenant_id) or []
+    provider_config_id = ""
+    if tenant_id:
+        try:
+            _git_provider = await asyncio.to_thread(_get_git_provider, tenant_id)
+            provider_config_id = _git_provider.config_id
+        except Exception:
+            pass
+
+    host_skills = _get_skills(tenant_id, provider_config_id) or []
     container_skills = []
     for p in host_skills:
         try:
