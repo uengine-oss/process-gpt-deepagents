@@ -14,6 +14,7 @@ def build_initial_chat_room_context(*, has_file: bool = False) -> dict[str, Any]
         "todos": [],
         "tools": [],
         "skills": [],
+        "connectors": [],
         "enabled": {"todos": False, "tools": True, "skills": False},
         "updatedAt": now_iso(),
         "orchestration": "deepagents",
@@ -38,6 +39,7 @@ class CtxAccumulator:
         self.tools: list[dict[str, Any]] = []
         self.skills: list[str] = []
         self.todos: list[dict[str, Any]] = []
+        self.connectors: list[str] = []
         self.mcp_tools: list[dict[str, Any]] = list(mcp_tools or [])
 
     def push(self, payload: dict) -> None:
@@ -67,6 +69,11 @@ class CtxAccumulator:
                 s = str(s).strip()
                 if s and s not in self.skills:
                     self.skills.append(s)
+        elif et == "plan_connectors":
+            for c in (payload.get("connectors") or []):
+                c = str(c).strip()
+                if c and c not in self.connectors:
+                    self.connectors.append(c)
         elif et == "plan_todos":
             for t in (payload.get("todos") or []):
                 if isinstance(t, dict):
@@ -77,6 +84,7 @@ class CtxAccumulator:
             "tools": self.tools,
             "skills": self.skills,
             "todos": self.todos,
+            "connectors": self.connectors,
             "enabled": {
                 "todos": bool(self.todos),
                 "tools": True,
@@ -121,7 +129,7 @@ def merge_chat_room_context_from_event(
     if not isinstance(evt, dict):
         return None
     et = str(evt.get("type") or "").strip()
-    if et not in ("plan_tools", "plan_skills", "plan_todos", "tool_start", "tool_end"):
+    if et not in ("plan_tools", "plan_skills", "plan_connectors", "plan_todos", "tool_start", "tool_end"):
         return None
 
     ctx: dict[str, Any] = (
@@ -131,6 +139,7 @@ def merge_chat_room_context_from_event(
     ctx.setdefault("todos", [])
     ctx.setdefault("tools", [])
     ctx.setdefault("skills", [])
+    ctx.setdefault("connectors", [])
     ctx.setdefault("enabled", {"todos": False, "tools": True, "skills": False})
     if "orchestration" in ctx:
         ctx["orchestration"] = str(ctx.get("orchestration") or "deepagents")
@@ -183,6 +192,14 @@ def merge_chat_room_context_from_event(
             en = dict(ctx.get("enabled") or {})
             en["skills"] = bool(ctx["skills"])
             ctx["enabled"] = en
+        return json_normalize(ctx)
+
+    if et == "plan_connectors":
+        connectors = evt.get("connectors")
+        if isinstance(connectors, list):
+            cur_c = [str(c).strip() for c in (ctx.get("connectors") or []) if str(c).strip()]
+            new_c = [str(c).strip() for c in connectors if str(c).strip()]
+            ctx["connectors"] = list(dict.fromkeys([*cur_c, *new_c]))
         return json_normalize(ctx)
 
     if et == "plan_todos":

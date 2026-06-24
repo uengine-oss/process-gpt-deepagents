@@ -29,10 +29,13 @@ class ToolTrackingCallback(AsyncCallbackHandler):
         *,
         streamer: Any,
         push_ctx: Callable[[dict], None],
+        mcp_tool_servers: dict[str, list[str]] | None = None,
     ) -> None:
         self._streamer = streamer
         self._push_ctx = push_ctx
         self._run_to_tool: dict[str, str] = {}
+        self._mcp_tool_servers: dict[str, list[str]] = mcp_tool_servers or {}
+        self._emitted_connectors: set[str] = set()
 
     async def _emit(self, payload: dict) -> None:
         if self._streamer:
@@ -53,6 +56,13 @@ class ToolTrackingCallback(AsyncCallbackHandler):
             return
         self._run_to_tool[str(run_id)] = tool_name
         await self._emit({"type": "tool_start", "tool": tool_name})
+
+        servers = self._mcp_tool_servers.get(tool_name)
+        if servers:
+            new = [s for s in servers if s not in self._emitted_connectors]
+            if new:
+                self._emitted_connectors.update(new)
+                await self._emit({"type": "plan_connectors", "connectors": new})
 
         args: dict = inputs if isinstance(inputs, dict) else {}
         if not args and isinstance(input_str, str):

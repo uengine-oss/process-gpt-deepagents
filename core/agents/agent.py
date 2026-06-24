@@ -172,7 +172,7 @@ async def build_agent(
     _skill_user_email.set((user_context or {}).get("user_email") or "")
     _set_storage_tenant_id(tenant_id)
     _set_bpm_tenant_id(tenant_id)
-    _dynamic, _mcp_meta = await _build_subagents(
+    _dynamic, _mcp_connectors, _mcp_tools_meta = await _build_subagents(
         subagents_raw or [], tenant_id, tenant_mcp, backend=backend
     )
     built_subagents = list(static_subagents or []) + _dynamic
@@ -248,4 +248,4 @@ async def build_agent(
     if middleware:
         kwargs["middleware"] = middleware
 
-    return create_deep_agent(**kwargs), _mcp_meta
+    return create_deep_agent(**kwargs), _mcp_connectors, _mcp_tools_meta

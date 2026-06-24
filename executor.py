@@ -571,9 +571,10 @@ class DeepAgentExecutor(AgentExecutor):
                     proc_def_id, activity_id,
                 )
 
-        _root_mcp_meta: list[dict] = []
-        if _root_mcp_tool_names:
-            _root_mcp_meta = [{"agent": "__root__", "servers": ["process-gpt-mcp"], "tools": _root_mcp_tool_names}]
+        _root_mcp_meta: list[dict] = (
+            [{"agent": "__root__", "servers": ["process-gpt-mcp"], "tools": _root_mcp_tool_names}]
+            if _root_mcp_tool_names else []
+        )
         _accum = CtxAccumulator(mcp_tools=_root_mcp_meta)
 
         sources = extras.get("sources") or []
@@ -612,21 +613,7 @@ class DeepAgentExecutor(AgentExecutor):
             len(knowledge_doc_ids), knowledge_doc_ids[:5],
         )
 
-        _tracking_cb = (
-            ToolTrackingCallback(streamer=streamer, push_ctx=_accum.push)
-            if is_chat
-            else None
-        )
-
-        config = {
-            "configurable": {
-                "thread_id": checkpoint_thread_id,
-                "tenant_id": tenant_id,
-                "knowledge_doc_ids": knowledge_doc_ids,
-            },
-            **({"callbacks": [_tracking_cb]} if _tracking_cb else {}),
-        }
-        graph, _mcp_tools_meta = await build_agent(
+        graph, _, _sub_mcp_tools_meta = await build_agent(
             tenant_id=tenant_id,
             conversation_id=chat_room_id or "",
             checkpointer=checkpointer,
@@ -641,8 +628,38 @@ class DeepAgentExecutor(AgentExecutor):
                 "user_name": user_name,
             },
         )
-        if _mcp_tools_meta:
-            _accum.mcp_tools = _root_mcp_meta + _mcp_tools_meta
+
+        if _sub_mcp_tools_meta:
+            _accum.mcp_tools = _root_mcp_meta + _sub_mcp_tools_meta
+
+        _mcp_tool_servers: dict[str, list[str]] = {}
+        for meta in _accum.mcp_tools:
+            srvs = meta.get("servers") or []
+            for tn in (meta.get("tools") or []):
+                _mcp_tool_servers.setdefault(tn, [])
+                for s in srvs:
+                    if s not in _mcp_tool_servers[tn]:
+                        _mcp_tool_servers[tn].append(s)
+
+        _tracking_cb = (
+            ToolTrackingCallback(
+                streamer=streamer,
+                push_ctx=_accum.push,
+                mcp_tool_servers=_mcp_tool_servers,
+            )
+            if is_chat
+            else None
+        )
+
+        config = {
+            "configurable": {
+                "thread_id": checkpoint_thread_id,
+                "tenant_id": tenant_id,
+                "knowledge_doc_ids": knowledge_doc_ids,
+            },
+            **({"callbacks": [_tracking_cb]} if _tracking_cb else {}),
+        }
+
         active_tool_calls: dict[str, str] = {}
         # write_file/edit_file tool_call_id → {path, op}. tool_end 시 파일을 읽어 file_artifact emit.
         pending_file_ops: dict[str, dict] = {}
