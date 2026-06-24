@@ -26,9 +26,10 @@ def _get_skills(tenant_id: str = "", provider_config_id: str = "") -> list[str] 
           local/                         ← skills uploaded via ZIP or external git URL
             {skill-name}/SKILL.md
 
-    When provider_config_id is given the function returns the keyed path plus the
-    local-upload path. When omitted it falls back to the legacy flat {tenant_id}/
-    layout for backward compatibility.
+    The flat {tenant_id}/ path is always included so that non-repo skills
+    (directories directly under the tenant dir) remain discoverable.
+    When provider_config_id is given the function additionally returns the
+    keyed path and the local-upload path.
     """
     raw = os.getenv("SKILLS_DIRS", str(_BASE_DIR / "skills"))
     seen: set[str] = set()
@@ -55,11 +56,11 @@ def _get_skills(tenant_id: str = "", provider_config_id: str = "") -> list[str] 
                 local = f"{root}/{tenant_id}/local"
                 if Path(local).is_dir():
                     _add(local)
-            else:
-                # Legacy / no provider: flat {tenant_id}/ structure
-                tenant_path = f"{root}/{tenant_id}"
-                if Path(tenant_path).is_dir():
-                    _add(tenant_path)
+            # Flat {tenant_id}/ structure — always included so non-repo skills
+            # (directories directly under the tenant dir) are discoverable.
+            tenant_path = f"{root}/{tenant_id}"
+            if Path(tenant_path).is_dir():
+                _add(tenant_path)
 
         # Global collections (anthropics-skills, etc.) — exclude tenant dir
         try:

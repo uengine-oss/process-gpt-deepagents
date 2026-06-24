@@ -39,8 +39,15 @@ async def _build_subagents(
     tenant_id: str = "",
     tenant_mcp: dict | None = None,
     backend=None,
-) -> list[SubAgent]:
+) -> tuple[list[SubAgent], list[dict]]:
+    """서브에이전트 목록과 MCP 도구 메타 정보를 반환한다.
+
+    Returns:
+        (subagents, mcp_tools_meta) — mcp_tools_meta 각 항목:
+        {"agent": "<name>", "servers": ["<server>", ...], "tools": ["tool1", ...]}
+    """
     subagents: list[SubAgent] = []
+    mcp_tools_meta: list[dict] = []
     seen_names: set[str] = set()
 
     for agent in agents:
@@ -70,6 +77,17 @@ async def _build_subagents(
         tools = []
         if mcp_server_names and tenant_mcp:
             tools = await _load_mcp_tools(mcp_server_names, tenant_mcp)
+            if tools:
+                tool_names = [
+                    getattr(t, "name", "") for t in tools
+                    if getattr(t, "name", "")
+                ]
+                if tool_names:
+                    mcp_tools_meta.append({
+                        "agent": name,
+                        "servers": mcp_server_names,
+                        "tools": tool_names,
+                    })
 
         skill_names = _parse_csv(agent.get("skills"))
         extra_middleware = []
@@ -108,4 +126,4 @@ async def _build_subagents(
 
         subagents.append(subagent)
 
-    return subagents
+    return subagents, mcp_tools_meta

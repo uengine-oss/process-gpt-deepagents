@@ -65,12 +65,45 @@ def _scan_collection(col_path: str) -> list[dict]:
 def _scan_skills(tenant_id: str = "") -> list[dict]:
     from core.skills.skills import _get_skills
 
-    collection_dirs = _get_skills(tenant_id) or []
+    config_id = ""
+    if tenant_id:
+        try:
+            provider = _get_provider(tenant_id)
+            config_id = provider.config_id
+        except Exception:
+            pass
+
+    # Provider-keyed skills have a linked repo
+    repo_skill_names: set[str] = set()
+    if config_id:
+        keyed_dirs = _get_skills(tenant_id, config_id) or []
+        for col_path in keyed_dirs:
+            col = Path(col_path)
+            if not col.is_dir() or col.name == _BUILTIN_COLLECTION:
+                continue
+            # Only the provider-keyed directory implies a repo link
+            if col.name == config_id:
+                try:
+                    for entry in sorted(col.iterdir()):
+                        if entry.is_dir() and (entry / "SKILL.md").exists():
+                            repo_skill_names.add(entry.name)
+                except OSError:
+                    pass
+
+    collection_dirs = _get_skills(tenant_id, config_id) if config_id else _get_skills(tenant_id)
+    collection_dirs = collection_dirs or []
+
+    seen_names: set[str] = set()
     skills: list[dict] = []
     for col_path in collection_dirs:
         if Path(col_path).name == _BUILTIN_COLLECTION:
             continue
-        skills.extend(_scan_collection(col_path))
+        for skill in _scan_collection(col_path):
+            if skill["name"] in seen_names:
+                continue
+            seen_names.add(skill["name"])
+            skill["has_repo"] = skill["name"] in repo_skill_names
+            skills.append(skill)
     return skills
 
 
@@ -114,10 +147,10 @@ def _find_tenant_skill_dir(skill_name: str, tenant_id: str, config_id: str = "")
             candidate = Path(root) / tenant_id / "local" / skill_name
             if candidate.is_dir() and (candidate / "SKILL.md").exists():
                 return candidate
-        else:
-            candidate = Path(root) / tenant_id / skill_name
-            if candidate.is_dir() and (candidate / "SKILL.md").exists():
-                return candidate
+        # Flat tenant path — always checked so non-repo skills are found
+        candidate = Path(root) / tenant_id / skill_name
+        if candidate.is_dir() and (candidate / "SKILL.md").exists():
+            return candidate
     return None
 
 

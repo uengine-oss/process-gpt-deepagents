@@ -422,6 +422,9 @@ class DeepAgentExecutor(AgentExecutor):
         if is_chat:
             tenant_mcp = ensure_process_gpt_mcp(tenant_mcp, tenant_id)
         chat_root_tools = await load_chat_root_tools(tenant_mcp) if is_chat else []
+        _root_mcp_tool_names = [
+            getattr(t, "name", "") for t in chat_root_tools if getattr(t, "name", "")
+        ]
 
         if is_chat and chat_room_id and tenant_id:
             try:
@@ -568,7 +571,10 @@ class DeepAgentExecutor(AgentExecutor):
                     proc_def_id, activity_id,
                 )
 
-        _accum = CtxAccumulator()
+        _root_mcp_meta: list[dict] = []
+        if _root_mcp_tool_names:
+            _root_mcp_meta = [{"agent": "__root__", "servers": ["process-gpt-mcp"], "tools": _root_mcp_tool_names}]
+        _accum = CtxAccumulator(mcp_tools=_root_mcp_meta)
 
         sources = extras.get("sources") or []
         knowledge_doc_ids = [
@@ -620,7 +626,7 @@ class DeepAgentExecutor(AgentExecutor):
             },
             **({"callbacks": [_tracking_cb]} if _tracking_cb else {}),
         }
-        graph = await build_agent(
+        graph, _mcp_tools_meta = await build_agent(
             tenant_id=tenant_id,
             conversation_id=chat_room_id or "",
             checkpointer=checkpointer,
@@ -635,6 +641,8 @@ class DeepAgentExecutor(AgentExecutor):
                 "user_name": user_name,
             },
         )
+        if _mcp_tools_meta:
+            _accum.mcp_tools = _root_mcp_meta + _mcp_tools_meta
         active_tool_calls: dict[str, str] = {}
         # write_file/edit_file tool_call_id → {path, op}. tool_end 시 파일을 읽어 file_artifact emit.
         pending_file_ops: dict[str, dict] = {}
@@ -668,15 +676,6 @@ class DeepAgentExecutor(AgentExecutor):
                             full_response += text
                             if streamer:
                                 await streamer.send_json({"type": "token", "content": text})
-
-                        for tc in getattr(msg, "tool_call_chunks", []):
-                            tc_id = tc.get("id")
-                            tc_name = tc.get("name")
-                            if tc_id and tc_name and tc_id not in active_tool_calls:
-                                active_tool_calls[tc_id] = tc_name
-                                if streamer:
-                                    _ts_payload = {"type": "tool_start", "tool": tc_name, "id": tc_id}
-                                    await streamer.send_json(_ts_payload)
 
                 elif stream_evt == "updates":
                     for _node, update in data.items():
@@ -768,8 +767,6 @@ class DeepAgentExecutor(AgentExecutor):
                                     job_id=job_id,
                                 )
                                 if streamer:
-                                    await streamer.send_json({"type": "tool_end", "tool": tool_name, "output": result_content})
-
                                     # 파일 산출물 실시간 전달: 방금 끝난 write_file/edit_file 의 결과 파일을
                                     # 샌드박스에서 읽어 file_artifact 이벤트로 프론트(파일 UI)에 보낸다.
                                     _fop = pending_file_ops.pop(msg.tool_call_id, None)

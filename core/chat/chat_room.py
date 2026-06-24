@@ -34,10 +34,11 @@ class CtxAccumulator:
     A single DB write is performed after streaming ends via to_context().
     """
 
-    def __init__(self) -> None:
+    def __init__(self, mcp_tools: list[dict[str, Any]] | None = None) -> None:
         self.tools: list[dict[str, Any]] = []
         self.skills: list[str] = []
         self.todos: list[dict[str, Any]] = []
+        self.mcp_tools: list[dict[str, Any]] = list(mcp_tools or [])
 
     def push(self, payload: dict) -> None:
         et = str(payload.get("type") or "")
@@ -72,7 +73,7 @@ class CtxAccumulator:
                     self.todos.append(t)
 
     def to_context(self) -> dict[str, Any]:
-        return json_normalize({
+        ctx: dict[str, Any] = {
             "tools": self.tools,
             "skills": self.skills,
             "todos": self.todos,
@@ -83,7 +84,10 @@ class CtxAccumulator:
             },
             "updatedAt": now_iso(),
             "orchestration": "deepagents",
-        })
+        }
+        if self.mcp_tools:
+            ctx["mcpTools"] = self.mcp_tools
+        return json_normalize(ctx)
 
 
 def _tool_plan_to_context_tools(tools: Any) -> list[dict[str, Any]]:
