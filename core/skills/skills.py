@@ -52,10 +52,10 @@ def _get_skills(tenant_id: str = "", provider_config_id: str = "") -> list[str] 
                 keyed = f"{root}/{tenant_id}/{provider_config_id}"
                 if Path(keyed).is_dir():
                     _add(keyed)
-                # Locally uploaded skills always included alongside provider skills
-                local = f"{root}/{tenant_id}/local"
-                if Path(local).is_dir():
-                    _add(local)
+            # Locally uploaded skills always included
+            local = f"{root}/{tenant_id}/local"
+            if Path(local).is_dir():
+                _add(local)
             # Flat {tenant_id}/ structure — always included so non-repo skills
             # (directories directly under the tenant dir) are discoverable.
             tenant_path = f"{root}/{tenant_id}"
