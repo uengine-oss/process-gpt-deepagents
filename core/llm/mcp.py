@@ -108,12 +108,33 @@ def ensure_process_gpt_mcp(tenant_mcp: dict, tenant_id: str = "") -> dict:
     return {**tenant_mcp, "mcpServers": mcp_servers}
 
 
+_LOCAL_BPM_TOOLS = frozenset({
+    "get_current_user",
+    "get_process_list",
+    "get_process_detail",
+    "get_form_fields",
+    "get_instance_list",
+    "get_todolist",
+    "get_organization",
+})
+
+
 async def load_chat_root_tools(tenant_mcp: dict) -> list:
-    """채팅 모드 루트 오케스트레이터용 process-gpt-mcp 도구를 로드한다."""
+    """채팅 모드 루트 오케스트레이터용 process-gpt-mcp 도구를 로드한다.
+
+    로컬 BPM 도구와 중복되는 MCP 도구는 제외한다.
+    """
     if "process-gpt-mcp" not in (tenant_mcp.get("mcpServers") or {}):
         return []
     try:
         tools = await _load_mcp_tools(["process-gpt-mcp"], tenant_mcp)
+        before = len(tools)
+        tools = [t for t in tools if t.name not in _LOCAL_BPM_TOOLS]
+        if before != len(tools):
+            logger.info(
+                "MCP 도구 중복 제거: %d개 → %d개 (로컬 BPM 도구 %d개 제외)",
+                before, len(tools), before - len(tools),
+            )
         logger.info("process-gpt-mcp 루트 도구: %d개", len(tools))
         return tools
     except Exception:

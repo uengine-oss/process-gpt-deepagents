@@ -26,6 +26,7 @@ from ..skills.tools import (
     _current_user_email as _skill_user_email,
 )
 from ..storage.storage import set_tenant_id as _set_storage_tenant_id
+from ..bpm.tools import get_bpm_tools, set_tenant_id as _set_bpm_tenant_id
 
 _BASE_DIR = Path(__file__).parent.parent.parent
 _SKILLS_DIR = Path(os.getenv("SKILLS_HOST", str(_BASE_DIR / "skills")))
@@ -155,6 +156,7 @@ async def build_agent(
         list(extra_tools or [])
         + get_hitl_tools()
         + get_memento_tools()
+        + get_bpm_tools()
         + [
             checkout_to_workspace,
             extract_document_structure,
@@ -169,6 +171,7 @@ async def build_agent(
     _skill_user_name.set((user_context or {}).get("user_name") or "")
     _skill_user_email.set((user_context or {}).get("user_email") or "")
     _set_storage_tenant_id(tenant_id)
+    _set_bpm_tenant_id(tenant_id)
     built_subagents = list(static_subagents or []) + await _build_subagents(
         subagents_raw or [], tenant_id, tenant_mcp, backend=backend
     )
