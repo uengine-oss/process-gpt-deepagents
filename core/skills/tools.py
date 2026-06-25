@@ -45,6 +45,10 @@ _current_conversation_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _current_user_request: contextvars.ContextVar[str] = contextvars.ContextVar(
     "tools_user_request", default=""
 )
+# 현재 요청 사용자 UUID — PR requester_id 로 사용. executor/agent 에서 set() 호출.
+_current_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tools_user_id", default=""
+)
 # Docker sandbox 백엔드 — agent.py에서 set() 호출
 _current_sandbox: contextvars.ContextVar = contextvars.ContextVar(
     "tools_sandbox", default=None
@@ -231,7 +235,11 @@ def _push_skill_sandbox(
     *,
     existing_repo: bool = False,
 ) -> str:
-    """sandbox 컨테이너 내부에서 git init/commit/push를 수행한다."""
+    """sandbox 컨테이너 내부에서 git init/commit/push를 수행한다.
+
+    신규 레포(existing_repo=False)일 때만 main 직접 푸시를 허용하고,
+    기존 레포를 수정할 때는 반드시 피처 브랜치에 푸시 후 PR을 생성한다.
+    """
     author_name = _current_user_name.get() or "Skill Creator Agent"
     author_email = _current_user_email.get() or "skill-creator@agent"
 
@@ -256,6 +264,11 @@ def _push_skill_sandbox(
     if code != 0 and "nothing to commit" not in out:
         return f"ERROR git commit: {out}"
 
+    # 기존 레포 수정 시 기본 브랜치 직접 푸시 금지 → 피처 브랜치 + PR 워크플로우
+    if existing_repo and branch == "main":
+        import time as _time
+        branch = f"skill/{_safe_name(skill_name)}/{int(_time.time())}"
+
     if branch != "main":
         _git_sb(cwd, "checkout", "-b", branch)
 
@@ -266,12 +279,134 @@ def _push_skill_sandbox(
     if code != 0:
         return f"ERROR git push: {out}"
 
+    # 기존 레포: PR 생성 및 DB 기록
+    if existing_repo:
+        return _create_pr_after_push(
+            skill_name=skill_name,
+            branch=branch,
+            base_branch="main",
+            html_url=html_url,
+            title=f"feat: update {skill_name}",
+            description=f"스킬 '{skill_name}' 업데이트",
+        )
+
     return (
         f"Published '{skill_name}' → {html_url}/tree/{branch}\n\n"
         f"REGISTER_PROMPT: 이 스킬을 테넌트 스킬로 등록하시겠습니까? "
         f"등록하면 에이전트가 이 스킬을 즉시 사용할 수 있습니다. "
         f"(repo_url: {html_url})"
     )
+
+
+def _create_pr_after_push(
+    *,
+    skill_name: str,
+    branch: str,
+    base_branch: str,
+    html_url: str,
+    title: str,
+    description: str,
+) -> str:
+    """피처 브랜치 푸시 후 Git provider에 PR을 생성하고 resource_pull_requests에 기록한다."""
+    import json as _json
+
+    provider = _get_git_provider()
+    owner = provider.username
+
+    # Git provider에 PR 생성
+    try:
+        pr_result = provider.create_pull_request(
+            owner=owner,
+            repo=skill_name,
+            title=title,
+            body=description,
+            head=branch,
+            base=base_branch,
+        )
+    except Exception as e:
+        return (
+            f"Pushed '{skill_name}' → {html_url}/tree/{branch}\n"
+            f"WARNING: PR 생성 실패: {e}\n"
+            f"수동으로 PR을 생성해 주세요."
+        )
+
+    pr_number = pr_result.get("number")
+    pr_url = pr_result.get("html_url", "")
+
+    # resource_pull_requests 테이블에 기록
+    _record_resource_pr(
+        resource_type="skill",
+        resource_id=skill_name,
+        branch_name=branch,
+        base_branch=base_branch,
+        title=title,
+        description=description,
+        git_pr_number=pr_number,
+        git_pr_url=pr_url,
+        git_repo_url=html_url,
+    )
+
+    return (
+        f"PR created for '{skill_name}' → {pr_url}\n"
+        f"Branch: {branch} → {base_branch}\n"
+        f"PR #{pr_number}: {title}\n\n"
+        f"기본 브랜치에 직접 커밋하지 않고 PR을 생성했습니다. "
+        f"리뷰 후 병합해 주세요."
+    )
+
+
+def _record_resource_pr(
+    *,
+    resource_type: str,
+    resource_id: str,
+    branch_name: str,
+    base_branch: str,
+    title: str,
+    description: str,
+    git_pr_number: int | None = None,
+    git_pr_url: str = "",
+    git_repo_url: str = "",
+) -> dict | None:
+    """resource_pull_requests 테이블에 PR 레코드를 삽입한다."""
+    tenant_id = _current_tenant_id.get()
+    if not tenant_id:
+        return None
+
+    requester_id = _current_user_id.get()
+    requester_name = _current_user_name.get() or None
+    if not requester_id:
+        import uuid as _uuid
+        requester_id = str(_uuid.UUID(int=0))
+
+    try:
+        from ..storage.db import get_supabase
+        sb = get_supabase()
+        row = {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "branch_name": branch_name,
+            "base_branch": base_branch,
+            "title": title,
+            "description": description,
+            "status": "OPEN",
+            "requester_id": requester_id,
+            "requester_name": requester_name,
+            "git_pr_number": git_pr_number,
+            "git_pr_url": git_pr_url,
+            "git_repo_url": git_repo_url,
+        }
+        resp = sb.table("resource_pull_requests").insert(row).execute()
+        data = getattr(resp, "data", None)
+        return data[0] if data else None
+    except Exception:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "resource_pull_requests 기록 실패: resource=%s/%s branch=%s",
+            resource_type, resource_id, branch_name,
+            exc_info=True,
+        )
+        return None
 
 
 def _read_process_definition_file() -> dict | None:
@@ -1592,24 +1727,17 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
       - /skills/<tenant-id>/<skill-name> → copied to /workspace/<skill-name> first
       - /skills/anthropics-skills/...    → rejected (read-only system skills)
 
-    **Two-phase flow:**
+    **Workflow:**
 
-    Phase 1 — call without `branch`:
-      - If the repo does NOT exist: creates it and pushes to main.
-        Returns the published URL.
-      - If the repo ALREADY exists: returns a "CONFIRM:" message with
-        the repo URL. Infer the target branch from the user's prior request —
-        if the user already specified a branch name, call this tool again with
-        that branch immediately without asking. Only call `ask_user` when the
-        branch truly cannot be inferred from context.
-
-    Phase 2 — call with `branch`:
-      - Pushes to the specified branch (use "main" to overwrite, or a new name
-        such as "v2" to preserve the current version).
+    - If the repo does NOT exist: creates it and pushes initial content to main.
+    - If the repo ALREADY exists: creates a feature branch, pushes changes,
+      and opens a Pull Request for review. Direct commits to the default branch
+      are not allowed — all changes go through the PR workflow.
 
     Args:
         skill_path: Docker container path to the completed skill folder.
-        branch:     Target branch. Omit on first call; set once branch is known.
+        branch:     Optional custom branch name for the PR. If omitted, an
+                    auto-generated branch name is used (skill/<name>/<timestamp>).
     """
     if _current_sandbox.get() is None:
         return "ERROR: sandbox not available. 스킬 퍼블리시는 Docker sandbox 환경에서만 가능합니다."
@@ -1654,15 +1782,8 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
     repo_info = provider.repo_exists(skill_name)
     repo_exists = repo_info is not None
 
-    if branch is None:
-        if repo_exists:
-            html_url = provider.get_repo_html_url(provider.username, skill_name)
-            return (
-                f"CONFIRM: '{skill_name}' 레포가 이미 존재합니다 ({html_url}). "
-                "ask_user를 호출해 main에 커밋으로 업데이트할지, "
-                "새 브랜치명을 쓸지 확인한 뒤 "
-                "branch 값을 지정해서 publish_skill을 다시 호출하세요."
-            )
+    if not repo_exists:
+        # 신규 레포: 생성 후 main에 초기 커밋 (PR 불필요)
         try:
             html_url = provider.create_repo(skill_name)
         except RuntimeError as e:
@@ -1673,10 +1794,19 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
             cwd, skill_name, "main", clone_url, html_url, existing_repo=False
         )
 
+    # 기존 레포: 피처 브랜치 + PR 워크플로우 (기본 브랜치 직접 커밋 금지)
+    if branch and branch == "main":
+        branch = None  # main 직접 푸시 요청은 자동 브랜치로 전환
+
     clone_url = provider.get_authenticated_clone_url(provider.username, skill_name)
     html_url = provider.get_repo_html_url(provider.username, skill_name)
+
+    if branch is None:
+        import time as _time
+        branch = f"skill/{_safe_name(skill_name)}/{int(_time.time())}"
+
     return _push_skill_sandbox(
-        cwd, skill_name, branch, clone_url, html_url, existing_repo=repo_exists
+        cwd, skill_name, branch, clone_url, html_url, existing_repo=True
     )
 
 

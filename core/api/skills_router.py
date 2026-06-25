@@ -210,6 +210,57 @@ def _save_tenant_skill(tenant_id: str, skill_name: str, owner_id: str) -> None:
     }).execute()
 
 
+def _record_resource_pr_sync(
+    *,
+    tenant_id: str,
+    resource_type: str,
+    resource_id: str,
+    branch_name: str,
+    base_branch: str,
+    title: str,
+    description: str,
+    requester_id: str | None = None,
+    requester_name: str | None = None,
+    git_pr_number: int | None = None,
+    git_pr_url: str = "",
+    git_repo_url: str = "",
+) -> dict | None:
+    """resource_pull_requests 테이블에 PR 레코드를 삽입한다 (동기 버전, API 라우터용)."""
+    import uuid
+    from core.storage.db import get_supabase
+
+    if not requester_id:
+        requester_id = str(uuid.UUID(int=0))
+
+    try:
+        sb = get_supabase()
+        row = {
+            "tenant_id": tenant_id,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "branch_name": branch_name,
+            "base_branch": base_branch,
+            "title": title,
+            "description": description,
+            "status": "OPEN",
+            "requester_id": requester_id,
+            "requester_name": requester_name,
+            "git_pr_number": git_pr_number,
+            "git_pr_url": git_pr_url,
+            "git_repo_url": git_repo_url,
+        }
+        resp = sb.table("resource_pull_requests").insert(row).execute()
+        data = getattr(resp, "data", None)
+        return data[0] if data else None
+    except Exception:
+        logger.warning(
+            "resource_pull_requests 기록 실패: resource=%s/%s branch=%s",
+            resource_type, resource_id, branch_name,
+            exc_info=True,
+        )
+        return None
+
+
 async def list_skills(request: Request) -> JSONResponse:
     tenant_id = request.query_params.get("tenant_id", "")
     skills = _scan_skills(tenant_id)
@@ -222,6 +273,13 @@ async def list_builtin_skills(_request: Request) -> JSONResponse:
 
 
 async def commit_skill_file(request: Request) -> JSONResponse:
+    """스킬 파일을 커밋한다.
+
+    기본 브랜치(main)로 직접 커밋은 금지된다. 기본 브랜치로 요청 시:
+      1. 자동으로 피처 브랜치를 생성
+      2. 해당 브랜치에 커밋
+      3. PR을 생성하고 resource_pull_requests에 기록
+    """
     skill_name = request.path_params["skill_name"]
     try:
         body = await request.json()
@@ -235,6 +293,8 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     branch = body.get("branch", "main")
     author_name = body.get("author_name") or None
     author_email = body.get("author_email") or None
+    requester_id = body.get("requester_id") or None
+    requester_name = body.get("requester_name") or author_name
 
     if not tenant_id:
         return JSONResponse({"error": "tenant_id is required"}, status_code=400)
@@ -246,6 +306,32 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
+    # 기본 브랜치 감지
+    try:
+        default_branch = await asyncio.to_thread(
+            provider.detect_default_branch, provider.username, skill_name
+        )
+    except Exception:
+        default_branch = "main"
+
+    is_default_branch = branch == default_branch
+
+    # 기본 브랜치 직접 커밋 금지 → 피처 브랜치 + PR 워크플로우
+    if is_default_branch:
+        import time
+        import uuid
+
+        branch = f"skill/{skill_name}/{int(time.time())}"
+
+        # 기본 브랜치에서 피처 브랜치 생성
+        try:
+            await asyncio.to_thread(
+                provider.create_branch, provider.username, skill_name, branch, default_branch
+            )
+        except Exception as e:
+            return JSONResponse({"error": f"브랜치 생성 실패: {e}"}, status_code=500)
+
+    # 피처 브랜치에 커밋
     try:
         result = await asyncio.to_thread(
             provider.update_file, provider.username, skill_name, file_path, content, message, branch,
@@ -254,22 +340,42 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-    if branch == "main":
-        config_id = provider.config_id
-        skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
-        if skill_dir is None and config_id:
-            skill_dir = _get_provider_keyed_skill_root(tenant_id, config_id) / skill_name
-        if skill_dir is not None:
-            resolved_skill = skill_dir.resolve()
-            target = (skill_dir / file_path).resolve()
-            try:
-                target.relative_to(resolved_skill)
-                await asyncio.to_thread(target.parent.mkdir, **{"parents": True, "exist_ok": True})
-                await asyncio.to_thread(target.write_text, content, "utf-8")
-            except (ValueError, OSError):
-                pass
+    # 기본 브랜치로 요청한 경우 PR 생성
+    pr_result: dict = {}
+    if is_default_branch:
+        try:
+            pr = await asyncio.to_thread(
+                provider.create_pull_request,
+                provider.username,
+                skill_name,
+                message,
+                f"파일 변경: {file_path}",
+                branch,
+                default_branch,
+            )
+            pr_result = {"pr_created": True, **pr}
 
-    return JSONResponse({"committed": True, **result})
+            # resource_pull_requests DB 기록
+            await asyncio.to_thread(
+                _record_resource_pr_sync,
+                tenant_id=tenant_id,
+                resource_type="skill",
+                resource_id=skill_name,
+                branch_name=branch,
+                base_branch=default_branch,
+                title=message,
+                description=f"파일 변경: {file_path}",
+                requester_id=requester_id,
+                requester_name=requester_name,
+                git_pr_number=pr.get("number"),
+                git_pr_url=pr.get("html_url", ""),
+                git_repo_url=provider.get_repo_html_url(provider.username, skill_name),
+            )
+        except Exception as e:
+            logger.warning("PR 생성 실패 skill=%s branch=%s: %s", skill_name, branch, e)
+            pr_result = {"pr_created": False, "pr_error": str(e)}
+
+    return JSONResponse({"committed": True, "branch": branch, **result, **pr_result})
 
 
 async def list_skill_branches(request: Request) -> JSONResponse:
@@ -362,6 +468,24 @@ async def merge_skill_pull_request(request: Request) -> JSONResponse:
                 sync_result = {"synced": True, "updated": updated, "errors": sync_errors}
         except Exception as e:
             sync_result = {"synced": False, "error": str(e)}
+
+    # resource_pull_requests 상태를 MERGED로 갱신
+    try:
+        from core.storage.db import get_supabase
+        sb = get_supabase()
+        sb.table("resource_pull_requests").update({
+            "status": "MERGED",
+            "merged_at": "now()",
+        }).eq("tenant_id", tenant_id).eq(
+            "resource_type", "skill"
+        ).eq("resource_id", skill_name).eq(
+            "git_pr_number", number
+        ).eq("status", "OPEN").execute()
+    except Exception:
+        logger.warning(
+            "resource_pull_requests MERGED 갱신 실패: skill=%s pr=%d",
+            skill_name, number, exc_info=True,
+        )
 
     return JSONResponse({"merged": True, "number": number, **result, "sync": sync_result})
 
@@ -571,6 +695,7 @@ async def delete_skill(request: Request) -> JSONResponse:
 
 
 async def delete_skill_file(request: Request) -> JSONResponse:
+    """스킬 파일을 삭제한다. 기본 브랜치 직접 삭제는 금지 → 피처 브랜치 + PR 워크플로우."""
     skill_name = request.path_params["skill_name"]
     file_path = request.path_params["file_path"]
     try:
@@ -583,6 +708,8 @@ async def delete_skill_file(request: Request) -> JSONResponse:
     branch = body.get("branch", "main")
     author_name = body.get("author_name") or None
     author_email = body.get("author_email") or None
+    requester_id = body.get("requester_id") or None
+    requester_name = body.get("requester_name") or author_name
 
     if not tenant_id:
         return JSONResponse({"error": "tenant_id is required"}, status_code=400)
@@ -591,6 +718,28 @@ async def delete_skill_file(request: Request) -> JSONResponse:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+
+    # 기본 브랜치 감지
+    try:
+        default_branch = await asyncio.to_thread(
+            provider.detect_default_branch, provider.username, skill_name
+        )
+    except Exception:
+        default_branch = "main"
+
+    is_default_branch = branch == default_branch
+
+    # 기본 브랜치 직접 삭제 금지 → 피처 브랜치 + PR 워크플로우
+    if is_default_branch:
+        import time
+
+        branch = f"skill/{skill_name}/{int(time.time())}"
+        try:
+            await asyncio.to_thread(
+                provider.create_branch, provider.username, skill_name, branch, default_branch
+            )
+        except Exception as e:
+            return JSONResponse({"error": f"브랜치 생성 실패: {e}"}, status_code=500)
 
     try:
         result = await asyncio.to_thread(
@@ -602,21 +751,41 @@ async def delete_skill_file(request: Request) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-    # main 브랜치 편집일 때만 로컬 디스크도 삭제 (path traversal 방지 포함)
-    if branch == "main":
-        config_id = provider.config_id
-        skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
-        if skill_dir is not None:
-            resolved_skill = skill_dir.resolve()
-            target = (skill_dir / file_path).resolve()
-            try:
-                target.relative_to(resolved_skill)
-                if target.is_file():
-                    await asyncio.to_thread(target.unlink)
-            except (ValueError, OSError):
-                pass
+    # 기본 브랜치로 요청한 경우 PR 생성
+    pr_result: dict = {}
+    if is_default_branch:
+        try:
+            pr = await asyncio.to_thread(
+                provider.create_pull_request,
+                provider.username,
+                skill_name,
+                message,
+                f"파일 삭제: {file_path}",
+                branch,
+                default_branch,
+            )
+            pr_result = {"pr_created": True, **pr}
 
-    return JSONResponse({"deleted": True, "file_path": file_path, **result})
+            await asyncio.to_thread(
+                _record_resource_pr_sync,
+                tenant_id=tenant_id,
+                resource_type="skill",
+                resource_id=skill_name,
+                branch_name=branch,
+                base_branch=default_branch,
+                title=message,
+                description=f"파일 삭제: {file_path}",
+                requester_id=requester_id,
+                requester_name=requester_name,
+                git_pr_number=pr.get("number"),
+                git_pr_url=pr.get("html_url", ""),
+                git_repo_url=provider.get_repo_html_url(provider.username, skill_name),
+            )
+        except Exception as e:
+            logger.warning("PR 생성 실패 (delete) skill=%s branch=%s: %s", skill_name, branch, e)
+            pr_result = {"pr_created": False, "pr_error": str(e)}
+
+    return JSONResponse({"deleted": True, "branch": branch, "file_path": file_path, **result, **pr_result})
 
 
 async def create_skill_repo(request: Request) -> JSONResponse:

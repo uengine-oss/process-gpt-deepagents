@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import uuid
+import asyncio
 from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -42,7 +43,7 @@ from core.chat.chat_room import (
 )
 from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
-from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id
+from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
@@ -379,6 +380,7 @@ class DeepAgentExecutor(AgentExecutor):
         user_name = extras.get("user_name")
 
         _skill_tenant_id.set(tenant_id)
+        _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())
         agents = extras.get("agents", [])
         streamer = extras.get("streamer")
         form_id = extras.get("form_id")
@@ -626,6 +628,7 @@ class DeepAgentExecutor(AgentExecutor):
                 "user_jwt": user_jwt,
                 "user_email": user_email,
                 "user_name": user_name,
+                "user_id": str(extras.get("user_id") or row.get("user_id") or "").strip(),
             },
         )
 

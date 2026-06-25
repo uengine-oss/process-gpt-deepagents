@@ -24,6 +24,7 @@ from ..skills.tools import (
     _current_sandbox as _skill_sandbox,
     _current_user_name as _skill_user_name,
     _current_user_email as _skill_user_email,
+    _current_user_id as _skill_user_id,
 )
 from ..storage.storage import set_tenant_id as _set_storage_tenant_id
 from ..bpm.tools import get_bpm_tools, set_tenant_id as _set_bpm_tenant_id
@@ -170,6 +171,7 @@ async def build_agent(
     _skill_sandbox.set(backend)
     _skill_user_name.set((user_context or {}).get("user_name") or "")
     _skill_user_email.set((user_context or {}).get("user_email") or "")
+    _skill_user_id.set((user_context or {}).get("user_id") or "")
     _set_storage_tenant_id(tenant_id)
     _set_bpm_tenant_id(tenant_id)
     _dynamic, _mcp_connectors, _mcp_tools_meta = await _build_subagents(
