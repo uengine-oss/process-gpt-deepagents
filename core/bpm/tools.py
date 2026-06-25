@@ -84,20 +84,26 @@ def get_current_user(email: str) -> str:
 # 2. get_process_list
 # ---------------------------------------------------------------------------
 @tool(parse_docstring=True)
-def get_process_list() -> str:
-    """현재 테넌트의 프로세스 정의 목록(id, name)을 조회한다.
+def get_process_list(type: Optional[str] = None) -> str:
+    """현재 테넌트의 프로세스 또는 비즈니스 규칙 정의 목록(id, name, type)을 조회한다.
 
     사용자가 기존 프로세스에 대해 질문하거나 실행 요청했을 때 대상 프로세스 식별용으로 사용한다.
+    사용자가 비즈니스 규칙(DMN)에 대해 질문할 때는 type='dmn'으로 호출한다.
+
+    Args:
+        type: 'bpmn'이면 프로세스만, 'dmn'이면 비즈니스 규칙만 조회. 미지정 시 전체 조회.
     """
     tenant_id = _require_tenant_id()
     try:
-        resp = (
+        q = (
             get_supabase()
             .table("proc_def")
-            .select("id,name")
+            .select("id,name,type")
             .eq("tenant_id", tenant_id)
-            .execute()
         )
+        if type:
+            q = q.eq("type", type)
+        resp = q.execute()
         return _json(resp.data)
     except Exception as e:
         logger.error("[get_process_list] %s", e)
@@ -109,27 +115,41 @@ def get_process_list() -> str:
 # ---------------------------------------------------------------------------
 @tool(parse_docstring=True)
 def get_process_detail(process_id: str) -> str:
-    """특정 프로세스 정의(definition)를 조회한다.
+    """특정 프로세스 정의 또는 비즈니스 규칙 상세를 조회한다.
 
+    프로세스(bpmn)는 definition(JSON)을, 비즈니스 규칙(dmn)은 bpmn 컬럼의 DMN XML을 반환한다.
     실행 전 activity_id/form_key 추출과 역할 담당자 검증에 사용한다.
 
     Args:
-        process_id: 프로세스 정의 ID.
+        process_id: 프로세스 또는 규칙 정의 ID.
     """
     tenant_id = _require_tenant_id()
     try:
         resp = (
             get_supabase()
             .table("proc_def")
-            .select("id,name,definition")
+            .select("id,name,type,definition,bpmn")
             .eq("tenant_id", tenant_id)
             .eq("id", process_id)
             .execute()
         )
         data = resp.data
-        if data:
-            return _json(data[0])
-        return _err("프로세스를 찾을 수 없습니다.")
+        if not data:
+            return _err("프로세스 또는 규칙을 찾을 수 없습니다.")
+        row = data[0]
+        if row.get("type") == "dmn":
+            return _json({
+                "id": row["id"],
+                "name": row.get("name"),
+                "type": "dmn",
+                "dmn_xml": row.get("bpmn"),
+            })
+        return _json({
+            "id": row["id"],
+            "name": row.get("name"),
+            "type": row.get("type"),
+            "definition": row.get("definition"),
+        })
     except Exception as e:
         logger.error("[get_process_detail] %s", e)
         return _err(str(e))

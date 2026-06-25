@@ -1694,11 +1694,32 @@ def _skills_from_tool_args(tool_args: dict) -> list[str]:
         skills_root = os.getenv("SKILLS_DIRS", str(Path(__file__).parent.parent.parent / "skills"))
         bases = [str(Path(skills_root).resolve())]
 
-    # Agents run inside Docker and use container paths like /skills/{collection}/{skill-name}.
-    # Add the container-side equivalents so we match both host and container paths.
+    known: set[str] = set()
+    for base in bases:
+        bp = Path(base)
+        if not bp.is_dir():
+            continue
+        try:
+            for entry in bp.iterdir():
+                if not entry.is_dir():
+                    continue
+                if (entry / "SKILL.md").exists():
+                    known.add(entry.name)
+                else:
+                    try:
+                        for sub in entry.iterdir():
+                            if sub.is_dir() and (sub / "SKILL.md").exists():
+                                known.add(sub.name)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    if not known:
+        return []
+
     container_bases = [f"/skills/{Path(p).name}" for p in bases if Path(p).name]
     all_bases = list(dict.fromkeys([*bases, *container_bases]))
-    all_bases.sort(key=len, reverse=True)
 
     found: list[str] = []
 
@@ -1710,17 +1731,16 @@ def _skills_from_tool_args(tool_args: dict) -> list[str]:
             for item in v:
                 _scan(item)
         elif isinstance(v, str):
-            consumed: set[int] = set()
             for base in all_bases:
                 base = base.rstrip("/")
                 idx = v.find(base)
-                if idx == -1 or idx in consumed:
+                if idx == -1:
                     continue
-                consumed.add(idx)
-                rest = v[idx + len(base):]
-                parts = [p for p in rest.split("/") if p]
-                if parts:
-                    found.append(parts[0])
+                for part in v[idx + len(base):].split("/"):
+                    if part in known:
+                        if part not in found:
+                            found.append(part)
+                        break
 
     _scan(tool_args)
-    return list(dict.fromkeys(found))
+    return found
