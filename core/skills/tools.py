@@ -1688,7 +1688,8 @@ def _skills_from_tool_args(tool_args: dict) -> list[str]:
     """Return skill names whose directory paths appear in any string value of tool_args."""
     from core.skills.skills import _get_skills
 
-    bases = _get_skills() or []
+    tenant_id = _current_tenant_id.get()
+    bases = (_get_skills(tenant_id) if tenant_id else _get_skills()) or []
     if not bases:
         skills_root = os.getenv("SKILLS_DIRS", str(Path(__file__).parent.parent.parent / "skills"))
         bases = [str(Path(skills_root).resolve())]
@@ -1697,6 +1698,7 @@ def _skills_from_tool_args(tool_args: dict) -> list[str]:
     # Add the container-side equivalents so we match both host and container paths.
     container_bases = [f"/skills/{Path(p).name}" for p in bases if Path(p).name]
     all_bases = list(dict.fromkeys([*bases, *container_bases]))
+    all_bases.sort(key=len, reverse=True)
 
     found: list[str] = []
 
@@ -1708,11 +1710,13 @@ def _skills_from_tool_args(tool_args: dict) -> list[str]:
             for item in v:
                 _scan(item)
         elif isinstance(v, str):
+            consumed: set[int] = set()
             for base in all_bases:
                 base = base.rstrip("/")
                 idx = v.find(base)
-                if idx == -1:
+                if idx == -1 or idx in consumed:
                     continue
+                consumed.add(idx)
                 rest = v[idx + len(base):]
                 parts = [p for p in rest.split("/") if p]
                 if parts:
