@@ -93,6 +93,11 @@ def _find_skill_dir(skill_name: str, tenant_id: str = "", config_id: str = "") -
         candidate = Path(col_path) / skill_name
         if candidate.is_dir() and (candidate / "SKILL.md").exists():
             return candidate
+    # 업로드된 스킬은 {tenant}/{config_id or 'local'}/{name} 에 저장되므로(컬렉션 직속이 아님) 추가 탐색.
+    if tenant_id:
+        td = _find_tenant_skill_dir(skill_name, tenant_id, config_id)
+        if td is not None:
+            return td
     return None
 
 
@@ -116,6 +121,10 @@ def _find_tenant_skill_dir(skill_name: str, tenant_id: str, config_id: str = "")
                 return candidate
         else:
             candidate = Path(root) / tenant_id / skill_name
+            if candidate.is_dir() and (candidate / "SKILL.md").exists():
+                return candidate
+            # config_id 가 없어도 업로드 기본 위치(local) 는 항상 탐색(프론트 getSkillFile 은 config_id 미전달).
+            candidate = Path(root) / tenant_id / "local" / skill_name
             if candidate.is_dir() and (candidate / "SKILL.md").exists():
                 return candidate
     return None

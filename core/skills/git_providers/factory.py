@@ -25,26 +25,37 @@ def get_provider(tenant_id: str) -> GitProvider:
 
     sb = get_supabase()
 
-    # is_default=true 우선, 없으면 첫 번째 레코드 사용
-    resp = (
-        sb.table("tenant_git_config")
-        .select("id, provider, base_url, username, token")
-        .eq("tenant_id", tenant_id)
-        .eq("is_default", True)
-        .limit(1)
-        .execute()
-    )
-    rows = getattr(resp, "data", None) or []
-
-    if not rows:
+    # is_default=true 우선, 없으면 첫 번째 레코드 사용.
+    # tenant_git_config 테이블이 없는 환경(로컬/dev)에서는 supabase 가 APIError(PGRST205)를
+    # 던지는데, 이는 '미연결'과 동일하게 다뤄 ValueError 로 변환한다(호출 도구들이 ValueError 를
+    # 잡아 graceful 폴백 — 스킬은 워크스페이스에 생성되고 프론트가 저장하므로 git 없이도 동작).
+    try:
         resp = (
             sb.table("tenant_git_config")
             .select("id, provider, base_url, username, token")
             .eq("tenant_id", tenant_id)
+            .eq("is_default", True)
             .limit(1)
             .execute()
         )
         rows = getattr(resp, "data", None) or []
+
+        if not rows:
+            resp = (
+                sb.table("tenant_git_config")
+                .select("id, provider, base_url, username, token")
+                .eq("tenant_id", tenant_id)
+                .limit(1)
+                .execute()
+            )
+            rows = getattr(resp, "data", None) or []
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(
+            "Git 계정이 연결되지 않았습니다(tenant_git_config 미설정/조회 불가). "
+            f"ask_user를 호출하지 말고 git 없이 작업을 계속하세요. (detail: {e})"
+        ) from e
 
     if not rows:
         raise ValueError(

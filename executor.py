@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -524,7 +525,7 @@ class DeepAgentExecutor(AgentExecutor):
         if human_answer_stripped:
             resume_run_state = {
                 "pending_field": run_state.get("pending_field") or "human_response",
-                "tool_name": run_state.get("tool_name") or "ask_user",
+                "tool_name": run_state.get("tool_name") or "request_human_input",
                 "last_question": run_state.get("last_question") or "",
                 "checkpoint_thread_id": checkpoint_thread_id or "",
                 "resume_source": "checkpoint_graph_resume" if use_graph_resume else "human_response",
@@ -833,6 +834,46 @@ class DeepAgentExecutor(AgentExecutor):
                     await streamer.send_json({"type": "process_result", "data": _pr_final})
 
             interrupt_payload = extract_interrupt_payload(final_state)
+
+            # 컨설팅 강제 HITL(resume 호환) — 모델이 비일관적으로 request_human_input 을 빠뜨리고
+            # 초안을 평문으로 끝내는 경우, 같은 그래프 thread 로 한 번 더 돌려 강제로 도구를 호출시켜
+            # '진짜' interrupt 를 만든다. 아직 생성 전(process-definition.json 미작성)이라 프로세스가
+            # 중복 생성되지 않으며, 이후 승인은 진짜 graph resume(Command) 으로 처리되어 단일 생성이 보장된다.
+            if (
+                not interrupt_payload
+                and is_chat
+                and not process_json_written
+                and not complete_called
+            ):
+                _txt = (raw_text or "").strip()
+                _steps = len(re.findall(r"(?m)^\s*\d+\s*[\.\)]\s", _txt))
+                if len(_txt) > 100 and (_steps >= 2 or re.search(r"진행|승인|반려|초안|어떻게|수정|바꿀|추가하거나", _txt)):
+                    logger.info(
+                        "컨설팅 강제 HITL: request_human_input 미호출 → 같은 thread 로 강제 interrupt 생성 | room=%s",
+                        chat_room_id,
+                    )
+                    forced_inputs = {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": (
+                                    "방금 작성한 프로세스 초안을 평문으로 끝내지 말고, 지금 즉시 `request_human_input` 도구를 호출해 "
+                                    "승인/반려를 물어라. question 인자에는 '이대로 진행할까요? 추가하거나 바꿀 단계가 있으면 알려주세요.' 만, "
+                                    "context 인자에는 위 초안 전체(번호 단계·담당 역할·분기 포함)를 담아라. "
+                                    "다른 평문 출력이나 프로세스 정의 생성은 하지 말고, 오직 request_human_input 도구만 호출하라."
+                                ),
+                            }
+                        ]
+                    }
+                    try:
+                        forced_state = await graph.ainvoke(forced_inputs, config=config)
+                        _forced_ip = extract_interrupt_payload(forced_state)
+                        if _forced_ip:
+                            interrupt_payload = _forced_ip
+                            final_state = forced_state
+                    except Exception:
+                        logger.warning("컨설팅 강제 HITL 2차 패스 실패", exc_info=True)
+
             if interrupt_payload:
                 question = (
                     interrupt_payload.get("question") if isinstance(interrupt_payload, dict) else None
@@ -847,7 +888,7 @@ class DeepAgentExecutor(AgentExecutor):
                 )
                 new_run_state = {
                     "pending_field": pending_field,
-                    "tool_name": "ask_user",
+                    "tool_name": "request_human_input",
                     "last_question": question,
                     "checkpoint_thread_id": checkpoint_thread_id or "",
                 }

@@ -65,7 +65,9 @@ def _ask_user_impl(question: str, context: str = "") -> str:
 
 ask_user = StructuredTool.from_function(
     func=_ask_user_impl,
-    name="ask_user",
+    # 프론트엔드(HITL 패널 감지)·프롬프트·executor resume 이 모두 `request_human_input` 이름을 기대한다.
+    # (incoming merge 가 `ask_user` 로 바꿔 이름이 어긋나면서 에이전트가 도구를 못 불러 텍스트로 폴백하던 문제 수정.)
+    name="request_human_input",
     description=(
         "사람 개입(HITL)이 필요할 때 호출하는 도구. "
         "명시적 인간 승인, 민감 정보 확인, 모호한 요청 명확화, 선택지 제시 등 "

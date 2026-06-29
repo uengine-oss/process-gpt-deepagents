@@ -472,16 +472,24 @@ def _normalize_to_processgpt_schema(pd: dict) -> tuple:
     if id_map:
         changed = True
         for e in new_els:
+            if not isinstance(e, dict):
+                continue
+            # id_map 키는 str(위 빌드 루프의 old=str(...))이므로, 조회 값도 str 로 coerce 한다.
+            # (모델이 id/source/target 에 dict 등 비문자열을 넣으면 `x in id_map` 이 unhashable 로 크래시)
             if e.get("elementType") == "Sequence":
-                if e.get("source") in id_map:
-                    e["source"] = id_map[e["source"]]
-                if e.get("target") in id_map:
-                    e["target"] = id_map[e["target"]]
+                src = str(e.get("source") or "")
+                if src in id_map:
+                    e["source"] = id_map[src]
+                tgt = str(e.get("target") or "")
+                if tgt in id_map:
+                    e["target"] = id_map[tgt]
             else:
-                if e.get("id") in id_map:
-                    e["id"] = id_map[e["id"]]
-                if e.get("source") in id_map:
-                    e["source"] = id_map[e["source"]]
+                eid = str(e.get("id") or "")
+                if eid in id_map:
+                    e["id"] = id_map[eid]
+                src = str(e.get("source") or "")
+                if src in id_map:
+                    e["source"] = id_map[src]
 
     pd["elements"] = new_els
     # flattened 잔재 제거(중복 방지)
@@ -908,8 +916,9 @@ def _ensure_forms_refs_skills(pd: dict, work, manifest: dict) -> None:
     fdir = work / "forms"
     existing_form_by_aid = {}
     if fdir.is_dir():
-        for g in fdir.glob("*.html"):
-            existing_form_by_aid[_to_snake(g.stem)] = g
+        # 폼은 의미있는 확장자 `.form` 으로 생성한다. 기존 `.html` 폼도 함께 읽어 호환한다.
+        for g in list(fdir.glob("*.form")) + list(fdir.glob("*.html")):
+            existing_form_by_aid.setdefault(_to_snake(g.stem), g)
 
     def _is_processgpt_form(html: str) -> bool:
         h = (html or "").lower()
@@ -941,8 +950,8 @@ def _ensure_forms_refs_skills(pd: dict, work, manifest: dict) -> None:
                 existing.write_text(_gen_form_html(a, proc_name), encoding="utf-8")
             else:
                 fdir.mkdir(parents=True, exist_ok=True)
-                (fdir / f"{aid}.html").write_text(_gen_form_html(a, proc_name), encoding="utf-8")
-                existing_form_by_aid[aid] = fdir / f"{aid}.html"
+                (fdir / f"{aid}.form").write_text(_gen_form_html(a, proc_name), encoding="utf-8")
+                existing_form_by_aid[aid] = fdir / f"{aid}.form"
         except Exception:
             pass
 
@@ -1028,18 +1037,33 @@ def _capture_selection_to_manifest(answer: str) -> None:
                 man = {}
         if not isinstance(man, dict):
             man = {}
-        # 에이전트 실제 id 매칭(agents.json 의 name → id)
+        # 에이전트 실제 id 매칭(name → id) — 개별 파일 agents/<id>.json 우선, 레거시 agents.json 호환.
         ag_by_name: dict = {}
+        _collect_agents: list = []
+        adir = d / "agents"
+        if adir.is_dir():
+            for af in sorted(adir.glob("*.json")):
+                try:
+                    obj = _json.loads(af.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    if not obj.get("id"):
+                        obj["id"] = af.stem
+                    _collect_agents.append(obj)
+                elif isinstance(obj, list):
+                    _collect_agents.extend([a for a in obj if isinstance(a, dict)])
         aj = d / "agents.json"
         if aj.is_file():
             try:
                 _a = _json.loads(aj.read_text(encoding="utf-8"))
                 arr = _a if isinstance(_a, list) else (_a.get("agents") if isinstance(_a, dict) else []) or []
-                for x in arr:
-                    if isinstance(x, dict) and x.get("id"):
-                        ag_by_name[str(x.get("name") or "").strip()] = x["id"]
+                _collect_agents.extend([a for a in arr if isinstance(a, dict)])
             except Exception:
                 pass
+        for x in _collect_agents:
+            if isinstance(x, dict) and x.get("id"):
+                ag_by_name[str(x.get("name") or "").strip()] = x["id"]
         man.setdefault("skills", [])
         ex_sk = {_safe_name(s.get("name") if isinstance(s, dict) else s) for s in man["skills"]}
         for nm in skills:
@@ -1112,7 +1136,7 @@ def _complete_one_process(work) -> dict | None:
     forms: list[dict] = []
     fdir = work / "forms"
     if fdir.is_dir():
-        for fp in sorted(fdir.glob("*.html")):
+        for fp in sorted(list(fdir.glob("*.form")) + list(fdir.glob("*.html"))):
             try:
                 # 폼 파일명(에이전트가 만든 원본 id, camelCase 일 수 있음)을 정규화된 activity id 와
                 # 동일 규칙(snake)으로 맞춰 매칭/형식을 일관화한다.
@@ -1125,15 +1149,33 @@ def _complete_one_process(work) -> dict | None:
             except Exception:
                 pass
 
-    # agents
+    # agents — 에이전트별 개별 파일 `agents/<id>.json` 우선 수집, 레거시 `agents.json`(배열/딕셔너리)도 호환.
     agents: list = []
+    adir = work / "agents"
+    if adir.is_dir():
+        for af in sorted(adir.glob("*.json")):
+            try:
+                obj = _json.loads(af.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                # 파일 1개 = 에이전트 1명. id 가 없으면 파일명(stem)을 id 로 사용.
+                if not obj.get("id"):
+                    obj["id"] = af.stem
+                agents.append(obj)
+            elif isinstance(obj, list):
+                agents.extend([a for a in obj if isinstance(a, dict)])
     ag = work / "agents.json"
     if ag.is_file():
         try:
             a = _json.loads(ag.read_text(encoding="utf-8"))
-            agents = a if isinstance(a, list) else (a.get("agents") if isinstance(a, dict) else []) or []
+            legacy = a if isinstance(a, list) else (a.get("agents") if isinstance(a, dict) else []) or []
+            seen_ids = {str(x.get("id")) for x in agents if isinstance(x, dict) and x.get("id")}
+            for x in legacy:
+                if isinstance(x, dict) and str(x.get("id")) not in seen_ids:
+                    agents.append(x)
         except Exception:
-            agents = []
+            pass
 
     # skills (디렉토리명 + frontmatter name)
     skills: list[str] = []

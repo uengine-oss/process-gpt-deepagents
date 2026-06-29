@@ -143,7 +143,7 @@ def build_graph_inputs(
         checkpointer is not None
         and checkpoint_thread_id
         and human_answer_stripped
-        and str(run_state.get("tool_name") or "") == "ask_user"
+        and str(run_state.get("tool_name") or "") == "request_human_input"
     )
 
     if use_graph_resume:

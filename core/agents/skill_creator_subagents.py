@@ -524,4 +524,8 @@ def build_skill_creator_subagents(
         "tools": [],
     }
 
-    return [repo_scout, rule_extractor, test_runner, evaluator]
+    # repo-scout(Git 레포 탐색 단계)는 ProcessGPT 프로세스 생성 흐름에서 불필요하다.
+    # 스킬은 워크스페이스에 SKILL.md 로 생성되고 프론트가 저장(zip 업로드)하므로 git 접근이 없어야 한다.
+    # → list_git_repos/checkout 호출로 step 을 낭비하지 않도록 repo-scout 을 제외한다.
+    _ = repo_scout  # 정의는 유지(향후 git 연동 옵션용)하되 파이프라인에선 제외.
+    return [rule_extractor, test_runner, evaluator]
