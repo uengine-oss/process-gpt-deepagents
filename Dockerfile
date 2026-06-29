@@ -8,6 +8,7 @@ RUN apt-get update \
     curl \
     gnupg \
     build-essential \
+    git \
  && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
  && echo $TZ > /etc/timezone \
  && apt-get clean \

@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import uuid
+import asyncio
 from typing import Any
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -43,7 +44,7 @@ from core.chat.chat_room import (
 )
 from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
-from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id
+from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
@@ -380,6 +381,7 @@ class DeepAgentExecutor(AgentExecutor):
         user_name = extras.get("user_name")
 
         _skill_tenant_id.set(tenant_id)
+        _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())
         agents = extras.get("agents", [])
         streamer = extras.get("streamer")
         form_id = extras.get("form_id")
@@ -423,6 +425,9 @@ class DeepAgentExecutor(AgentExecutor):
         if is_chat:
             tenant_mcp = ensure_process_gpt_mcp(tenant_mcp, tenant_id)
         chat_root_tools = await load_chat_root_tools(tenant_mcp) if is_chat else []
+        _root_mcp_tool_names = [
+            getattr(t, "name", "") for t in chat_root_tools if getattr(t, "name", "")
+        ]
 
         if is_chat and chat_room_id and tenant_id:
             try:
@@ -569,7 +574,11 @@ class DeepAgentExecutor(AgentExecutor):
                     proc_def_id, activity_id,
                 )
 
-        _accum = CtxAccumulator()
+        _root_mcp_meta: list[dict] = (
+            [{"agent": "__root__", "servers": ["process-gpt-mcp"], "tools": _root_mcp_tool_names}]
+            if _root_mcp_tool_names else []
+        )
+        _accum = CtxAccumulator(mcp_tools=_root_mcp_meta)
 
         sources = extras.get("sources") or []
         knowledge_doc_ids = [
@@ -607,21 +616,7 @@ class DeepAgentExecutor(AgentExecutor):
             len(knowledge_doc_ids), knowledge_doc_ids[:5],
         )
 
-        _tracking_cb = (
-            ToolTrackingCallback(streamer=streamer, push_ctx=_accum.push)
-            if is_chat
-            else None
-        )
-
-        config = {
-            "configurable": {
-                "thread_id": checkpoint_thread_id,
-                "tenant_id": tenant_id,
-                "knowledge_doc_ids": knowledge_doc_ids,
-            },
-            **({"callbacks": [_tracking_cb]} if _tracking_cb else {}),
-        }
-        graph = await build_agent(
+        graph, _, _sub_mcp_tools_meta = await build_agent(
             tenant_id=tenant_id,
             conversation_id=chat_room_id or "",
             checkpointer=checkpointer,
@@ -634,8 +629,41 @@ class DeepAgentExecutor(AgentExecutor):
                 "user_jwt": user_jwt,
                 "user_email": user_email,
                 "user_name": user_name,
+                "user_id": str(extras.get("user_id") or row.get("user_id") or "").strip(),
             },
         )
+
+        if _sub_mcp_tools_meta:
+            _accum.mcp_tools = _root_mcp_meta + _sub_mcp_tools_meta
+
+        _mcp_tool_servers: dict[str, list[str]] = {}
+        for meta in _accum.mcp_tools:
+            srvs = meta.get("servers") or []
+            for tn in (meta.get("tools") or []):
+                _mcp_tool_servers.setdefault(tn, [])
+                for s in srvs:
+                    if s not in _mcp_tool_servers[tn]:
+                        _mcp_tool_servers[tn].append(s)
+
+        _tracking_cb = (
+            ToolTrackingCallback(
+                streamer=streamer,
+                push_ctx=_accum.push,
+                mcp_tool_servers=_mcp_tool_servers,
+            )
+            if is_chat
+            else None
+        )
+
+        config = {
+            "configurable": {
+                "thread_id": checkpoint_thread_id,
+                "tenant_id": tenant_id,
+                "knowledge_doc_ids": knowledge_doc_ids,
+            },
+            **({"callbacks": [_tracking_cb]} if _tracking_cb else {}),
+        }
+
         active_tool_calls: dict[str, str] = {}
         # write_file/edit_file tool_call_id → {path, op}. tool_end 시 파일을 읽어 file_artifact emit.
         pending_file_ops: dict[str, dict] = {}
@@ -669,15 +697,6 @@ class DeepAgentExecutor(AgentExecutor):
                             full_response += text
                             if streamer:
                                 await streamer.send_json({"type": "token", "content": text})
-
-                        for tc in getattr(msg, "tool_call_chunks", []):
-                            tc_id = tc.get("id")
-                            tc_name = tc.get("name")
-                            if tc_id and tc_name and tc_id not in active_tool_calls:
-                                active_tool_calls[tc_id] = tc_name
-                                if streamer:
-                                    _ts_payload = {"type": "tool_start", "tool": tc_name, "id": tc_id}
-                                    await streamer.send_json(_ts_payload)
 
                 elif stream_evt == "updates":
                     for _node, update in data.items():
@@ -769,8 +788,6 @@ class DeepAgentExecutor(AgentExecutor):
                                     job_id=job_id,
                                 )
                                 if streamer:
-                                    await streamer.send_json({"type": "tool_end", "tool": tool_name, "output": result_content})
-
                                     # 파일 산출물 실시간 전달: 방금 끝난 write_file/edit_file 의 결과 파일을
                                     # 샌드박스에서 읽어 file_artifact 이벤트로 프론트(파일 UI)에 보낸다.
                                     _fop = pending_file_ops.pop(msg.tool_call_id, None)

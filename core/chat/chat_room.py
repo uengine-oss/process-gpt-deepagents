@@ -14,6 +14,7 @@ def build_initial_chat_room_context(*, has_file: bool = False) -> dict[str, Any]
         "todos": [],
         "tools": [],
         "skills": [],
+        "connectors": [],
         "enabled": {"todos": False, "tools": True, "skills": False},
         "updatedAt": now_iso(),
         "orchestration": "deepagents",
@@ -34,10 +35,12 @@ class CtxAccumulator:
     A single DB write is performed after streaming ends via to_context().
     """
 
-    def __init__(self) -> None:
+    def __init__(self, mcp_tools: list[dict[str, Any]] | None = None) -> None:
         self.tools: list[dict[str, Any]] = []
         self.skills: list[str] = []
         self.todos: list[dict[str, Any]] = []
+        self.connectors: list[str] = []
+        self.mcp_tools: list[dict[str, Any]] = list(mcp_tools or [])
 
     def push(self, payload: dict) -> None:
         et = str(payload.get("type") or "")
@@ -66,16 +69,22 @@ class CtxAccumulator:
                 s = str(s).strip()
                 if s and s not in self.skills:
                     self.skills.append(s)
+        elif et == "plan_connectors":
+            for c in (payload.get("connectors") or []):
+                c = str(c).strip()
+                if c and c not in self.connectors:
+                    self.connectors.append(c)
         elif et == "plan_todos":
             for t in (payload.get("todos") or []):
                 if isinstance(t, dict):
                     self.todos.append(t)
 
     def to_context(self) -> dict[str, Any]:
-        return json_normalize({
+        ctx: dict[str, Any] = {
             "tools": self.tools,
             "skills": self.skills,
             "todos": self.todos,
+            "connectors": self.connectors,
             "enabled": {
                 "todos": bool(self.todos),
                 "tools": True,
@@ -83,7 +92,10 @@ class CtxAccumulator:
             },
             "updatedAt": now_iso(),
             "orchestration": "deepagents",
-        })
+        }
+        if self.mcp_tools:
+            ctx["mcpTools"] = self.mcp_tools
+        return json_normalize(ctx)
 
 
 def _tool_plan_to_context_tools(tools: Any) -> list[dict[str, Any]]:
@@ -117,7 +129,7 @@ def merge_chat_room_context_from_event(
     if not isinstance(evt, dict):
         return None
     et = str(evt.get("type") or "").strip()
-    if et not in ("plan_tools", "plan_skills", "plan_todos", "tool_start", "tool_end"):
+    if et not in ("plan_tools", "plan_skills", "plan_connectors", "plan_todos", "tool_start", "tool_end"):
         return None
 
     ctx: dict[str, Any] = (
@@ -127,6 +139,7 @@ def merge_chat_room_context_from_event(
     ctx.setdefault("todos", [])
     ctx.setdefault("tools", [])
     ctx.setdefault("skills", [])
+    ctx.setdefault("connectors", [])
     ctx.setdefault("enabled", {"todos": False, "tools": True, "skills": False})
     if "orchestration" in ctx:
         ctx["orchestration"] = str(ctx.get("orchestration") or "deepagents")
@@ -179,6 +192,14 @@ def merge_chat_room_context_from_event(
             en = dict(ctx.get("enabled") or {})
             en["skills"] = bool(ctx["skills"])
             ctx["enabled"] = en
+        return json_normalize(ctx)
+
+    if et == "plan_connectors":
+        connectors = evt.get("connectors")
+        if isinstance(connectors, list):
+            cur_c = [str(c).strip() for c in (ctx.get("connectors") or []) if str(c).strip()]
+            new_c = [str(c).strip() for c in connectors if str(c).strip()]
+            ctx["connectors"] = list(dict.fromkeys([*cur_c, *new_c]))
         return json_normalize(ctx)
 
     if et == "plan_todos":
