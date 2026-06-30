@@ -9,6 +9,29 @@ _BASE_DIR = Path(__file__).parent.parent.parent
 logger = logging.getLogger(__name__)
 
 
+def _global_collection_names() -> set[str]:
+    """Return directory names under the skills root that are legitimate
+    global collections (fetched via SKILL_REPO_URLS), keyed by repo slug.
+
+    This is a whitelist, not a blacklist: only directories produced by
+    `git_skill_fetcher.prefetch_git_skills` are considered global. Anything
+    else directly under the skills root (most notably another tenant's
+    `{tenant_id}/` directory) must never be treated as a global collection,
+    or one tenant's agent would see — and be able to read_file — another
+    tenant's private skills.
+    """
+    from .git_skill_fetcher import _configured_repos, _parse_repo_url, _repo_slug
+
+    names: set[str] = set()
+    for url in _configured_repos():
+        try:
+            owner, repo = _parse_repo_url(url)
+        except ValueError:
+            continue
+        names.add(_repo_slug(owner, repo))
+    return names
+
+
 def _get_skills(tenant_id: str = "", provider_config_id: str = "") -> list[str] | None:
     """Return SkillsMiddleware source paths.
 
@@ -62,10 +85,12 @@ def _get_skills(tenant_id: str = "", provider_config_id: str = "") -> list[str] 
             if Path(tenant_path).is_dir():
                 _add(tenant_path)
 
-        # Global collections (anthropics-skills, etc.) — exclude tenant dir
+        # Global collections (anthropics-skills, etc.) — whitelist by known
+        # repo slug so other tenants' directories are never picked up here.
+        global_names = _global_collection_names()
         try:
             for entry in sorted(Path(root).iterdir()):
-                if entry.is_dir() and entry.name != tenant_id:
+                if entry.is_dir() and entry.name in global_names:
                     _add(str(entry))
         except OSError:
             pass
