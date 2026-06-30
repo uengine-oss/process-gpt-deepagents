@@ -58,10 +58,22 @@ async def main() -> None:
 
     logger.info("서버 시작: http://%s:%d/chat/stream", HOST, PORT)
 
-    await asyncio.gather(
-        server.run(),
-        uvicorn_server.serve(),
-    )
+    all_tasks = [
+        asyncio.create_task(server.run()),
+        asyncio.create_task(uvicorn_server.serve()),
+    ]
+
+    if os.environ.get("FEEDBACK_POLLING_ENABLED", "").lower() in ("1", "true", "yes", "on"):
+        from core.feedback.polling import start_feedback_polling
+        all_tasks.append(asyncio.create_task(start_feedback_polling(interval=7)))
+        logger.info("피드백 폴링 활성화 (interval=7s)")
+
+    # server.run()이 SIGINT/SIGTERM으로 종료되면 나머지 task도 취소한다.
+    done, pending = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    logger.info("서버 종료 완료")
 
 
 if __name__ == "__main__":

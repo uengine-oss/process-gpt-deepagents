@@ -71,20 +71,32 @@ def extract_archive(archive_bytes: bytes, dest: Path) -> None:
         raise ValueError(f"Invalid archive: {e}") from e
 
 
+_JUNK_DIR_NAMES = {"__MACOSX"}
+
+
+def _is_junk_part(name: str) -> bool:
+    return name in _JUNK_DIR_NAMES or name.startswith(".")
+
+
 def find_skill_root(extracted_dir: Path) -> Path | None:
     """Return the directory containing SKILL.md, or None if not found.
 
-    Checks two layouts:
-    1. SKILL.md directly in extracted_dir (flat layout)
-    2. Single subdirectory in extracted_dir that contains SKILL.md
+    Searches the extracted tree at any depth for a SKILL.md, ignoring
+    archive junk such as macOS Finder's __MACOSX folder or dotfiles/dirs
+    (.DS_Store, .git, ...). Returns the unique parent directory if exactly
+    one candidate is found; returns None if there is none or the location
+    is ambiguous (multiple SKILL.md files).
     """
-    if (extracted_dir / "SKILL.md").exists():
-        return extracted_dir
-
-    subdirs = [p for p in extracted_dir.iterdir() if p.is_dir()]
-    if len(subdirs) == 1 and (subdirs[0] / "SKILL.md").exists():
-        return subdirs[0]
-
+    candidates = sorted(
+        {
+            p.parent
+            for p in extracted_dir.rglob("SKILL.md")
+            if not any(_is_junk_part(part) for part in p.relative_to(extracted_dir).parts[:-1])
+        },
+        key=lambda p: len(p.relative_to(extracted_dir).parts),
+    )
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
 

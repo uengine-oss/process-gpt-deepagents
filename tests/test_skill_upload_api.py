@@ -92,6 +92,21 @@ class TestUploadSkill:
         body = resp.json()
         assert body["skill_name"] == "my-skill"
 
+    def test_macos_finder_zip_with_macosx_junk_succeeds(self, client, tmp_path, monkeypatch):
+        """macOS Finder zips add a __MACOSX junk dir alongside the real skill dir; should still register."""
+        monkeypatch.setenv("SKILLS_DIRS", str(tmp_path))
+
+        zip_bytes = _make_zip({
+            "my-skill/SKILL.md": "name: my-skill\n",
+            "my-skill/run.py": "print('hello')",
+            "__MACOSX/my-skill/._SKILL.md": "junk",
+            "__MACOSX/._my-skill": "junk",
+        })
+        resp = _upload_request(client, zip_bytes, filename="bundle.zip", tenant_id="tenant1")
+
+        assert resp.status_code == 201
+        assert resp.json()["skill_name"] == "my-skill"
+
     def test_missing_skill_md_returns_422(self, client, tmp_path, monkeypatch):
         """6.2 — Archive without SKILL.md returns 422."""
         monkeypatch.setenv("SKILLS_DIRS", str(tmp_path))

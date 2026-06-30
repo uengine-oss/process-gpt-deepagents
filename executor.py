@@ -6,7 +6,7 @@ import logging
 import re
 import uuid
 import asyncio
-from typing import Any
+from typing import Any, Optional
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -159,9 +159,10 @@ async def _enqueue_status(
     text: str,
     event_type: str,
     job_id: str,
+    crew_type: Optional[str] = "deepagents"
 ) -> None:
     evt = new_text_status_update_event(task_id=task_id, context_id=context_id, state=state, text=text)
-    ParseDict({"event_type": event_type, "job_id": job_id, "crew_type": "deepagents"}, evt.metadata)
+    ParseDict({"event_type": event_type, "job_id": job_id, "crew_type": crew_type}, evt.metadata)
     await event_queue.enqueue_event(evt)
 
 
@@ -1013,6 +1014,7 @@ class DeepAgentExecutor(AgentExecutor):
                 ),
                 event_type="task_started",
                 job_id=result_job_id,
+                crew_type="result",
             )
 
             final_text = extract_json_text(raw_text) if form_id else raw_text
@@ -1024,6 +1026,7 @@ class DeepAgentExecutor(AgentExecutor):
                 text=final_text,
                 event_type="task_completed",
                 job_id=result_job_id,
+                crew_type="result",
             )
 
             artifact_evt = new_text_artifact_update_event(
