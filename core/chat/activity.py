@@ -140,3 +140,89 @@ def build_fallback_subagent(
         "skills": ",".join(activity_skills),
         "agent_type": "activity_fallback",
     }
+
+
+def _find_subprocess(definition: Any, activity_id: str) -> dict[str, Any] | None:
+    """definition.subProcesses[]에서 id가 activity_id와 일치하는 항목을 반환한다."""
+    aid = (activity_id or "").strip()
+    if not aid or not isinstance(definition, dict):
+        return None
+    for sp in (definition.get("subProcesses") or []):
+        if not isinstance(sp, dict):
+            continue
+        if str(sp.get("id") or "").strip() == aid:
+            return sp
+    return None
+
+
+def load_subprocess_subagents(
+    *,
+    tenant_id: str,
+    proc_def_id: str,
+    activity_id: str,
+) -> list[dict[str, Any]]:
+    """서브프로세스 워크아이템의 children.activities[]를 서브에이전트 스펙 목록으로 반환한다.
+
+    activity_id가 definition.subProcesses[].id와 매칭되지 않으면 빈 리스트를 반환한다.
+    반환된 딕셔너리 형태는 core.agents.subagents._build_subagents가 소비한다:
+    - tools: MCP 서버명 CSV (children.activities[].tools)
+    - skills: 스킬명 CSV (children.activities[].skills)
+    """
+    tid = (tenant_id or "").strip()
+    pdid = (proc_def_id or "").strip()
+    aid = (activity_id or "").strip()
+    if not (tid and pdid and aid):
+        return []
+
+    try:
+        definition = _get_proc_def_definition(tid, pdid)
+    except Exception:
+        logger.exception(
+            "subprocess subagents lookup failed | tenant_id=%s proc_def_id=%s activity_id=%s",
+            tid, pdid, aid,
+        )
+        return []
+
+    if not isinstance(definition, dict):
+        return []
+
+    sp = _find_subprocess(definition, aid)
+    if sp is None:
+        return []
+
+    children = sp.get("children") or {}
+    if not isinstance(children, dict):
+        return []
+
+    child_activities = children.get("activities") or []
+    if not child_activities:
+        return []
+
+    def _as_csv(value: Any) -> str:
+        if not value:
+            return ""
+        if isinstance(value, list):
+            return ",".join(str(v).strip() for v in value if str(v).strip())
+        if isinstance(value, str):
+            return value.strip()
+        return ""
+
+    result: list[dict[str, Any]] = []
+    for act in child_activities:
+        if not isinstance(act, dict):
+            continue
+        name = (act.get("name") or act.get("id") or "").strip()
+        if not name:
+            continue
+        result.append({
+            "name": name,
+            "username": name,
+            "alias": str(act.get("id") or name),
+            "description": (act.get("instruction") or act.get("description") or "").strip(),
+            "role": (act.get("role") or "").strip(),
+            "tools": _as_csv(act.get("tools")),
+            "skills": _as_csv(act.get("skills")),
+            "tool": str(act.get("tool") or ""),
+            "agent_type": "subprocess_activity",
+        })
+    return result

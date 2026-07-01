@@ -35,7 +35,8 @@ from core.agents.input_builder import (
     collect_recent_messages,
     resolve_chat_room_id,
 )
-from core.chat.activity import build_fallback_subagent, load_activity_capabilities
+from core.chat.activity import build_fallback_subagent, load_activity_capabilities, load_subprocess_subagents
+from core.feedback.db import fetch_child_activity_todo
 from core.chat.chat_room import (
     CtxAccumulator,
     a_set_chat_room_context,
@@ -549,31 +550,81 @@ class DeepAgentExecutor(AgentExecutor):
                 job_id=job_id,
             )
 
+        subprocess_alias_map: dict[str, str] = {}
+        root_proc_inst_id: str = ""
         if not agents:
             proc_def_id = str(row.get("proc_def_id") or "").strip()
             activity_id = str(row.get("activity_id") or "").strip()
-            act_tools, act_skills = load_activity_capabilities(
+            subprocess_agents = load_subprocess_subagents(
                 tenant_id=tenant_id,
                 proc_def_id=proc_def_id,
                 activity_id=activity_id,
             )
-            if act_tools or act_skills:
-                fallback = build_fallback_subagent(
+            if subprocess_agents:
+                agents = subprocess_agents
+                subprocess_alias_map = {
+                    re.sub(r"[^\w-]", "-", spec["name"]).lower().strip("-"): spec["alias"]
+                    for spec in subprocess_agents
+                }
+                root_proc_inst_id = str(row.get("root_proc_inst_id") or "").strip()
+                logger.info(
+                    "서브프로세스 딥에이전트 구성 | proc_def_id=%s activity_id=%s agents=%d",
+                    proc_def_id, activity_id, len(subprocess_agents),
+                )
+                from processgpt_agent_sdk.database import fetch_form_def as _fetch_form_def
+                _freeform_instruction = (
+                    "\n\n[응답 형식]\n"
+                    "반드시 JSON으로만 출력하세요. 다른 설명 없이 JSON만 출력하세요.\n"
+                    '출력 형식:\n{"free_input": "<답변 내용>"}'
+                )
+                for _spec in agents:
+                    _tool_val = (_spec.get("tool") or "").strip()
+                    if not _tool_val.startswith("formHandler:"):
+                        continue
+                    try:
+                        _form_id_val, _fields, _ = await _fetch_form_def(_tool_val, tenant_id)
+                        if _fields:
+                            _field_schema = json.dumps(_fields, ensure_ascii=False)
+                            _example = json.dumps(
+                                {_form_id_val: {f["key"]: f"<{f['text']}>" for f in _fields if "key" in f}},
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                            _form_instruction = (
+                                "\n\n[응답 형식]\n"
+                                "아래 폼 필드에 맞춰 반드시 JSON으로만 출력하세요. 다른 설명 없이 JSON만 출력하세요.\n"
+                                f"필드 정의:\n{_field_schema}\n"
+                                f"출력 예시:\n{_example}"
+                            )
+                        else:
+                            _form_instruction = _freeform_instruction
+                        _spec["description"] = (_spec.get("description") or "") + _form_instruction
+                    except Exception:
+                        logger.warning("서브에이전트 폼 정의 조회 실패 | tool=%s", _tool_val, exc_info=True)
+                        _spec["description"] = (_spec.get("description") or "") + _freeform_instruction
+            else:
+                act_tools, act_skills = load_activity_capabilities(
                     tenant_id=tenant_id,
-                    activity_tools=act_tools,
-                    activity_skills=act_skills,
+                    proc_def_id=proc_def_id,
+                    activity_id=activity_id,
                 )
-                if fallback:
-                    agents = [fallback]
-                    logger.info(
-                        "서브에이전트 폴백 활성화 | proc_def_id=%s activity_id=%s tools=%s skills=%s",
-                        proc_def_id, activity_id, act_tools, act_skills,
+                if act_tools or act_skills:
+                    fallback = build_fallback_subagent(
+                        tenant_id=tenant_id,
+                        activity_tools=act_tools,
+                        activity_skills=act_skills,
                     )
-            elif not is_chat:
-                logger.warning(
-                    "서브에이전트 미설정 (activity fallback 없음) | proc_def_id=%s activity_id=%s",
-                    proc_def_id, activity_id,
-                )
+                    if fallback:
+                        agents = [fallback]
+                        logger.info(
+                            "서브에이전트 폴백 활성화 | proc_def_id=%s activity_id=%s tools=%s skills=%s",
+                            proc_def_id, activity_id, act_tools, act_skills,
+                        )
+                elif not is_chat:
+                    logger.warning(
+                        "서브에이전트 미설정 (activity fallback 없음) | proc_def_id=%s activity_id=%s",
+                        proc_def_id, activity_id,
+                    )
 
         _root_mcp_meta: list[dict] = (
             [{"agent": "__root__", "servers": ["process-gpt-mcp"], "tools": _root_mcp_tool_names}]
@@ -668,6 +719,8 @@ class DeepAgentExecutor(AgentExecutor):
         active_tool_calls: dict[str, str] = {}
         # write_file/edit_file tool_call_id → {path, op}. tool_end 시 파일을 읽어 file_artifact emit.
         pending_file_ops: dict[str, dict] = {}
+        # subprocess 딥에이전트: task() tool_call_id → subagent_type slug
+        pending_task_calls: dict[str, str] = {}
         full_response = ""
         final_state: dict[str, Any] = {}
         _seen_msg_namespaces: dict[str, str] = {}
@@ -713,6 +766,11 @@ class DeepAgentExecutor(AgentExecutor):
                                     tool_args = tc.get("args", {})
                                     # 파일 산출물 추적: write_file/edit_file 의 대상 경로를 기록해두고
                                     # tool_end 에서 실제 내용을 읽어 file_artifact 로 프론트에 전달한다.
+                                    if subprocess_alias_map and tool_name == "task":
+                                        _tc_id = tc.get("id")
+                                        _subagent_slug = (tool_args.get("subagent_type") or "") if isinstance(tool_args, dict) else ""
+                                        if _tc_id and _subagent_slug:
+                                            pending_task_calls[_tc_id] = _subagent_slug
                                     if streamer and tool_name in _FILE_TOOL_NAMES:
                                         _fp = (tool_args.get("file_path") or tool_args.get("path") or "") if isinstance(tool_args, dict) else ""
                                         _tc_id = tc.get("id")
@@ -827,6 +885,62 @@ class DeepAgentExecutor(AgentExecutor):
                                         if _pr is not None:
                                             process_result_sent = True
                                             await streamer.send_json({"type": "process_result", "data": _pr})
+
+                                if subprocess_alias_map and tool_name == "task":
+                                    _subagent_slug = pending_task_calls.pop(msg.tool_call_id, None)
+                                    if _subagent_slug:
+                                        _child_activity_id = subprocess_alias_map.get(_subagent_slug)
+                                        if _child_activity_id:
+                                            _child_todo = fetch_child_activity_todo(root_proc_inst_id, _child_activity_id)
+                                            if _child_todo:
+                                                _child_todo_id = _child_todo["id"]
+                                                _child_proc_inst_id = _child_todo.get("proc_inst_id")
+                                                _child_form_id = _child_todo.get("form_id")
+                                                _child_result_text = extract_json_text(str(result_content)) if _child_form_id else str(result_content or "")
+                                                _child_job_id = str(uuid.uuid4())
+                                                await _enqueue_status(
+                                                    event_queue,
+                                                    task_id=_child_todo_id,
+                                                    context_id=_child_proc_inst_id,
+                                                    state=TaskState.TASK_STATE_WORKING,
+                                                    text=json.dumps(
+                                                        {"goal": "최종 결과를 반환합니다.", "name": "최종 결과 반환", "role": "최종 결과 반환", "agent_profile": "/images/chat-icon.png"},
+                                                        ensure_ascii=False,
+                                                    ),
+                                                    event_type="task_started",
+                                                    job_id=_child_job_id,
+                                                    crew_type="result",
+                                                )
+                                                await _enqueue_status(
+                                                    event_queue,
+                                                    task_id=_child_todo_id,
+                                                    context_id=_child_proc_inst_id,
+                                                    state=TaskState.TASK_STATE_COMPLETED,
+                                                    text=_child_result_text,
+                                                    event_type="task_completed",
+                                                    job_id=_child_job_id,
+                                                    crew_type="result",
+                                                )
+                                                from processgpt_agent_sdk.event_queue_process import ProcessEventQueue as _ChildProcessEventQueue
+                                                _child_eq = _ChildProcessEventQueue(
+                                                    todolist_id=_child_todo_id,
+                                                    agent_orch="",
+                                                    proc_inst_id=_child_proc_inst_id,
+                                                )
+                                                _artifact_evt = new_text_artifact_update_event(
+                                                    task_id=_child_todo_id,
+                                                    context_id=_child_proc_inst_id,
+                                                    name="assistant_response",
+                                                    text=_child_result_text,
+                                                    last_chunk=True,
+                                                )
+                                                ParseDict({"role": "assistant"}, _artifact_evt.metadata)
+                                                await _child_eq.enqueue_event(_artifact_evt)
+                                            else:
+                                                logger.warning(
+                                                    "child todo 없음: subagent=%s activity_id=%s root_proc_inst_id=%s",
+                                                    _subagent_slug, _child_activity_id, root_proc_inst_id,
+                                                )
 
                 elif stream_evt == "values" and isinstance(data, dict):
                     if not _ns:  # root graph only — ignore subagent intermediate states

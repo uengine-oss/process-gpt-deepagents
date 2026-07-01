@@ -39,6 +39,41 @@ async def update_feedback_status(todo_id: str, status: str) -> bool:
         return False
 
 
+def fetch_child_activity_todo(root_proc_inst_id: str, activity_id: str) -> dict | None:
+    """root_proc_inst_id + activity_id로 child activity todo를 조회한다.
+
+    반환: {"id": str, "proc_inst_id": str | None, "form_id": str | None} 또는 None.
+    form_id는 todolist.tool 컬럼의 "formHandler:<id>" 값에서 파싱된다.
+    """
+    rpid = (root_proc_inst_id or "").strip()
+    aid = (activity_id or "").strip()
+    if not (rpid and aid):
+        return None
+    try:
+        sb = get_supabase()
+        resp = (
+            sb.table("todolist")
+            .select("id, proc_inst_id, tool")
+            .eq("root_proc_inst_id", rpid)
+            .eq("activity_id", aid)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        tool_val = str(row.get("tool") or "")
+        form_id = tool_val.replace("formHandler:", "", 1) if tool_val.startswith("formHandler:") else None
+        return {"id": row["id"], "proc_inst_id": row.get("proc_inst_id"), "form_id": form_id}
+    except Exception:
+        logger.warning(
+            "child activity todo 조회 실패: root_proc_inst_id=%s activity_id=%s",
+            rpid, aid, exc_info=True,
+        )
+        return None
+
+
 async def fetch_events_by_todo_id(todo_id: str) -> list[dict[str, Any]]:
     try:
         sb = get_supabase()
