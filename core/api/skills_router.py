@@ -946,6 +946,9 @@ async def create_skill_repo(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
     tenant_id = body.get("tenant_id", "")
+    owner_id: str = body.get("owner_id", "")
+    initial_content: str | None = body.get("initial_content") or None
+    initial_file_path: str = body.get("file_path") or "SKILL.md"
     if not tenant_id:
         return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
@@ -979,7 +982,32 @@ async def create_skill_repo(request: Request) -> JSONResponse:
     pushed: list[str] = []
     errors: list[str] = []
 
-    if skill_dir is not None:
+    if skill_dir is None and initial_content:
+        # 로컬 파일 없음 + 초기 내용 제공 → 직접 초기 커밋으로 기본 브랜치를 생성
+        try:
+            await asyncio.to_thread(
+                provider.update_file,
+                actual_owner,
+                skill_name,
+                initial_file_path,
+                initial_content,
+                f"init: create {skill_name}",
+                "main",
+            )
+            pushed.append(initial_file_path)
+        except Exception as e:
+            errors.append(f"{initial_file_path}: {e}")
+
+        # GitHub/GitLab 커밋 성공 시 로컬 디스크에도 저장 → _scan_skills 반영
+        if initial_file_path in pushed:
+            from core.skills.upload_utils import get_tenant_skill_dest
+            local_file = get_tenant_skill_dest(tenant_id, skill_name, config_id=config_id or "local") / initial_file_path
+            try:
+                await asyncio.to_thread(local_file.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(local_file.write_text, initial_content, encoding="utf-8")
+            except Exception as e:
+                logger.warning("로컬 스킬 파일 동기화 실패 skill=%s file=%s: %s", skill_name, initial_file_path, e)
+    elif skill_dir is not None:
         resolved = skill_dir.resolve()
         local_files = [
             p for p in sorted(resolved.rglob("*"))
@@ -1006,6 +1034,12 @@ async def create_skill_repo(request: Request) -> JSONResponse:
         logger.warning("create_skill_repo: push errors for skill=%s: %s", skill_name, errors)
     if not pushed and skill_dir is not None:
         logger.warning("create_skill_repo: no files pushed for skill=%s (skill_dir=%s)", skill_name, skill_dir)
+
+    if pushed and owner_id:
+        try:
+            await asyncio.to_thread(_save_tenant_skill, tenant_id, skill_name, owner_id)
+        except Exception as e:
+            logger.error("tenant_skills 저장 실패 skill=%s tenant=%s: %s", skill_name, tenant_id, e)
 
     return JSONResponse({
         "created": True,
