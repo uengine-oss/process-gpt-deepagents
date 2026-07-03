@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import os
 import re
 import uuid
 import asyncio
@@ -59,6 +61,9 @@ logger = logging.getLogger(__name__)
 _FILE_TOOL_NAMES = ("write_file", "edit_file")
 _FILE_ARTIFACT_MAX_BYTES = 400_000  # 미리보기에 과한 대용량 파일은 잘라 보냄
 
+# 채팅 산출물에서 스킬이 만든 hwpx 컨테이너 경로를 잡아내기 위한 패턴.
+_HWPX_PATH_RE = re.compile(r"/workspace/[^\s\"']+\.hwpx")
+
 
 def _ws_file_meta(path: str) -> tuple[str, str]:
     """container 경로 → (파일명, 확장자 소문자)."""
@@ -88,6 +93,199 @@ async def _read_ws_file_content(tenant_id: str, path: str) -> str | None:
     except Exception:
         logger.warning("file_artifact: workspace 파일 읽기 실패 path=%s", path, exc_info=True)
     return None
+
+
+def _office_mcp_url() -> str:
+    """office-mcp streamable-http 엔드포인트 URL (deep-research 와 동일 env 사용)."""
+    raw = (os.environ.get("PROCESS_GPT_OFFICE_MCP_URL") or "").strip()
+    if not raw:
+        raw = "http://localhost:1192/mcp/"
+    # /mcp 경로 보장 + 트레일링 슬래시(streamable-http)
+    if not raw.rstrip("/").endswith("/mcp"):
+        raw = raw.rstrip("/") + "/mcp"
+    if not raw.endswith("/"):
+        raw = raw + "/"
+    return raw
+
+
+async def _call_office_mcp_tool(tool: str, arguments: dict) -> dict | None:
+    """office-mcp 도구를 JSON-RPC(tools/call)로 호출하고 결과 dict 를 반환한다(실패 시 None).
+
+    office-mcp(main.py)는 stateless_http + json_response 이므로 프론트처럼 bare POST 로 호출 가능.
+    """
+    import httpx
+
+    url = _office_mcp_url()
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    }
+    try:
+        # office-mcp(streamable-http)는 /mcp/ → /mcp 로 307 리다이렉트할 수 있어 반드시 따라가야 한다
+        # (httpx 는 기본적으로 리다이렉트를 안 따라감 → raise_for_status 에서 터짐).
+        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+            r = await client.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            )
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        logger.warning("office-mcp 호출 실패 | tool=%s url=%s", tool, url, exc_info=True)
+        return None
+
+    result = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        logger.warning("office-mcp 응답 형식 이상 | tool=%s data=%.200s", tool, str(data))
+        return None
+    if isinstance(result.get("structuredContent"), dict):
+        sc = result["structuredContent"]
+        # FastMCP 는 dict 반환을 {"result": {...}} 로 감싸기도 한다.
+        return sc.get("result") if isinstance(sc.get("result"), dict) else sc
+    for c in result.get("content") or []:
+        if isinstance(c, dict) and c.get("type") == "text":
+            try:
+                return json.loads(c.get("text") or "")
+            except Exception:
+                continue
+    return None
+
+
+async def _materialize_hwpx_form_outputs(tenant_id: str, final_text: str) -> str:
+    """worklist 폼 출력 JSON 안의 샌드박스 hwpx 경로(/workspace/*.hwpx)를 실제 문서로 실체화한다.
+
+    스킬(hwpx-writer)이 만든 .hwpx 는 Docker 샌드박스 안에만 있고 폼값엔 컨테이너 경로만 담긴다.
+    그 파일을 꺼내 base64 로 office-mcp(store_and_render_hwpx)에 넘겨 storage 업로드 + HTML 변환을
+    시키고(=deepagents 는 storage 직접 미접근), 폼값을 {path:file_url, name, html_url, ext} 로 바꾼다.
+    이러면 프론트 FileField 다운로드 + HwpxViewer 미리보기/편집(html_url·file_url) 이 그대로 동작한다.
+    실패는 베스트에포트(원본 경로 유지)."""
+    if not final_text or ".hwpx" not in final_text.lower():
+        return final_text
+    try:
+        obj = json.loads(final_text)
+    except Exception:
+        return final_text
+    if not isinstance(obj, (dict, list)):
+        return final_text
+
+    try:
+        from core.agents.agent import _BASE_DIR as _AGENT_BASE_DIR, _SKILLS_DIR as _AGENT_SKILLS_DIR
+        from core.sandbox.docker_sandbox import get_or_create_sandbox
+    except Exception:
+        logger.warning("hwpx 실체화: sandbox 모듈 로드 실패", exc_info=True)
+        return final_text
+    from pathlib import PurePosixPath
+
+    backend = get_or_create_sandbox(
+        tenant_id,
+        workspace_host=_AGENT_BASE_DIR / "workspace",
+        skills_host=_AGENT_SKILLS_DIR,
+    )
+    cache: dict[str, dict] = {}
+
+    async def _resolve(path_val: str) -> dict | None:
+        container_path = path_val if path_val.startswith("/") else "/" + path_val
+        if not container_path.startswith("/workspace"):
+            return None
+        if container_path in cache:
+            return cache[container_path]
+        results = await asyncio.to_thread(backend.download_files, [container_path])
+        res = results[0] if results else None
+        content = getattr(res, "content", None) if res else None
+        if content is None or getattr(res, "error", None):
+            logger.warning("hwpx 실체화: 샌드박스에 파일 없음 | path=%s", container_path)
+            return None
+        name = PurePosixPath(container_path).name
+        b64 = base64.b64encode(content).decode("ascii")
+        out = await _call_office_mcp_tool(
+            "store_and_render_hwpx",
+            {"base64_data": b64, "file_name": name, "tenant_id": tenant_id or ""},
+        )
+        if not out or not out.get("file_url"):
+            logger.warning("hwpx 실체화: office-mcp 결과 없음 | path=%s", container_path)
+            return None
+        val = {
+            "path": out.get("file_url"),
+            "name": out.get("file_name") or name,
+            "html_url": out.get("html_url") or "",
+            "ext": ".hwpx",
+        }
+        cache[container_path] = val
+        logger.info("hwpx 실체화 완료 | %s → file_url=%s html_url=%s", container_path, val["path"], val["html_url"])
+        return val
+
+    async def _walk(node):
+        if isinstance(node, dict):
+            for k, v in list(node.items()):
+                node[k] = await _walk(v)
+            return node
+        if isinstance(node, list):
+            return [await _walk(x) for x in node]
+        if isinstance(node, str):
+            s = node.strip()
+            if s.lower().endswith(".hwpx") and ("workspace/" in s or s.startswith("/workspace")):
+                r = await _resolve(s)
+                return r if r is not None else node
+        return node
+
+    try:
+        obj = await _walk(obj)
+    except Exception:
+        logger.warning("hwpx 실체화: JSON 순회 실패", exc_info=True)
+        return final_text
+    return json.dumps(obj, ensure_ascii=False)
+
+
+async def _emit_chat_hwpx_artifacts(streamer, tenant_id: str, texts: list[str], collected: set[str] | None = None) -> None:
+    """채팅 경로: 스킬이 샌드박스에 만든 hwpx 를 office-mcp 로 실체화(storage 업로드 + HTML 변환)하고,
+    기존 채팅 파이프라인(onToolEnd → pushHwpxArtifact)이 인식하는 tool_end 이벤트로 내보낸다.
+
+    이렇게 하면 채팅 우측 아티팩트 패널에 HwpxViewer(미리보기·편집)가 그대로 뜬다(프론트 무수정).
+    실패는 베스트에포트."""
+    if streamer is None:
+        return
+    paths: set[str] = set(collected or set())
+    for txt in texts or []:
+        if txt:
+            for m in _HWPX_PATH_RE.findall(txt):
+                paths.add(m)
+    if not paths:
+        return
+    try:
+        from core.agents.agent import _BASE_DIR as _AGENT_BASE_DIR, _SKILLS_DIR as _AGENT_SKILLS_DIR
+        from core.sandbox.docker_sandbox import get_or_create_sandbox
+    except Exception:
+        logger.warning("채팅 hwpx: sandbox 모듈 로드 실패", exc_info=True)
+        return
+    from pathlib import PurePosixPath
+
+    backend = get_or_create_sandbox(
+        tenant_id,
+        workspace_host=_AGENT_BASE_DIR / "workspace",
+        skills_host=_AGENT_SKILLS_DIR,
+    )
+    for cp in sorted(paths):
+        try:
+            results = await asyncio.to_thread(backend.download_files, [cp])
+            res = results[0] if results else None
+            content = getattr(res, "content", None) if res else None
+            if content is None or getattr(res, "error", None):
+                continue
+            name = PurePosixPath(cp).name
+            out = await _call_office_mcp_tool(
+                "store_and_render_hwpx",
+                {"base64_data": base64.b64encode(content).decode("ascii"), "file_name": name, "tenant_id": tenant_id or ""},
+            )
+            if not out or not out.get("html_url"):
+                logger.warning("채팅 hwpx: office-mcp 결과 없음 | path=%s", cp)
+                continue
+            await streamer.send_json({"type": "tool_end", "output": out})
+            logger.info("채팅 hwpx 아티팩트 emit | %s → html_url=%s", cp, out.get("html_url"))
+        except Exception:
+            logger.warning("채팅 hwpx 실체화 실패 | path=%s", cp, exc_info=True)
 
 
 def _file_artifact_payload(path: str, content: str | None, op: str) -> dict:
@@ -126,7 +324,10 @@ async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
     room_host = (_ABASE / "workspace" / ".bpmn" / slug) if slug else (_ABASE / "workspace" / ".bpmn")
     if not room_host.exists():
         return
-    proc_dirs = sorted([d for d in room_host.glob("process-*") if d.is_dir()]) or [room_host]
+    # 프로세스 폴더들 + (단독 스킬용) 방 base 자체를 항상 포함해 base 바로 아래 skills/ 도 스캔한다.
+    proc_dirs = sorted([d for d in room_host.glob("process-*") if d.is_dir()])
+    if room_host not in proc_dirs:
+        proc_dirs.append(room_host)
     seen: set = set()
     for pdir in proc_dirs:
         # process-definition.json·manifest.json·agents.json + forms/*.html + skills/**/SKILL.md
@@ -461,6 +662,13 @@ class DeepAgentExecutor(AgentExecutor):
             _skill_user_request.set(_user_input_text)
         except Exception:
             pass
+        # 스킬/에이전트 '생성' 요청이면 프로세스 컨설팅 강제 HITL 대상이 아니다(파일 업로드가 있어도).
+        # 프로세스 생성/워크플로 요청이 아닌, 스킬·에이전트 만들기 의도만 잡는다.
+        _req_l = (_user_input_text or "").lower()
+        _wants_skill_or_agent = (
+            bool(re.search(r"스킬|skill|에이전트|agent", _req_l))
+            and not re.search(r"프로세스|워크플로|process|workflow", _req_l)
+        )
         # 후보 선택 HITL 답변이면([스킬]/[에이전트]/[DMN]) manifest 로 캡처(에이전트가 안 써도 스킬/연결 보장).
         # process-* 폴더는 1단계에서 이미 생성됨(이번 턴은 후보선택 resume). 방은 contextvar(위에서 set)로 찾는다.
         try:
@@ -674,7 +882,10 @@ class DeepAgentExecutor(AgentExecutor):
         # 생성 턴 폴백: 에이전트가 process-definition.json 은 만들었지만 complete 를 호출하지 않고
         # 턴을 끝내는 경우(스킬 생성 등으로 step 소진)가 있어, 스트림 종료 시 자동으로 complete 한다.
         process_json_written = False
+        skill_written = False
         complete_called = False
+        # 채팅 경로: 스킬이 만든 hwpx 컨테이너 경로 수집(종료 시 office-mcp 로 실체화 → 아티팩트).
+        chat_hwpx_paths: set[str] = set()
 
         try:
             async for _ns, stream_evt, data in graph.astream(
@@ -723,6 +934,8 @@ class DeepAgentExecutor(AgentExecutor):
                                             }
                                             if str(_fp).endswith("process-definition.json"):
                                                 process_json_written = True
+                                            if str(_fp).endswith("SKILL.md") or "/skills/" in str(_fp):
+                                                skill_written = True
                                     await _enqueue_status(
                                         event_queue,
                                         task_id=task_id,
@@ -775,6 +988,13 @@ class DeepAgentExecutor(AgentExecutor):
                                     msg.tool_call_id, getattr(msg, "name", "unknown")
                                 )
                                 result_content = msg.content
+                                # 채팅: 도구 결과(예: build_hwpx 실행 출력)에서 hwpx 경로를 모아 종료 시 실체화.
+                                if is_chat:
+                                    try:
+                                        for _hp in _HWPX_PATH_RE.findall(str(result_content or "")):
+                                            chat_hwpx_paths.add(_hp)
+                                    except Exception:
+                                        pass
                                 await _enqueue_status(
                                     event_queue,
                                     task_id=task_id,
@@ -843,6 +1063,15 @@ class DeepAgentExecutor(AgentExecutor):
 
             raw_text = extract_final_text(final_state, streamed_fallback=full_response)
 
+            # 채팅: 스킬이 만든 hwpx 를 office-mcp 로 실체화해 기존 채팅 아티팩트(미리보기/편집)로 띄운다.
+            if is_chat and streamer is not None:
+                try:
+                    await _emit_chat_hwpx_artifacts(
+                        streamer, tenant_id, [raw_text, full_response], chat_hwpx_paths
+                    )
+                except Exception:
+                    logger.warning("채팅 hwpx 아티팩트 emit 실패", exc_info=True)
+
             # 도구 출력에서 못 잡았을 때 대비: 최종 텍스트에 요약/출력계약 JSON 이 있으면 결과 카드용 이벤트 emit.
             if streamer and not process_result_sent:
                 _pr_final = _detect_process_result(raw_text)
@@ -861,10 +1090,14 @@ class DeepAgentExecutor(AgentExecutor):
                 and is_chat
                 and not process_json_written
                 and not complete_called
+                and not skill_written          # 스킬 파일을 만들었으면 프로세스 컨설팅이 아님
+                and not _wants_skill_or_agent  # 스킬/에이전트 생성 요청이면 컨설팅 강제 안 함
             ):
                 _txt = (raw_text or "").strip()
                 _steps = len(re.findall(r"(?m)^\s*\d+\s*[\.\)]\s", _txt))
-                if len(_txt) > 100 and (_steps >= 2 or re.search(r"진행|승인|반려|초안|어떻게|수정|바꿀|추가하거나", _txt)):
+                # 프로세스 컨설팅 초안의 특징(번호 매긴 흐름)이 뚜렷할 때만 강제 HITL.
+                # 일반 대화성 문구(어떻게/수정/추가)는 오탐이 많아 제외하고 실제 절차 흐름만 본다.
+                if len(_txt) > 100 and _steps >= 2 and re.search(r"→|->|승인|반려|담당|역할|분기|단계", _txt):
                     logger.info(
                         "컨설팅 강제 HITL: request_human_input 미호출 → 같은 thread 로 강제 interrupt 생성 | room=%s",
                         chat_room_id,
@@ -986,6 +1219,23 @@ class DeepAgentExecutor(AgentExecutor):
                 except Exception:
                     logger.exception("auto-complete(폴백) 실패")
 
+            # 단독 스킬 생성: process-definition.json 이 없어 위 complete 폴백을 타지 않으므로,
+            # 방 산출물(base/skills/*/SKILL.md)을 file_artifact 로 재전송해 프론트 패널 표시 + 저장을 보장한다.
+            if (
+                streamer
+                and not process_json_written
+                and not complete_called
+                and (skill_written or _wants_skill_or_agent or "스킬을 생성" in (raw_text or ""))
+            ):
+                try:
+                    await _reemit_room_artifacts(streamer, chat_room_id or "")
+                    logger.info("단독 스킬 산출물 재전송 | room=%s (skill_written=%s intent=%s)",
+                                chat_room_id, skill_written, _wants_skill_or_agent)
+                    if "확인 후 저장" not in (raw_text or ""):
+                        raw_text = "스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요."
+                except Exception:
+                    logger.exception("단독 스킬 산출물 재전송 실패")
+
             await _enqueue_status(
                 event_queue,
                 task_id=task_id,
@@ -1016,6 +1266,13 @@ class DeepAgentExecutor(AgentExecutor):
             )
 
             final_text = extract_json_text(raw_text) if form_id else raw_text
+            # worklist(폼) 산출물에 샌드박스 hwpx 경로가 있으면 office-mcp 로 실체화(storage 업로드 +
+            # HTML 변환)해 폼값을 file_url/html_url 로 치환한다 → 프론트 다운로드/미리보기/편집이 동작.
+            if form_id:
+                try:
+                    final_text = await _materialize_hwpx_form_outputs(tenant_id, final_text)
+                except Exception:
+                    logger.warning("hwpx 폼 산출물 실체화 처리 실패 — 원본 유지", exc_info=True)
             await _enqueue_status(
                 event_queue,
                 task_id=task_id,
