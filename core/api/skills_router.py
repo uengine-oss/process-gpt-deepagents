@@ -13,6 +13,8 @@ import re
 import shutil
 from pathlib import Path
 
+import yaml
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
@@ -20,14 +22,57 @@ from starlette.routing import Route
 logger = logging.getLogger(__name__)
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
-_KV_RE = re.compile(r"^([^:\n]+?)\s*:\s*(.+)$", re.MULTILINE)
 
 
-def _parse_frontmatter(text: str) -> dict[str, str]:
+def _parse_frontmatter(text: str) -> dict:
     m = _FRONTMATTER_RE.match(text)
     if not m:
         return {}
-    return {k.strip(): v.strip() for k, v in _KV_RE.findall(m.group(1))}
+    yaml_text = m.group(1)
+    try:
+        data = yaml.safe_load(yaml_text)
+        return data if isinstance(data, dict) else {}
+    except yaml.YAMLError:
+        # YAML이 깨진 경우(e.g. description에 비따옴표 콜론) regex로 핵심 필드만 추출
+        return _parse_frontmatter_regex_fallback(yaml_text)
+
+
+def _parse_frontmatter_regex_fallback(yaml_text: str) -> dict:
+    """YAML 파싱 실패 시 regex로 핵심 필드를 추출한다.
+
+    description 같은 긴 문자열 필드는 콜론 포함 가능성이 높아 추출을 생략하고,
+    name / license / extends 처럼 값이 단순한 필드만 복원한다.
+    """
+    result: dict = {}
+    for key in ("name", "license"):
+        fm = re.search(rf"^{key}:\s*(.+)$", yaml_text, re.MULTILINE)
+        if fm:
+            result[key] = fm.group(1).strip().strip("\"'")
+    # extends: single-value 형식
+    ext_m = re.search(r"^extends:\s*(\S.*)$", yaml_text, re.MULTILINE)
+    if ext_m:
+        result["extends"] = ext_m.group(1).strip().strip("\"'")
+    else:
+        # extends: YAML 리스트 형식
+        ext_list_m = re.search(r"^extends:\s*$", yaml_text, re.MULTILINE)
+        if ext_list_m:
+            rest = yaml_text[ext_list_m.end():]
+            nk = re.search(r"^\S", rest, re.MULTILINE)
+            section = rest[: nk.start()] if nk else rest
+            items = [i.strip().strip("\"'") for i in re.findall(r"^\s+-\s+(.+)$", section, re.MULTILINE)]
+            if items:
+                result["extends"] = items
+    return result
+
+
+def _normalize_extends(val: object) -> list[str]:
+    if not val:
+        return []
+    if isinstance(val, str):
+        return [val.strip()] if val.strip() else []
+    if isinstance(val, list):
+        return [str(v).strip() for v in val if str(v).strip()]
+    return []
 
 
 _BUILTIN_COLLECTION = "anthropics-skills"
@@ -58,6 +103,7 @@ def _scan_collection(col_path: str) -> list[dict]:
             "collection": collection_name,
             "license": meta.get("license", ""),
             "path": str(entry),
+            "extends": _normalize_extends(meta.get("extends")),
         })
     return skills
 
@@ -104,6 +150,15 @@ def _scan_skills(tenant_id: str = "") -> list[dict]:
             seen_names.add(skill["name"])
             skill["has_repo"] = skill["name"] in repo_skill_names
             skills.append(skill)
+
+    # Compute children: reverse-index extends for tree rendering
+    children_map: dict[str, list[str]] = {}
+    for skill in skills:
+        for parent_name in skill.get("extends", []):
+            children_map.setdefault(parent_name, []).append(skill["name"])
+    for skill in skills:
+        skill["children"] = children_map.get(skill["name"], [])
+
     return skills
 
 
@@ -276,6 +331,80 @@ async def list_skills(request: Request) -> JSONResponse:
     return JSONResponse({"skills": skills, "total": len(skills)})
 
 
+def _resolve_inheritance_chain(
+    skill_name: str,
+    tenant_id: str = "",
+    config_id: str = "",
+) -> dict:
+    """스킬의 extends 체인을 재귀 해소해 { skill, extends, chain, warnings } 반환."""
+    from core.skills.skills import _get_skills, _parse_extends_from_skill_md
+
+    collection_dirs = (_get_skills(tenant_id, config_id) if config_id else _get_skills(tenant_id)) or []
+
+    # 검색 가능한 모든 스킬 인덱스 구성 (name → skill dict)
+    by_name: dict[str, dict] = {}
+    for col_path in collection_dirs:
+        if Path(col_path).name == _BUILTIN_COLLECTION:
+            continue
+        for skill in _scan_collection(col_path):
+            by_name.setdefault(skill["name"], skill)
+
+    if skill_name not in by_name:
+        return None  # type: ignore[return-value]
+
+    warnings: list[str] = []
+    chain: list[dict] = []
+    done: set[str] = set()
+    in_progress: set[str] = set()
+
+    def _visit(name: str) -> None:
+        if name in done:
+            return
+        if name not in by_name:
+            warnings.append(f"parent skill '{name}' not found")
+            return
+        if name in in_progress:
+            warnings.append(f"circular inheritance detected: '{name}'")
+            return
+        in_progress.add(name)
+        for parent in _parse_extends_from_skill_md(by_name[name]["path"]):
+            _visit(parent)
+        in_progress.discard(name)
+        if name not in done:
+            done.add(name)
+            chain.append(by_name[name])
+
+    _visit(skill_name)
+
+    root = by_name[skill_name]
+    return {
+        "skill": skill_name,
+        "extends": root.get("extends", []),
+        "chain": chain,
+        "warnings": warnings,
+    }
+
+
+async def get_skill_inheritance(request: Request) -> JSONResponse:
+    skill_name = request.path_params["skill_name"]
+    tenant_id = request.query_params.get("tenant_id", "")
+
+    config_id = ""
+    if tenant_id:
+        try:
+            provider = await asyncio.to_thread(_get_provider, tenant_id)
+            config_id = provider.config_id
+        except Exception:
+            pass
+
+    result = await asyncio.to_thread(
+        _resolve_inheritance_chain, skill_name, tenant_id, config_id
+    )
+    if result is None:
+        return JSONResponse({"error": f"skill '{skill_name}' not found"}, status_code=404)
+    return JSONResponse(result)
+
+
 async def list_builtin_skills(_request: Request) -> JSONResponse:
     skills = _scan_builtin_skills()
     return JSONResponse({"skills": skills, "total": len(skills)})
@@ -325,8 +454,19 @@ async def commit_skill_file(request: Request) -> JSONResponse:
 
     is_default_branch = branch == default_branch
 
-    # 기본 브랜치 직접 커밋 금지 → 피처 브랜치 + PR 워크플로우
+    # 빈 레포(초기 커밋 없음) 감지 — 첫 커밋은 main에 직접, feature branch/PR 불필요
+    repo_is_empty = False
     if is_default_branch:
+        try:
+            existing_branches = await asyncio.to_thread(
+                provider.list_branches, provider.username, skill_name
+            )
+            repo_is_empty = len(existing_branches) == 0
+        except Exception:
+            repo_is_empty = True
+
+    # 기본 브랜치 직접 커밋 금지 → 피처 브랜치 + PR 워크플로우 (빈 레포 제외)
+    if is_default_branch and not repo_is_empty:
         import time
         import uuid
 
@@ -340,7 +480,7 @@ async def commit_skill_file(request: Request) -> JSONResponse:
         except Exception as e:
             return JSONResponse({"error": f"브랜치 생성 실패: {e}"}, status_code=500)
 
-    # 피처 브랜치에 커밋
+    # 피처 브랜치(또는 빈 레포의 경우 default branch)에 커밋
     try:
         result = await asyncio.to_thread(
             provider.update_file, provider.username, skill_name, file_path, content, message, branch,
@@ -349,9 +489,9 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
-    # 기본 브랜치로 요청한 경우 PR 생성
+    # 기본 브랜치로 요청한 경우 PR 생성 (빈 레포 제외)
     pr_result: dict = {}
-    if is_default_branch:
+    if is_default_branch and not repo_is_empty:
         try:
             pr = await asyncio.to_thread(
                 provider.create_pull_request,
@@ -806,6 +946,9 @@ async def create_skill_repo(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
     tenant_id = body.get("tenant_id", "")
+    owner_id: str = body.get("owner_id", "")
+    initial_content: str | None = body.get("initial_content") or None
+    initial_file_path: str = body.get("file_path") or "SKILL.md"
     if not tenant_id:
         return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
@@ -839,7 +982,32 @@ async def create_skill_repo(request: Request) -> JSONResponse:
     pushed: list[str] = []
     errors: list[str] = []
 
-    if skill_dir is not None:
+    if skill_dir is None and initial_content:
+        # 로컬 파일 없음 + 초기 내용 제공 → 직접 초기 커밋으로 기본 브랜치를 생성
+        try:
+            await asyncio.to_thread(
+                provider.update_file,
+                actual_owner,
+                skill_name,
+                initial_file_path,
+                initial_content,
+                f"init: create {skill_name}",
+                "main",
+            )
+            pushed.append(initial_file_path)
+        except Exception as e:
+            errors.append(f"{initial_file_path}: {e}")
+
+        # GitHub/GitLab 커밋 성공 시 로컬 디스크에도 저장 → _scan_skills 반영
+        if initial_file_path in pushed:
+            from core.skills.upload_utils import get_tenant_skill_dest
+            local_file = get_tenant_skill_dest(tenant_id, skill_name, config_id=config_id or "local") / initial_file_path
+            try:
+                await asyncio.to_thread(local_file.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(local_file.write_text, initial_content, encoding="utf-8")
+            except Exception as e:
+                logger.warning("로컬 스킬 파일 동기화 실패 skill=%s file=%s: %s", skill_name, initial_file_path, e)
+    elif skill_dir is not None:
         resolved = skill_dir.resolve()
         local_files = [
             p for p in sorted(resolved.rglob("*"))
@@ -866,6 +1034,12 @@ async def create_skill_repo(request: Request) -> JSONResponse:
         logger.warning("create_skill_repo: push errors for skill=%s: %s", skill_name, errors)
     if not pushed and skill_dir is not None:
         logger.warning("create_skill_repo: no files pushed for skill=%s (skill_dir=%s)", skill_name, skill_dir)
+
+    if pushed and owner_id:
+        try:
+            await asyncio.to_thread(_save_tenant_skill, tenant_id, skill_name, owner_id)
+        except Exception as e:
+            logger.error("tenant_skills 저장 실패 skill=%s tenant=%s: %s", skill_name, tenant_id, e)
 
     return JSONResponse({
         "created": True,
@@ -917,6 +1091,7 @@ async def upload_skill(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=413)
 
     skill_name_override = form.get("skill_name", "")
+    owner_id = form.get("owner_id", "")
 
     tmpdir = tempfile.mkdtemp(prefix="skill-upload-")
     tmp_path = Path(tmpdir)
@@ -948,6 +1123,12 @@ async def upload_skill(request: Request) -> JSONResponse:
         dest.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.move, str(skill_root), str(dest))
         files = list_skill_files(dest)
+
+        try:
+            await asyncio.to_thread(_save_tenant_skill, tenant_id, skill_name, owner_id)
+        except Exception as e:
+            logger.error("tenant_skills 저장 실패 skill=%s tenant=%s: %s", skill_name, tenant_id, e)
+
         return JSONResponse({"registered": True, "skill_name": skill_name, "files": files}, status_code=201)
     finally:
         await asyncio.to_thread(shutil.rmtree, tmpdir, True)
@@ -1261,6 +1442,7 @@ routes = [
     Route("/skills/upload", upload_skill, methods=["POST"]),
     Route("/skills/upload-from-git", upload_skill_from_git, methods=["POST"]),
     Route("/skills/{skill_name}", delete_skill, methods=["DELETE"]),
+    Route("/skills/{skill_name}/inheritance", get_skill_inheritance, methods=["GET"]),
     Route("/skills/{skill_name}/repo", create_skill_repo, methods=["POST"]),
     Route("/skills/{skill_name}/sync", sync_skill, methods=["POST"]),
     Route("/skills/{skill_name}/commit", commit_skill_file, methods=["POST"]),

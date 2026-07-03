@@ -5,7 +5,9 @@ tenant_id 당 하나의 컨테이너를 재사용하며, atexit 훅으로 프로
 
 컨테이너는 다음 볼륨을 마운트한다:
   - {workspace_host}/  →  /workspace  (read-write)
-  - {skills_host}/     →  /skills     (read-only, optional)
+  - {skills_host}/{tenant_id}/ 및 알려진 글로벌 컬렉션만 각각 /skills/<name> 으로
+    개별 bind-mount (read-only, optional) — skills_host 전체를 통째로 마운트하면
+    다른 테넌트의 스킬 디렉토리까지 노출되므로 디렉토리 단위로 화이트리스트한다.
 
 환경변수는 호스트 전체를 상속하지 않고, 스킬 후처리(저장/검증)에 필요한
 **화이트리스트(_FORWARD_ENV_KEYS)만** 컨테이너로 전달한다. 또한 요청이 들어온
@@ -172,6 +174,33 @@ class DockerSandboxBackend(BaseSandbox):
                 self._client = _get_docker_client()
         raise RuntimeError("unreachable")
 
+    def _skill_volumes(self) -> dict:
+        """이 테넌트 디렉토리와 알려진 글로벌 컬렉션만 개별 bind-mount한다.
+
+        skills_host 전체를 한 번에 마운트하면 같은 루트에 있는 다른 테넌트의
+        스킬 디렉토리까지 컨테이너의 /skills 트리에 그대로 노출되어, ls/read_file
+        같은 파일시스템 도구로 직접 열람할 수 있게 된다(core/skills/skills.py 의
+        _get_skills 화이트리스트는 시스템 프롬프트 노출만 막을 뿐 마운트 자체는
+        막지 못함). 디렉토리 단위로 개별 마운트해 컨테이너 안에 다른 테넌트
+        항목이 애초에 존재하지 않도록 한다.
+        """
+        if not self._skills_host or not self._skills_host.exists():
+            return {}
+        from core.skills.skills import _global_collection_names
+
+        allowed = _global_collection_names()
+        if self._tenant_id:
+            allowed = allowed | {self._tenant_id}
+
+        volumes: dict = {}
+        try:
+            for entry in sorted(self._skills_host.iterdir()):
+                if entry.is_dir() and entry.name in allowed:
+                    volumes[str(entry)] = {"bind": f"/skills/{entry.name}", "mode": "ro"}
+        except OSError:
+            pass
+        return volumes
+
     def _start_container(self) -> docker.models.containers.Container:
         name = f"deepagent-sandbox-{self._tenant_id or 'shared'}"
 
@@ -187,8 +216,7 @@ class DockerSandboxBackend(BaseSandbox):
 
         self._workspace_host.mkdir(parents=True, exist_ok=True)
         volumes: dict = {str(self._workspace_host): {"bind": _CONTAINER_WORKSPACE, "mode": "rw"}}
-        if self._skills_host and self._skills_host.exists():
-            volumes[str(self._skills_host)] = {"bind": "/skills", "mode": "ro"}
+        volumes.update(self._skill_volumes())
 
         container = self._client.containers.run(
             SANDBOX_IMAGE,
