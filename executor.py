@@ -729,6 +729,8 @@ class DeepAgentExecutor(AgentExecutor):
         # 턴을 끝내는 경우(스킬 생성 등으로 step 소진)가 있어, 스트림 종료 시 자동으로 complete 한다.
         process_json_written = False
         complete_called = False
+        # /workspace 에 파일을 썼으면 True — 컨설팅 1단계(파일 미작성)와 구분하는 데 사용한다.
+        workspace_write_made = False
 
         try:
             async for _ns, stream_evt, data in graph.astream(
@@ -780,6 +782,7 @@ class DeepAgentExecutor(AgentExecutor):
                                                 "op": "create" if tool_name == "write_file" else "edit",
                                                 "inline": (tool_args.get("content") if tool_name == "write_file" else None),
                                             }
+                                            workspace_write_made = True
                                             if str(_fp).endswith("process-definition.json"):
                                                 process_json_written = True
                                     await _enqueue_status(
@@ -976,10 +979,11 @@ class DeepAgentExecutor(AgentExecutor):
                 and is_chat
                 and not process_json_written
                 and not complete_called
+                and not workspace_write_made
             ):
                 _txt = (raw_text or "").strip()
                 _steps = len(re.findall(r"(?m)^\s*\d+\s*[\.\)]\s", _txt))
-                if len(_txt) > 100 and (_steps >= 2 or re.search(r"진행|승인|반려|초안|어떻게|수정|바꿀|추가하거나", _txt)):
+                if len(_txt) > 100 and (_steps >= 2 or re.search(r"담당\s*(역할|자)\s*[:：]|역할\s*[:：]|승인/반려|분기\s*[:：→]|프로세스\s*초안", _txt)):
                     logger.info(
                         "컨설팅 강제 HITL: request_human_input 미호출 → 같은 thread 로 강제 interrupt 생성 | room=%s",
                         chat_room_id,

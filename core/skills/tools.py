@@ -226,6 +226,67 @@ def extract_document_structure(file_path: str) -> str:
 # Git 푸시 헬퍼 (sandbox 내부 실행)
 # ---------------------------------------------------------------------------
 
+def _auto_register_tenant_skill(cwd: str, skill_name: str, html_url: str) -> str:
+    """신규 레포 push 후 skills/ 디렉토리에 파일을 sync하고 tenant_skills DB에 등록한다."""
+    import shutil as _shutil
+    import logging as _logging
+
+    tenant_id = _current_tenant_id.get()
+    if not tenant_id:
+        return (
+            f"Published '{skill_name}' → {html_url}\n"
+            "NOTE: tenant_id가 없어 테넌트 스킬 자동 등록을 건너뜁니다."
+        )
+
+    host_src = _resolve_ws_path(cwd)
+    if not host_src.is_dir():
+        return (
+            f"Published '{skill_name}' → {html_url}\n"
+            f"WARNING: 로컬 파일 경로를 찾을 수 없어 자동 등록을 건너뜁니다: {host_src}"
+        )
+
+    try:
+        provider = _get_git_provider()
+        config_id = getattr(provider, "config_id", "") or "local"
+    except Exception:
+        config_id = "local"
+
+    _BASE_DIR = Path(__file__).parent.parent.parent
+    raw = os.getenv("SKILLS_DIRS", str(_BASE_DIR / "skills"))
+    first = raw.split(",")[0].strip() or str(_BASE_DIR / "skills")
+    skills_root = Path(first) if os.path.isabs(first) else (_BASE_DIR / first).resolve()
+    skill_dir = skills_root / tenant_id / config_id / skill_name
+
+    try:
+        skill_dir.parent.mkdir(parents=True, exist_ok=True)
+        if skill_dir.exists():
+            _shutil.rmtree(skill_dir)
+        _shutil.copytree(str(host_src), str(skill_dir))
+    except Exception as e:
+        return (
+            f"Published '{skill_name}' → {html_url}\n"
+            f"WARNING: 파일 sync 실패로 자동 등록을 건너뜁니다: {e}"
+        )
+
+    owner_id = _current_user_id.get() or ""
+    try:
+        from ..storage.db import get_supabase
+        get_supabase().table("tenant_skills").insert({
+            "tenant_id": tenant_id,
+            "skill_name": skill_name,
+            "owner_id": owner_id,
+        }).execute()
+    except Exception as e:
+        _logging.getLogger(__name__).warning("tenant_skills 등록 실패 skill=%s: %s", skill_name, e)
+        _shutil.rmtree(str(skill_dir), ignore_errors=True)
+        return (
+            f"Published '{skill_name}' → {html_url}\n"
+            f"WARNING: DB 등록 실패로 파일 sync를 롤백했습니다: {e}"
+        )
+
+    return f"Published '{skill_name}' → {html_url}\n✓ 테넌트 스킬로 등록 완료"
+
+
 def _push_skill_sandbox(
     cwd: str,
     skill_name: str,
@@ -290,12 +351,8 @@ def _push_skill_sandbox(
             description=f"스킬 '{skill_name}' 업데이트",
         )
 
-    return (
-        f"Published '{skill_name}' → {html_url}/tree/{branch}\n\n"
-        f"REGISTER_PROMPT: 이 스킬을 테넌트 스킬로 등록하시겠습니까? "
-        f"등록하면 에이전트가 이 스킬을 즉시 사용할 수 있습니다. "
-        f"(repo_url: {html_url})"
-    )
+    # 신규 레포: 파일 sync + tenant_skills DB 삽입 자동 수행
+    return _auto_register_tenant_skill(cwd, skill_name, html_url)
 
 
 def _create_pr_after_push(
@@ -1008,7 +1065,12 @@ def _normalize_form_html(html: str) -> str:
     return h
 
 
-def _gen_skill_md(name: str, activity_name: str, description: str = "") -> str:
+def _gen_skill_md(
+    name: str,
+    activity_name: str,
+    description: str = "",
+    extends: list[str] | None = None,
+) -> str:
     """선택된 스킬의 SKILL.md(결정적 폴백). YAML frontmatter + SOP 형식 본문.
 
     원칙적으로 스킬은 에이전트가 skill-creator 로 풍부하게 만들어야 하지만, 누락 시
@@ -1016,11 +1078,29 @@ def _gen_skill_md(name: str, activity_name: str, description: str = "") -> str:
     desc = (description or f"{activity_name} 작업을 수행합니다.").replace('"', "'").strip()
     title = name.replace("-", " ").replace("_", " ")
     act = activity_name or "해당"
+
+    extends_list = [e.strip() for e in (extends or []) if e.strip()]
+    if extends_list:
+        if len(extends_list) == 1:
+            extends_field = f"extends: {extends_list[0]}\n"
+        else:
+            extends_field = "extends:\n" + "".join(f"  - {e}\n" for e in extends_list)
+        parents_str = ", ".join(extends_list)
+        inheritance_directive = (
+            f"> **상속 규칙**: 이 스킬은 [{parents_str}] 스킬을 상속합니다. "
+            "아래 규칙이 상속된 규칙보다 우선 적용됩니다.\n\n"
+        )
+    else:
+        extends_field = ""
+        inheritance_directive = ""
+
     return (
         "---\n"
         f"name: {name}\n"
         f'description: "{desc}"\n'
+        f"{extends_field}"
         "---\n\n"
+        f"{inheritance_directive}"
         f"# {title}\n\n"
         "## 개요\n\n"
         f"이 스킬은 '{act}' 단계를 표준 절차에 따라 수행합니다. {desc}\n\n"
@@ -1850,6 +1930,80 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
     return _push_skill_sandbox(
         cwd, skill_name, branch, clone_url, html_url, existing_repo=True
     )
+
+
+@tool
+def register_skill_as_tenant(skill_path: str) -> str:
+    """Register a packaged skill (.skill file) as a tenant skill without git.
+
+    Use this when there is no git provider configured. After packaging the skill
+    with `package_skill.py`, call this tool with the resulting .skill file path
+    to register it directly as a tenant skill.
+
+    The tool extracts the archive, copies files to the tenant skill directory, and
+    records the registration in the tenant_skills table. No UI upload needed.
+
+    Args:
+        skill_path: Container path to the .skill (or .zip) file, e.g. /workspace/my-skill.skill
+    """
+    import shutil as _shutil
+    import tempfile as _tempfile
+    import logging as _logging
+
+    tenant_id = _current_tenant_id.get()
+    if not tenant_id:
+        return "ERROR: tenant_id가 설정되지 않았습니다. ask_user를 호출하지 말고 작업을 중단하세요."
+
+    host_path = _resolve_ws_path(skill_path)
+    if not host_path.is_file():
+        return f"ERROR: 파일을 찾을 수 없습니다: {host_path}"
+
+    from .upload_utils import extract_archive, find_skill_root, get_tenant_skill_dest, skill_name_from_filename
+
+    try:
+        archive_bytes = host_path.read_bytes()
+    except Exception as e:
+        return f"ERROR: 파일 읽기 실패: {e}"
+
+    tmpdir = Path(_tempfile.mkdtemp(prefix="skill-register-"))
+    try:
+        try:
+            extract_archive(archive_bytes, tmpdir)
+        except ValueError as e:
+            return f"ERROR: 압축 해제 실패: {e}"
+
+        skill_root = find_skill_root(tmpdir)
+        if skill_root is None:
+            return "ERROR: SKILL.md가 없습니다. 유효한 스킬 패키지가 아닙니다."
+
+        skill_name = skill_root.name if skill_root != tmpdir else skill_name_from_filename(host_path.name)
+        dest = get_tenant_skill_dest(tenant_id, skill_name, config_id="local")
+
+        if dest.exists():
+            return f"ERROR: '{skill_name}' 스킬이 이미 존재합니다 (tenant: {tenant_id}). 다른 이름을 사용하거나 기존 스킬을 삭제하세요."
+
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            _shutil.move(str(skill_root), str(dest))
+        except Exception as e:
+            return f"ERROR: 파일 복사 실패: {e}"
+    finally:
+        _shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    owner_id = _current_user_id.get() or ""
+    try:
+        from ..storage.db import get_supabase
+        get_supabase().table("tenant_skills").insert({
+            "tenant_id": tenant_id,
+            "skill_name": skill_name,
+            "owner_id": owner_id,
+        }).execute()
+    except Exception as e:
+        _logging.getLogger(__name__).warning("tenant_skills 등록 실패 skill=%s: %s", skill_name, e)
+        _shutil.rmtree(str(dest), ignore_errors=True)
+        return f"ERROR: DB 등록 실패로 파일을 롤백했습니다: {e}"
+
+    return f"✓ '{skill_name}' 테넌트 스킬로 등록 완료 (경로: {dest})"
 
 
 # ---------------------------------------------------------------------------

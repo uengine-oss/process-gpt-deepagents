@@ -18,6 +18,7 @@ from ..skills.tools import (
     extract_document_structure,
     list_git_repos,
     publish_skill,
+    register_skill_as_tenant,
     validate_process_definition,
     complete_process_generation,
     bpmn_container_base,
@@ -166,6 +167,7 @@ async def build_agent(
             extract_document_structure,
             list_git_repos,
             publish_skill,
+            register_skill_as_tenant,
             validate_process_definition,
             complete_process_generation,
         ]
