@@ -577,6 +577,7 @@ class DeepAgentExecutor(AgentExecutor):
         ctx_data = context.get_context_data() or {}
         extras = ctx_data.get("extras", {})
         row = ctx_data.get("row", {})
+        agent_mode = str(row.get("agent_mode") or "").strip()
 
         tenant_id = str(row.get("tenant_id") or extras.get("tenant_id") or "").strip()
         user_jwt = extras.get("user_jwt")
@@ -610,22 +611,28 @@ class DeepAgentExecutor(AgentExecutor):
             or ""
         ).strip()
 
-        tenant_mcp: dict[str, Any] = dict(extras.get("tenant_mcp") or {})
-        if not tenant_mcp and tenant_id:
-            try:
-                from processgpt_agent_sdk.database import fetch_tenant_mcp
-                fetched = await fetch_tenant_mcp(tenant_id)
-                if isinstance(fetched, dict):
-                    tenant_mcp = fetched
-            except Exception:
-                logger.warning("tenant_mcp DB 조회 실패 | tenant_id=%s", tenant_id, exc_info=True)
-
         is_chat = streamer is not None
         chat_room_id = resolve_chat_room_id(extras, row if isinstance(row, dict) else {})
         # 산출물을 방별 디렉터리(.bpmn/<room>/)로 격리 — 경로 충돌/덮어쓰기 방지.
         _skill_conversation_id.set(chat_room_id or "")
 
-        if is_chat:
+        tenant_mcp: dict[str, Any] = {}
+        if is_chat and tenant_id:
+            try:
+                from core.storage.db import get_supabase
+                sb = get_supabase()
+                result = (
+                    sb.table("tenants")
+                    .select("mcp")
+                    .eq("id", tenant_id)
+                    .single()
+                    .execute()
+                )
+                fetched = (result.data or {}).get("mcp")
+                if isinstance(fetched, dict):
+                    tenant_mcp = fetched
+            except Exception:
+                logger.warning("tenant_mcp DB 조회 실패 | tenant_id=%s", tenant_id, exc_info=True)
             tenant_mcp = ensure_process_gpt_mcp(tenant_mcp, tenant_id)
         chat_root_tools = await load_chat_root_tools(tenant_mcp) if is_chat else []
         _root_mcp_tool_names = [
@@ -885,6 +892,7 @@ class DeepAgentExecutor(AgentExecutor):
             extra_tools=chat_root_tools,
             middleware=[ToolResultTruncationMiddleware()],
             static_subagents=build_skill_creator_subagents(task_id=task_id),
+            agent_mode=agent_mode,
             user_context={
                 "user_jwt": user_jwt,
                 "user_email": user_email,
@@ -1206,6 +1214,7 @@ class DeepAgentExecutor(AgentExecutor):
             if (
                 not interrupt_payload
                 and is_chat
+                and agent_mode != "DRAFT"
                 and not process_json_written
                 and not complete_called
                 and not skill_written          # 스킬 파일을 만들었으면 프로세스 컨설팅이 아님

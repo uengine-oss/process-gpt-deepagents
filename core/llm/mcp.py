@@ -120,14 +120,16 @@ _LOCAL_BPM_TOOLS = frozenset({
 
 
 async def load_chat_root_tools(tenant_mcp: dict) -> list:
-    """채팅 모드 루트 오케스트레이터용 process-gpt-mcp 도구를 로드한다.
+    """채팅 모드 루트 오케스트레이터용 MCP 도구를 로드한다.
 
-    로컬 BPM 도구와 중복되는 MCP 도구는 제외한다.
+    tenants.mcp.mcpServers 에 등록된 모든 서버의 도구를 로드하며,
+    로컬 BPM 도구와 중복되는 항목은 제외한다.
     """
-    if "process-gpt-mcp" not in (tenant_mcp.get("mcpServers") or {}):
+    server_names = list((tenant_mcp.get("mcpServers") or {}).keys())
+    if not server_names:
         return []
     try:
-        tools = await _load_mcp_tools(["process-gpt-mcp"], tenant_mcp)
+        tools = await _load_mcp_tools(server_names, tenant_mcp)
         before = len(tools)
         tools = [t for t in tools if t.name not in _LOCAL_BPM_TOOLS]
         if before != len(tools):
@@ -135,8 +137,8 @@ async def load_chat_root_tools(tenant_mcp: dict) -> list:
                 "MCP 도구 중복 제거: %d개 → %d개 (로컬 BPM 도구 %d개 제외)",
                 before, len(tools), before - len(tools),
             )
-        logger.info("process-gpt-mcp 루트 도구: %d개", len(tools))
+        logger.info("채팅 루트 MCP 도구: %d개 (%s)", len(tools), server_names)
         return tools
     except Exception:
-        logger.warning("process-gpt-mcp 루트 도구 로드 실패", exc_info=True)
+        logger.warning("채팅 루트 MCP 도구 로드 실패", exc_info=True)
         return []

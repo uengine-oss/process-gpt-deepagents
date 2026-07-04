@@ -175,10 +175,11 @@ async def build_agent(
     static_subagents: list = None,
     conversation_id: str = "",
     user_context: dict | None = None,
+    agent_mode: str = "",
 ):
     tools = (
         list(extra_tools or [])
-        + get_hitl_tools()
+        + ([] if agent_mode == "DRAFT" else get_hitl_tools())
         + get_memento_tools()
         + get_bpm_tools()
         + [
