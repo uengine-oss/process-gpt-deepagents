@@ -65,6 +65,12 @@ _FILE_ARTIFACT_MAX_BYTES = 400_000  # 미리보기에 과한 대용량 파일은
 # 채팅 산출물에서 스킬이 만든 hwpx 컨테이너 경로를 잡아내기 위한 패턴.
 _HWPX_PATH_RE = re.compile(r"/workspace/[^\s\"']+\.hwpx")
 
+# 폼 출력에서 샌드박스 바이너리 파일(pdf/docx 등) 경로를 감지하기 위한 패턴.
+_WS_BINARY_FILE_RE = re.compile(
+    r"/workspace/[^\s\"']+\.(?:pdf|docx?|xlsx?|pptx?)",
+    re.IGNORECASE,
+)
+
 
 def _ws_file_meta(path: str) -> tuple[str, str]:
     """container 경로 → (파일명, 확장자 소문자)."""
@@ -236,6 +242,86 @@ async def _materialize_hwpx_form_outputs(tenant_id: str, final_text: str) -> str
         obj = await _walk(obj)
     except Exception:
         logger.warning("hwpx 실체화: JSON 순회 실패", exc_info=True)
+        return final_text
+    return json.dumps(obj, ensure_ascii=False)
+
+
+async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> str:
+    """worklist 폼 출력 JSON 안의 샌드박스 바이너리 파일 경로(pdf/docx/xlsx/pptx 등)를
+    내부 다운로드 토큰 URL로 치환한다. Supabase 업로드 없이 서버 자체에서 파일을 제공한다.
+
+    폼값을 {path: <download_url>, name: <filename>, ext: <ext>} 로 바꿔
+    프론트 FileField 다운로드가 그대로 동작한다. 실패는 베스트에포트(원본 경로 유지)."""
+    if not final_text or not _WS_BINARY_FILE_RE.search(final_text):
+        return final_text
+    try:
+        obj = json.loads(final_text)
+    except Exception:
+        return final_text
+    if not isinstance(obj, (dict, list)):
+        return final_text
+
+    try:
+        from core.agents.agent import _BASE_DIR as _AGENT_BASE_DIR, _SKILLS_DIR as _AGENT_SKILLS_DIR
+        from core.sandbox.docker_sandbox import get_or_create_sandbox
+        from core.api.file_download import register_file
+    except Exception:
+        logger.warning("ws 파일 실체화: 모듈 로드 실패", exc_info=True)
+        return final_text
+    from pathlib import PurePosixPath
+
+    base_url = (os.environ.get("SELF_BASE_URL") or f"http://localhost:{os.environ.get('PORT', '8888')}").rstrip("/")
+
+    backend = get_or_create_sandbox(
+        tenant_id,
+        workspace_host=_AGENT_BASE_DIR / "workspace",
+        skills_host=_AGENT_SKILLS_DIR,
+    )
+    cache: dict[str, dict] = {}
+
+    async def _resolve(path_val: str) -> dict | None:
+        container_path = path_val if path_val.startswith("/") else "/" + path_val
+        if not container_path.startswith("/workspace"):
+            return None
+        if container_path in cache:
+            return cache[container_path]
+        results = await asyncio.to_thread(backend.download_files, [container_path])
+        res = results[0] if results else None
+        content = getattr(res, "content", None) if res else None
+        if content is None or getattr(res, "error", None):
+            logger.warning("ws 파일 실체화: 샌드박스에 파일 없음 | path=%s", container_path)
+            return None
+        p = PurePosixPath(container_path)
+        name = p.name
+        ext = p.suffix.lower()
+        token = register_file(content, name)
+        val = {
+            "path": f"{base_url}/api/internal/download/{token}",
+            "name": name,
+            "ext": ext,
+        }
+        cache[container_path] = val
+        logger.info("ws 파일 실체화 완료 | %s → token URL", container_path)
+        return val
+
+    async def _walk(node):
+        if isinstance(node, dict):
+            for k, v in list(node.items()):
+                node[k] = await _walk(v)
+            return node
+        if isinstance(node, list):
+            return [await _walk(x) for x in node]
+        if isinstance(node, str):
+            s = node.strip()
+            if s.startswith("/workspace") and _WS_BINARY_FILE_RE.search(s):
+                r = await _resolve(s)
+                return r if r is not None else node
+        return node
+
+    try:
+        obj = await _walk(obj)
+    except Exception:
+        logger.warning("ws 파일 실체화: JSON 순회 실패", exc_info=True)
         return final_text
     return json.dumps(obj, ensure_ascii=False)
 
@@ -445,55 +531,103 @@ def _iter_json_objects(text: str):
         i = j + 1 if j > i else i + 1
 
 
-def _inject_sources_to_workspace(sources: list) -> list:
-    """업로드 문서를 Supabase Storage(버킷 'files')에서 받아 샌드박스 workspace 에 넣고
-    file_path 를 컨테이너 경로(/workspace/uploads/<name>)로 교체한다. 실패는 베스트에포트(원본 유지)."""
-    if not isinstance(sources, list) or not sources:
-        return sources or []
-    import httpx
-    from core.skills.tools import write_upload_to_workspace
+_INPUT_DATA_THRESHOLD = 500  # bytes: 이 크기 이상의 필드 값은 workspace 파일로 오프로드
+
+
+def _sanitize_ws_name(name: str, max_len: int = 80) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or "")).strip("_") or "field"
+    return safe[:max_len]
+
+
+def _instance_ws_dir(instance_id: str, subdir: str):
+    """인스턴스 격리 workspace 디렉토리(호스트 Path)를 반환한다."""
+    from core.skills.tools import WORKSPACE_ROOT
+    if instance_id:
+        return WORKSPACE_ROOT / _sanitize_ws_name(instance_id, 64) / subdir
+    return WORKSPACE_ROOT / subdir
+
+
+def _offload_input_data(text: str, instance_id: str) -> str:
+    """[InputData] 섹션의 큰 필드(≥ 500B)를 workspace 파일로 오프로드하고 참조 텍스트로 교체한다.
+
+    실패 시 원본 텍스트를 그대로 반환한다(best-effort).
+    """
+    if not isinstance(text, str) or "[InputData]" not in text:
+        return text
     try:
-        from core.storage.db import get_supabase
-        sb = get_supabase()
-    except Exception:
-        sb = None
-    out: list = []
-    for s in sources:
-        if not isinstance(s, dict):
-            out.append(s)
-            continue
-        s = dict(s)
-        fp = str(s.get("file_path") or "").strip()
-        fid = str(s.get("file_id") or "").strip()
-        name = str(s.get("file_name") or "").strip() or (fp.rsplit("/", 1)[-1] if fp else fid) or "upload"
-        content: bytes | None = None
-        try:
-            if fp.startswith("http"):
-                r = httpx.get(fp, timeout=30)
-                if r.status_code < 300:
-                    content = r.content
-            if content is None and sb is not None:
-                keys = [k for k in (fp, fid, (f"uploads/{fp}" if fp and not fp.startswith("uploads/") else "")) if k]
-                for key in keys:
-                    try:
-                        data = sb.storage.from_("files").download(key)
-                        if data:
-                            content = data
-                            break
-                    except Exception:
-                        pass
-        except Exception:
-            content = None
-        if content:
-            try:
-                s["file_path"] = write_upload_to_workspace(name, content)
-                logger.info("source 샌드박스 주입 | name=%s → %s", name, s["file_path"])
-            except Exception:
-                logger.warning("source 샌드박스 주입 실패 | name=%s", name, exc_info=True)
+        m = re.search(r'\[InputData\]\s*\n([\s\S]+?)(?=\n\[|\Z)', text)
+        if not m:
+            return text
+        json_block = m.group(1).strip()
+        data = json.loads(json_block)
+        if not isinstance(data, dict):
+            return text
+
+        dir_inputs = _instance_ws_dir(instance_id, "inputs")
+        dir_inputs.mkdir(parents=True, exist_ok=True)
+        if instance_id:
+            container_base = f"/workspace/{_sanitize_ws_name(instance_id, 64)}/inputs"
         else:
-            logger.warning("source 다운로드 실패(원본 file_path 유지) | name=%s fp=%s", name, fp)
-        out.append(s)
-    return out
+            container_base = "/workspace/inputs"
+
+        lines: list[str] = [
+            "[이전 단계 입력 데이터]",
+            "이전 단계 결과가 파일로 저장되었습니다. 필요한 항목을 read_file로 읽어 사용하세요.",
+        ]
+        for form_id, fields in data.items():
+            lines.append(f"\n[입력: {form_id}]")
+            if not isinstance(fields, dict):
+                raw = json.dumps(fields, ensure_ascii=False)
+                if len(raw.encode()) >= _INPUT_DATA_THRESHOLD:
+                    fname = _sanitize_ws_name(str(form_id)) + ".md"
+                    try:
+                        (dir_inputs / fname).write_text(raw, encoding="utf-8")
+                        lines.append(f"- ({len(raw.encode()) / 1024:.1f} KB) → {container_base}/{fname}")
+                    except Exception:
+                        logger.warning("step input 파일 저장 실패 | form_id=%s", form_id, exc_info=True)
+                        lines.append(f"- {raw}")
+                else:
+                    lines.append(f"- {raw}")
+                continue
+            for field_name, value in fields.items():
+                raw = json.dumps(value, ensure_ascii=False)
+                size = len(raw.encode())
+                if size >= _INPUT_DATA_THRESHOLD:
+                    fname = _sanitize_ws_name(f"{form_id}_{field_name}") + ".md"
+                    try:
+                        content = value if isinstance(value, str) else raw
+                        (dir_inputs / fname).write_text(content, encoding="utf-8")
+                        lines.append(f"- {field_name} ({size / 1024:.1f} KB) → {container_base}/{fname}")
+                    except Exception:
+                        logger.warning("step input 파일 저장 실패 | field=%s", field_name, exc_info=True)
+                        lines.append(f"- {field_name}: {raw}")
+                else:
+                    lines.append(f"- {field_name}: {raw}")
+
+        replacement = "\n".join(lines)
+        return text[: m.start()] + replacement + text[m.end():]
+    except Exception:
+        logger.warning("_offload_input_data 실패 — 원본 텍스트 유지", exc_info=True)
+        return text
+
+
+def _save_step_output(text: str, instance_id: str, activity_id: str) -> None:
+    """딥에이전트 단계 완료 시 LLM 최종 응답을 workspace에 저장한다 (D2D 핸드오프용).
+
+    실패해도 에이전트 응답 전송에 영향 없음(best-effort).
+    """
+    if not text or not activity_id:
+        return
+    try:
+        dir_outputs = _instance_ws_dir(instance_id, "outputs")
+        dir_outputs.mkdir(parents=True, exist_ok=True)
+        fname = _sanitize_ws_name(activity_id) + ".md"
+        (dir_outputs / fname).write_text(text, encoding="utf-8")
+        logger.info("step output 저장 | activity_id=%s path=%s", activity_id, dir_outputs / fname)
+    except Exception:
+        logger.warning("step output 저장 실패 | activity_id=%s", activity_id, exc_info=True)
+
+
 
 
 def _extract_output_contract(text: Any) -> dict | None:
@@ -580,6 +714,8 @@ class DeepAgentExecutor(AgentExecutor):
         agent_mode = str(row.get("agent_mode") or "").strip()
 
         tenant_id = str(row.get("tenant_id") or extras.get("tenant_id") or "").strip()
+        instance_id = str(row.get("root_proc_inst_id") or row.get("proc_inst_id") or row.get("id") or "").strip()
+        activity_id = str(row.get("activity_id") or "").strip()
         user_jwt = extras.get("user_jwt")
         user_email = extras.get("user_email")
         user_name = extras.get("user_name")
@@ -654,12 +790,21 @@ class DeepAgentExecutor(AgentExecutor):
                     "chat_room start upsert 실패 | room_id=%s", chat_room_id, exc_info=True
                 )
 
-        # 업로드 문서를 Supabase Storage 에서 받아 샌드박스 workspace 로 주입하고,
-        # file_path 를 컨테이너 경로(/workspace/uploads/<name>)로 바꿔 에이전트가 직접 read_file 하게 한다.
-        injected_sources = _inject_sources_to_workspace(extras.get("sources") or [])
+        # [InputData] 섹션의 큰 필드를 workspace 파일로 오프로드해 초기 LLM 컨텍스트 크기를 줄인다.
+        # 피드백 재작업(FB_REQUESTED)이면 summarized_feedback 기반으로 메시지를 구성한다.
+        _summarized_feedback = str(extras.get("summarized_feedback") or "").strip()
+        if _summarized_feedback:
+            _original_query = str(context.get_user_input() or "").strip()
+            _feedback_raw = (
+                f"[재작업 요청 — 피드백]\n{_summarized_feedback}"
+                + (f"\n\n[원본 작업 지시]\n{_original_query}" if _original_query else "")
+            )
+            _base_message = _offload_input_data(_feedback_raw, instance_id)
+        else:
+            _base_message = _offload_input_data(str(context.get_user_input() or ""), instance_id)
         user_message = build_user_message(
-            context.get_user_input(),
-            sources=injected_sources,
+            _base_message,
+            sources=extras.get("sources") or [],
             form_id=form_id,
             form_fields=extras.get("form_fields"),
         )
@@ -848,10 +993,18 @@ class DeepAgentExecutor(AgentExecutor):
         _accum = CtxAccumulator(mcp_tools=_root_mcp_meta)
 
         sources = extras.get("sources") or []
-        knowledge_doc_ids = [
-            s.get("file_id", "") for s in sources
-            if isinstance(s, dict) and s.get("file_id")
-        ]
+        knowledge_doc_ids: list[str] = []
+        for _s in sources:
+            if not isinstance(_s, dict):
+                continue
+            # file_id 우선, 없으면 file_path/URL 을 normalize 해서 storage 경로로 사용
+            _kid = str(_s.get("file_id") or _s.get("fileId") or "").strip()
+            if not _kid:
+                _raw_fp = str(_s.get("file_path") or _s.get("url") or "").strip()
+                if _raw_fp:
+                    _kid = _normalize_doc_id(_raw_fp)
+            if _kid:
+                knowledge_doc_ids.append(_kid)
         if not knowledge_doc_ids:
             knowledge_docs = (metadata or {}).get("knowledge_docs") or []
             knowledge_doc_ids = [
@@ -1402,6 +1555,12 @@ class DeepAgentExecutor(AgentExecutor):
                     final_text = await _materialize_hwpx_form_outputs(tenant_id, final_text)
                 except Exception:
                     logger.warning("hwpx 폼 산출물 실체화 처리 실패 — 원본 유지", exc_info=True)
+                try:
+                    final_text = await _materialize_ws_file_form_outputs(tenant_id, final_text)
+                except Exception:
+                    logger.warning("ws 파일 폼 산출물 실체화 처리 실패 — 원본 유지", exc_info=True)
+            # D2D 핸드오프: 단계 완료 시 LLM 최종 응답을 workspace에 저장해 다음 딥에이전트 단계가 직접 읽을 수 있게 한다.
+            _save_step_output(raw_text, instance_id, activity_id)
             await _enqueue_status(
                 event_queue,
                 task_id=task_id,

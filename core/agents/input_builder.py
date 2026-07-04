@@ -24,17 +24,20 @@ def build_user_message(
         source_lines: list[str] = []
         for s in (sources if isinstance(sources, list) else []):
             file_name = s.get("file_name", "")
-            file_id = s.get("file_id", "")
-            file_path = s.get("file_path", "")
+            file_id = s.get("file_id", "") or s.get("id", "")
             line = file_name
             if file_id:
                 line += f"\n[file_id]: {file_id}"
-            if file_path:
-                line += f"\n[file_path]: {file_path}"
             if line:
                 source_lines.append(line)
         if source_lines:
-            message = f"[참고 소스]\n{chr(10).join(source_lines)}\n\n{message}"
+            rag_sources = [s for s in (sources if isinstance(sources, list) else []) if s.get("file_id") or s.get("id")]
+            rag_note = (
+                "\n⚠️ 위 소스 파일은 RAG 인덱싱되어 있습니다. "
+                "read_file 로 직접 읽지 말고 반드시 search_documents 도구를 사용해 내용을 조회하세요."
+                if rag_sources else ""
+            )
+            message = f"[참고 소스]\n{chr(10).join(source_lines)}{rag_note}\n\n{message}"
 
     if form_id and form_fields:
         field_schema = json.dumps(form_fields, ensure_ascii=False)
@@ -47,7 +50,9 @@ def build_user_message(
             f"[응답 형식 안내]\n"
             f"아래 양식 필드에 맞춰 반드시 JSON 형태로만 답변하세요. 다른 설명 없이 JSON만 출력하세요.\n"
             f"필드 정의:\n{field_schema}\n"
-            f"출력 예시:\n{example_output}\n\n"
+            f"출력 예시:\n{example_output}\n"
+            f"주의: 출력 JSON의 최상위 키는 반드시 \"{form_id}\" 이어야 합니다."
+            f" 이전 단계 입력 데이터([입력: ...])의 폼 ID를 출력 키로 사용하지 마세요.\n\n"
             f"{message}"
         )
 

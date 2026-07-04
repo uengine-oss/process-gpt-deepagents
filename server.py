@@ -26,6 +26,7 @@ from starlette.routing import Route
 from processgpt_agent_sdk import ProcessGPTAgentServer
 
 from core.api.skills_router import routes as skills_routes
+from core.api.file_download import routes as file_download_routes
 from executor import DeepAgentExecutor
 
 load_dotenv()
@@ -49,7 +50,7 @@ async def main() -> None:
     async def health(_request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
-    app = Starlette(routes=[Route("/health", health), *skills_routes])
+    app = Starlette(routes=[Route("/health", health), *skills_routes, *file_download_routes])
     server.mount_chat_sse(app, path="/chat/stream")
 
     uvicorn_server = uvicorn.Server(
