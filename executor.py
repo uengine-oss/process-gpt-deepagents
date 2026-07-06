@@ -24,6 +24,7 @@ from langgraph.types import Overwrite
 from typing_extensions import override
 
 from core.agents.agent import build_agent
+from core.bpm.tools import set_process_context
 from core.storage.checkpointer import (
     get_async_postgres_checkpointer,
     get_shared_memory_checkpointer,
@@ -714,7 +715,9 @@ class DeepAgentExecutor(AgentExecutor):
         agent_mode = str(row.get("agent_mode") or "").strip()
 
         tenant_id = str(row.get("tenant_id") or extras.get("tenant_id") or "").strip()
-        instance_id = str(row.get("root_proc_inst_id") or row.get("proc_inst_id") or row.get("id") or "").strip()
+        root_proc_inst_id = str(row.get("root_proc_inst_id") or row.get("proc_inst_id") or "").strip()
+        current_workitem_id = str(row.get("id") or "").strip()
+        instance_id = root_proc_inst_id or current_workitem_id
         activity_id = str(row.get("activity_id") or "").strip()
         user_jwt = extras.get("user_jwt")
         user_email = extras.get("user_email")
@@ -722,6 +725,7 @@ class DeepAgentExecutor(AgentExecutor):
 
         _skill_tenant_id.set(tenant_id)
         _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())
+        set_process_context(root_proc_inst_id, current_workitem_id)
         agents = extras.get("agents", [])
         streamer = extras.get("streamer")
         form_id = extras.get("form_id")
@@ -806,6 +810,7 @@ class DeepAgentExecutor(AgentExecutor):
             sources=extras.get("sources") or [],
             form_id=form_id,
             form_fields=extras.get("form_fields"),
+            suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
         )
         recent_msgs = collect_recent_messages(extras) if is_chat else []
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).

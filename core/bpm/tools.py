@@ -19,10 +19,22 @@ logger = logging.getLogger(__name__)
 _current_tenant_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "bpm_tenant_id", default=""
 )
+_current_root_proc_inst_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "bpm_root_proc_inst_id", default=""
+)
+_current_workitem_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "bpm_workitem_id", default=""
+)
 
 
 def set_tenant_id(tenant_id: str) -> None:
     _current_tenant_id.set(tenant_id)
+
+
+def set_process_context(root_proc_inst_id: str, workitem_id: str) -> None:
+    """프로세스 모드 워크아이템 실행 컨텍스트(root_proc_inst_id, 현재 워크아이템 id)를 주입한다."""
+    _current_root_proc_inst_id.set(root_proc_inst_id or "")
+    _current_workitem_id.set(workitem_id or "")
 
 
 def _require_tenant_id() -> str:
@@ -239,7 +251,7 @@ def get_todolist(instance_ids: list[str]) -> str:
             .table("todolist")
             .select("*")
             .eq("tenant_id", tenant_id)
-            .in_("proc_inst_id", instance_ids)
+            .in_("root_proc_inst_id", instance_ids)
             .order("start_date")
             .execute()
         )
@@ -267,7 +279,54 @@ def get_todolist(instance_ids: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 7. get_organization
+# 7. get_related_workitem_outputs
+# ---------------------------------------------------------------------------
+@tool(parse_docstring=True)
+def get_related_workitem_outputs() -> str:
+    """워크아이템을 수행 시, 같은 루트 프로세스의 이전 완료 워크아이템 output을 입력 데이터로 쓰고 싶을 때 호출한다.
+
+    인자 없이 호출한다. 현재 실행 중인 워크아이템과 같은 root_proc_inst_id를 가지면서
+    output이 채워진(완료된) 다른 워크아이템들을 end_date 최근순(최신 완료 먼저)으로 반환한다.
+    현재 워크아이템 자신과 아직 output이 없는 워크아이템은 결과에서 제외한다.
+    실행 결과/진행 상태를 최종 확인할 때는 이 도구 대신 get_todolist 를 사용한다.
+    """
+    root_proc_inst_id = _current_root_proc_inst_id.get()
+    if not root_proc_inst_id:
+        return _err("현재 워크아이템의 root_proc_inst_id를 확인할 수 없습니다.")
+    tenant_id = _require_tenant_id()
+    current_workitem_id = _current_workitem_id.get()
+    try:
+        q = (
+            get_supabase()
+            .table("todolist")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .eq("root_proc_inst_id", root_proc_inst_id)
+            .not_.is_("output", "null")
+            .order("end_date", desc=True)
+        )
+        if current_workitem_id:
+            q = q.neq("id", current_workitem_id)
+        resp = q.execute()
+        activities = [
+            {
+                "workitemId": todo.get("id"),
+                "procInstId": todo.get("proc_inst_id"),
+                "activityId": todo.get("activity_id"),
+                "activityName": todo.get("activity_name"),
+                "endDate": todo.get("end_date"),
+                "output": todo.get("output"),
+            }
+            for todo in resp.data
+        ]
+        return _json(activities)
+    except Exception as e:
+        logger.error("[get_related_workitem_outputs] %s", e)
+        return _err(str(e))
+
+
+# ---------------------------------------------------------------------------
+# 8. get_organization
 # ---------------------------------------------------------------------------
 @tool(parse_docstring=True)
 def get_organization() -> str:
@@ -307,5 +366,6 @@ def get_bpm_tools() -> list:
         get_form_fields,
         get_instance_list,
         get_todolist,
+        get_related_workitem_outputs,
         get_organization,
     ]

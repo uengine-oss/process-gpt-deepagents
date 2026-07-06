@@ -16,12 +16,13 @@ def build_user_message(
     sources: Any = None,
     form_id: str | None = None,
     form_fields: Any = None,
+    suggest_related_outputs: bool = False,
 ) -> str:
     """소스 첨부·폼 형식 안내를 포함한 최종 사용자 메시지를 조립한다."""
     message = base_message
+    source_lines: list[str] = []
 
     if sources:
-        source_lines: list[str] = []
         for s in (sources if isinstance(sources, list) else []):
             file_name = s.get("file_name", "")
             file_id = s.get("file_id", "") or s.get("id", "")
@@ -38,6 +39,13 @@ def build_user_message(
                 if rag_sources else ""
             )
             message = f"[참고 소스]\n{chr(10).join(source_lines)}{rag_note}\n\n{message}"
+
+    if suggest_related_outputs:
+        message = (
+            "ℹ️ 참고 소스 외에도, 이 작업에 같은 프로세스의 이전 워크아이템 산출물(output)이 입력으로 필요할 수 있습니다. "
+            "필요하면 get_related_workitem_outputs 도구를 호출해 같은 프로세스의 이전 완료 워크아이템 output을 확인하세요.\n\n"
+            f"{message}"
+        )
 
     if form_id and form_fields:
         field_schema = json.dumps(form_fields, ensure_ascii=False)
