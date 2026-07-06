@@ -753,7 +753,7 @@ class DeepAgentExecutor(AgentExecutor):
         _skill_conversation_id.set(chat_room_id or "")
 
         tenant_mcp: dict[str, Any] = {}
-        if is_chat and tenant_id:
+        if tenant_id:
             try:
                 from core.storage.db import get_supabase
                 sb = get_supabase()
@@ -770,10 +770,9 @@ class DeepAgentExecutor(AgentExecutor):
             except Exception:
                 logger.warning("tenant_mcp DB 조회 실패 | tenant_id=%s", tenant_id, exc_info=True)
             tenant_mcp = ensure_process_gpt_mcp(tenant_mcp, tenant_id)
-        chat_root_tools = await load_chat_root_tools(tenant_mcp) if is_chat else []
-        _root_mcp_tool_names = [
-            getattr(t, "name", "") for t in chat_root_tools if getattr(t, "name", "")
-        ]
+        chat_root_tools, _root_tool_servers = (
+            await load_chat_root_tools(tenant_mcp) if is_chat else ([], {})
+        )
 
         if is_chat and chat_room_id and tenant_id:
             try:
@@ -816,13 +815,6 @@ class DeepAgentExecutor(AgentExecutor):
             _skill_user_request.set(_user_input_text)
         except Exception:
             pass
-        # 스킬/에이전트 '생성' 요청이면 프로세스 컨설팅 강제 HITL 대상이 아니다(파일 업로드가 있어도).
-        # 프로세스 생성/워크플로 요청이 아닌, 스킬·에이전트 만들기 의도만 잡는다.
-        _req_l = (_user_input_text or "").lower()
-        _wants_skill_or_agent = (
-            bool(re.search(r"스킬|skill|에이전트|agent", _req_l))
-            and not re.search(r"프로세스|워크플로|process|workflow", _req_l)
-        )
         # 후보 선택 HITL 답변이면([스킬]/[에이전트]/[DMN]) manifest 로 캡처(에이전트가 안 써도 스킬/연결 보장).
         # process-* 폴더는 1단계에서 이미 생성됨(이번 턴은 후보선택 resume). 방은 contextvar(위에서 set)로 찾는다.
         try:
@@ -986,10 +978,13 @@ class DeepAgentExecutor(AgentExecutor):
                         proc_def_id, activity_id,
                     )
 
-        _root_mcp_meta: list[dict] = (
-            [{"agent": "__root__", "servers": ["process-gpt-mcp"], "tools": _root_mcp_tool_names}]
-            if _root_mcp_tool_names else []
-        )
+        _root_tools_by_server: dict[str, list[str]] = {}
+        for _tool_name, _srv in _root_tool_servers.items():
+            _root_tools_by_server.setdefault(_srv, []).append(_tool_name)
+        _root_mcp_meta: list[dict] = [
+            {"agent": "__root__", "servers": [_srv], "tools": _tool_names}
+            for _srv, _tool_names in _root_tools_by_server.items()
+        ]
         _accum = CtxAccumulator(mcp_tools=_root_mcp_meta)
 
         sources = extras.get("sources") or []
@@ -1360,51 +1355,6 @@ class DeepAgentExecutor(AgentExecutor):
 
             interrupt_payload = extract_interrupt_payload(final_state)
 
-            # 컨설팅 강제 HITL(resume 호환) — 모델이 비일관적으로 request_human_input 을 빠뜨리고
-            # 초안을 평문으로 끝내는 경우, 같은 그래프 thread 로 한 번 더 돌려 강제로 도구를 호출시켜
-            # '진짜' interrupt 를 만든다. 아직 생성 전(process-definition.json 미작성)이라 프로세스가
-            # 중복 생성되지 않으며, 이후 승인은 진짜 graph resume(Command) 으로 처리되어 단일 생성이 보장된다.
-            if (
-                not interrupt_payload
-                and is_chat
-                and agent_mode != "DRAFT"
-                and not process_json_written
-                and not complete_called
-                and not skill_written          # 스킬 파일을 만들었으면 프로세스 컨설팅이 아님
-                and not _wants_skill_or_agent  # 스킬/에이전트 생성 요청이면 컨설팅 강제 안 함
-                and not workspace_write_made
-            ):
-                _txt = (raw_text or "").strip()
-                _steps = len(re.findall(r"(?m)^\s*\d+\s*[\.\)]\s", _txt))
-                # 프로세스 컨설팅 초안의 특징(번호 매긴 흐름)이 뚜렷할 때만 강제 HITL.
-                # 일반 대화성 문구(어떻게/수정/추가)는 오탐이 많아 제외하고 실제 절차 흐름만 본다.
-                if len(_txt) > 100 and (_steps >= 2 or re.search(r"담당\s*(역할|자)\s*[:：]|역할\s*[:：]|승인/반려|분기\s*[:：→]|프로세스\s*초안", _txt)):
-                    logger.info(
-                        "컨설팅 강제 HITL: request_human_input 미호출 → 같은 thread 로 강제 interrupt 생성 | room=%s",
-                        chat_room_id,
-                    )
-                    forced_inputs = {
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": (
-                                    "방금 작성한 프로세스 초안을 평문으로 끝내지 말고, 지금 즉시 `request_human_input` 도구를 호출해 "
-                                    "승인/반려를 물어라. question 인자에는 '이대로 진행할까요? 추가하거나 바꿀 단계가 있으면 알려주세요.' 만, "
-                                    "context 인자에는 위 초안 전체(번호 단계·담당 역할·분기 포함)를 담아라. "
-                                    "다른 평문 출력이나 프로세스 정의 생성은 하지 말고, 오직 request_human_input 도구만 호출하라."
-                                ),
-                            }
-                        ]
-                    }
-                    try:
-                        forced_state = await graph.ainvoke(forced_inputs, config=config)
-                        _forced_ip = extract_interrupt_payload(forced_state)
-                        if _forced_ip:
-                            interrupt_payload = _forced_ip
-                            final_state = forced_state
-                    except Exception:
-                        logger.warning("컨설팅 강제 HITL 2차 패스 실패", exc_info=True)
-
             if interrupt_payload:
                 question = (
                     interrupt_payload.get("question") if isinstance(interrupt_payload, dict) else None
@@ -1502,16 +1452,12 @@ class DeepAgentExecutor(AgentExecutor):
 
             # 단독 스킬 생성: process-definition.json 이 없어 위 complete 폴백을 타지 않으므로,
             # 방 산출물(base/skills/*/SKILL.md)을 file_artifact 로 재전송해 프론트 패널 표시 + 저장을 보장한다.
-            if (
-                streamer
-                and not process_json_written
-                and not complete_called
-                and (skill_written or _wants_skill_or_agent or "스킬을 생성" in (raw_text or ""))
-            ):
+            # 실제로 SKILL.md 를 썼는지(skill_written, 관측된 부작용)로만 판단한다 — 사용자 입력
+            # 문장에 "스킬"이 들어있다는 이유만으로(조회성 질문 포함) 응답을 대체하지 않는다.
+            if streamer and not process_json_written and not complete_called and skill_written:
                 try:
                     await _reemit_room_artifacts(streamer, chat_room_id or "")
-                    logger.info("단독 스킬 산출물 재전송 | room=%s (skill_written=%s intent=%s)",
-                                chat_room_id, skill_written, _wants_skill_or_agent)
+                    logger.info("단독 스킬 산출물 재전송 | room=%s", chat_room_id)
                     if "확인 후 저장" not in (raw_text or ""):
                         raw_text = "스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요."
                 except Exception:

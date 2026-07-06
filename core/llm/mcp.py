@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -42,8 +43,13 @@ def _mcp_connection_config(server_config: dict) -> dict:
     return conn
 
 
-async def _load_mcp_tools(server_names: list[str], tenant_mcp: dict) -> list:
-    """지정된 MCP 서버들에서 LangChain BaseTool 목록을 로드한다."""
+async def _load_mcp_tools_grouped(server_names: list[str], tenant_mcp: dict) -> dict[str, list]:
+    """지정된 MCP 서버들에서 LangChain BaseTool 목록을 서버별로 로드한다.
+
+    반환값은 실제로 그 도구를 제공한 서버 이름 -> BaseTool 목록. 여러 서버를 한 번에
+    로드해도 각 도구가 어느 서버에서 왔는지 유실되지 않도록, 서버별로 개별 조회한다
+    (chat_room context 의 connectors 를 정확히 귀속시키기 위해 필요).
+    """
     mcp_servers = tenant_mcp.get("mcpServers", {})
     connections = {}
     for name in server_names:
@@ -53,24 +59,32 @@ async def _load_mcp_tools(server_names: list[str], tenant_mcp: dict) -> list:
             logger.warning("MCP 서버 설정 없음: %s (사용 가능: %s)", name, list(mcp_servers))
 
     if not connections:
-        return []
+        return {}
 
     from langchain_mcp_adapters.client import MultiServerMCPClient
     client = MultiServerMCPClient(connections)
-    try:
-        tools = await client.get_tools()
-        # 로드 후 비활성 도구 임시 제거
-        if _DISABLED_MCP_TOOLS:
-            before = len(tools)
-            tools = [t for t in tools if getattr(t, "name", "") not in _DISABLED_MCP_TOOLS]
-            removed = before - len(tools)
-            if removed:
-                logger.info("MCP 도구 임시 제거: %d개 %s", removed, sorted(_DISABLED_MCP_TOOLS))
-        logger.info("MCP tools 로드 완료: %s → %d개", list(connections), len(tools))
-        return tools
-    except Exception as e:
-        logger.error("MCP tools 로드 실패 (%s): %s", list(connections), e)
-        return []
+
+    async def _load_one(name: str) -> tuple[str, list]:
+        try:
+            tools = await client.get_tools(server_name=name)
+            if _DISABLED_MCP_TOOLS:
+                before = len(tools)
+                tools = [t for t in tools if getattr(t, "name", "") not in _DISABLED_MCP_TOOLS]
+                removed = before - len(tools)
+                if removed:
+                    logger.info("MCP 도구 임시 제거: %d개 %s (server=%s)", removed, sorted(_DISABLED_MCP_TOOLS), name)
+            return name, tools
+        except Exception as e:
+            logger.error("MCP tools 로드 실패 (%s): %s", name, e)
+            return name, []
+
+    results = await asyncio.gather(*(_load_one(name) for name in connections))
+    grouped = {name: tools for name, tools in results if tools}
+    logger.info(
+        "MCP tools 로드 완료: %s → %d개", list(connections),
+        sum(len(t) for t in grouped.values()),
+    )
+    return grouped
 
 
 def ensure_process_gpt_mcp(tenant_mcp: dict, tenant_id: str = "") -> dict:
@@ -119,26 +133,39 @@ _LOCAL_BPM_TOOLS = frozenset({
 })
 
 
-async def load_chat_root_tools(tenant_mcp: dict) -> list:
+async def load_chat_root_tools(tenant_mcp: dict) -> tuple[list, dict[str, str]]:
     """채팅 모드 루트 오케스트레이터용 MCP 도구를 로드한다.
 
     tenants.mcp.mcpServers 에 등록된 모든 서버의 도구를 로드하며,
     로컬 BPM 도구와 중복되는 항목은 제외한다.
+
+    Returns:
+        (tools, tool_servers) — tool_servers 는 도구 이름 -> 실제로 그 도구를
+        제공한 MCP 서버 이름 매핑이다(여러 서버가 등록돼 있어도 도구별로
+        정확한 서버를 chat_room context 의 connectors 에 귀속시키기 위함).
     """
     server_names = list((tenant_mcp.get("mcpServers") or {}).keys())
     if not server_names:
-        return []
+        return [], {}
     try:
-        tools = await _load_mcp_tools(server_names, tenant_mcp)
-        before = len(tools)
-        tools = [t for t in tools if t.name not in _LOCAL_BPM_TOOLS]
+        grouped = await _load_mcp_tools_grouped(server_names, tenant_mcp)
+        tools: list = []
+        tool_servers: dict[str, str] = {}
+        before = 0
+        for server, srv_tools in grouped.items():
+            before += len(srv_tools)
+            for t in srv_tools:
+                if t.name in _LOCAL_BPM_TOOLS:
+                    continue
+                tools.append(t)
+                tool_servers[t.name] = server
         if before != len(tools):
             logger.info(
                 "MCP 도구 중복 제거: %d개 → %d개 (로컬 BPM 도구 %d개 제외)",
                 before, len(tools), before - len(tools),
             )
         logger.info("채팅 루트 MCP 도구: %d개 (%s)", len(tools), server_names)
-        return tools
+        return tools, tool_servers
     except Exception:
         logger.warning("채팅 루트 MCP 도구 로드 실패", exc_info=True)
-        return []
+        return [], {}

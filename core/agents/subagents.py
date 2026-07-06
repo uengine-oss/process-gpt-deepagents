@@ -4,7 +4,7 @@ import re
 
 from deepagents import SubAgent
 
-from ..llm.mcp import _load_mcp_tools
+from ..llm.mcp import _load_mcp_tools_grouped
 from ..skills.skills import FilteredSkillsMiddleware, _get_skills
 from ..skills.git_providers.factory import get_provider as _get_git_provider
 
@@ -72,19 +72,19 @@ async def _build_subagents(
         mcp_server_names = _parse_csv(agent.get("tools"))
         tools = []
         if mcp_server_names and tenant_mcp:
-            tools = await _load_mcp_tools(mcp_server_names, tenant_mcp)
-            if tools:
-                for srv in mcp_server_names:
-                    if srv not in mcp_connectors:
-                        mcp_connectors.append(srv)
+            grouped = await _load_mcp_tools_grouped(mcp_server_names, tenant_mcp)
+            for srv, srv_tools in grouped.items():
+                tools.extend(srv_tools)
+                if srv not in mcp_connectors:
+                    mcp_connectors.append(srv)
                 tool_names = [
-                    getattr(t, "name", "") for t in tools
+                    getattr(t, "name", "") for t in srv_tools
                     if getattr(t, "name", "")
                 ]
                 if tool_names:
                     mcp_tools_meta.append({
                         "agent": name,
-                        "servers": mcp_server_names,
+                        "servers": [srv],
                         "tools": tool_names,
                     })
 
