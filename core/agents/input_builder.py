@@ -10,6 +10,18 @@ from langgraph.types import Command
 _MSG_RE = re.compile(r'\[(user|assistant)\](?:\[[^\]]*\])*:\s*')
 
 
+def _field_example_value(field: dict[str, Any]) -> Any:
+    """폼 필드 정의로부터 출력 예시 값을 만든다. 다중 입력 모드 필드는 행(row) 객체의 배열로 표현한다."""
+    if str(field.get("is_multidata_mode")).lower() == "true" and isinstance(field.get("fields"), list):
+        row = {
+            nf["key"]: f"<{nf.get('text', nf['key'])}>"
+            for nf in field["fields"]
+            if "key" in nf
+        }
+        return [row]
+    return f"<{field.get('text', field.get('key'))}>"
+
+
 def build_user_message(
     base_message: str,
     *,
@@ -50,15 +62,28 @@ def build_user_message(
     if form_id and form_fields:
         field_schema = json.dumps(form_fields, ensure_ascii=False)
         example_output = json.dumps(
-            {form_id: {f["key"]: f"<{f['text']}>" for f in form_fields if "key" in f}},
+            {form_id: {f["key"]: _field_example_value(f) for f in form_fields if "key" in f}},
             ensure_ascii=False,
             indent=2,
         )
+        multidata_fields = [
+            f for f in form_fields
+            if str(f.get("is_multidata_mode")).lower() == "true" and isinstance(f.get("fields"), list)
+        ]
+        multidata_note = ""
+        if multidata_fields:
+            keys = ", ".join(f'"{f["key"]}"' for f in multidata_fields if "key" in f)
+            multidata_note = (
+                f"주의: {keys} 필드는 다중 입력(is_multidata_mode) 필드입니다. "
+                "값은 반드시 객체의 배열이어야 하며, 각 배열 원소는 해당 필드의 하위 fields 정의를 따르는 "
+                "하나의 행(row)을 나타냅니다. 처리 건수만큼 배열 원소를 추가하세요.\n"
+            )
         message = (
             f"[응답 형식 안내]\n"
             f"아래 양식 필드에 맞춰 반드시 JSON 형태로만 답변하세요. 다른 설명 없이 JSON만 출력하세요.\n"
             f"필드 정의:\n{field_schema}\n"
             f"출력 예시:\n{example_output}\n"
+            f"{multidata_note}"
             f"주의: 출력 JSON의 최상위 키는 반드시 \"{form_id}\" 이어야 합니다."
             f" 이전 단계 입력 데이터([입력: ...])의 폼 ID를 출력 키로 사용하지 마세요.\n\n"
             f"{message}"
