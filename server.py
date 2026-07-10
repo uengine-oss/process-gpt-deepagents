@@ -64,11 +64,6 @@ async def main() -> None:
         asyncio.create_task(uvicorn_server.serve()),
     ]
 
-    if os.environ.get("FEEDBACK_POLLING_ENABLED", "").lower() in ("1", "true", "yes", "on"):
-        from core.feedback.polling import start_feedback_polling
-        all_tasks.append(asyncio.create_task(start_feedback_polling(interval=7)))
-        logger.info("피드백 폴링 활성화 (interval=7s)")
-
     # server.run()이 SIGINT/SIGTERM으로 종료되면 나머지 task도 취소한다.
     done, pending = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
     for t in pending:

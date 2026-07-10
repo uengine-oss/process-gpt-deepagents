@@ -38,8 +38,12 @@ from core.agents.input_builder import (
     collect_recent_messages,
     resolve_chat_room_id,
 )
-from core.chat.activity import build_fallback_subagent, load_activity_capabilities, load_subprocess_subagents
-from core.feedback.db import fetch_child_activity_todo
+from core.chat.activity import (
+    build_fallback_subagent,
+    fetch_child_activity_todo,
+    load_activity_capabilities,
+    load_subprocess_subagents,
+)
 from core.chat.chat_room import (
     CtxAccumulator,
     a_set_chat_room_context,
