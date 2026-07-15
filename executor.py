@@ -47,9 +47,11 @@ from core.chat.activity import (
 from core.chat.chat_room import (
     CtxAccumulator,
     a_set_chat_room_context,
+    a_update_chat_room_context,
     a_upsert_chat_room_start,
     build_initial_chat_room_context,
 )
+from core.chat.stream_registry import MulticastStreamer, mark_done, start_run
 from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
@@ -759,6 +761,29 @@ class DeepAgentExecutor(AgentExecutor):
         chat_room_id = resolve_chat_room_id(extras, row if isinstance(row, dict) else {})
         # 산출물을 방별 디렉터리(.bpmn/<room>/)로 격리 — 경로 충돌/덮어쓰기 방지.
         _skill_conversation_id.set(chat_room_id or "")
+
+        # 재접속(attach) 지원: 이번 턴을 conversation_id(=chat_room_id) 기준 메모리 레지스트리에
+        # 등록하고, streamer 를 프록시로 감싸 모든 토큰/이벤트를 (a) 원래 streamer (b) 누적 텍스트
+        # (c) attach 구독자에게 broadcast 한다. tool/plan 이벤트는 부가로 채팅방 컨텍스트 증분 저장.
+        if streamer is not None and chat_room_id:
+            await start_run(chat_room_id)
+
+            _persist_tenant_id = tenant_id
+            _persist_has_file = has_file
+
+            async def _on_context_event(evt: dict) -> None:
+                et = str(evt.get("type") or "")
+                if not _persist_tenant_id:
+                    return
+                if et in ("plan_tools", "plan_skills", "plan_connectors", "plan_todos", "tool_start", "tool_end"):
+                    await a_update_chat_room_context(
+                        tenant_id=_persist_tenant_id,
+                        room_id=chat_room_id,
+                        evt=evt,
+                        has_file=_persist_has_file,
+                    )
+
+            streamer = MulticastStreamer(streamer, chat_room_id, on_event=_on_context_event)
 
         tenant_mcp: dict[str, Any] = {}
         if tenant_id:
@@ -1538,6 +1563,7 @@ class DeepAgentExecutor(AgentExecutor):
             await event_queue.enqueue_event(artifact_evt)
 
             if is_chat and chat_room_id:
+                await mark_done(chat_room_id)
                 logger.info(
                     "채팅 완료 | room_id=%s task_id=%s response_len=%d",
                     chat_room_id, task_id, len(final_text),
