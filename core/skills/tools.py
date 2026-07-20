@@ -119,6 +119,40 @@ def bpmn_container_base(conversation_id: str = "") -> str:
     return f"/workspace/{BPMN_WORK_SUBDIR}/{slug}" if slug else f"/workspace/{BPMN_WORK_SUBDIR}"
 
 
+def canonical_process_dir_name(conversation_id: str = "") -> str:
+    """Return the deterministic process directory injected into the agent prompt.
+
+    Keeping this calculation in one place prevents HITL resumes and completion
+    scans from disagreeing about which ``process-*`` directory belongs to the
+    current generation attempt.
+    """
+    import uuid as _uuid
+
+    seed = str(conversation_id or _current_conversation_id.get() or _current_tenant_id.get() or "processgpt")
+    return f"process-{_uuid.uuid5(_uuid.NAMESPACE_URL, seed).hex[:7]}"
+
+
+def process_work_dirs(room: Path, conversation_id: str = "") -> list[Path]:
+    """Return only the current attempt's process directories.
+
+    Older versions generated a random directory after every HITL resume. Those
+    stale folders must not be completed or re-emitted with the current process.
+    Multi-process output is represented by the canonical directory followed by
+    ``-2``, ``-3`` and so on.
+    """
+    primary = canonical_process_dir_name(conversation_id)
+    candidates: list[tuple[int, Path]] = []
+    pattern = re.compile(rf"^{re.escape(primary)}(?:-(\d+))?$")
+    if room.is_dir():
+        for child in room.iterdir():
+            if not child.is_dir():
+                continue
+            match = pattern.fullmatch(child.name)
+            if match:
+                candidates.append((int(match.group(1) or "1"), child))
+    return [path for _, path in sorted(candidates, key=lambda item: item[0])]
+
+
 def write_upload_to_workspace(file_name: str, content: bytes) -> str:
     """업로드 문서 바이트를 호스트 workspace(/workspace ↔ bind mount)에 써서 컨테이너 경로를 돌려준다.
 
@@ -601,6 +635,27 @@ def _normalize_to_processgpt_schema(pd: dict) -> tuple:
                 e2["type"] = ntype
             changed = True
             et = net
+        # flattened 저장 형식은 event/gateway type 의 첫 글자가 소문자다.
+        # elementType 이 이미 보강된 상태에서도 canonical ProcessGPT type 으로 복원한다.
+        if e2.get("elementType") == "Event":
+            canonical = {
+                "startevent": "StartEvent",
+                "endevent": "EndEvent",
+                "intermediatecatchevent": "IntermediateCatchEvent",
+                "intermediatethrowevent": "IntermediateThrowEvent",
+            }.get(str(e2.get("type") or "").lower())
+            if canonical and e2.get("type") != canonical:
+                e2["type"] = canonical
+                changed = True
+        elif e2.get("elementType") == "Gateway":
+            canonical = {
+                "exclusivegateway": "ExclusiveGateway",
+                "parallelgateway": "ParallelGateway",
+                "inclusivegateway": "InclusiveGateway",
+            }.get(str(e2.get("type") or "").lower())
+            if canonical and e2.get("type") != canonical:
+                e2["type"] = canonical
+                changed = True
         # Sequence: sourceRef/targetRef → source/target
         if e2.get("elementType") == "Sequence":
             src = e2.get("source") or e2.get("sourceRef") or ""
@@ -621,6 +676,13 @@ def _normalize_to_processgpt_schema(pd: dict) -> tuple:
                     e2.pop(k, None)
                     changed = True
             if e2.get("elementType") == "Activity":
+                role = e2.get("role")
+                if isinstance(role, list):
+                    e2["role"] = "/".join(str(item).strip() for item in role if str(item).strip())
+                    changed = True
+                elif role is not None and not isinstance(role, str):
+                    e2["role"] = str(role)
+                    changed = True
                 _eid = str(e2.get("id") or "").lower()
                 # DMN 을 노드/활동으로 잘못 만든 경우(예: id 'dmn1_decision') → 분기 게이트웨이로 교정.
                 # DMN 은 노드가 아니라 게이트웨이 속성이므로, 흐름은 유지하되 타입만 Gateway 로 바꿔
@@ -735,10 +797,21 @@ def _schema_conformance_defects(pd: dict) -> list:
                           "detail": f"'{eid}': Activity.type 은 'UserActivity' 여야 합니다(받음: {t!r}). UserTask/ServiceTask 등 금지."})
             if not e.get("role"):
                 d.append({"severity": "critical", "type": "schema_role", "detail": f"'{eid}': Activity 에 role 이 필요합니다."})
+            elif not isinstance(e.get("role"), str):
+                d.append({"severity": "critical", "type": "schema_role_type", "detail": f"'{eid}': Activity role 은 문자열이어야 합니다."})
             od = e.get("outputData")
             if not (isinstance(od, list) and len(od) > 0):
                 d.append({"severity": "critical", "type": "schema_outputData",
                           "detail": f"'{eid}': outputData 가 최소 1개 필요합니다(빈 배열/누락 금지)."})
+            elif any(not isinstance(value, str) for value in od):
+                d.append({"severity": "critical", "type": "schema_outputData_type",
+                          "detail": f"'{eid}': outputData 항목은 모두 문자열이어야 합니다."})
+            idata = e.get("inputData")
+            if idata is not None and (
+                not isinstance(idata, list) or any(not isinstance(value, str) for value in idata)
+            ):
+                d.append({"severity": "critical", "type": "schema_inputData_type",
+                          "detail": f"'{eid}': inputData 는 문자열 배열이어야 합니다."})
         elif et == "Event":
             if t not in _ALLOWED_EVENT_TYPES:
                 d.append({"severity": "critical", "type": "schema_event_type",
@@ -751,10 +824,19 @@ def _schema_conformance_defects(pd: dict) -> list:
             if t not in _ALLOWED_GATEWAY_TYPES:
                 d.append({"severity": "critical", "type": "schema_gateway_type",
                           "detail": f"'{eid}': Gateway.type 오류({t!r}). ExclusiveGateway/ParallelGateway/InclusiveGateway 중 하나."})
+            cdata = e.get("conditionData")
+            if cdata is not None and (
+                not isinstance(cdata, list) or any(not isinstance(value, str) for value in cdata)
+            ):
+                d.append({"severity": "critical", "type": "schema_conditionData_type",
+                          "detail": f"'{eid}': conditionData 는 '<form_id>.<field_name>' 문자열 배열이어야 합니다."})
         elif et == "Sequence":
             if not e.get("source") or not e.get("target"):
                 d.append({"severity": "critical", "type": "schema_sequence",
                           "detail": f"Sequence '{eid}' 는 source 와 target 이 모두 필요합니다."})
+            if e.get("condition") is not None and not isinstance(e.get("condition"), str):
+                d.append({"severity": "critical", "type": "schema_sequence_condition_type",
+                          "detail": f"Sequence '{eid}' condition 은 문자열이어야 합니다."})
     if n_start < 1:
         d.append({"severity": "critical", "type": "schema_start", "detail": "StartEvent(elementType:Event, type:StartEvent) 1개가 필요합니다."})
     if n_end < 1:
@@ -765,14 +847,369 @@ def _schema_conformance_defects(pd: dict) -> list:
 _SCHEMA_BLOCKING_TYPES = {"schema", "schema_empty", "schema_format", "schema_elementType", "schema_el"}
 
 
+def _atomic_write_json(target: Path, payload: dict) -> None:
+    """Write one complete JSON document without exposing a partial file."""
+    import json as _json
+    import uuid as _uuid
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{_uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            _json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        # Parse the exact bytes before replacing the last known-good definition.
+        _json.loads(temporary.read_text(encoding="utf-8"))
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+@tool
+def write_process_definition(
+    definition: dict,
+    path: str = ".bpmn/process-definition.json",
+) -> str:
+    """Atomically replace a ProcessGPT process definition with one JSON object.
+
+    Use this tool for every creation or update of ``process-definition.json``.
+    It rejects empty or structurally invalid definitions before the previous
+    valid file is replaced. Never use generic ``edit_file`` for that file.
+    """
+    import hashlib as _hashlib
+    import json as _json
+
+    if path in (".bpmn/process-definition.json", "process-definition.json"):
+        target = _bpmn_work_dir() / "process-definition.json"
+    else:
+        target = _resolve_ws_path(path)
+
+    payload = definition
+    if isinstance(payload, dict) and isinstance(payload.get("processDefinition"), dict):
+        payload = payload["processDefinition"]
+    if not isinstance(payload, dict):
+        return _json.dumps({
+            "written": False,
+            "error": "definition must be one JSON object",
+        }, ensure_ascii=False)
+
+    normalized, _ = _normalize_to_processgpt_schema(payload)
+    blocking = [
+        item for item in _schema_conformance_defects(normalized)
+        if str(item.get("type")) in _SCHEMA_BLOCKING_TYPES
+    ]
+    if blocking:
+        return _json.dumps({
+            "written": False,
+            "error": "schema_blocked",
+            "defects": blocking,
+        }, ensure_ascii=False)
+
+    _atomic_write_json(target, normalized)
+    content = target.read_bytes()
+    return _json.dumps({
+        "written": True,
+        "path": str(target),
+        "sha256": _hashlib.sha256(content).hexdigest(),
+        "elements": len(normalized.get("elements") or []),
+    }, ensure_ascii=False)
+
+
+@tool
+def update_process_definition(
+    element_updates: list[dict],
+    top_level_updates: dict | None = None,
+    path: str = ".bpmn/process-definition.json",
+) -> str:
+    """Safely update selected fields while preserving the existing definition.
+
+    ``element_updates`` entries have ``id`` and ``changes`` keys. The changes
+    are deep-merged into the matching element. ``top_level_updates`` is used
+    for metadata such as skills and DMN arrays. Structural replacement of the
+    complete ``elements`` array is deliberately rejected; use
+    ``write_process_definition`` for a deliberate structural rewrite.
+    """
+    import hashlib as _hashlib
+    import json as _json
+
+    if path in (".bpmn/process-definition.json", "process-definition.json"):
+        target = _bpmn_work_dir() / "process-definition.json"
+    else:
+        target = _resolve_ws_path(path)
+    if not target.is_file():
+        return _json.dumps({"updated": False, "error": "missing_file", "path": str(target)}, ensure_ascii=False)
+    try:
+        current = _json.loads(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return _json.dumps({"updated": False, "error": "parse_error", "detail": str(exc)}, ensure_ascii=False)
+    if isinstance(current, dict) and isinstance(current.get("processDefinition"), dict):
+        current = current["processDefinition"]
+    if not isinstance(current, dict) or not isinstance(current.get("elements"), list):
+        return _json.dumps({"updated": False, "error": "invalid_definition"}, ensure_ascii=False)
+
+    def merge(target_obj: dict, changes: dict) -> None:
+        for key, value in changes.items():
+            if isinstance(value, dict) and isinstance(target_obj.get(key), dict):
+                merge(target_obj[key], value)
+            else:
+                target_obj[key] = value
+
+    by_id = {
+        str(item.get("id")): item
+        for item in current["elements"]
+        if isinstance(item, dict) and item.get("id")
+    }
+    changed_ids: list[str] = []
+    for update in element_updates or []:
+        element_id = str(update.get("id") or "") if isinstance(update, dict) else ""
+        changes = update.get("changes") if isinstance(update, dict) else None
+        if not element_id or element_id not in by_id or not isinstance(changes, dict):
+            return _json.dumps({
+                "updated": False,
+                "error": "invalid_element_update",
+                "element_id": element_id,
+            }, ensure_ascii=False)
+        if "id" in changes or "elementType" in changes:
+            return _json.dumps({
+                "updated": False,
+                "error": "immutable_element_identity",
+                "element_id": element_id,
+            }, ensure_ascii=False)
+        merge(by_id[element_id], changes)
+        changed_ids.append(element_id)
+
+    top = top_level_updates or {}
+    if not isinstance(top, dict) or "elements" in top or "processDefinition" in top:
+        return _json.dumps({"updated": False, "error": "structural_update_rejected"}, ensure_ascii=False)
+    merge(current, top)
+
+    blocking = [
+        item for item in _schema_conformance_defects(current)
+        if str(item.get("type")) in _SCHEMA_BLOCKING_TYPES
+    ]
+    if blocking:
+        return _json.dumps({
+            "updated": False,
+            "error": "schema_blocked",
+            "defects": blocking,
+        }, ensure_ascii=False)
+
+    _atomic_write_json(target, current)
+    return _json.dumps({
+        "updated": True,
+        "path": str(target),
+        "sha256": _hashlib.sha256(target.read_bytes()).hexdigest(),
+        "changed_element_ids": changed_ids,
+        "top_level_keys": sorted(top.keys()),
+    }, ensure_ascii=False)
+_VALIDATION_RECEIPT = ".process-validation.json"
+
+
+def _static_process_defects(pd: dict) -> tuple[dict, list]:
+    """Normalize a definition and run the same deterministic checks as validation."""
+    import copy as _copy
+
+    normalized, _ = _normalize_to_processgpt_schema(_copy.deepcopy(pd))
+    schema = _schema_conformance_defects(normalized)
+    if any(str(item.get("type")) in _SCHEMA_BLOCKING_TYPES for item in schema):
+        return normalized, schema
+    _ensure_skill_scripts_on_path()
+    try:
+        from save_to_supabase import flatten as _flatten  # type: ignore
+        from validation.process_validator import ProcessValidator  # type: ignore
+
+        validator = ProcessValidator(
+            llm_call=None,
+            save_definition=None,
+            engine_base_url="",
+            tenant_id=_current_tenant_id.get() or "localhost",
+        )
+        return normalized, schema + validator._static_check(_flatten(normalized))
+    except Exception as exc:
+        return normalized, schema + [{
+            "severity": "critical",
+            "type": "validator_load",
+            "detail": str(exc),
+        }]
+
+
+def _definition_digest(path: Path) -> str:
+    import hashlib as _hashlib
+
+    return _hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_validation_receipt(target: Path, result: dict) -> None:
+    """Persist proof that the exact current definition passed validation."""
+    import json as _json
+
+    receipt = target.parent / _VALIDATION_RECEIPT
+    if result.get("passed") is True:
+        receipt.write_text(_json.dumps({
+            "passed": True,
+            "definition_sha256": _definition_digest(target),
+            "engine_validated": bool(result.get("engine_validated")),
+            "iterations": result.get("iterations", 0),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    elif receipt.exists():
+        receipt.unlink()
+
+
+def _validated_definition_defects(target: Path) -> list:
+    """Return completion-blocking defects for a definition/validation receipt."""
+    import json as _json
+
+    try:
+        pd = _json.loads(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [{"severity": "critical", "type": "parse_error", "detail": str(exc)}]
+    _, defects = _static_process_defects(pd)
+    if defects:
+        return defects
+    receipt_path = target.parent / _VALIDATION_RECEIPT
+    try:
+        receipt = _json.loads(receipt_path.read_text(encoding="utf-8"))
+    except Exception:
+        receipt = {}
+    if receipt.get("passed") is not True:
+        return [{
+            "severity": "critical",
+            "type": "validation_required",
+            "detail": "validate_process_definition 검증 통과 기록이 없습니다.",
+        }]
+    if receipt.get("engine_validated") is not True:
+        return [{
+            "severity": "critical",
+            "type": "engine_validation_required",
+            "detail": "실제 실행엔진 검증 통과 기록이 없습니다.",
+        }]
+    if receipt.get("definition_sha256") != _definition_digest(target):
+        return [{
+            "severity": "critical",
+            "type": "definition_changed_after_validation",
+            "detail": "검증 후 process-definition.json 이 변경되었습니다. 다시 검증해야 합니다.",
+        }]
+    return []
+
+
+def _run_engine_process_validation(target: Path, pd: dict, *, include_definition: bool = False) -> dict:
+    """Validate a temporary definition through the real completion engine.
+
+    The generated process is not published. A temporary ``proc_def`` row is
+    created only so the existing /initiate and /complete production path can
+    load it; validation instances and the temporary definition are removed
+    before this function returns.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    engine_url = os.getenv("COMPLETION_ENGINE_URL", "").strip()
+    if not engine_url:
+        return {
+            "passed": False,
+            "engine_validated": False,
+            "remaining_defects": [{
+                "severity": "critical",
+                "type": "engine_unconfigured",
+                "detail": "COMPLETION_ENGINE_URL 이 없어 실행엔진 검증을 수행할 수 없습니다.",
+            }],
+        }
+
+    _ensure_skill_scripts_on_path()
+    temp_id = f"validation_{_uuid.uuid4().hex}"
+    tenant_id = _current_tenant_id.get() or "localhost"
+    sb = None
+    try:
+        from save_to_supabase import flatten as _flatten, get_client as _get_client, _save_proc_def  # type: ignore
+        from validate_process import validate as _validate  # type: ignore
+
+        flat = _flatten(pd)
+        sb = _get_client()
+        _save_proc_def(
+            sb,
+            proc_def_id=temp_id,
+            name=f"[검증용] {pd.get('processDefinitionName') or '생성 프로세스'}",
+            definition=flat,
+            tenant_id=tenant_id,
+        )
+        forms = []
+        form_dir = target.parent / "forms"
+        activity_form_ids = {}
+        for element in pd.get("elements") or []:
+            if not isinstance(element, dict) or element.get("elementType") != "Activity":
+                continue
+            tool_name = str(element.get("tool") or "")
+            if tool_name.startswith("formHandler:"):
+                activity_form_ids[_to_snake(str(element.get("id") or ""))] = tool_name.split(":", 1)[1]
+        if form_dir.is_dir():
+            for fp in sorted(list(form_dir.glob("*.form")) + list(form_dir.glob("*.html"))):
+                activity_id = _to_snake(fp.stem)
+                forms.append({
+                    "activity_id": activity_id,
+                    # 게이트웨이 conditionData 와 활동 tool 이 실제 참조하는 동일한 ID를
+                    # 사용해야 분기 검증이 운영 실행과 같은 데이터를 읽는다.
+                    "form_id": activity_form_ids.get(activity_id, activity_id),
+                    "html": fp.read_text(encoding="utf-8"),
+                })
+        report = _validate(
+            sb=sb,
+            tenant_id=tenant_id,
+            proc_def_id=temp_id,
+            process_name=pd.get("processDefinitionName") or "생성 프로세스",
+            definition=flat,
+            forms=forms,
+            actor_email=_current_user_email.get() or None,
+            report_path=str(target.parent / "validation-report.md"),
+        )
+        if report.get("passed") is True and isinstance(report.get("final_definition"), dict):
+            normalized, _ = _normalize_to_processgpt_schema(report["final_definition"])
+            _atomic_write_json(target, normalized)
+            pd = normalized
+        result = {
+            "passed": report.get("passed") is True,
+            "engine_validated": report.get("passed") is True and not report.get("skipped"),
+            "iterations": report.get("iterations", 0),
+            "repaired": bool(report.get("repaired")),
+            "remaining_defects": report.get("remaining_defects") or ([{
+                "severity": "critical",
+                "type": "engine_validation_skipped",
+                "detail": report.get("skip_reason") or "실행엔진 검증이 완료되지 않았습니다.",
+            }] if report.get("skipped") else []),
+        }
+        if include_definition:
+            result["_validated_definition"] = pd
+        return result
+    except Exception as exc:
+        return {
+            "passed": False,
+            "engine_validated": False,
+            "remaining_defects": [{
+                "severity": "critical",
+                "type": "engine_validation_error",
+                "detail": str(exc),
+            }],
+        }
+    finally:
+        if sb is not None:
+            for table in ("form_def", "proc_def"):
+                try:
+                    sb.table(table).delete().eq("tenant_id", tenant_id).eq(
+                        "proc_def_id" if table == "form_def" else "id", temp_id
+                    ).execute()
+                except Exception:
+                    pass
+
+
 @tool
 def validate_process_definition(path: str = ".bpmn/process-definition.json") -> str:
-    """샌드박스의 프로세스 정의(elements[])를 **스키마+로직 검증**하고, 결함이 있으면 LLM 으로 **최대 5회 자동개선**한다.
+    """샌드박스의 프로세스 정의(elements[])를 **스키마+로직 검증**하고, 결함이 있으면 LLM 으로 **최대 2회 자동개선**한다.
 
     실행 엔진/DB 없이(읽기 전용) pdf2bpmn 의 구조 검사(_static_check)를 그대로 호출한다:
     startEvent/endEvent 존재, 끊긴 시퀀스, startEvent 에서 도달 불가(흐름 단절), endEvent 미연결,
     게이트웨이 없는 분기 등. 결함이 있으면 LLM 으로 정의를 교정해 같은 샌드박스 파일에 다시 쓰고
-    재검증한다(최대 5회). 결함이 elements 자체가 비었음을 의미하면 즉시 실패 — 1단계로 돌아가
+    재검증한다(최대 2회). 결함이 elements 자체가 비었음을 의미하면 즉시 실패 — 1단계로 돌아가
     실제 elements 를 생성해야 한다.
 
     Args:
@@ -789,6 +1226,12 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
         target = _bpmn_work_dir() / "process-definition.json"
     else:
         target = _resolve_ws_path(path)
+    receipt = target.parent / _VALIDATION_RECEIPT
+    if receipt.exists():
+        try:
+            receipt.unlink()
+        except Exception:
+            pass
     if not target.is_file():
         return _json.dumps({"passed": False, "iterations": 0, "repaired": False,
                             "remaining_defects": [{"type": "missing_file",
@@ -805,9 +1248,21 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
 
     # 일반 BPMN(Camunda)식으로 생성됐어도 ProcessGPT 규격으로 결정적 변환(안전망) 후 파일에 반영.
     pd, _normalized = _normalize_to_processgpt_schema(pd)
-    if _normalized:
+    manifest = {}
+    manifest_path = target.parent / "manifest.json"
+    if manifest_path.is_file():
         try:
-            target.write_text(_json.dumps(pd, ensure_ascii=False, indent=2), encoding="utf-8")
+            manifest = _json.loads(manifest_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            manifest = {}
+    _ensure_forms_refs_skills(pd, target.parent, manifest if isinstance(manifest, dict) else {})
+    contract_changed = _ensure_gateway_decision_contract(pd, target.parent)
+    contract_changed = _ensure_requested_supplemental_artifacts(
+        pd, target.parent, _current_user_request.get()
+    ) or contract_changed
+    if _normalized or contract_changed:
+        try:
+            _atomic_write_json(target, pd)
         except Exception:
             pass
 
@@ -838,7 +1293,7 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
     defects = _check(pd)
     repaired = False
     iterations = 0
-    for _ in range(5):
+    for _ in range(2):
         if not defects:
             break
         iterations += 1
@@ -882,17 +1337,25 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
 
     if repaired:
         try:
-            target.write_text(_json.dumps(pd, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_json(target, pd)
         except Exception:
             pass
 
     criticals = [d for d in defects if str(d.get("severity") or "").lower() == "critical"]
-    return _json.dumps({
+    result = {
         "passed": len(criticals) == 0,
         "iterations": iterations,
         "repaired": repaired,
         "remaining_defects": defects,
-    }, ensure_ascii=False)
+        "engine_validated": False,
+    }
+    if result["passed"]:
+        engine_result = _run_engine_process_validation(target, pd)
+        result.update(engine_result)
+        result["iterations"] = iterations + int(engine_result.get("iterations") or 0)
+        result["repaired"] = repaired or bool(engine_result.get("repaired"))
+    _write_validation_receipt(target, result)
+    return _json.dumps(result, ensure_ascii=False)
 
 
 def _safe_name(name: str) -> str:
@@ -1065,6 +1528,181 @@ def _normalize_form_html(html: str) -> str:
     return h
 
 
+def _ensure_gateway_decision_contract(pd: dict, work: Path) -> bool:
+    """배타 게이트웨이의 분기값·직전 폼·conditionData를 하나의 실행 계약으로 맞춘다.
+
+    모델이 분기선에는 ``승인/반려``를 쓰면서 직전 활동 폼에는 판단 필드를 만들지
+    않는 경우가 있다. 이 정의는 그림으로는 정상이나 엔진은 어느 선도 선택할 수 없다.
+    각 ExclusiveGateway 바로 전 UserActivity에 분기값을 그대로 선택하는 필드를 보장하고,
+    gateway.conditionData가 그 필드를 참조하도록 한다.
+    """
+    import html as _html
+
+    elements = pd.get("elements") or []
+    if not isinstance(elements, list):
+        return False
+    activities = {
+        str(e.get("id")): e for e in elements
+        if isinstance(e, dict) and e.get("elementType") == "Activity"
+    }
+    sequences = [
+        e for e in elements
+        if isinstance(e, dict) and e.get("elementType") == "Sequence"
+    ]
+    form_dir = work / "forms"
+    changed = False
+
+    for gateway in elements:
+        if not isinstance(gateway, dict) or gateway.get("elementType") != "Gateway":
+            continue
+        if "exclusive" not in str(gateway.get("type") or "").lower():
+            continue
+        gateway_id = str(gateway.get("id") or "")
+        options = []
+        for seq in sequences:
+            if str(seq.get("source") or "") != gateway_id:
+                continue
+            value = str(seq.get("condition") or seq.get("name") or "").strip()
+            if value and value not in options:
+                options.append(value)
+        if len(options) < 2:
+            continue
+
+        incoming = [
+            activities.get(str(seq.get("source") or "")) for seq in sequences
+            if str(seq.get("target") or "") == gateway_id
+        ]
+        incoming = [activity for activity in incoming if activity is not None]
+        if len(incoming) != 1:
+            continue
+        activity = incoming[0]
+        activity_id = _to_snake(str(activity.get("id") or ""))
+        if not activity_id:
+            continue
+
+        tool_name = str(activity.get("tool") or "")
+        if tool_name.startswith("formHandler:") and tool_name.split(":", 1)[1].strip():
+            form_id = tool_name.split(":", 1)[1].strip()
+        else:
+            form_id = activity_id
+            activity["tool"] = f"formHandler:{form_id}"
+            changed = True
+
+        field_name = f"{_to_snake(gateway_id) or activity_id}_decision"
+        expected_ref = f"{form_id}.{field_name}"
+        if gateway.get("conditionData") != [expected_ref]:
+            gateway["conditionData"] = [expected_ref]
+            changed = True
+
+        form_path = next(
+            (candidate for candidate in (form_dir / f"{activity_id}.form", form_dir / f"{activity_id}.html")
+             if candidate.is_file()),
+            None,
+        )
+        if form_path is None:
+            continue
+        try:
+            content = form_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if re.search(rf"\bname\s*=\s*['\"]{re.escape(field_name)}['\"]", content):
+            continue
+        label = _html.escape(str(gateway.get("name") or "분기 판단"), quote=True)
+        option_html = "".join(
+            f"<option value='{_html.escape(value, quote=True)}'>{_html.escape(value)}</option>"
+            for value in options
+        )
+        field_html = (
+            f"      <select-field name='{field_name}' alias='{label}' disabled='false' readonly='false'>"
+            f"{option_html}</select-field>\n"
+        )
+        insert_at = content.rfind("</div>")
+        if insert_at < 0:
+            continue
+        form_path.write_text(content[:insert_at] + field_html + content[insert_at:], encoding="utf-8")
+        output_data = activity.setdefault("outputData", [])
+        if isinstance(output_data, list) and field_name not in [
+            item.get("name") if isinstance(item, dict) else item for item in output_data
+        ]:
+            output_data.append(field_name)
+        changed = True
+
+    return changed
+
+
+def _ensure_requested_supplemental_artifacts(pd: dict, work: Path, request: str) -> bool:
+    """사용자가 명시한 Markdown/HTML 보조 산출물이 실제 파일로 남도록 보장한다."""
+    import html as _html
+
+    request_text = str(request or "")
+    wants_markdown = bool(re.search(r"markdown|마크다운|\.md\b|운영\s*가이드", request_text, re.IGNORECASE))
+    wants_html = bool(re.search(r"html|\.html\b|보고서\s*템플릿", request_text, re.IGNORECASE))
+    changed = False
+    elements = [element for element in (pd.get("elements") or []) if isinstance(element, dict)]
+    activities = [element for element in elements if element.get("elementType") == "Activity"]
+    gateways = [element for element in elements if element.get("elementType") == "Gateway"]
+    process_name = str(pd.get("processDefinitionName") or "생성 프로세스")
+
+    non_skill_markdown = [
+        fp for fp in work.rglob("*.md")
+        if "skills" not in {part.lower() for part in fp.relative_to(work).parts}
+        and fp.name.lower() != "validation-report.md"
+    ]
+    if wants_markdown and not non_skill_markdown:
+        step_rows = "\n".join(
+            f"| {index} | {activity.get('name') or activity.get('id')} | {activity.get('role') or '-'} |"
+            for index, activity in enumerate(activities, 1)
+        )
+        branch_rows = "\n".join(
+            f"- **{gateway.get('name') or gateway.get('id')}**: "
+            + ", ".join(
+                str(sequence.get("condition") or sequence.get("name") or "기본 경로")
+                for sequence in elements
+                if sequence.get("elementType") == "Sequence" and sequence.get("source") == gateway.get("id")
+            )
+            for gateway in gateways
+        ) or "- 분기 없음"
+        (work / "operation-guide.md").write_text(
+            f"# {process_name} 운영 가이드\n\n"
+            "## 목적\n\n현업 담당자가 생성된 프로세스를 일관되게 실행하고 증빙을 남기기 위한 가이드입니다.\n\n"
+            "## 단계와 책임\n\n| 순서 | 활동 | 담당 역할 |\n|---:|---|---|\n"
+            f"{step_rows}\n\n## 분기 기준\n\n{branch_rows}\n\n"
+            "## 실행 체크리스트\n\n- 각 폼의 필수 현업 데이터와 증빙 링크를 입력합니다.\n"
+            "- 반려·미흡 분기에서는 보완 사유와 변경 내용을 기록합니다.\n"
+            "- 종결 전 조치 결과, 효과성 지표, 문서 개정 이력을 확인합니다.\n",
+            encoding="utf-8",
+        )
+        changed = True
+
+    non_form_html = [
+        fp for fp in list(work.rglob("*.html")) + list(work.rglob("*.htm"))
+        if "forms" not in {part.lower() for part in fp.relative_to(work).parts}
+    ]
+    if wants_html and not non_form_html:
+        rows = "".join(
+            "<tr><td>{}</td><td>{}</td><td></td><td></td></tr>".format(
+                index,
+                _html.escape(str(activity.get("name") or activity.get("id") or "")),
+            )
+            for index, activity in enumerate(activities, 1)
+        )
+        title = _html.escape(process_name)
+        (work / "closeout-report.html").write_text(
+            "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
+            f"<title>{title} 종결보고서</title>"
+            "<style>body{font-family:sans-serif;margin:32px;color:#222}table{border-collapse:collapse;width:100%}"
+            "th,td{border:1px solid #bbb;padding:8px;text-align:left}h1{color:#075985}</style></head><body>"
+            f"<h1>{title} CAPA 종결보고서</h1><p>부적합 처리와 시정조치의 실행·검증 증빙을 기록합니다.</p>"
+            "<h2>기본 정보</h2><ul><li>부적합 번호:</li><li>협력사/품목/LOT:</li><li>종결 승인자:</li></ul>"
+            "<h2>단계별 결과</h2><table><thead><tr><th>순서</th><th>활동</th><th>처리 결과</th><th>증빙</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table><h2>효과성 및 종결 판단</h2><p>핵심 지표, 잔여 위험, 표준 문서 개정 이력을 기재합니다.</p>"
+            "</body></html>",
+            encoding="utf-8",
+        )
+        changed = True
+    return changed
+
+
 def _gen_skill_md(
     name: str,
     activity_name: str,
@@ -1139,15 +1777,28 @@ def _ensure_forms_refs_skills(pd: dict, work, manifest: dict) -> None:
         h = (html or "").lower()
         return ("-field" in h) and ("class='row'" in h or 'class="row"' in h or "<section" in h)
 
+    def _data_names(value) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        result = []
+        for item in value:
+            if isinstance(item, dict):
+                name = str(item.get("name") or item.get("displayName") or "").strip()
+            else:
+                name = str(item or "").strip()
+            if name:
+                result.append(name)
+        return result
+
     for a in elements:
         if not _is_user_activity(a):
             continue
         aid = _to_snake(str(a.get("id") or ""))
         if not aid:
             continue
-        if not isinstance(a.get("inputData"), list):
-            a["inputData"] = []
-        if not (isinstance(a.get("outputData"), list) and a.get("outputData")):
+        a["inputData"] = _data_names(a.get("inputData"))
+        a["outputData"] = _data_names(a.get("outputData"))
+        if not a["outputData"]:
             a["outputData"] = [f"{a.get('name') or aid} 결과"]
         existing = existing_form_by_aid.get(aid)
         try:
@@ -1300,7 +1951,7 @@ def _capture_selection_to_manifest(answer: str) -> None:
             pass
 
 
-def _complete_one_process(work) -> dict | None:
+def _complete_one_process(work, *, persist: bool = True) -> dict | None:
     """한 프로세스 폴더(work)의 산출물을 ProcessGPT 규격(flattened+통합)으로 조립하고
     process-definition.json 에 최종본을 기록한다. 출력계약 dict 반환(없으면 None)."""
     import json as _json
@@ -1346,6 +1997,8 @@ def _complete_one_process(work) -> dict | None:
 
     # 결정적 보장: 폼·참조정보는 항상, 선택된 스킬 파일은 빠짐없이 생성(에이전트 누락 보정).
     _ensure_forms_refs_skills(pd, work, manifest)
+    _ensure_gateway_decision_contract(pd, work)
+    _ensure_requested_supplemental_artifacts(pd, work, _current_user_request.get())
 
     # forms (파일명 stem == activity id 규칙)
     forms: list[dict] = []
@@ -1414,6 +2067,7 @@ def _complete_one_process(work) -> dict | None:
 
     # --- 통합: 생성된 폼/에이전트를 elements 에 반영 후 flattened(proc_def) 스키마로 변환 ---
     form_by_aid = {f["activity_id"]: f["form_id"] for f in forms}
+    old_form_ids: dict[str, str] = {}
     agent_by_role: dict[str, str] = {}
     for a in agents:
         if isinstance(a, dict) and a.get("id"):
@@ -1424,7 +2078,12 @@ def _complete_one_process(work) -> dict | None:
         if not isinstance(el, dict) or el.get("elementType") != "Activity":
             continue
         aid = str(el.get("id") or "")
-        if aid in form_by_aid and not el.get("tool"):
+        old_tool = str(el.get("tool") or "")
+        if old_tool.startswith("formHandler:"):
+            old_form_ids[aid] = old_tool.split(":", 1)[1]
+        if aid in form_by_aid:
+            # 저장용 UUID가 정해진 뒤에는 항상 실제 form_def ID로 치환한다. 작업 폴더의
+            # 임시 formHandler:<activity_id>를 남기면 저장 후 폼/게이트웨이 조회가 끊긴다.
             el["tool"] = f"formHandler:{form_by_aid[aid]}"
         if not el.get("agent"):
             ag_id = agent_by_role.get((el.get("role") or "").strip())
@@ -1432,6 +2091,26 @@ def _complete_one_process(work) -> dict | None:
                 el["agent"] = ag_id
                 if (el.get("agentMode") or "none") == "none":
                     el["agentMode"] = "draft"
+
+    # gateway.conditionData 역시 위에서 치환한 최종 form ID를 참조해야 한다.
+    form_id_remap = {
+        old_form_ids[aid]: final_id for aid, final_id in form_by_aid.items()
+        if aid in old_form_ids
+    }
+    for el in elements:
+        if not isinstance(el, dict) or el.get("elementType") != "Gateway":
+            continue
+        refs = el.get("conditionData")
+        if not isinstance(refs, list):
+            continue
+        remapped = []
+        for ref in refs:
+            if not isinstance(ref, str) or "." not in ref:
+                remapped.append(ref)
+                continue
+            prefix, field_name = ref.split(".", 1)
+            remapped.append(f"{form_id_remap.get(prefix, prefix)}.{field_name}")
+        el["conditionData"] = remapped
 
     # --- manifest.json 결정적 링크: 에이전트가 쓴 skill/agent/dmn → activity/gateway 매핑을 반영
     #     (에이전트가 JSON 을 직접 안 고쳐도 최종 JSON 에 스킬/에이전트/DMN 이 빠짐없이 들어가게 한다).
@@ -1604,12 +2283,11 @@ def _complete_one_process(work) -> dict | None:
                     _el["name"] = _el.get("id") or _el.get("name") or ""
 
     # 최종 flattened 정의를 process-definition.json 에 그대로 기록(파일 UI·저장이 이 최종본을 본다)
-    try:
-        (work / "process-definition.json").write_text(
-            _json.dumps(flat, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception:
-        pass
+    if persist:
+        try:
+            _atomic_write_json(work / "process-definition.json", flat)
+        except Exception:
+            pass
 
     out = {
         "type": "process-definition-result",
@@ -1686,21 +2364,97 @@ def complete_process_generation() -> str:
 
     room = _bpmn_work_dir()
     _reconcile_scattered_room_dirs(room)  # 오타로 흩어진 거의 동일한 방 폴더 병합
-    proc_dirs = sorted([d for d in room.glob("process-*") if d.is_dir()])
+    proc_dirs = process_work_dirs(room, _current_conversation_id.get())
     if not proc_dirs:
-        proc_dirs = [room]  # 단일 프로세스(방 루트) 하위호환
+        proc_dirs = [room] if (room / "process-definition.json").is_file() else []  # 단일 프로세스 하위호환
+
+    validation_errors: list[dict] = []
+    for directory in proc_dirs:
+        definition_file = directory / "process-definition.json"
+        if not definition_file.is_file():
+            validation_errors.append({"dir": directory.name, "defects": [{
+                "severity": "critical",
+                "type": "missing_file",
+                "detail": "process-definition.json 이 없습니다.",
+            }]})
+            continue
+        defects = _validated_definition_defects(definition_file)
+        if defects:
+            validation_errors.append({"dir": directory.name, "defects": defects})
+    if validation_errors:
+        return "ERROR: " + _json.dumps({
+            "message": "검증을 통과하지 않은 프로세스는 완료할 수 없습니다.",
+            "validation_errors": validation_errors,
+        }, ensure_ascii=False)
 
     processes: list[dict] = []
+    final_validation_errors: list[dict] = []
     for d in proc_dirs:
-        out = _complete_one_process(d)
+        out = _complete_one_process(d, persist=False)
         if not isinstance(out, dict):
             continue
         flat = out.get("processDefinition") or {}
+        canonical, final_defects = _static_process_defects(flat)
+        if final_defects:
+            final_validation_errors.append({"dir": d.name, "defects": final_defects})
+            continue
+
+        validation_target = d / ".final-process-validation.json"
+        _atomic_write_json(validation_target, canonical)
+        try:
+            engine_result = _run_engine_process_validation(
+                validation_target,
+                canonical,
+                include_definition=True,
+            )
+        finally:
+            if validation_target.exists():
+                validation_target.unlink()
+        validated_canonical = engine_result.pop("_validated_definition", canonical)
+        if engine_result.get("passed") is not True or engine_result.get("engine_validated") is not True:
+            final_validation_errors.append({
+                "dir": d.name,
+                "defects": engine_result.get("remaining_defects") or [{
+                    "severity": "critical",
+                    "type": "final_engine_validation_failed",
+                    "detail": "최종 통합본이 실제 실행엔진 검증을 통과하지 못했습니다.",
+                }],
+            })
+            continue
+
+        final_flat = flat
+        if engine_result.get("repaired"):
+            _ensure_skill_scripts_on_path()
+            from save_to_supabase import flatten as _flatten  # type: ignore
+            final_flat = _flatten(validated_canonical)
+            for key in (
+                "processDefinitionId", "processDefinitionName", "description", "isHorizontal",
+                "data", "participants", "subProcesses", "skills", "dmn_decisions", "dmn_rules",
+            ):
+                if key in flat and key not in final_flat:
+                    final_flat[key] = flat[key]
+        _, persisted_defects = _static_process_defects(final_flat)
+        if persisted_defects:
+            final_validation_errors.append({"dir": d.name, "defects": persisted_defects})
+            continue
+
+        definition_file = d / "process-definition.json"
+        _atomic_write_json(definition_file, final_flat)
+        _write_validation_receipt(definition_file, engine_result)
         processes.append({
             "dir": d.name,
-            "processDefinitionId": flat.get("processDefinitionId", ""),
-            "processDefinitionName": flat.get("processDefinitionName", ""),
+            "processDefinitionId": final_flat.get("processDefinitionId", ""),
+            "processDefinitionName": final_flat.get("processDefinitionName", ""),
+            "definitionSha256": _definition_digest(definition_file),
+            "engineValidated": True,
+            "validationIterations": engine_result.get("iterations", 0),
         })
+
+    if final_validation_errors:
+        return "ERROR: " + _json.dumps({
+            "message": "최종 통합본이 검증을 통과하지 못했습니다.",
+            "validation_errors": final_validation_errors,
+        }, ensure_ascii=False)
 
     if not processes:
         return ("ERROR: 처리할 process-definition.json 이 없습니다. "

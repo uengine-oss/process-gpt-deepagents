@@ -14,18 +14,24 @@ def _build_model():
             model=llm_model or "gpt-4o",
             base_url=proxy_url,
             api_key=proxy_key,
+            timeout=180,
+            max_retries=2,
         )
 
     if os.getenv("ANTHROPIC_API_KEY"):
         return ChatAnthropic(
             model_name=llm_model or "claude-sonnet-4-6",
             api_key=os.getenv("ANTHROPIC_API_KEY"),
+            timeout=180,
+            max_retries=2,
         )
 
     if os.getenv("OPENAI_API_KEY"):
         return ChatOpenAI(
             model=llm_model or "gpt-4o",
             api_key=os.getenv("OPENAI_API_KEY"),
+            timeout=180,
+            max_retries=2,
         )
 
     raise ValueError(

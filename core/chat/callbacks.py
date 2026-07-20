@@ -3,12 +3,32 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
 from langchain_core.callbacks.base import AsyncCallbackHandler
 
 from core.skills.tools import _skills_from_tool_args
+
+
+_SENSITIVE_KEY = re.compile(r"(^|_)(authorization|password|passwd|secret|token|jwt|api_?key|access_?key)($|_)", re.I)
+
+
+def _safe_preview(value: Any, depth: int = 0) -> Any:
+    """Keep execution details useful without streaming secrets or huge file bodies."""
+    if depth > 8:
+        return "[omitted]"
+    if isinstance(value, str):
+        return value if len(value) <= 6000 else value[:6000] + "\n…(truncated)"
+    if isinstance(value, list):
+        return [_safe_preview(v, depth + 1) for v in value[:50]]
+    if isinstance(value, dict):
+        return {
+            str(k): "[redacted]" if _SENSITIVE_KEY.search(str(k)) else _safe_preview(v, depth + 1)
+            for k, v in list(value.items())[:100]
+        }
+    return value
 
 
 class ToolTrackingCallback(AsyncCallbackHandler):
@@ -55,14 +75,7 @@ class ToolTrackingCallback(AsyncCallbackHandler):
         if not tool_name:
             return
         self._run_to_tool[str(run_id)] = tool_name
-        await self._emit({"type": "tool_start", "tool": tool_name})
-
         servers = self._mcp_tool_servers.get(tool_name)
-        if servers:
-            new = [s for s in servers if s not in self._emitted_connectors]
-            if new:
-                self._emitted_connectors.update(new)
-                await self._emit({"type": "plan_connectors", "connectors": new})
 
         args: dict = inputs if isinstance(inputs, dict) else {}
         if not args and isinstance(input_str, str):
@@ -72,6 +85,20 @@ class ToolTrackingCallback(AsyncCallbackHandler):
                     args = parsed
             except Exception:
                 pass
+
+        await self._emit({
+            "type": "tool_start",
+            "tool": tool_name,
+            "input": _safe_preview(args) if args else None,
+            "connectors": list(servers or []),
+        })
+
+        if servers:
+            new = [s for s in servers if s not in self._emitted_connectors]
+            if new:
+                self._emitted_connectors.update(new)
+                await self._emit({"type": "plan_connectors", "connectors": new})
+
         skill_names = _skills_from_tool_args(args)
         if skill_names:
             await self._emit({"type": "plan_skills", "skills": skill_names})
@@ -85,4 +112,5 @@ class ToolTrackingCallback(AsyncCallbackHandler):
         tool_name = self._run_to_tool.pop(str(run_id), "")
         if tool_name:
             result_str = output if isinstance(output, str) else str(output)
+            result_str = _safe_preview(result_str)
             await self._emit({"type": "tool_end", "tool": tool_name, "output": result_str})

@@ -19,9 +19,12 @@ from ..skills.tools import (
     list_git_repos,
     publish_skill,
     register_skill_as_tenant,
+    write_process_definition,
+    update_process_definition,
     validate_process_definition,
     complete_process_generation,
     bpmn_container_base,
+    canonical_process_dir_name,
     _current_sandbox as _skill_sandbox,
     _current_user_name as _skill_user_name,
     _current_user_email as _skill_user_email,
@@ -97,8 +100,13 @@ DEFAULT_SYSTEM_PROMPT = (
     "이 정도 구체성으로 초안을 만들되, **초안을 본문(어시스턴트 텍스트)으로 쓰지 말고 반드시 `request_human_input` 도구로 승인/반려를 묻는다.** "
     "`request_human_input` 의 `question` 에는 `이대로 진행할까요? 추가하거나 바꿀 단계가 있으면 알려주세요.` 만 넣고, "
     "`context` 에는 위 초안 전체(번호 단계·담당 역할·분기 포함)를 그대로 담는다(승인/반려형 HITL 패널로 표시된다). "
+    "⛔ **1단계 컨설팅 초안은 반드시 '자연어 문장 + 번호 목록'(`1) … → 2) …`)으로만** 작성한다. "
+    "`question`·`context` 어디에도 **줄 첫머리 `•`·`-`·`*` 불릿이나, 한 줄 전체가 `[제목]` 형태인 대괄호 머리글 줄을 절대 쓰지 마라.** "
+    "그런 형식(대괄호 섹션 + 불릿)은 **2단계(스킬·에이전트·DMN 후보) 전용**이며, 프론트가 이를 **다중 선택 체크박스 패널로 오인**해 컨설팅이 승인/반려가 아닌 체크박스로 잘못 렌더된다. "
+    "분기는 `[분기]` 를 줄 단독으로 쓰지 말고 `… → (승인 시) … / (반려 시) …` 처럼 문장 안에서 표현한다. "
+    "즉 1단계 HITL 은 항상 **승인/반려 + 자유 의견** 형태여야 한다(체크박스 금지). "
     "**절대 초안을 평문으로 출력하고 턴을 끝내지 말 것**(그러면 승인 패널이 안 뜬다). '어떤 절차를 거치나요?' 같은 되묻기 금지. "
-    "승인받으면 프로세스 정의(elements[] 형식)를 `write_file` 로 **`/workspace/.bpmn/process-definition.json`** 에 만든다(빈 elements 금지 — 실제 요소 생성). "
+    "승인받으면 프로세스 정의(elements[] 형식)를 `write_process_definition` 로 **`/workspace/.bpmn/process-definition.json`** 에 만든다(빈 elements 금지 — 실제 요소 생성). "
     "**사용자가 직전 초안을 승인('승인'·'진행'·'좋아요'·'네' 등)하면, 다시 초안을 제시하거나 되묻지 말고 곧바로 이 단계(process-definition.json 생성)부터 진행한다.** "
     "**`processDefinitionName` 은 사용자가 요청한 프로세스 이름으로 반드시 채운다**(예: '휴가 신청 프로세스'). 비워두지 말 것.\n"
     "- **2단계(후보 선택)**: JSON 의 elements 에서 스킬/에이전트/DMN **구체 후보**를 도출해 `request_human_input` 으로 묻는다. "
@@ -118,7 +126,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "에이전트는 **에이전트마다 개별 파일** `/workspace/.bpmn/agents/<agent_id>.json` 로 만든다 "
     "(각 파일은 단일 에이전트 객체 `{\"id\":\"<agent_id>\",\"name\":\"<이름>\",\"role\":\"<역할>\",\"goal\":\"...\",\"persona\":\"...\",\"description\":\"...\"}`; "
     "여러 에이전트를 한 파일에 합치지 말 것 — 산출물 패널에서 에이전트별 '편집' 연결을 위해 반드시 1에이전트=1파일). "
-    "그리고 `edit_file` 로 process-definition.json 을 업데이트한다.\n"
+    "그런 다음 기존 구조를 보존한 채 요소 ID별 변경을 `update_process_definition` 으로 반영한다. 구조 자체를 바꿀 때만 `write_process_definition` 을 사용하며, process-definition.json 텍스트에는 `edit_file`/일반 `write_file`을 사용하지 않는다.\n"
     "  **선택된 모든 후보(스킬·에이전트·DMN)를 빠짐없이 생성한다 — 하나라도 누락한 채 complete 하지 말 것.** "
     "선택 개수와 생성 개수가 일치해야 한다(스킬 N개 선택 → SKILL.md N개, 에이전트 M개 선택 → agents/*.json M개).\n"
     "  **그리고 반드시 `/workspace/.bpmn/manifest.json` 에 매핑을 `write_file` 한다(스킬/에이전트/DMN 을 activity·gateway 에 연결하는 핵심 — 이게 있어야 최종 JSON 에 빠짐없이 반영된다):**\n"
@@ -132,7 +140,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "</div></div></section>` (여러 줄 입력은 `<textarea-field ... rows='5'>`, 선택은 `<select-field>`, "
     "**날짜는 `<text-field type='date'>`**). **`date-field`·`number-field` 같은 태그는 존재하지 않으니 쓰지 말 것**(날짜·숫자는 text-field 의 type 으로). name 은 고유, col-sm 합은 12. "
     "정보가 부족하면 `free_input` textarea-field 하나라도 넣는다(폼은 비어있으면 안 됨). 참조정보(inputData/conditionData)도 process-definition.json 에 반영(추가 질문 없이 자동).\n"
-    "- **4단계**: `validate_process_definition` 도구로 검증한다. 결함이 있으면 도구가 최대 5회 자동개선하며, 반환 결과가 passed=false 면 파일을 보고 직접 더 고친 뒤 다시 호출한다.\n"
+    "- **4단계**: `validate_process_definition` 도구로 검증한다. 결함이 있으면 제한된 횟수만 자동개선하며, 반환 결과가 passed=false 면 전체 객체를 `write_process_definition` 으로 다시 쓴 뒤 한 번만 재검증한다.\n"
     "- **5단계**: `complete_process_generation` 도구를 호출한다(인자 없음). 도구가 샌드박스 파일에서 산출물을 모아 프론트로 전달한다(작업 파일은 보존). "
     "**검증 결함 내용을 채팅에 나열하거나 '결함이 발견됐다'고 설명하지 말 것**(검증·보정은 4단계에서 조용히 끝낸다). "
     "그 뒤 채팅엔 **'프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요.'** 한 줄만 남긴다(같은 안내를 반복하지 말 것).\n"
@@ -188,6 +196,8 @@ async def build_agent(
             list_git_repos,
             publish_skill,
             register_skill_as_tenant,
+            write_process_definition,
+            update_process_definition,
             validate_process_definition,
             complete_process_generation,
         ]
@@ -229,8 +239,9 @@ async def build_agent(
     # 방별 산출물 디렉터리 주입 + 프로세스별 하위 폴더(한 방에 여러 프로세스 가능).
     # 폴더명은 executor 가 **구체적인 값**을 생성해 주입한다(에이전트가 `<랜덤 id>`·`<new_id>` 같은
     # placeholder 를 그대로 적어 `<`,`>` 가 든 Windows 비호환 폴더를 만들던 문제 방지).
-    import uuid as _uuid4
-    _pfolder = f"process-{_uuid4.uuid4().hex[:7]}"
+    # HITL resume rebuilds the graph/agent. Keep the folder calculation shared
+    # with validation/completion so stale random folders are never re-collected.
+    _pfolder = canonical_process_dir_name(conversation_id)
     _bpmn_base = bpmn_container_base(conversation_id)
     final_prompt = final_prompt + (
         f"\n\n## 📁 이번 대화 전용 산출물 경로(필수)\n"

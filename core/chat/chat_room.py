@@ -53,7 +53,12 @@ class CtxAccumulator:
                 e.get("tool") == tool and e.get("status") == "running"
                 for e in self.tools
             ):
-                self.tools.append({"tool": tool, "status": "running"})
+                self.tools.append({
+                    "tool": tool,
+                    "status": "running",
+                    "input": payload.get("input"),
+                    "connectors": payload.get("connectors") or [],
+                })
         elif et == "tool_end":
             tool = str(payload.get("tool") or "").strip()
             if not tool:
@@ -61,9 +66,10 @@ class CtxAccumulator:
             for entry in reversed(self.tools):
                 if entry.get("tool") == tool and entry.get("status") == "running":
                     entry["status"] = "done"
+                    entry["output"] = payload.get("output")
                     return
             # No matching running entry (e.g. subagent tool_end without prior start)
-            self.tools.append({"tool": tool, "status": "done"})
+            self.tools.append({"tool": tool, "status": "done", "output": payload.get("output")})
         elif et == "plan_skills":
             for s in (payload.get("skills") or []):
                 s = str(s).strip()

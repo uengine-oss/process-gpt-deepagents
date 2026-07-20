@@ -16,7 +16,7 @@ from pathlib import Path
 import yaml
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 logger = logging.getLogger(__name__)
@@ -793,6 +793,53 @@ async def list_skill_files(request: Request) -> JSONResponse:
     return JSONResponse({"skill_name": skill_name, "files": files, "count": len(files)})
 
 
+async def export_skill(request: Request) -> Response:
+    """스킬 디렉토리 전체를 zip으로 묶어 반환한다.
+
+    프로세스 컴포넌트 패키지(export) 파이프라인에서 스킬 파일을 동봉하기 위해 사용한다.
+    zip 내부는 스킬 디렉토리 기준 상대 경로(SKILL.md 가 루트)로 구성되어,
+    그대로 다시 압축하면 /skills/upload 가 받는 형태와 호환된다.
+    """
+    import io
+    import zipfile
+
+    skill_name = request.path_params["skill_name"]
+    tenant_id = request.query_params.get("tenant_id", "")
+
+    config_id = ""
+    if tenant_id:
+        try:
+            provider = await asyncio.to_thread(_get_provider, tenant_id)
+            config_id = provider.config_id
+        except Exception:
+            pass
+
+    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
+    if skill_dir is None and config_id:
+        try:
+            provider = await asyncio.to_thread(_get_provider, tenant_id)
+            skill_dir = await _ensure_skill_synced(provider, skill_name, tenant_id)
+        except Exception:
+            pass
+    if skill_dir is None:
+        return JSONResponse({"error": f"skill '{skill_name}' not found"}, status_code=404)
+
+    resolved = skill_dir.resolve()
+
+    def _build_zip() -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in sorted(resolved.rglob("*")):
+                if not p.is_file() or ".git" in p.parts:
+                    continue
+                zf.write(p, arcname=str(p.relative_to(resolved)))
+        return buf.getvalue()
+
+    data = await asyncio.to_thread(_build_zip)
+    headers = {"Content-Disposition": f'attachment; filename="{skill_name}.zip"'}
+    return Response(content=data, media_type="application/zip", headers=headers)
+
+
 async def delete_skill(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -1455,6 +1502,7 @@ routes = [
     Route("/skills/{skill_name}/pull-requests", create_skill_pull_request, methods=["POST"]),
     Route("/skills/{skill_name}/pull-requests/{number:int}/files", get_pull_request_files, methods=["GET"]),
     Route("/skills/{skill_name}/pull-requests/{number:int}/merge", merge_skill_pull_request, methods=["POST"]),
+    Route("/skills/{skill_name}/export", export_skill, methods=["GET"]),
     Route("/skills/{skill_name}/files", list_skill_files, methods=["GET"]),
     Route("/skills/{skill_name}/files/{file_path:path}", get_skill_file, methods=["GET"]),
     Route("/skills/{skill_name}/files/{file_path:path}", delete_skill_file, methods=["DELETE"]),

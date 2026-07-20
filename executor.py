@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 # deepagent 가 샌드박스 workspace 에 생성/수정하는 산출물 파일을 프론트(Claude Desktop식 파일 UI)로
 # 실시간 전달하기 위한 설정. write_file/edit_file 도구가 건드린 /workspace 하위 파일을 file_artifact 로 보낸다.
-_FILE_TOOL_NAMES = ("write_file", "edit_file")
+_FILE_TOOL_NAMES = ("write_file", "edit_file", "write_process_definition", "update_process_definition")
 _FILE_ARTIFACT_MAX_BYTES = 400_000  # 미리보기에 과한 대용량 파일은 잘라 보냄
 
 # 채팅 산출물에서 스킬이 만든 hwpx 컨테이너 경로를 잡아내기 위한 패턴.
@@ -403,7 +403,7 @@ async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
     if streamer is None:
         return
     try:
-        from core.skills.tools import bpmn_container_base as _bcb, _conv_slug
+        from core.skills.tools import bpmn_container_base as _bcb, _conv_slug, process_work_dirs
         from core.agents.agent import _BASE_DIR as _ABASE
     except Exception:
         return
@@ -413,19 +413,28 @@ async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
     if not room_host.exists():
         return
     # 프로세스 폴더들 + (단독 스킬용) 방 base 자체를 항상 포함해 base 바로 아래 skills/ 도 스캔한다.
-    proc_dirs = sorted([d for d in room_host.glob("process-*") if d.is_dir()])
+    proc_dirs = process_work_dirs(room_host, chat_room_id or "")
     if room_host not in proc_dirs:
         proc_dirs.append(room_host)
     seen: set = set()
+    previewable_suffixes = {".bpmn", ".json", ".md", ".markdown", ".html", ".htm", ".form", ".xml", ".dmn", ".yaml", ".yml", ".txt", ".csv"}
+    excluded_names = {".process-validation.json", "validation-report.md"}
     for pdir in proc_dirs:
-        # process-definition.json·manifest.json·agents.json + forms/*.html + skills/**/SKILL.md
-        targets = []
-        for fn in ("process-definition.json", "manifest.json", "agents.json"):
-            fp = pdir / fn
-            if fp.is_file():
-                targets.append(fp)
-        targets += sorted((pdir / "forms").glob("*.html")) if (pdir / "forms").is_dir() else []
-        targets += sorted((pdir / "skills").glob("*/SKILL.md")) if (pdir / "skills").is_dir() else []
+        # 최종 산출물은 특정 파일명만 열거하지 않고 지원 형식을 재전송한다. 그래야 모델이
+        # 추가로 만든 Markdown/HTML/JSON도 라이브 표시와 새로고침 복원에서 누락되지 않는다.
+        # 방 루트는 stale process-*까지 재귀하지 않고 단독 산출물과 skills만 스캔한다.
+        if pdir == room_host:
+            candidates = [fp for fp in pdir.iterdir() if fp.is_file()]
+            if (pdir / "skills").is_dir():
+                candidates += list((pdir / "skills").rglob("*"))
+        else:
+            candidates = list(pdir.rglob("*"))
+        targets = sorted(
+            fp for fp in candidates
+            if fp.is_file()
+            and (fp.suffix.lower() in previewable_suffixes or fp.name in {"process-definition.json", "manifest.json"})
+            and fp.name.lower() not in excluded_names
+        )
         for hp in targets:
             try:
                 key = hp.as_posix()
@@ -817,7 +826,26 @@ class DeepAgentExecutor(AgentExecutor):
         _user_input_text = ""
         try:
             _user_input_text = str(context.get_user_input() or "")
-            _skill_user_request.set(_user_input_text)
+            # HITL resume 턴의 current input은 "승인" 또는 후보 선택 답변뿐이다. 원 요청을
+            # 잃으면 이름과 명시 추가 산출물(.md/.html) 요구가 완료 단계에서 사라진다.
+            request_candidates = [
+                str(msg.get("content") or "").strip() for msg in recent_msgs
+                if msg.get("role") == "user" and str(msg.get("content") or "").strip()
+            ]
+            request_candidates.append(_user_input_text)
+            non_hitl = [
+                text for text in request_candidates
+                if not re.search(r"\[(?:스킬|에이전트|DMN)\]|^\s*(?:승인|반려)\s*$", text, re.IGNORECASE)
+            ]
+            original_request = max(
+                non_hitl or request_candidates or [""],
+                key=lambda text: (
+                    int(bool(re.search(r"프로세스|workflow|bpmn", text, re.IGNORECASE))),
+                    int(bool(re.search(r"markdown|마크다운|\.md\b|html|\.html\b", text, re.IGNORECASE))),
+                    len(text),
+                ),
+            )
+            _skill_user_request.set(original_request)
         except Exception:
             pass
         # 후보 선택 HITL 답변이면([스킬]/[에이전트]/[DMN]) manifest 로 캡처(에이전트가 안 써도 스킬/연결 보장).
@@ -1151,8 +1179,14 @@ class DeepAgentExecutor(AgentExecutor):
                                         if _fp and _tc_id and str(_fp).startswith("/workspace"):
                                             pending_file_ops[_tc_id] = {
                                                 "path": str(_fp),
-                                                "op": "create" if tool_name == "write_file" else "edit",
-                                                "inline": (tool_args.get("content") if tool_name == "write_file" else None),
+                                                "op": "create" if tool_name in ("write_file", "write_process_definition") else "edit",
+                                                "inline": (
+                                                    tool_args.get("content")
+                                                    if tool_name == "write_file"
+                                                    else json.dumps(tool_args.get("definition"), ensure_ascii=False, indent=2)
+                                                    if tool_name == "write_process_definition"
+                                                    else None
+                                                ),
                                             }
                                             workspace_write_made = True
                                             if str(_fp).endswith("process-definition.json"):
@@ -1430,14 +1464,58 @@ class DeepAgentExecutor(AgentExecutor):
             # 폴백: 에이전트가 process-definition.json 은 만들었으나(이번 턴) complete 를 호출하지 않고
             # 인터럽트 없이 턴을 끝낸 경우 — 스킬 생성 등으로 step 이 소진되면 발생한다.
             # 결과 통합이 누락되므로 executor 가 직접 complete 를 호출해 최종본을 만들고 프론트에 전달한다.
+            # On HITL resume the process definition may have been written in the
+            # previous turn. Detect the durable room artifact as well as this
+            # turn's write_file event, otherwise a resumed process is mistaken
+            # for a standalone skill generation and never post-processed.
+            if not process_json_written and chat_room_id:
+                try:
+                    from core.skills.tools import process_work_dirs as _process_work_dirs
+                    room_dir = _ABASE / "workspace" / ".bpmn" / _conv_slug(chat_room_id)
+                    process_json_written = any(
+                        (directory / "process-definition.json").is_file()
+                        for directory in _process_work_dirs(room_dir, chat_room_id)
+                    )
+                except Exception:
+                    pass
+
             if streamer and process_json_written and not complete_called:
                 try:
                     from core.skills.tools import (
                         complete_process_generation as _cpg,
+                        validate_process_definition as _vpd,
                         _current_conversation_id as _ccid,
+                        process_work_dirs as _process_work_dirs,
                     )
 
                     _ccid.set(chat_room_id or "")
+                    _room_dir = _ABASE / "workspace" / ".bpmn" / _conv_slug(chat_room_id or "")
+                    _validation_failures = []
+                    for _work_dir in _process_work_dirs(_room_dir, chat_room_id or ""):
+                        _definition_path = _work_dir / "process-definition.json"
+                        if not _definition_path.is_file():
+                            continue
+                        _vres = await asyncio.to_thread(
+                            _vpd.invoke, {"path": str(_definition_path)}
+                        )
+                        try:
+                            _vobj = json.loads(str(_vres or "{}"))
+                        except Exception:
+                            _vobj = {"passed": False, "remaining_defects": [{"detail": str(_vres)}]}
+                        if _vobj.get("passed") is not True:
+                            _validation_failures.append({
+                                "dir": _work_dir.name,
+                                "defects": _vobj.get("remaining_defects") or [],
+                            })
+                    if _validation_failures:
+                        complete_called = True  # 이번 턴의 무검증 재시도 방지
+                        logger.error(
+                            "auto-complete 검증 실패 | room=%s failures=%s",
+                            chat_room_id,
+                            _validation_failures,
+                        )
+                        raw_text = "프로세스 실행 검증을 통과하지 못해 결과 전달을 중단했습니다. 자동 보정 후 다시 검증합니다."
+                        raise RuntimeError("process validation failed before auto-complete")
                     _cres = await asyncio.to_thread(_cpg.invoke, {})
                     logger.info("auto-complete(폴백) | room=%s result=%.140s", chat_room_id, str(_cres))
                     complete_called = True
