@@ -27,6 +27,7 @@ from processgpt_agent_sdk import ProcessGPTAgentServer
 
 from core.api.skills_router import routes as skills_routes
 from core.api.file_download import routes as file_download_routes
+from core.api.chat_stream_attach import routes as chat_stream_attach_routes
 from executor import DeepAgentExecutor
 
 load_dotenv()
@@ -50,7 +51,12 @@ async def main() -> None:
     async def health(_request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
-    app = Starlette(routes=[Route("/health", health), *skills_routes, *file_download_routes])
+    app = Starlette(routes=[
+        Route("/health", health),
+        *skills_routes,
+        *file_download_routes,
+        *chat_stream_attach_routes,
+    ])
     server.mount_chat_sse(app, path="/chat/stream")
 
     uvicorn_server = uvicorn.Server(
@@ -63,11 +69,6 @@ async def main() -> None:
         asyncio.create_task(server.run()),
         asyncio.create_task(uvicorn_server.serve()),
     ]
-
-    if os.environ.get("FEEDBACK_POLLING_ENABLED", "").lower() in ("1", "true", "yes", "on"):
-        from core.feedback.polling import start_feedback_polling
-        all_tasks.append(asyncio.create_task(start_feedback_polling(interval=7)))
-        logger.info("피드백 폴링 활성화 (interval=7s)")
 
     # server.run()이 SIGINT/SIGTERM으로 종료되면 나머지 task도 취소한다.
     done, pending = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
