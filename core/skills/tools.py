@@ -412,6 +412,19 @@ def _create_pr_after_push(
     )
 
 
+def _as_list(value: str | list[str] | None) -> list[str]:
+    """단일 값 또는 리스트를 배열 컬럼용 리스트로 정규화한다(빈 값 제거)."""
+    items = [value] if isinstance(value, str) else list(value or [])
+    return [i for i in items if i]
+
+
+def _normalize_requester_ids(requester_id: str | list[str] | None) -> list[str]:
+    """requester_id 를 uuid[] 컬럼용 리스트로 정규화한다. 값이 없으면 nil UUID 한 건."""
+    import uuid as _uuid
+
+    return _as_list(requester_id) or [str(_uuid.UUID(int=0))]
+
+
 def _record_resource_pr(
     *,
     resource_type: str,
@@ -429,11 +442,8 @@ def _record_resource_pr(
     if not tenant_id:
         return None
 
-    requester_id = _current_user_id.get()
-    requester_name = _current_user_name.get() or None
-    if not requester_id:
-        import uuid as _uuid
-        requester_id = str(_uuid.UUID(int=0))
+    requester_ids = _normalize_requester_ids(_current_user_id.get())
+    requester_names = _as_list(_current_user_name.get()) or None
 
     try:
         from ..storage.db import get_supabase
@@ -447,8 +457,8 @@ def _record_resource_pr(
             "title": title,
             "description": description,
             "status": "OPEN",
-            "requester_id": requester_id,
-            "requester_name": requester_name,
+            "requester_id": requester_ids,
+            "requester_name": requester_names,
             "git_pr_number": git_pr_number,
             "git_pr_url": git_pr_url,
             "git_repo_url": git_repo_url,

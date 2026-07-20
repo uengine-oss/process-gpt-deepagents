@@ -274,6 +274,19 @@ def _save_tenant_skill(tenant_id: str, skill_name: str, owner_id: str) -> None:
     }).execute()
 
 
+def _as_list(value: str | list[str] | None) -> list[str]:
+    """단일 값 또는 리스트를 배열 컬럼용 리스트로 정규화한다(빈 값 제거)."""
+    items = [value] if isinstance(value, str) else list(value or [])
+    return [i for i in items if i]
+
+
+def _normalize_requester_ids(requester_id: str | list[str] | None) -> list[str]:
+    """requester_id 를 uuid[] 컬럼용 리스트로 정규화한다. 값이 없으면 nil UUID 한 건."""
+    import uuid
+
+    return _as_list(requester_id) or [str(uuid.UUID(int=0))]
+
+
 def _record_resource_pr_sync(
     *,
     tenant_id: str,
@@ -283,18 +296,17 @@ def _record_resource_pr_sync(
     base_branch: str,
     title: str,
     description: str,
-    requester_id: str | None = None,
-    requester_name: str | None = None,
+    requester_id: str | list[str] | None = None,
+    requester_name: str | list[str] | None = None,
     git_pr_number: int | None = None,
     git_pr_url: str = "",
     git_repo_url: str = "",
 ) -> dict | None:
     """resource_pull_requests 테이블에 PR 레코드를 삽입한다 (동기 버전, API 라우터용)."""
-    import uuid
     from core.storage.db import get_supabase
 
-    if not requester_id:
-        requester_id = str(uuid.UUID(int=0))
+    requester_ids = _normalize_requester_ids(requester_id)
+    requester_names = _as_list(requester_name) or None
 
     try:
         sb = get_supabase()
@@ -307,8 +319,8 @@ def _record_resource_pr_sync(
             "title": title,
             "description": description,
             "status": "OPEN",
-            "requester_id": requester_id,
-            "requester_name": requester_name,
+            "requester_id": requester_ids,
+            "requester_name": requester_names,
             "git_pr_number": git_pr_number,
             "git_pr_url": git_pr_url,
             "git_repo_url": git_repo_url,
