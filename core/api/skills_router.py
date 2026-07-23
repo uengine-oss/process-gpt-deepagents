@@ -867,15 +867,9 @@ async def delete_skill(request: Request) -> JSONResponse:
     if mode not in ("local", "repo"):
         return JSONResponse({"error": "mode must be 'local' or 'repo'"}, status_code=400)
 
-    try:
-        provider = await asyncio.to_thread(_get_provider, tenant_id)
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-    config_id = provider.config_id
-
     if mode == "local":
-        skill_dir = await asyncio.to_thread(_find_tenant_skill_dir, skill_name, tenant_id, config_id)
+        # 로컬 전용 삭제는 Git 연동 여부와 무관하게 동작해야 한다 (git 미연동 테넌트도 로컬 스킬은 있음).
+        skill_dir = await asyncio.to_thread(_find_tenant_skill_dir, skill_name, tenant_id, "")
         if skill_dir is None:
             return JSONResponse(
                 {"error": f"skill '{skill_name}' not found in tenant '{tenant_id}'"}, status_code=404
@@ -887,6 +881,13 @@ async def delete_skill(request: Request) -> JSONResponse:
         return JSONResponse({"deleted": True, "mode": "local", "skill_name": skill_name})
 
     # mode == "repo": Git provider로 원격 레포 삭제 후 로컬도 정리
+    try:
+        provider = await asyncio.to_thread(_get_provider, tenant_id)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    config_id = provider.config_id
+
     try:
         await asyncio.to_thread(provider.delete_repo, provider.username, skill_name)
     except Exception as e:
