@@ -1060,7 +1060,6 @@ def _write_validation_receipt(target: Path, result: dict) -> None:
         receipt.write_text(_json.dumps({
             "passed": True,
             "definition_sha256": _definition_digest(target),
-            "engine_validated": bool(result.get("engine_validated")),
             "iterations": result.get("iterations", 0),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
     elif receipt.exists():
@@ -1089,12 +1088,6 @@ def _validated_definition_defects(target: Path) -> list:
             "type": "validation_required",
             "detail": "validate_process_definition 검증 통과 기록이 없습니다.",
         }]
-    if receipt.get("engine_validated") is not True:
-        return [{
-            "severity": "critical",
-            "type": "engine_validation_required",
-            "detail": "실제 실행엔진 검증 통과 기록이 없습니다.",
-        }]
     if receipt.get("definition_sha256") != _definition_digest(target):
         return [{
             "severity": "critical",
@@ -1102,114 +1095,6 @@ def _validated_definition_defects(target: Path) -> list:
             "detail": "검증 후 process-definition.json 이 변경되었습니다. 다시 검증해야 합니다.",
         }]
     return []
-
-
-def _run_engine_process_validation(target: Path, pd: dict, *, include_definition: bool = False) -> dict:
-    """Validate a temporary definition through the real completion engine.
-
-    The generated process is not published. A temporary ``proc_def`` row is
-    created only so the existing /initiate and /complete production path can
-    load it; validation instances and the temporary definition are removed
-    before this function returns.
-    """
-    import json as _json
-    import uuid as _uuid
-
-    engine_url = os.getenv("COMPLETION_ENGINE_URL", "").strip()
-    if not engine_url:
-        return {
-            "passed": False,
-            "engine_validated": False,
-            "remaining_defects": [{
-                "severity": "critical",
-                "type": "engine_unconfigured",
-                "detail": "COMPLETION_ENGINE_URL 이 없어 실행엔진 검증을 수행할 수 없습니다.",
-            }],
-        }
-
-    _ensure_skill_scripts_on_path()
-    temp_id = f"validation_{_uuid.uuid4().hex}"
-    tenant_id = _current_tenant_id.get() or "localhost"
-    sb = None
-    try:
-        from save_to_supabase import flatten as _flatten, get_client as _get_client, _save_proc_def  # type: ignore
-        from validate_process import validate as _validate  # type: ignore
-
-        flat = _flatten(pd)
-        sb = _get_client()
-        _save_proc_def(
-            sb,
-            proc_def_id=temp_id,
-            name=f"[검증용] {pd.get('processDefinitionName') or '생성 프로세스'}",
-            definition=flat,
-            tenant_id=tenant_id,
-        )
-        forms = []
-        form_dir = target.parent / "forms"
-        activity_form_ids = {}
-        for element in pd.get("elements") or []:
-            if not isinstance(element, dict) or element.get("elementType") != "Activity":
-                continue
-            tool_name = str(element.get("tool") or "")
-            if tool_name.startswith("formHandler:"):
-                activity_form_ids[_to_snake(str(element.get("id") or ""))] = tool_name.split(":", 1)[1]
-        if form_dir.is_dir():
-            for fp in sorted(list(form_dir.glob("*.form")) + list(form_dir.glob("*.html"))):
-                activity_id = _to_snake(fp.stem)
-                forms.append({
-                    "activity_id": activity_id,
-                    # 게이트웨이 conditionData 와 활동 tool 이 실제 참조하는 동일한 ID를
-                    # 사용해야 분기 검증이 운영 실행과 같은 데이터를 읽는다.
-                    "form_id": activity_form_ids.get(activity_id, activity_id),
-                    "html": fp.read_text(encoding="utf-8"),
-                })
-        report = _validate(
-            sb=sb,
-            tenant_id=tenant_id,
-            proc_def_id=temp_id,
-            process_name=pd.get("processDefinitionName") or "생성 프로세스",
-            definition=flat,
-            forms=forms,
-            actor_email=_current_user_email.get() or None,
-            report_path=str(target.parent / "validation-report.md"),
-        )
-        if report.get("passed") is True and isinstance(report.get("final_definition"), dict):
-            normalized, _ = _normalize_to_processgpt_schema(report["final_definition"])
-            _atomic_write_json(target, normalized)
-            pd = normalized
-        result = {
-            "passed": report.get("passed") is True,
-            "engine_validated": report.get("passed") is True and not report.get("skipped"),
-            "iterations": report.get("iterations", 0),
-            "repaired": bool(report.get("repaired")),
-            "remaining_defects": report.get("remaining_defects") or ([{
-                "severity": "critical",
-                "type": "engine_validation_skipped",
-                "detail": report.get("skip_reason") or "실행엔진 검증이 완료되지 않았습니다.",
-            }] if report.get("skipped") else []),
-        }
-        if include_definition:
-            result["_validated_definition"] = pd
-        return result
-    except Exception as exc:
-        return {
-            "passed": False,
-            "engine_validated": False,
-            "remaining_defects": [{
-                "severity": "critical",
-                "type": "engine_validation_error",
-                "detail": str(exc),
-            }],
-        }
-    finally:
-        if sb is not None:
-            for table in ("form_def", "proc_def"):
-                try:
-                    sb.table(table).delete().eq("tenant_id", tenant_id).eq(
-                        "proc_def_id" if table == "form_def" else "id", temp_id
-                    ).execute()
-                except Exception:
-                    pass
 
 
 @tool
@@ -1357,13 +1242,7 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
         "iterations": iterations,
         "repaired": repaired,
         "remaining_defects": defects,
-        "engine_validated": False,
     }
-    if result["passed"]:
-        engine_result = _run_engine_process_validation(target, pd)
-        result.update(engine_result)
-        result["iterations"] = iterations + int(engine_result.get("iterations") or 0)
-        result["repaired"] = repaired or bool(engine_result.get("repaired"))
     _write_validation_receipt(target, result)
     return _json.dumps(result, ensure_ascii=False)
 
@@ -2409,40 +2288,7 @@ def complete_process_generation() -> str:
             final_validation_errors.append({"dir": d.name, "defects": final_defects})
             continue
 
-        validation_target = d / ".final-process-validation.json"
-        _atomic_write_json(validation_target, canonical)
-        try:
-            engine_result = _run_engine_process_validation(
-                validation_target,
-                canonical,
-                include_definition=True,
-            )
-        finally:
-            if validation_target.exists():
-                validation_target.unlink()
-        validated_canonical = engine_result.pop("_validated_definition", canonical)
-        if engine_result.get("passed") is not True or engine_result.get("engine_validated") is not True:
-            final_validation_errors.append({
-                "dir": d.name,
-                "defects": engine_result.get("remaining_defects") or [{
-                    "severity": "critical",
-                    "type": "final_engine_validation_failed",
-                    "detail": "최종 통합본이 실제 실행엔진 검증을 통과하지 못했습니다.",
-                }],
-            })
-            continue
-
         final_flat = flat
-        if engine_result.get("repaired"):
-            _ensure_skill_scripts_on_path()
-            from save_to_supabase import flatten as _flatten  # type: ignore
-            final_flat = _flatten(validated_canonical)
-            for key in (
-                "processDefinitionId", "processDefinitionName", "description", "isHorizontal",
-                "data", "participants", "subProcesses", "skills", "dmn_decisions", "dmn_rules",
-            ):
-                if key in flat and key not in final_flat:
-                    final_flat[key] = flat[key]
         _, persisted_defects = _static_process_defects(final_flat)
         if persisted_defects:
             final_validation_errors.append({"dir": d.name, "defects": persisted_defects})
@@ -2450,14 +2296,12 @@ def complete_process_generation() -> str:
 
         definition_file = d / "process-definition.json"
         _atomic_write_json(definition_file, final_flat)
-        _write_validation_receipt(definition_file, engine_result)
+        _write_validation_receipt(definition_file, {"passed": True, "iterations": 0})
         processes.append({
             "dir": d.name,
             "processDefinitionId": final_flat.get("processDefinitionId", ""),
             "processDefinitionName": final_flat.get("processDefinitionName", ""),
             "definitionSha256": _definition_digest(definition_file),
-            "engineValidated": True,
-            "validationIterations": engine_result.get("iterations", 0),
         })
 
     if final_validation_errors:

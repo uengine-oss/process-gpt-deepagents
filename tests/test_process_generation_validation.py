@@ -238,30 +238,14 @@ def test_completion_requires_exact_validated_definition_and_ignores_stale_dirs(t
     assert before_validation.startswith("ERROR:")
     assert "validation_required" in before_validation
 
-    def engine_pass(target, definition, *, include_definition=False):
-        result = {
-            "passed": True,
-            "engine_validated": True,
-            "iterations": 1,
-            "repaired": False,
-            "remaining_defects": [],
-        }
-        if include_definition:
-            result["_validated_definition"] = definition
-        return result
-
-    monkeypatch.setattr(tools, "_run_engine_process_validation", engine_pass)
     validated = json.loads(tools.validate_process_definition.invoke({"path": str(definition_file)}))
     assert validated["passed"] is True
-    assert validated["engine_validated"] is True
 
     completed = json.loads(tools.complete_process_generation.invoke({}))
     assert completed["count"] == 1
     assert completed["processes"][0]["dir"] == active.name
-    assert completed["processes"][0]["engineValidated"] is True
     final_bytes = definition_file.read_bytes()
     receipt = json.loads((active / ".process-validation.json").read_text(encoding="utf-8"))
-    assert receipt["engine_validated"] is True
     assert receipt["definition_sha256"] == hashlib.sha256(final_bytes).hexdigest()
     assert completed["processes"][0]["definitionSha256"] == receipt["definition_sha256"]
     assert json.loads((stale / "process-definition.json").read_text(encoding="utf-8")) == {"elements": []}

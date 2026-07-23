@@ -470,54 +470,6 @@ async def _enqueue_status(
     await event_queue.enqueue_event(evt)
 
 
-_POSTPROCESS_MARKER = "process-definition-postprocess-result"
-
-
-def _extract_postprocess_result(text: Any) -> dict | None:
-    """run_postprocess.py 가 stdout 으로 낸 최종 요약 JSON(process-definition-postprocess-result)을
-    도구 출력/최종 텍스트에서 추출한다. 못 찾으면 None."""
-    if not isinstance(text, str):
-        try:
-            text = str(text)
-        except Exception:
-            return None
-    if _POSTPROCESS_MARKER not in text:
-        return None
-
-    # 1) 보통 마지막 stdout 한 줄이 요약 JSON (앞 줄은 로그) — 뒤에서부터 줄 단위 파싱
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if not line or _POSTPROCESS_MARKER not in line:
-            continue
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
-        if isinstance(obj, dict) and obj.get("type") == _POSTPROCESS_MARKER:
-            return obj
-
-    # 2) fallback: 마커를 포함하는 최외곽 중괄호 블록을 균형 맞춰 추출
-    idx = text.find(_POSTPROCESS_MARKER)
-    start = text.rfind("{", 0, idx)
-    if start != -1:
-        depth = 0
-        for i in range(start, len(text)):
-            c = text[i]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        obj = json.loads(text[start : i + 1])
-                        if isinstance(obj, dict) and obj.get("type") == _POSTPROCESS_MARKER:
-                            return obj
-                    except Exception:
-                        pass
-                    break
-    return None
-
-
 def _iter_json_objects(text: str):
     """문자열에서 균형 잡힌 최상위 {...} 블록을 찾아 파싱되는 dict 를 순서대로 yield."""
     n = len(text)
@@ -1325,8 +1277,8 @@ class DeepAgentExecutor(AgentExecutor):
                                         ]
                                         await streamer.send_json({"type": "plan_todos", "todos": _done_todos})
 
-                                    # run_postprocess 가 낸 저장/검증 요약(JSON)을 도구 출력에서 잡아
-                                    # 프론트에 구조화 이벤트로 전달 → 생성 결과 카드(프로세스/스킬/에이전트) 렌더.
+                                    # 도구 출력의 출력계약(JSON)을 잡아 프론트에 구조화 이벤트로
+                                    # 전달 → 생성 결과 카드(프로세스/스킬/에이전트) 렌더. 저장은 하지 않는다.
                                     if not process_result_sent:
                                         _pr = _detect_process_result(result_content)
                                         if _pr is not None:

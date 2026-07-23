@@ -9,10 +9,9 @@ tenant_id 당 하나의 컨테이너를 재사용하며, atexit 훅으로 프로
     개별 bind-mount (read-only, optional) — skills_host 전체를 통째로 마운트하면
     다른 테넌트의 스킬 디렉토리까지 노출되므로 디렉토리 단위로 화이트리스트한다.
 
-환경변수는 호스트 전체를 상속하지 않고, 스킬 후처리(저장/검증)에 필요한
-**화이트리스트(_FORWARD_ENV_KEYS)만** 컨테이너로 전달한다. 또한 요청이 들어온
-tenant 로 `TENANT_ID` 를 자동 세팅하고, 로컬(127.0.0.1/localhost) Supabase·완료엔진
-주소는 컨테이너에서 닿도록 host.docker.internal 로 치환한다.
+환경변수는 호스트 전체를 상속하지 않고 **화이트리스트(_FORWARD_ENV_KEYS)만** 컨테이너로
+전달하며, 여기에 Supabase 자격증명은 포함하지 않는다(샌드박스에서 DB 직접 쓰기 차단).
+또한 요청이 들어온 tenant 로 `TENANT_ID` 를 자동 세팅한다.
 """
 
 from __future__ import annotations
@@ -43,40 +42,24 @@ _CONTAINER_WORKSPACE = "/workspace"
 _MAX_OUTPUT_BYTES = 100_000
 
 # 컨테이너로 전달할 호스트 env 화이트리스트.
-# bpmn-process-generation-skill 후처리(scripts/run_postprocess.py)의 저장/검증에 필요.
+#
+# ⚠️ Supabase 자격증명(SUPABASE_URL/SERVICE_ROLE_KEY 등)은 **의도적으로 전달하지 않는다.**
+# 샌드박스에는 에이전트가 임의 셸을 실행할 수 있으므로, 여기에 service_role 키를 넘기면
+# "스킬·에이전트는 DB 에 직접 쓰지 않는다" 는 원칙이 프롬프트 금지문구로만 지켜지게 된다.
+# 프로세스/스킬/에이전트의 임시저장·최종저장은 모두 프론트가 사용자 자격증명으로 수행한다.
+# 실행엔진 검증도 프론트의 /validate-and-improve 가 담당하므로 COMPLETION_ENGINE_URL 도 넘기지 않는다.
 _FORWARD_ENV_KEYS = (
-    # Supabase (core/db.py 와 동일 변수명)
-    "SUPABASE_URL", "SUPABASE_KEY_URL", "SERVICE_ROLE_KEY", "SUPABASE_KEY", "SUPABASE_ANON_KEY",
-    # LLM (core/model.py 와 동일 변수명) — 검증 자동교정용
+    # LLM (core/model.py 와 동일 변수명) — 샌드박스에서 도는 스킬들의 모델 호출용
     "LLM_MODEL", "LLM_PROXY_URL", "LLM_PROXY_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-    # 실행 검증 엔진 + 튜닝
-    "COMPLETION_ENGINE_URL",
-    "PDF2BPMN_VALIDATION_MAX_ITERS",
-    "PDF2BPMN_VALIDATION_ADVANCE_TIMEOUT",
-    "PDF2BPMN_VALIDATION_CLEANUP",
 )
 
-_HOST_GATEWAY = "host.docker.internal"
-# 컨테이너 내부에서 호스트 로컬 서비스에 닿게 하려면 loopback 주소를 치환해야 한다.
-_LOOPBACK_URL_KEYS = ("SUPABASE_URL", "SUPABASE_KEY_URL", "COMPLETION_ENGINE_URL")
-
-
-def _rewrite_loopback(url: str) -> str:
-    if not url:
-        return url
-    return url.replace("127.0.0.1", _HOST_GATEWAY).replace("localhost", _HOST_GATEWAY)
-
-
 def _build_container_env(tenant_id: str) -> dict[str, str]:
-    """화이트리스트 host env + 요청 tenant 자동주입(TENANT_ID) + loopback 치환."""
+    """화이트리스트 host env + 요청 tenant 자동주입(TENANT_ID)."""
     env: dict[str, str] = {}
     for k in _FORWARD_ENV_KEYS:
         v = os.environ.get(k)
         if v:
             env[k] = v
-    for url_key in _LOOPBACK_URL_KEYS:
-        if env.get(url_key):
-            env[url_key] = _rewrite_loopback(env[url_key])
     # 요청이 들어온 tenant 로 자동 세팅 (스킬 scripts 가 --tenant 없이 TENANT_ID 로 읽는다)
     env["TENANT_ID"] = tenant_id or ""
     return env
@@ -129,9 +112,6 @@ class DockerSandboxBackend(BaseSandbox):
         self._container: docker.models.containers.Container | None = None
         self._lock = threading.Lock()
         self._client: docker.DockerClient | None = None
-        # bpmn-process-generation-skill 저장(run_postprocess)에 필요한 supabase 패키지를
-        # 샌드박스(python:3.13-slim)에 1회 보장 설치했는지 플래그(프로세스 단위).
-        self._deps_ensured = False
 
     # ------------------------------------------------------------------
     # 컨테이너 생명주기
@@ -253,25 +233,8 @@ class DockerSandboxBackend(BaseSandbox):
     def id(self) -> str:
         return f"docker-{self._tenant_id or 'shared'}"
 
-    def _ensure_deps(self, container: "docker.models.containers.Container") -> None:
-        """저장 스크립트(run_postprocess)가 쓰는 supabase/httpx 를 샌드박스에 1회 보장 설치.
-
-        기본 이미지(python:3.13-slim)에는 supabase 가 없어, 모델이 pip install 을 빠뜨리면
-        저장이 'supabase 패키지 없음' 으로 실패한다. import 가드로 이미 있으면 즉시 통과(빠름),
-        없으면 설치한다(최초 1회 ~10여초). 프로세스 단위로 1회만 시도한다.
-        """
-        if self._deps_ensured:
-            return
-        try:
-            check = "python -c 'import supabase' 2>/dev/null || pip install -q supabase httpx"
-            container.exec_run(["bash", "-c", check], demux=False)
-        except Exception:
-            logger.warning("sandbox 의존성(supabase) 보장 설치 실패 — 저장 시 재시도 필요", exc_info=True)
-        self._deps_ensured = True
-
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         container = self._ensure_container()
-        self._ensure_deps(container)
         _timeout = timeout or 180
 
         def _exec(cmd: str) -> tuple[int, str]:
