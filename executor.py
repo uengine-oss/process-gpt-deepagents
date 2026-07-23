@@ -1451,7 +1451,8 @@ class DeepAgentExecutor(AgentExecutor):
             # for a standalone skill generation and never post-processed.
             if not process_json_written and chat_room_id:
                 try:
-                    from core.skills.tools import process_work_dirs as _process_work_dirs
+                    from core.skills.tools import process_work_dirs as _process_work_dirs, _conv_slug
+                    from core.agents.agent import _BASE_DIR as _ABASE
                     room_dir = _ABASE / "workspace" / ".bpmn" / _conv_slug(chat_room_id)
                     process_json_written = any(
                         (directory / "process-definition.json").is_file()
@@ -1467,7 +1468,9 @@ class DeepAgentExecutor(AgentExecutor):
                         validate_process_definition as _vpd,
                         _current_conversation_id as _ccid,
                         process_work_dirs as _process_work_dirs,
+                        _conv_slug,
                     )
+                    from core.agents.agent import _BASE_DIR as _ABASE
 
                     _ccid.set(chat_room_id or "")
                     _room_dir = _ABASE / "workspace" / ".bpmn" / _conv_slug(chat_room_id or "")

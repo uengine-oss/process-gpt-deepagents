@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "python:3.13-slim")
 _CONTAINER_WORKSPACE = "/workspace"
 _MAX_OUTPUT_BYTES = 100_000
+_HOST_GATEWAY = "host.docker.internal"
 
 # 컨테이너로 전달할 호스트 env 화이트리스트.
 #
