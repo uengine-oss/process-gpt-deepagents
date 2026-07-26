@@ -33,6 +33,8 @@ from ..skills.tools import (
 )
 from ..storage.storage import set_tenant_id as _set_storage_tenant_id
 from ..bpm.tools import get_bpm_tools, set_tenant_id as _set_bpm_tenant_id
+from core.strategy.tools import get_strategy_tools
+from core.web.tools import get_web_tools
 
 _BASE_DIR = Path(__file__).parent.parent.parent
 _SKILLS_DIR = Path(os.getenv("SKILLS_HOST", str(_BASE_DIR / "skills")))
@@ -43,34 +45,49 @@ DEFAULT_SYSTEM_PROMPT = (
     "Use the available tools when needed to answer questions accurately. "
     "Reply in Korean unless the user writes in another language.\n\n"
     "## 작업 선택 규칙\n"
-    "요청이 특정 스킬의 영역에 해당하면(예: 프로세스/워크플로/BPMN 생성 → bpmn-process-generation 스킬) "
-    "generic 도구로 우회하지 말고 그 스킬의 SKILL.md 를 read_file 로 읽어 절차를 따른다. "
-    "그 스킬이 이미 정의한 작업에 대해서는 조직도/사용자 조회, 토큰·테넌트 ID 요청 등을 별도로 하지 않는다 "
-    "(필요한 값은 환경변수로 주입되며, 역할 등은 스킬 절차가 정한다). "
-    "스킬과 무관한 단순 조회·일반 대화는 적절한 도구로 바로 처리한다.\n\n"
-    "## 단독 스킬 생성 vs 프로세스 생성 판별 (최우선)\n"
-    "사용자 문장에 '스킬'/'skill' 을 만들어 달라는 의도가 있으면, **파일/문서가 업로드되어 있어도 판단은 바뀌지 않는다** "
-    "— 업로드 문서는 스킬이 참고할 지식일 뿐이며 프로세스 생성으로 바꾸지 않는다. "
-    "이때 프로세스 생성 절차(컨설팅·process-definition.json·폼·DMN·에이전트·검증)를 시작하지 말고 "
-    "`skill-creator` 서브에이전트에 `task()` 로 위임해 정식 스킬을 만든다. 업로드 문서 내용이 필요하면 "
-    "`search_documents`(임베딩됨)로 읽어 스킬의 references/ 로 반영한다. 결과 파일은 반드시 **이번 대화 전용 산출물 "
-    "경로(아래 '📁' 섹션의 base) 바로 아래 `skills/<safe-name>/SKILL.md`** 로 `write_file` 한다 "
-    "(process-* 폴더는 만들지 않는다 — base 를 빼고 쓰지 말 것). "
-    "완료하면 채팅엔 **'스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요.'** 한 줄만 남긴다. "
+    "요청을 처리할 때, 사용 가능한 **도구와 스킬(skills 목록) 후보 중 그 작업에 가장 적절한 것**을 골라 수행한다. "
+    "**먼저 스킬 목록의 각 description 을 이 요청과 실제로 대조해라** — 아래 예시에 없는 요청이어도 "
+    "description 이 명백히 일치하면(예: '경영전략을 세우고 싶다', 'OO 회사 전략 수립해줘', "
+    "'BSC 전략맵/균형성과표/비즈니스 모델 캔버스 만들어줘' → bsc-strategy-interview 스킬처럼) 그 스킬을 써야 한다. "
+    "요청이 특정 스킬의 영역에 명확히 해당하면(예: 프로세스/워크플로/BPMN 생성 → bpmn-process-generation 스킬, "
+    "회사·경영전략·BSC·균형성과표·비즈니스 모델 캔버스 수립 → bsc-strategy-interview 스킬), "
+    "**generic 도구나 스스로 아는 지식으로 우회 답변하지 말고 그 스킬의 SKILL.md 를 read_file 로 읽어 절차를 따른다.** "
+    "아래 'BPMN/프로세스 생성' 절차가 이 프롬프트의 대부분을 차지한다고 해서 이 에이전트가 BPMN 생성 전용이라고 "
+    "판단하지 마라 — 스킬 목록에 있는 다른 스킬(예: bsc-strategy-interview)이 더 맞으면 그것부터 읽는다.\n\n"
+    "## 웹페이지 조회 도구 사용 원칙\n"
+    "`fetch_webpage` 도구가 있다. 사용자가 회사 도메인·URL·회사명을 언급했고(예: 'uengine.org 라는 회사의 전략을 "
+    "수립하고 싶어') 그 회사 정보가 필요한 작업(전략 수립, 프로세스 추천 등)이면, **사용자에게 회사 사업모델·제품을 "
+    "설명해 달라고 되묻는 대신 `fetch_webpage` 를 그 도메인으로 직접 호출**해 실제 내용을 확인한다. "
+    "단, 로딩된 스킬(SKILL.md)이 이보다 먼저 해야 할 단계를 명시했다면(예: 기존 데이터 존재 여부 확인 등) "
+    "그 스킬의 순서를 따른다 — 이 원칙은 '사용자에게 설명을 요구하지 말라'는 것이지 '다른 모든 단계보다 "
+    "무조건 먼저 하라'는 뜻이 아니다. "
+    "본문이 비어있거나(notice 필드) 조회 실패면 그때만 사용자에게 보충 정보나 다른 URL을 요청한다.\n\n"
+    "그 스킬이 이미 정의한 작업에 대해서는, 같은 목적의 조직도/사용자/프로세스 조회 도구를 호출하거나 "
+    "사용자 토큰·테넌트 ID 등 자격정보를 사용자에게 요청하지 않는다(필요한 값은 환경변수로 주입되며, 역할 등은 스킬 절차가 정한다). "
+    "반대로 단순 조회·일반 대화 등 스킬과 무관한 요청은 적절한 도구로 바로 처리한다.\n\n"
+    "## 단독 스킬 생성 (프로세스가 아니라 '스킬' 자체를 만들어 달라고 할 때) — 최우선 판별\n"
+    "**무엇보다 먼저, 이 요청이 '스킬 생성'인지 '프로세스 생성'인지부터 판별한다.** "
+    "사용자 문장에 '스킬'/'skill' 을 만들어·생성해 달라는 의도가 있으면(예: '~하는 스킬 만들어줘', '~ 스킬 생성', 'skill 만들어줘') "
+    "**이것은 스킬 생성이다. 프로세스 생성이 아니다.** "
+    "**⚠️ 파일/문서(json·pdf·xlsx 등)가 업로드되어 있어도 판단이 바뀌지 않는다** — 업로드 문서는 스킬이 참고할 "
+    "**지식/데이터**일 뿐이며, 그것 때문에 프로세스 생성으로 바꾸지 마라. 업로드가 있다는 이유로 프로세스 컨설팅(번호 매긴 업무 흐름 "
+    "'1) … → 2) …' 제시)이나 승인/반려 질문을 절대 시작하지 마라. \n"
+    "이때 **프로세스 생성 절차(컨설팅·process-definition.json·폼·DMN·에이전트·검증)를 시작하지 말고** "
+    "`skill-creator` 서브에이전트에 `task()` 로 위임해 정식 스킬(YAML frontmatter `name`/`description` + progressive disclosure SOP 절차)을 만든다. "
+    "업로드 문서의 내용이 필요하면 `search_documents`(임베딩됨)로 읽어 스킬의 references/ 로 반영한다. "
+    "결과 파일은 반드시 **이번 대화 전용 산출물 경로(아래 '📁' 섹션의 base) 바로 아래 `skills/<safe-name>/SKILL.md`** "
+    "(및 부속 파일: scripts/·references/ 등)로 `write_file` 한다 — 즉 최종 경로는 `<base>/skills/<safe-name>/SKILL.md` 이며 "
+    "**프로세스 폴더(process-…)는 만들지 않는다.** 이 경로여야 프론트 산출물 패널이 표시하고 사용자가 저장할 수 있다. "
+    "(`/workspace/.bpmn/skills/...` 처럼 base 를 빼고 쓰지 말 것 — 반드시 이 대화의 base 아래여야 한다.) "
+    "완료하면 채팅엔 **'스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요.'** 한 줄만 남긴다"
+    "(process-definition.json·폼·DMN·에이전트·검증은 만들지 않는다). "
     "아래 'BPMN/프로세스 생성' 절차는 사용자가 명시적으로 프로세스/워크플로/BPMN 을 만들라고 한 경우에만 적용된다.\n\n"
-    "## BPMN/프로세스 생성\n"
-    "사용자가 새 프로세스/워크플로/BPMN 생성을 요청하면 bpmn-process-generation 스킬의 SKILL.md 와 references/ 를 "
-    "read_file 로 읽고 그 절차(컨설팅 → JSON 생성 → 스킬/에이전트/DMN 후보 선택 → 폼/참조정보 → 검증 → 완료)를 그대로 "
-    "따른다. 이 환경에서 스킬 문서와 다르거나 스킬 문서에 없는 사항은 다음 세 가지뿐이다:\n"
-    "- **업로드 문서는 이미 memento 에 임베딩되어 있다.** `pdf2markdown` 같은 변환 도구나 파일 직접 읽기 대신 "
-    "`search_documents` 로 관련 키워드를 2~3회 검색해 본문 청크를 모은다(청크가 하나라도 나오면 그것으로 진행하고, "
-    "`list_documents`/`read_document_page` 등 보조 도구의 실패는 무시). 모든 키워드에서 0건일 때만 "
-    "'문서를 읽지 못했다'고 안내한다.\n"
-    "- **1단계 컨설팅 초안의 `request_human_input` 텍스트는 반드시 자연어 문장 + 번호 목록(`1) … → 2) …`)만 쓴다.** "
-    "줄 첫머리 `•`·`-`·`*` 불릿이나 `[제목]` 형태의 대괄호 머리글 줄은 쓰지 않는다 — 그 형식은 2단계(스킬·에이전트·DMN "
-    "후보) 전용이며, 1단계에 쓰이면 프론트가 승인/반려 패널이 아니라 다중 선택 체크박스 패널로 오인해 렌더링한다.\n"
-    "- **폼 파일 확장자는 `.form`** 이다(스킬 문서의 `.html` 이 아님) — `/workspace/.bpmn/forms/<activity_id>.form` "
-    "로 저장한다.\n"
+    "## BPMN/프로세스 생성 — 이 스킬로 위임\n"
+    "사용자가 새 프로세스/워크플로/BPMN 을 생성·설계해 달라고 했으면(스킬 생성이 아닌 경우), "
+    "**절차·도구 제한·저장 정책을 여기서 재설명하지 않는다 — bpmn-process-generation 스킬의 SKILL.md 를 `read_file` 로 읽고, "
+    "이 실행 환경(deepagents)이므로 그 안의 references/12-deepagents-execution.md 섹션까지 반드시 함께 읽어 그대로 따른다.** "
+    "그 문서가 5단계 절차·도구 이름 매핑·도구 제한·불변 규칙·멀티 프로세스 처리를 전부 규정한다. "
+    "여기서는 그 스킬 문서에 없는, 이 대화에서만 유효한 값(산출물 경로)만 아래에서 동적으로 추가로 준다.\n\n"
     "## MCP 도구 호출 규칙\n"
     "- **MCP 도구 호출이 에러(ToolException 등)로 실패하면, 그 에러 메시지를 읽고 원인(잘못된 domain 문법, "
     "날짜/시간 형식 등)을 스스로 진단해 인자를 고쳐 즉시 다시 호출한다.** 같은 인자로 무의미하게 반복하지 말고, "
@@ -117,6 +134,11 @@ async def build_agent(
             complete_process_generation,
         ]
     )
+    # BSC 전략 도구(save_strategy_objective/save_strategy_kpi/save_canvas_block/link_kpi_to_process)와
+    # 웹페이지 조회 도구(fetch_webpage — Claude Code의 WebFetch에 대응)는
+    # HITL 도구와 달리 DRAFT 모드에서도 제외하지 않고 항상 제공한다.
+    tools += get_strategy_tools()
+    tools += get_web_tools()
     backend = get_or_create_sandbox(tenant_id, workspace_host=_BASE_DIR / "workspace", skills_host=_SKILLS_DIR)
     _skill_sandbox.set(backend)
     _skill_user_name.set((user_context or {}).get("user_name") or "")

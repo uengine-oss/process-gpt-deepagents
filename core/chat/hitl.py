@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import StructuredTool
 from langgraph.types import interrupt
@@ -27,7 +27,22 @@ class AskUserArgs(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     question: str = Field(default="", description="사용자에게 물어볼 질문 또는 요청.")
-    context: str = Field(default="", description="결정을 돕기 위한 배경 설명 또는 선택지 목록(선택).")
+    context: str = Field(default="", description="결정을 돕기 위한 배경 설명(선택). 구조화된 선택지는 context에 텍스트로 나열하지 말고 options 필드를 채워라.")
+    options: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description=(
+            "질문에 정해진 선택지가 있을 때만 채운다(예: 진입 모드 3가지, 업종 4가지, "
+            "구축할 프로세스 후보 등). 각 항목은 {\"label\": <선택지 이름>, "
+            "\"description\": <1줄 설명, 선택>} 형태. 이 필드를 채우면 프런트엔드가 실제 "
+            "라디오/체크박스 선택 UI를 그린다 — context 안에 번호나 불릿으로 선택지를 "
+            "나열하는 것은 UI에 반영되지 않으니 하지 마라. 자유 응답만 필요한 질문(정성적 "
+            "설명 요청 등)이면 비워둔다."
+        ),
+    )
+    multi_select: bool = Field(
+        default=False,
+        description="options를 여러 개 동시에 고를 수 있게 할지 여부. 상호 배타적 선택(진입 모드 등)이면 false, 복수 공존 가능(BMC 채널·자원 등)이면 true.",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -55,8 +70,16 @@ class AskUserArgs(BaseModel):
         return self
 
 
-def _ask_user_impl(question: str, context: str = "") -> str:
-    payload = {"question": question, "context": context}
+def _ask_user_impl(
+    question: str,
+    context: str = "",
+    options: Optional[List[Dict[str, str]]] = None,
+    multi_select: bool = False,
+) -> str:
+    payload: Dict[str, Any] = {"question": question, "context": context}
+    if options:
+        payload["options"] = options
+        payload["multi_select"] = bool(multi_select)
     response = interrupt(payload)
     if isinstance(response, dict):
         return response.get("answer", str(response))
@@ -72,7 +95,8 @@ ask_user = StructuredTool.from_function(
         "사람 개입(HITL)이 필요할 때 호출하는 도구. "
         "명시적 인간 승인, 민감 정보 확인, 모호한 요청 명확화, 선택지 제시 등 "
         "모든 사용자 입력이 필요한 상황에서 사용한다. "
-        "context에 배경 설명이나 선택지를 포함할 수 있다. "
+        "정해진 선택지 중 고르게 하는 질문이면 반드시 options 파라미터를 채워라 — "
+        "context에 선택지를 텍스트로 나열해도 화면에는 선택 UI로 반영되지 않는다. "
         "내부에서 LangGraph interrupt()를 발생시켜 그래프 실행을 일시 중단한다. "
         "단, GitHub 토큰·GitHub 인증 정보는 시스템이 자동으로 관리하므로 "
         "이 도구로 요청하지 마세요."

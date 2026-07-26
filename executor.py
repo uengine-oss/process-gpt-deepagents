@@ -32,6 +32,11 @@ from core.storage.checkpointer import (
 )
 from core.chat.hitl import extract_interrupt_payload, is_duplicate_hitl_request
 from core.chat.callbacks import ToolTrackingCallback
+from core.chat.inflight_registry import (
+    clear_inflight_if_current,
+    set_inflight,
+    supersede_previous_turn,
+)
 from core.agents.input_builder import (
     build_graph_inputs,
     build_user_message,
@@ -54,10 +59,12 @@ from core.chat.chat_room import (
 from core.chat.stream_registry import MulticastStreamer, mark_done, start_run
 from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
+from core.skills.local_system_skills import seed_local_system_skills
 from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
+from core.deterministic import try_deterministic_execution
 # 우리 기능(프로세스 생성 HITL 캡처/이름도출)에서 사용하는 contextvar — incoming 에는 없으나 유지.
 from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
@@ -670,6 +677,11 @@ class DeepAgentExecutor(AgentExecutor):
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> dict | None:
         try:
+            await asyncio.to_thread(seed_local_system_skills)
+        except Exception:
+            logger.exception("local-system-skills: 시딩 실패, 번들 시스템 스킬 없이 계속 진행")
+
+        try:
             await prefetch_git_skills()
         except Exception:
             logger.exception("git-skills: prefetch 실패, Git 스킬 없이 계속 진행")
@@ -684,6 +696,8 @@ class DeepAgentExecutor(AgentExecutor):
         tenant_id = str(row.get("tenant_id") or extras.get("tenant_id") or "").strip()
         root_proc_inst_id = str(row.get("root_proc_inst_id") or row.get("proc_inst_id") or "").strip()
         current_workitem_id = str(row.get("id") or "").strip()
+        # todolist 행은 proc_def_id 를 실어 나른다(없으면 안전하게 "" 로 폴백).
+        current_proc_def_id = str(row.get("proc_def_id") or "").strip()
         instance_id = root_proc_inst_id or current_workitem_id
         activity_id = str(row.get("activity_id") or "").strip()
         user_jwt = extras.get("user_jwt")
@@ -692,7 +706,7 @@ class DeepAgentExecutor(AgentExecutor):
 
         _skill_tenant_id.set(tenant_id)
         _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())
-        set_process_context(root_proc_inst_id, current_workitem_id)
+        set_process_context(root_proc_inst_id, current_workitem_id, current_proc_def_id)
         agents = extras.get("agents", [])
         streamer = extras.get("streamer")
         form_id = extras.get("form_id")
@@ -722,6 +736,17 @@ class DeepAgentExecutor(AgentExecutor):
         chat_room_id = resolve_chat_room_id(extras, row if isinstance(row, dict) else {})
         # 산출물을 방별 디렉터리(.bpmn/<room>/)로 격리 — 경로 충돌/덮어쓰기 방지.
         _skill_conversation_id.set(chat_room_id or "")
+
+        if is_chat and chat_room_id:
+            # 같은 chat_room_id 에 아직 끝나지 않은 이전 turn이 있으면 취소하고 끝날 때까지
+            # 기다린다 — 두 graph.astream() 실행이 동시에 체크포인트를 쓰는 레이스를 막는다.
+            await supersede_previous_turn(chat_room_id)
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                set_inflight(chat_room_id, current_task, event_queue)
+                current_task.add_done_callback(
+                    lambda _t, _rid=chat_room_id, _task=current_task: clear_inflight_if_current(_rid, _task)
+                )
 
         # 재접속(attach) 지원: 이번 턴을 conversation_id(=chat_room_id) 기준 메모리 레지스트리에
         # 등록하고, streamer 를 프록시로 감싸 모든 토큰/이벤트를 (a) 원래 streamer (b) 누적 텍스트
@@ -844,6 +869,63 @@ class DeepAgentExecutor(AgentExecutor):
         )
 
         activity_name = row.get("activity_name", "Unknown")
+
+        # Worklist 활동에는 CrewAI와 동일한 mcp_python_code 저장소를 먼저 확인한다.
+        # 코드가 없을 때만 아래 DeepAgents 그래프(LLM 추론)를 구성한다.
+        if not is_chat:
+            deterministic = await try_deterministic_execution(row, tenant_mcp)
+            if deterministic is not None:
+                deterministic_job_id = str(uuid.uuid4())
+                is_undo = deterministic.mode == "deterministic-undo"
+                card_name = (
+                    "Undo(실행 취소) 후 재실행 결과"
+                    if is_undo
+                    else "결정론적 코드 실행 결과"
+                )
+                await _enqueue_status(
+                    event_queue,
+                    task_id=task_id,
+                    context_id=context_id,
+                    state=TaskState.TASK_STATE_WORKING,
+                    text=json.dumps(
+                        {
+                            "role": card_name,
+                            "name": card_name,
+                            "goal": (
+                                "고착화된 undo 코드로 이전 실행을 되돌린 뒤 새 입력으로 재실행합니다."
+                                if is_undo
+                                else "고착화된 코드로 LLM 추론 없이 재실행합니다."
+                            ),
+                            "agent_profile": "/images/chat-icon.png",
+                            "execution_mode": deterministic.mode,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    event_type="task_started",
+                    job_id=deterministic_job_id,
+                    crew_type="result",
+                )
+                await _enqueue_status(
+                    event_queue,
+                    task_id=task_id,
+                    context_id=context_id,
+                    state=TaskState.TASK_STATE_COMPLETED,
+                    text=deterministic.result_text,
+                    event_type="task_completed",
+                    job_id=deterministic_job_id,
+                    crew_type="result",
+                )
+                artifact_evt = new_text_artifact_update_event(
+                    task_id=task_id,
+                    context_id=context_id,
+                    name="assistant_response",
+                    text=deterministic.result_text,
+                    last_chunk=True,
+                )
+                ParseDict({"role": "assistant"}, artifact_evt.metadata)
+                await event_queue.enqueue_event(artifact_evt)
+                return None
+
         job_id = str(uuid.uuid4())
 
         await _enqueue_status(
@@ -1382,6 +1464,12 @@ class DeepAgentExecutor(AgentExecutor):
                 context_text = (
                     interrupt_payload.get("context", "") if isinstance(interrupt_payload, dict) else ""
                 )
+                options_payload = (
+                    interrupt_payload.get("options") if isinstance(interrupt_payload, dict) else None
+                )
+                multi_select_payload = bool(
+                    interrupt_payload.get("multi_select") if isinstance(interrupt_payload, dict) else False
+                )
                 pending_field = "human_response"
 
                 is_duplicate = is_duplicate_hitl_request(
@@ -1403,6 +1491,8 @@ class DeepAgentExecutor(AgentExecutor):
                             "type": "human_input_required",
                             "question": question,
                             "context": context_text,
+                            "options": options_payload or [],
+                            "multi_select": multi_select_payload,
                             "run_state": new_run_state,
                         },
                         ensure_ascii=False,
@@ -1422,6 +1512,8 @@ class DeepAgentExecutor(AgentExecutor):
                         {
                             "question": question,
                             "context": context_text,
+                            "options": options_payload or [],
+                            "multi_select": multi_select_payload,
                             "type": "text",
                             "run_state": new_run_state,
                         },

@@ -25,16 +25,35 @@ _current_root_proc_inst_id: contextvars.ContextVar[str] = contextvars.ContextVar
 _current_workitem_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "bpm_workitem_id", default=""
 )
+_current_proc_def_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "bpm_proc_def_id", default=""
+)
 
 
 def set_tenant_id(tenant_id: str) -> None:
     _current_tenant_id.set(tenant_id)
 
 
-def set_process_context(root_proc_inst_id: str, workitem_id: str) -> None:
-    """프로세스 모드 워크아이템 실행 컨텍스트(root_proc_inst_id, 현재 워크아이템 id)를 주입한다."""
+def set_process_context(
+    root_proc_inst_id: str,
+    workitem_id: str,
+    proc_def_id: Optional[str] = None,
+) -> None:
+    """프로세스 모드 워크아이템 실행 컨텍스트를 주입한다.
+
+    root_proc_inst_id, 현재 워크아이템 id, (선택) 현재 프로세스 정의 id 를 컨텍스트에
+    설정한다. proc_def_id 는 기존 호출자와의 호환을 위해 선택 인자다 — 생략하면
+    프로세스 정의 컨텍스트는 변경하지 않는다.
+    """
     _current_root_proc_inst_id.set(root_proc_inst_id or "")
     _current_workitem_id.set(workitem_id or "")
+    if proc_def_id is not None:
+        _current_proc_def_id.set(proc_def_id or "")
+
+
+def get_current_proc_def_id() -> str:
+    """현재 실행 맥락의 프로세스 정의 id 를 반환한다(없으면 빈 문자열)."""
+    return _current_proc_def_id.get()
 
 
 def _require_tenant_id() -> str:

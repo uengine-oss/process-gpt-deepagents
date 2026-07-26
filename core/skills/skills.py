@@ -13,18 +13,27 @@ logger = logging.getLogger(__name__)
 
 def _global_collection_names() -> set[str]:
     """Return directory names under the skills root that are legitimate
-    global collections (fetched via SKILL_REPO_URLS), keyed by repo slug.
+    global collections, keyed by repo slug (git-fetched) plus the bundled
+    local system-skills collection.
 
     This is a whitelist, not a blacklist: only directories produced by
-    `git_skill_fetcher.prefetch_git_skills` are considered global. Anything
-    else directly under the skills root (most notably another tenant's
-    `{tenant_id}/` directory) must never be treated as a global collection,
-    or one tenant's agent would see — and be able to read_file — another
+    `git_skill_fetcher.prefetch_git_skills` or `local_system_skills.seed_
+    local_system_skills` are considered global. Anything else directly
+    under the skills root (most notably another tenant's `{tenant_id}/`
+    directory) must never be treated as a global collection, or one
+    tenant's agent would see — and be able to read_file — another
     tenant's private skills.
+
+    `local_system_skills.SYSTEM_COLLECTION_NAME` is included unconditionally
+    (independent of `SKILL_REPO_URLS`/git config) so process-gpt's own
+    bundled system skills stay available with zero network dependency —
+    required for closed/on-prem installs where outbound git access may not
+    exist.
     """
     from .git_skill_fetcher import _configured_repos, _parse_repo_url, _repo_slug
+    from .local_system_skills import SYSTEM_COLLECTION_NAME
 
-    names: set[str] = set()
+    names: set[str] = {SYSTEM_COLLECTION_NAME}
     for url in _configured_repos():
         try:
             owner, repo = _parse_repo_url(url)

@@ -29,11 +29,16 @@ ENV PYTHONPATH=/app
 ENV PIP_DEFAULT_TIMEOUT=300
 RUN pip install --no-cache-dir uv
 
-COPY requirements.txt ./
+COPY services/deepagents/requirements.txt ./
 RUN uv pip install --system --no-cache -r requirements.txt
 
-# 4) Copy source
-COPY . .
+# 4) Copy source (build context is the repo root — see docker-compose.yml)
+COPY services/deepagents/. .
+
+# 5) 오프라인 안전 번들 시스템 스킬 (레포 루트 skills/ submodule들).
+#    core/skills/local_system_skills.py가 기동 시 이 경로를
+#    {SKILLS_DIRS}/process-gpt-system/ 으로 동기화해 모든 테넌트에 전역 노출한다.
+COPY skills /app/system-skills/process-gpt-system
 
 EXPOSE 8888
 CMD ["python", "server.py"]

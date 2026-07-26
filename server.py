@@ -28,6 +28,7 @@ from processgpt_agent_sdk import ProcessGPTAgentServer
 from core.api.skills_router import routes as skills_routes
 from core.api.file_download import routes as file_download_routes
 from core.api.chat_stream_attach import routes as chat_stream_attach_routes
+from core.skills.local_system_skills import seed_local_system_skills
 from executor import DeepAgentExecutor
 
 load_dotenv()
@@ -43,6 +44,12 @@ PORT = int(os.environ.get("PORT", "8888"))
 AGENT_TYPE = "deepagents"
 
 async def main() -> None:
+    try:
+        synced = await asyncio.to_thread(seed_local_system_skills)
+        logger.info("local-system-skills: 기동 시 %d개 스킬 시딩", synced)
+    except Exception:
+        logger.exception("local-system-skills: 기동 시 시딩 실패, 번들 시스템 스킬 없이 계속 진행")
+
     server = ProcessGPTAgentServer(
         agent_executor=DeepAgentExecutor(),
         agent_type=AGENT_TYPE,
