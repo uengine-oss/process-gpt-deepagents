@@ -703,6 +703,17 @@ class DeepAgentExecutor(AgentExecutor):
         user_jwt = extras.get("user_jwt")
         user_email = extras.get("user_email")
         user_name = extras.get("user_name")
+        if not (user_email or user_name):
+            # process/worklist 모드는 SDK 컨텍스트가 user_email/user_name 을 채우지 않는다.
+            # 대신 workitem 담당자 목록(extras["users"])에서 조회해 채운다.
+            _uid = str(extras.get("user_id") or row.get("user_id") or "").split(",")[0].strip()
+            for _u in (extras.get("users") or []):
+                if not isinstance(_u, dict):
+                    continue
+                if not _uid or str(_u.get("id") or "") == _uid:
+                    user_name = user_name or _u.get("name") or _u.get("username")
+                    user_email = user_email or _u.get("email")
+                    break
 
         _skill_tenant_id.set(tenant_id)
         _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())

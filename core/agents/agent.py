@@ -151,15 +151,20 @@ async def build_agent(
     )
     built_subagents = list(static_subagents or []) + _dynamic
 
-    if user_context:
-        parts = ["\n\n## 현재 사용자 정보"]
-        if user_context.get("user_name"):
-            parts.append(f"- 이름: {user_context['user_name']}")
-        if user_context.get("user_email"):
-            parts.append(f"- 이메일: {user_context['user_email']}")
-        if user_context.get("user_jwt"):
-            parts.append(f"- JWT: {user_context['user_jwt']}")
-        system_prompt = system_prompt + "\n".join(parts)
+    _user_ctx = user_context or {}
+    _info_parts = []
+    if tenant_id:
+        _info_parts.append(f"- 테넌트 ID: {tenant_id}")
+    if _user_ctx.get("user_id"):
+        _info_parts.append(f"- 사용자 ID: {_user_ctx['user_id']}")
+    if _user_ctx.get("user_name"):
+        _info_parts.append(f"- 이름: {_user_ctx['user_name']}")
+    if _user_ctx.get("user_email"):
+        _info_parts.append(f"- 이메일: {_user_ctx['user_email']}")
+    if _user_ctx.get("user_jwt"):
+        _info_parts.append(f"- JWT: {_user_ctx['user_jwt']}")
+    if _info_parts:
+        system_prompt = system_prompt + "\n\n## 현재 사용자 정보\n" + "\n".join(_info_parts)
 
     if built_subagents:
         agent_names = ", ".join(f"`{a['name']}`" for a in built_subagents)
