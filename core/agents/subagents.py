@@ -23,7 +23,7 @@ def _parse_csv(value) -> list[str]:
     return []
 
 
-def _build_subagent_system_prompt(agent: dict) -> str:
+def _build_subagent_system_prompt(agent: dict, tenant_id: str = "") -> str:
     username = agent.get("username") or agent.get("name", "에이전트")
     parts = [f"You are {username}."]
     if desc := (agent.get("description") or "").strip():
@@ -31,6 +31,8 @@ def _build_subagent_system_prompt(agent: dict) -> str:
     for key in ("role", "goal", "persona"):
         if val := (agent.get(key) or "").strip():
             parts.append(f"{key.capitalize()}: {val}")
+    if tenant_id:
+        parts.append(f"- 테넌트 ID: {tenant_id}")
     parts.append("Reply in Korean unless the user writes in another language.")
     return "\n".join(parts)
 
@@ -121,7 +123,7 @@ async def _build_subagents(
         subagent: SubAgent = SubAgent(
             name=name,
             description=description,
-            system_prompt=_build_subagent_system_prompt(agent),
+            system_prompt=_build_subagent_system_prompt(agent, tenant_id),
         )
         if tools:
             subagent["tools"] = tools

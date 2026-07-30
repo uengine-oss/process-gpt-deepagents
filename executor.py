@@ -820,24 +820,31 @@ class DeepAgentExecutor(AgentExecutor):
                 )
 
         # [InputData] 섹션의 큰 필드를 workspace 파일로 오프로드해 초기 LLM 컨텍스트 크기를 줄인다.
-        # 피드백 재작업(FB_REQUESTED)이면 summarized_feedback 기반으로 메시지를 구성한다.
-        _summarized_feedback = str(extras.get("summarized_feedback") or "").strip()
-        if _summarized_feedback:
+        # 피드백 재작업(FB_REQUESTED)이면 feedback 배열의 가장 최근 항목의 content만 추출해
+        # 메시지를 구성한다(build_user_message 미사용 — 소스/폼 형식 안내가 재작업 지시와 섞이지 않게).
+        _feedback_list = row.get("feedback")
+        _latest_feedback_content = ""
+        if isinstance(_feedback_list, list) and _feedback_list:
+            _latest_feedback_item = _feedback_list[-1]
+            if isinstance(_latest_feedback_item, dict):
+                _latest_feedback_content = str(_latest_feedback_item.get("content") or "").strip()
+            else:
+                _latest_feedback_content = str(_latest_feedback_item or "").strip()
+        if _latest_feedback_content:
             _original_query = str(context.get_user_input() or "").strip()
-            _feedback_raw = (
-                f"[재작업 요청 — 피드백]\n{_summarized_feedback}"
+            user_message = (
+                f"[재작업 요청 — 피드백]\n{_latest_feedback_content}"
                 + (f"\n\n[원본 작업 지시]\n{_original_query}" if _original_query else "")
             )
-            _base_message = _offload_input_data(_feedback_raw, instance_id)
         else:
             _base_message = _offload_input_data(str(context.get_user_input() or ""), instance_id)
-        user_message = build_user_message(
-            _base_message,
-            sources=extras.get("sources") or [],
-            form_id=form_id,
-            form_fields=extras.get("form_fields"),
-            suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
-        )
+            user_message = build_user_message(
+                _base_message,
+                sources=extras.get("sources") or [],
+                form_id=form_id,
+                form_fields=extras.get("form_fields"),
+                suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
+            )
         recent_msgs = collect_recent_messages(extras) if is_chat else []
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).
         _user_input_text = ""
