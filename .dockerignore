@@ -1,0 +1,16 @@
+.git
+.github
+.agent
+.claude
+.codex
+.vscode
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+.env
+.env.example
+workspace
+openspec
+tests
+README.md
