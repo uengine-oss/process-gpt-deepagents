@@ -43,7 +43,7 @@ def build_user_message(
             if isinstance(a, dict) and str(a.get("username") or a.get("name")).strip()
         ]
         if agent_names:
-            prev_message = f"서브에이전트 {', '.join(agent_names)}에게 작업을 위임합니다.\n\n{message}"
+            prev_message = f"서브에이전트 {', '.join(agent_names)}에게 작업을 위임합니다.\n\n"
 
     if sources:
         for s in (sources if isinstance(sources, list) else []):
@@ -100,6 +100,8 @@ def build_user_message(
             f" 이전 단계 입력 데이터([입력: ...])의 폼 ID를 출력 키로 사용하지 마세요.\n\n"
             f"{message}"
         )
+    else:
+        message = f"{prev_message}{message}"
 
     return message
 
