@@ -34,9 +34,9 @@ def build_user_message(
     """소스 첨부·폼 형식 안내를 포함한 최종 사용자 메시지를 조립한다."""
     message = base_message
     source_lines: list[str] = []
+    prev_message = ""
 
     if isinstance(agents, list) and agents:
-        prev_message = ''
         agent_names = [
             str(a.get("username") or a.get("name")).strip().replace(" ", "-")
             for a in agents
