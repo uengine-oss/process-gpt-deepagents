@@ -36,13 +36,14 @@ def build_user_message(
     source_lines: list[str] = []
 
     if isinstance(agents, list) and agents:
+        prev_message = ''
         agent_names = [
-            str(a.get("name") or "").strip().replace(" ", "-")
+            str(a.get("username") or a.get("name")).strip().replace(" ", "-")
             for a in agents
-            if isinstance(a, dict) and str(a.get("name") or "").strip()
+            if isinstance(a, dict) and str(a.get("username") or a.get("name")).strip()
         ]
         if agent_names:
-            message = f"서브에이전트 {', '.join(agent_names)}에게 작업을 위임합니다.\n\n{message}"
+            prev_message = f"서브에이전트 {', '.join(agent_names)}에게 작업을 위임합니다.\n\n{message}"
 
     if sources:
         for s in (sources if isinstance(sources, list) else []):
@@ -89,6 +90,7 @@ def build_user_message(
                 "하나의 행(row)을 나타냅니다. 처리 건수만큼 배열 원소를 추가하세요.\n"
             )
         message = (
+            f"{prev_message}"
             f"[응답 형식 안내]\n"
             f"아래 양식 필드에 맞춰 반드시 JSON 형태로만 답변하세요. 다른 설명 없이 JSON만 출력하세요.\n"
             f"필드 정의:\n{field_schema}\n"
