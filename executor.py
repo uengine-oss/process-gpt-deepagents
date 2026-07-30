@@ -844,6 +844,7 @@ class DeepAgentExecutor(AgentExecutor):
                 form_id=form_id,
                 form_fields=extras.get("form_fields"),
                 suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
+                agents=agents,
             )
         recent_msgs = collect_recent_messages(extras) if is_chat else []
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).

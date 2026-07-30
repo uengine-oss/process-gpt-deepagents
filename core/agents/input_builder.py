@@ -29,10 +29,20 @@ def build_user_message(
     form_id: str | None = None,
     form_fields: Any = None,
     suggest_related_outputs: bool = False,
+    agents: Any = None,
 ) -> str:
     """소스 첨부·폼 형식 안내를 포함한 최종 사용자 메시지를 조립한다."""
     message = base_message
     source_lines: list[str] = []
+
+    if isinstance(agents, list) and agents:
+        agent_names = [
+            str(a.get("name") or "").strip().replace(" ", "-")
+            for a in agents
+            if isinstance(a, dict) and str(a.get("name") or "").strip()
+        ]
+        if agent_names:
+            message = f"서브에이전트 {', '.join(agent_names)}에게 작업을 위임합니다.\n\n{message}"
 
     if sources:
         for s in (sources if isinstance(sources, list) else []):
