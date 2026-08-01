@@ -1262,6 +1262,7 @@ class DeepAgentExecutor(AgentExecutor):
             middleware=[ToolResultTruncationMiddleware()],
             static_subagents=build_skill_creator_subagents(task_id=task_id),
             agent_mode=agent_mode,
+            is_chat=is_chat,
             user_context={
                 "user_jwt": user_jwt,
                 "user_email": user_email,
