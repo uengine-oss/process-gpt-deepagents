@@ -5,22 +5,75 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import StructuredTool
-from langgraph.types import interrupt
+from langgraph.types import Interrupt, interrupt
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-def extract_interrupt_payload(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def normalize_hitl_payload(data: Any) -> Dict[str, Any]:
+    """Normalize request_human_input args or interrupt values for UI emission."""
+    try:
+        args = AskUserArgs.model_validate(data if isinstance(data, dict) else {})
+    except Exception:
+        args = AskUserArgs()
+    payload: Dict[str, Any] = {"question": args.question, "context": args.context}
+    if args.options:
+        payload["options"] = args.options
+        payload["multi_select"] = bool(args.multi_select)
+    return payload
+
+
+def _interrupt_value_payload(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Interrupt):
+        return None
+    payload = getattr(value, "value", None)
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        return normalize_hitl_payload(payload)
+    return {"raw": payload}
+
+
+def _interrupts_payload(interrupts: Any) -> Optional[Dict[str, Any]]:
+    if not interrupts:
+        return None
+    try:
+        first = interrupts[0] if isinstance(interrupts, (list, tuple)) else interrupts
+        return _interrupt_value_payload(first) or {"raw": interrupts}
+    except Exception:
+        return {"raw": interrupts}
+
+
+def extract_interrupt_payload(result: Any) -> Optional[Dict[str, Any]]:
     """Extract interrupt payload from a LangGraph execution result dict."""
     if not isinstance(result, dict):
         return None
     interrupts = result.get("__interrupt__")
-    if not interrupts:
-        return None
-    try:
-        first = interrupts[0]
-        return getattr(first, "value", None) or {"raw": interrupts}
-    except Exception:
-        return {"raw": interrupts}
+    return _interrupts_payload(interrupts)
+
+
+def find_interrupt_payload(value: Any) -> Optional[Dict[str, Any]]:
+    """Find a LangGraph interrupt payload in nested stream data.
+
+    With subgraphs enabled, LangGraph may surface interrupts under update
+    payloads or namespaced subgraph values rather than the final root values.
+    """
+    direct = extract_interrupt_payload(value)
+    if direct:
+        return direct
+    direct_obj = _interrupt_value_payload(value)
+    if direct_obj:
+        return direct_obj
+    if isinstance(value, dict):
+        for item in value.values():
+            found = find_interrupt_payload(item)
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = find_interrupt_payload(item)
+            if found:
+                return found
+    return None
 
 
 class AskUserArgs(BaseModel):

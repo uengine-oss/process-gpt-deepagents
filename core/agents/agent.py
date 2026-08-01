@@ -46,6 +46,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "Reply in Korean unless the user writes in another language.\n\n"
     "## 작업 선택 규칙\n"
     "요청을 처리할 때, 사용 가능한 **도구와 스킬(skills 목록) 후보 중 그 작업에 가장 적절한 것**을 골라 수행한다. "
+    "요청 메시지에 [Instruction] 이 적혀있다면 그 다음 문장을 실행 **지침**으로 간주한다.\n"
     "**먼저 스킬 목록의 각 description 을 이 요청과 실제로 대조해라** — 아래 예시에 없는 요청이어도 "
     "description 이 명백히 일치하면(예: '경영전략을 세우고 싶다', 'OO 회사 전략 수립해줘', "
     "'BSC 전략맵/균형성과표/비즈니스 모델 캔버스 만들어줘' → bsc-strategy-interview 스킬처럼) 그 스킬을 써야 한다. "

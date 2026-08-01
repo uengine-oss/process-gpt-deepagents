@@ -30,7 +30,12 @@ from core.storage.checkpointer import (
     get_shared_memory_checkpointer,
     resolve_checkpoint_thread_id,
 )
-from core.chat.hitl import extract_interrupt_payload, is_duplicate_hitl_request
+from core.chat.hitl import (
+    extract_interrupt_payload,
+    find_interrupt_payload,
+    is_duplicate_hitl_request,
+    normalize_hitl_payload,
+)
 from core.chat.callbacks import ToolTrackingCallback
 from core.chat.inflight_registry import (
     clear_inflight_if_current,
@@ -475,6 +480,107 @@ async def _enqueue_status(
     evt = new_text_status_update_event(task_id=task_id, context_id=context_id, state=state, text=text)
     ParseDict({"event_type": event_type, "job_id": job_id, "crew_type": crew_type}, evt.metadata)
     await event_queue.enqueue_event(evt)
+
+
+async def _emit_human_asked(
+    event_queue: EventQueue,
+    *,
+    task_id: str,
+    context_id: str,
+    interrupt_payload: dict[str, Any],
+    run_state: dict[str, Any],
+    checkpoint_thread_id: str,
+    job_id: str,
+    streamer: Any = None,
+) -> dict[str, Any]:
+    question = (
+        interrupt_payload.get("question") if isinstance(interrupt_payload, dict) else None
+    ) or "이 작업을 계속 진행하려면 추가 입력이 필요합니다."
+    context_text = (
+        interrupt_payload.get("context", "") if isinstance(interrupt_payload, dict) else ""
+    )
+    options_payload = (
+        interrupt_payload.get("options") if isinstance(interrupt_payload, dict) else None
+    )
+    multi_select_payload = bool(
+        interrupt_payload.get("multi_select") if isinstance(interrupt_payload, dict) else False
+    )
+    pending_field = "human_response"
+
+    is_duplicate = is_duplicate_hitl_request(
+        run_state, question=question, pending_field=pending_field
+    )
+    new_run_state = {
+        "pending_field": pending_field,
+        "tool_name": "request_human_input",
+        "last_question": question,
+        "checkpoint_thread_id": checkpoint_thread_id or "",
+    }
+
+    if is_duplicate:
+        logger.info("중복 HITL 요청 억제 | task_id=%s", task_id)
+        if streamer:
+            hitl_content = json.dumps(
+                {
+                    "type": "human_input_required",
+                    "question": question,
+                    "context": context_text,
+                    "options": options_payload or [],
+                    "multi_select": multi_select_payload,
+                    "run_state": new_run_state,
+                },
+                ensure_ascii=False,
+            )
+            await streamer.send_json({"type": "done", "content": hitl_content})
+        return {"status": "waiting_for_human", "run_state": dict(run_state)}
+
+    await _enqueue_status(
+        event_queue,
+        task_id=task_id,
+        context_id=context_id,
+        state=TaskState.TASK_STATE_INPUT_REQUIRED,
+        text=json.dumps(
+            {
+                "question": question,
+                "context": context_text,
+                "options": options_payload or [],
+                "multi_select": multi_select_payload,
+                "type": "text",
+                "run_state": new_run_state,
+            },
+            ensure_ascii=False,
+        ),
+        event_type="human_asked",
+        job_id=job_id,
+    )
+    # 채팅 경로: ChatEventQueue 는 TaskStatusUpdateEvent(human_asked)를 무시하고,
+    # interrupt 후 done/error 가 없으면 SSE 가 끝나지 않아 프론트가 무한 대기한다.
+    # 그래서 human_asked enqueue 직후 질문/컨텍스트/run_state 를 담은 done 메시지도 보낸다.
+    if streamer:
+        hitl_content = json.dumps(
+            {
+                "type": "human_input_required",
+                "question": question,
+                "context": context_text,
+                "options": options_payload or [],
+                "multi_select": multi_select_payload,
+                "run_state": new_run_state,
+            },
+            ensure_ascii=False,
+        )
+        await streamer.send_json({"type": "done", "content": hitl_content})
+
+    ae_text = f"{question}\n\n{context_text}"
+    artifact_evt = new_text_artifact_update_event(
+        task_id=task_id,
+        context_id=context_id,
+        name="assistant_response",
+        text=ae_text,
+        last_chunk=True,
+    )
+    ParseDict({"role": "assistant"}, artifact_evt.metadata)
+    await event_queue.enqueue_event(artifact_evt)
+    return {"status": "waiting_for_human", "run_state": new_run_state}
 
 
 def _iter_json_objects(text: str):
@@ -1213,6 +1319,7 @@ class DeepAgentExecutor(AgentExecutor):
         chat_hwpx_paths: set[str] = set()
         # /workspace 에 파일을 썼으면 True — 컨설팅 1단계(파일 미작성)와 구분하는 데 사용한다.
         workspace_write_made = False
+        pending_hitl_payload: dict[str, Any] | None = None
 
         try:
             async for _ns, stream_evt, data in graph.astream(
@@ -1237,6 +1344,18 @@ class DeepAgentExecutor(AgentExecutor):
                                 await streamer.send_json({"type": "token", "content": text})
 
                 elif stream_evt == "updates":
+                    interrupt_payload = find_interrupt_payload(data)
+                    if interrupt_payload:
+                        return await _emit_human_asked(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            interrupt_payload=interrupt_payload,
+                            run_state=run_state,
+                            checkpoint_thread_id=checkpoint_thread_id or "",
+                            job_id=job_id,
+                            streamer=streamer,
+                        )
                     for _node, update in data.items():
                         if not isinstance(update, dict):
                             continue
@@ -1248,16 +1367,19 @@ class DeepAgentExecutor(AgentExecutor):
                                 for tc in msg.tool_calls:
                                     tool_name = tc["name"]
                                     tool_args = tc.get("args", {})
+                                    _tc_id = tc.get("id")
+                                    if _tc_id:
+                                        active_tool_calls[_tc_id] = tool_name
+                                    if tool_name == "request_human_input":
+                                        pending_hitl_payload = normalize_hitl_payload(tool_args)
                                     # 파일 산출물 추적: write_file/edit_file 의 대상 경로를 기록해두고
                                     # tool_end 에서 실제 내용을 읽어 file_artifact 로 프론트에 전달한다.
                                     if subprocess_alias_map and tool_name == "task":
-                                        _tc_id = tc.get("id")
                                         _subagent_slug = (tool_args.get("subagent_type") or "") if isinstance(tool_args, dict) else ""
                                         if _tc_id and _subagent_slug:
                                             pending_task_calls[_tc_id] = _subagent_slug
                                     if streamer and tool_name in _FILE_TOOL_NAMES:
                                         _fp = (tool_args.get("file_path") or tool_args.get("path") or "") if isinstance(tool_args, dict) else ""
-                                        _tc_id = tc.get("id")
                                         if _fp and _tc_id and str(_fp).startswith("/workspace"):
                                             pending_file_ops[_tc_id] = {
                                                 "path": str(_fp),
@@ -1443,6 +1565,18 @@ class DeepAgentExecutor(AgentExecutor):
                                                 )
 
                 elif stream_evt == "values" and isinstance(data, dict):
+                    interrupt_payload = find_interrupt_payload(data)
+                    if interrupt_payload:
+                        return await _emit_human_asked(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            interrupt_payload=interrupt_payload,
+                            run_state=run_state,
+                            checkpoint_thread_id=checkpoint_thread_id or "",
+                            job_id=job_id,
+                            streamer=streamer,
+                        )
                     if not _ns:  # root graph only — ignore subagent intermediate states
                         final_state = data
 
@@ -1474,84 +1608,19 @@ class DeepAgentExecutor(AgentExecutor):
                     process_result_sent = True
                     await streamer.send_json({"type": "process_result", "data": _pr_final})
 
-            interrupt_payload = extract_interrupt_payload(final_state)
+            interrupt_payload = extract_interrupt_payload(final_state) or pending_hitl_payload
 
             if interrupt_payload:
-                question = (
-                    interrupt_payload.get("question") if isinstance(interrupt_payload, dict) else None
-                ) or "이 작업을 계속 진행하려면 추가 입력이 필요합니다."
-                context_text = (
-                    interrupt_payload.get("context", "") if isinstance(interrupt_payload, dict) else ""
-                )
-                options_payload = (
-                    interrupt_payload.get("options") if isinstance(interrupt_payload, dict) else None
-                )
-                multi_select_payload = bool(
-                    interrupt_payload.get("multi_select") if isinstance(interrupt_payload, dict) else False
-                )
-                pending_field = "human_response"
-
-                is_duplicate = is_duplicate_hitl_request(
-                    run_state, question=question, pending_field=pending_field
-                )
-                new_run_state = {
-                    "pending_field": pending_field,
-                    "tool_name": "request_human_input",
-                    "last_question": question,
-                    "checkpoint_thread_id": checkpoint_thread_id or "",
-                }
-                # 채팅 경로: ChatEventQueue 는 TaskStatusUpdateEvent(human_asked)를 무시하고,
-                # interrupt 후 done/error 가 없으면 SSE 가 끝나지 않아 프론트가 무한 대기한다.
-                # 그래서 질문/컨텍스트/run_state 를 담은 done 메시지를 streamer 로 보내 스트림을
-                # 정상 종료시키고, 프론트가 이 마커로 HITL 패널을 띄우고 같은 세션으로 resume 한다.
-                if streamer:
-                    hitl_content = json.dumps(
-                        {
-                            "type": "human_input_required",
-                            "question": question,
-                            "context": context_text,
-                            "options": options_payload or [],
-                            "multi_select": multi_select_payload,
-                            "run_state": new_run_state,
-                        },
-                        ensure_ascii=False,
-                    )
-                    await streamer.send_json({"type": "done", "content": hitl_content})
-
-                if is_duplicate:
-                    logger.info("중복 HITL 요청 억제 | task_id=%s", task_id)
-                    return {"status": "waiting_for_human", "run_state": dict(run_state)}
-
-                await _enqueue_status(
+                return await _emit_human_asked(
                     event_queue,
                     task_id=task_id,
                     context_id=context_id,
-                    state=TaskState.TASK_STATE_INPUT_REQUIRED,
-                    text=json.dumps(
-                        {
-                            "question": question,
-                            "context": context_text,
-                            "options": options_payload or [],
-                            "multi_select": multi_select_payload,
-                            "type": "text",
-                            "run_state": new_run_state,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    event_type="human_asked",
+                    interrupt_payload=interrupt_payload,
+                    run_state=run_state,
+                    checkpoint_thread_id=checkpoint_thread_id or "",
                     job_id=job_id,
+                    streamer=streamer,
                 )
-                ae_text = f"{question}\n\n{context_text}"
-                artifact_evt = new_text_artifact_update_event(
-                    task_id=task_id,
-                    context_id=context_id,
-                    name="assistant_response",
-                    text=ae_text,
-                    last_chunk=True,
-                )
-                ParseDict({"role": "assistant"}, artifact_evt.metadata)
-                await event_queue.enqueue_event(artifact_evt)
-                return {"status": "waiting_for_human", "run_state": new_run_state}
 
             # 폴백: 에이전트가 process-definition.json 은 만들었으나(이번 턴) complete 를 호출하지 않고
             # 인터럽트 없이 턴을 끝낸 경우 — 스킬 생성 등으로 step 이 소진되면 발생한다.
