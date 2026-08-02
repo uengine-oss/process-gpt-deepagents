@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -102,6 +103,37 @@ def _build_tool_retry_middleware() -> ToolRetryMiddleware:
     (odoo-mcp aggregate_records/search_records 의 domain·datetime 형식 오류 등)
     """
     return ToolRetryMiddleware(max_retries=1, on_failure="continue")
+
+
+logger = logging.getLogger(__name__)
+
+# OpenAI 는 요청당 tools 배열을 128개로 제한한다(초과 시 400 array_above_max_length).
+# 테넌트가 MCP 서버를 여러 개 등록하면 이 한도를 쉽게 넘는다.
+# (예: wms + erp-supabase + supabase-mcp + ontology-studio-search = MCP 도구만 86개)
+#
+# create_deep_agent 가 여기서 넘긴 목록 위에 자체 도구(파일시스템·task 등 약 9개)를
+# 더 붙이므로, 그 몫만큼 여유를 두고 잘라야 최종 배열이 한도 안에 들어온다.
+_MAX_TOOLS = int(os.environ.get("MAX_TOOLS", "110"))
+
+
+def _cap_tools(tools: list) -> list:
+    """도구 수를 모델 한도 안으로 줄인다.
+
+    앞쪽에 붙는 MCP 도구부터 잘라낸다. 프로세스 생성·HITL·BPM 같은 내장 도구가
+    뒤쪽에 있고 그것들이 없으면 기능 자체가 죽기 때문이다.
+    자르면 어떤 도구가 빠졌는지 로그로 남긴다 — 조용히 사라지면 원인을 못 찾는다.
+    """
+    if len(tools) <= _MAX_TOOLS:
+        return tools
+
+    dropped = len(tools) - _MAX_TOOLS
+    removed = tools[:dropped]
+    logger.warning(
+        "도구 %d개가 모델 한도(%d)를 넘어 앞쪽 MCP 도구 %d개를 제외한다: %s",
+        len(tools), _MAX_TOOLS, dropped,
+        [getattr(t, "name", str(t)) for t in removed],
+    )
+    return tools[dropped:]
 
 
 async def build_agent(
@@ -211,6 +243,8 @@ async def build_agent(
             container_skills.append(f"{_SKILLS_CONTAINER_MOUNT}/{rel}")
         except ValueError:
             container_skills.append(p)
+
+    tools = _cap_tools(tools)
 
     kwargs = dict(
         model=_build_model(),
