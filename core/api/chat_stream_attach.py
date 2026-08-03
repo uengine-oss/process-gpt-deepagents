@@ -18,7 +18,10 @@ from core.storage.db import get_supabase
 
 logger = logging.getLogger(__name__)
 
-_INACTIVE = JSONResponse({"active": False}, status_code=404)
+# 활성 스트림 없음은 클라이언트 관점에서 정상 상태(재접속할 대상이 없을 뿐)이므로
+# 200으로 응답한다. 404로 표현하면 매 메시지 전송마다(첫 attach 시도는 항상 "아직
+# 스트림 없음") 브라우저 네트워크 탭에 실패 요청으로 기록되어 불필요한 노이즈가 된다.
+_INACTIVE = JSONResponse({"active": False}, status_code=200)
 
 
 def _room_tenant_id(conversation_id: str) -> str:

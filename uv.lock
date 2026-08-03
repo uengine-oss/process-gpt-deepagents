@@ -1857,7 +1857,7 @@ wheels = [
 
 [[package]]
 name = "process-gpt-agent-sdk"
-version = "0.4.23"
+version = "0.4.24"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "a2a-sdk" },
@@ -1868,9 +1868,9 @@ dependencies = [
     { name = "supabase" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/60/97/37b8076323683485bc74efabee957dad0b1bda2c81c582a33186eaebb985/process_gpt_agent_sdk-0.4.23.tar.gz", hash = "sha256:d9b94fea4e840a80c61e13b425fab5975929a05e3b279ddb00e20ab955602f66", size = 37725, upload-time = "2026-05-15T07:28:42.222Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/24/e4d506665b3c9a410c050bcc5c7062c09d56667fe6fd9a99315113292327/process_gpt_agent_sdk-0.4.24.tar.gz", hash = "sha256:92dcdfda142d4860371d404621acfeba8a70251ed4f1fc870267511ac23ad437", size = 38593, upload-time = "2026-08-03T02:13:59.607Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/eb/e3/f1f7085b24129adea31fdc16ff9ab285dd790047614d6fdad2f4cb3f0883/process_gpt_agent_sdk-0.4.23-py3-none-any.whl", hash = "sha256:60b717c2f184da2d3b754b381fed036635d846117ba14713154c215c1928db00", size = 39347, upload-time = "2026-05-15T07:28:40.086Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/e9/120c7f4b8abf429d4cb167e5e4408f26534d0d7121e2f9e168679b60b309/process_gpt_agent_sdk-0.4.24-py3-none-any.whl", hash = "sha256:bed03ed21642d622f7947496fc65a2a1a9552d197efc91c88a6e2f361665ebb3", size = 39668, upload-time = "2026-08-03T02:13:58.214Z" },
 ]
 
 [package.optional-dependencies]
@@ -1930,7 +1930,7 @@ requires-dist = [
     { name = "langgraph-checkpoint", specifier = "==4.1.1" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=2.0" },
     { name = "mcp", specifier = ">=1.0" },
-    { name = "process-gpt-agent-sdk", extras = ["sse"], specifier = "==0.4.23" },
+    { name = "process-gpt-agent-sdk", extras = ["sse"], specifier = "==0.4.24" },
     { name = "protobuf", specifier = "==6.33.6" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "psycopg-pool", specifier = ">=3.2" },
