@@ -28,6 +28,7 @@ from processgpt_agent_sdk import ProcessGPTAgentServer
 from core.api.skills_router import routes as skills_routes
 from core.api.file_download import routes as file_download_routes
 from core.api.chat_stream_attach import routes as chat_stream_attach_routes
+from core.chat.inflight_registry import start_cancel_listener
 from core.skills.local_system_skills import seed_local_system_skills
 from executor import DeepAgentExecutor
 
@@ -76,6 +77,11 @@ async def main() -> None:
         asyncio.create_task(server.run()),
         asyncio.create_task(uvicorn_server.serve()),
     ]
+    # REDIS_URL 설정 시에만 cancel listener를 띄운다. 미설정이면 start_cancel_listener()가
+    # 즉시 반환하는데, 아래 FIRST_COMPLETED가 이를 "task 종료"로 보고 나머지(서버 자체)까지
+    # 같이 내려버리므로 애초에 task 목록에 넣지 않는다.
+    if os.environ.get("REDIS_URL"):
+        all_tasks.append(asyncio.create_task(start_cancel_listener()))
 
     # server.run()이 SIGINT/SIGTERM으로 종료되면 나머지 task도 취소한다.
     done, pending = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)

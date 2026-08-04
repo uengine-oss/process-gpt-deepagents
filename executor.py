@@ -38,8 +38,8 @@ from core.chat.hitl import (
 )
 from core.chat.callbacks import ToolTrackingCallback
 from core.chat.inflight_registry import (
-    clear_inflight_if_current,
-    set_inflight,
+    clear_inflight_and_release,
+    set_inflight_and_claim,
     supersede_previous_turn,
 )
 from core.agents.input_builder import (
@@ -73,6 +73,12 @@ from core.deterministic import try_deterministic_execution
 # 우리 기능(프로세스 생성 HITL 캡처/이름도출)에서 사용하는 contextvar — incoming 에는 없으나 유지.
 from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
+from core.skills.tools import _bpmn_work_dir
+from core.storage.storage import (
+    download_workspace_directory,
+    set_tenant_id as _set_storage_tenant_id,
+    upload_workspace_directory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -313,7 +319,7 @@ async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> 
         p = PurePosixPath(container_path)
         name = p.name
         ext = p.suffix.lower()
-        token = register_file(content, name)
+        token = await register_file(content, name)
         val = {
             "path": f"{base_url}/api/internal/download/{token}",
             "name": name,
@@ -854,15 +860,32 @@ class DeepAgentExecutor(AgentExecutor):
         # 산출물을 방별 디렉터리(.bpmn/<room>/)로 격리 — 경로 충돌/덮어쓰기 방지.
         _skill_conversation_id.set(chat_room_id or "")
 
+        if is_chat and chat_room_id and tenant_id:
+            # 이 파드가 이 방을 처음 다루는 경우(로컬에 파일이 없음) 다른 파드가 이전 턴에
+            # 만들었을 수 있는 워크스페이스 파일을 Supabase Storage에서 미리 내려받는다.
+            # 로컬 디스크는 파드 로컬이라(RWX 공유 스토리지 없음) 이게 없으면 다른 파드가
+            # 만든 process-definition.json 등을 이어서 못 읽는다.
+            try:
+                _set_storage_tenant_id(tenant_id)
+                room_dir = _bpmn_work_dir()
+                has_local_files = room_dir.exists() and any(room_dir.glob("**/*"))
+                if not has_local_files:
+                    result = await asyncio.to_thread(download_workspace_directory, chat_room_id, room_dir)
+                    logger.info("워크스페이스 하이드레이션 | room_id=%s | %s", chat_room_id, result.splitlines()[0] if result else "")
+            except Exception:
+                logger.warning("워크스페이스 하이드레이션 실패(무시하고 진행) | room_id=%s", chat_room_id, exc_info=True)
+
         if is_chat and chat_room_id:
             # 같은 chat_room_id 에 아직 끝나지 않은 이전 turn이 있으면 취소하고 끝날 때까지
             # 기다린다 — 두 graph.astream() 실행이 동시에 체크포인트를 쓰는 레이스를 막는다.
             await supersede_previous_turn(chat_room_id)
             current_task = asyncio.current_task()
             if current_task is not None:
-                set_inflight(chat_room_id, current_task, event_queue)
+                await set_inflight_and_claim(chat_room_id, current_task, event_queue)
                 current_task.add_done_callback(
-                    lambda _t, _rid=chat_room_id, _task=current_task: clear_inflight_if_current(_rid, _task)
+                    lambda _t, _rid=chat_room_id, _task=current_task: asyncio.create_task(
+                        clear_inflight_and_release(_rid, _task)
+                    )
                 )
 
         # 재접속(attach) 지원: 이번 턴을 conversation_id(=chat_room_id) 기준 메모리 레지스트리에
@@ -1782,6 +1805,17 @@ class DeepAgentExecutor(AgentExecutor):
                     "채팅 완료 | room_id=%s task_id=%s response_len=%d",
                     chat_room_id, task_id, len(final_text),
                 )
+                if tenant_id:
+                    # 이번 턴이 만든/수정한 워크스페이스 파일을 Supabase Storage에 올려서,
+                    # 다음 턴이 다른 파드로 라우팅돼도 이어서 읽을 수 있게 한다.
+                    try:
+                        room_dir = _bpmn_work_dir()
+                        if room_dir.exists():
+                            _set_storage_tenant_id(tenant_id)
+                            result = await asyncio.to_thread(upload_workspace_directory, chat_room_id, room_dir)
+                            logger.info("워크스페이스 동기화 | room_id=%s | %s", chat_room_id, result.splitlines()[0] if result else "")
+                    except Exception:
+                        logger.warning("워크스페이스 동기화 실패(무시) | room_id=%s", chat_room_id, exc_info=True)
 
         except Exception as e:
             logger.exception("execute 실패: %s", e)
