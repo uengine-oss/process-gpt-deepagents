@@ -90,7 +90,8 @@ def build_user_message(
                 "하나의 행(row)을 나타냅니다. 처리 건수만큼 배열 원소를 추가하세요.\n"
             )
         message = (
-            f"{prev_message}"
+            f"{prev_message}\n"
+            f"{message}\n\n"
             f"[응답 형식 안내]\n"
             f"아래 양식 필드에 맞춰 반드시 JSON 형태로만 답변하세요. 다른 설명 없이 JSON만 출력하세요.\n"
             f"필드 정의:\n{field_schema}\n"
@@ -98,7 +99,6 @@ def build_user_message(
             f"{multidata_note}"
             f"주의: 출력 JSON의 최상위 키는 반드시 \"{form_id}\" 이어야 합니다."
             f" 이전 단계 입력 데이터([입력: ...])의 폼 ID를 출력 키로 사용하지 마세요.\n\n"
-            f"{message}"
         )
     else:
         message = f"{prev_message}{message}"

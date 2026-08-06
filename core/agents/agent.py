@@ -130,17 +130,17 @@ async def build_agent(
             list_git_repos,
             publish_skill,
             register_skill_as_tenant,
-            write_process_definition,
-            update_process_definition,
-            validate_process_definition,
-            complete_process_generation,
+            # write_process_definition,
+            # update_process_definition,
+            # validate_process_definition,
+            # complete_process_generation,
         ]
     )
     # BSC 전략 도구(save_strategy_objective/save_strategy_kpi/save_canvas_block/link_kpi_to_process)와
     # 웹페이지 조회 도구(fetch_webpage — Claude Code의 WebFetch에 대응)는
     # HITL 도구와 달리 DRAFT 모드에서도 제외하지 않고 항상 제공한다.
-    tools += get_strategy_tools()
-    tools += get_web_tools()
+    # tools += get_strategy_tools()
+    # tools += get_web_tools()
     backend = get_or_create_sandbox(tenant_id, workspace_host=_BASE_DIR / "workspace", skills_host=_SKILLS_DIR)
     _skill_sandbox.set(backend)
     _skill_user_name.set((user_context or {}).get("user_name") or "")
