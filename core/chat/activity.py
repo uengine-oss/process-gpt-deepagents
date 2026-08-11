@@ -130,53 +130,6 @@ def fetch_child_activity_todo(root_proc_inst_id: str, activity_id: str) -> dict 
         return None
 
 
-def build_fallback_subagent(
-    *,
-    tenant_id: str,
-    activity_tools: list[str],
-    activity_skills: list[str],
-) -> dict[str, Any] | None:
-    """Build a SubAgent-compatible dict from activity-declared tools/skills.
-
-    The returned dict shape is understood by core.agents.subagents._build_subagents:
-    - tools: CSV/list of MCP server names
-    - skills: CSV of skill names
-    """
-    if not activity_tools and not activity_skills:
-        return None
-
-    name = "업무 실행자"
-    sys_lines = [
-        "=== 역할 ===",
-        "- 당신은 프로세스 액티비티에 정의된 도구/스킬을 사용해 업무를 수행하는 실행 에이전트입니다.",
-        "- 결과는 간결하고 검증 가능한 형태(파일/JSON/근거)로 반환하세요.",
-    ]
-    if activity_tools:
-        sys_lines.append(f"- 액티비티 지정 도구: {', '.join(activity_tools)}")
-    if activity_skills:
-        sys_lines.append(f"- 액티비티 지정 스킬: {', '.join(activity_skills)}")
-    sys_lines.extend([
-        "",
-        "=== 우선순위 ===",
-        "- 1) task() 위임(description)의 지시/출력 형식을 최우선으로 따른다.",
-        "- 2) 스킬은 추정하지 말고, 필요한 경우 도구로 문서를 조회/로드한 뒤 사용한다.",
-        "- 3) 실행이 가능하면 실행(샌드박스)하고, 불가하면 근거와 다음 시도안을 보고한다.",
-    ])
-
-    return {
-        "name": name,
-        "username": name,
-        "alias": name,
-        "description": (
-            f"프로세스 액티비티 정의 기반 폴백 실행자 (tenant={tenant_id or '(unknown)'})"
-        ),
-        "system_prompt": "\n".join(sys_lines),
-        "tools": ",".join(activity_tools),
-        "skills": ",".join(activity_skills),
-        "agent_type": "activity_fallback",
-    }
-
-
 def _find_subprocess(definition: Any, activity_id: str) -> dict[str, Any] | None:
     """definition.subProcesses[]에서 id가 activity_id와 일치하는 항목을 반환한다."""
     aid = (activity_id or "").strip()

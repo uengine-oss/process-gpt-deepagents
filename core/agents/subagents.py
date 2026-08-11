@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 
@@ -73,9 +74,17 @@ async def _build_subagents(
         seen_names.add(name)
 
         mcp_server_names = _parse_csv(agent.get("tools"))
+        tool_filters = agent.get("tool_filters") or {}
+        if isinstance(tool_filters, str):
+            try:
+                tool_filters = json.loads(tool_filters)
+            except (ValueError, TypeError):
+                tool_filters = {}
+        if not isinstance(tool_filters, dict):
+            tool_filters = {}
         tools = []
         if mcp_server_names and tenant_mcp:
-            grouped = await _load_mcp_tools_grouped(mcp_server_names, tenant_mcp)
+            grouped = await _load_mcp_tools_grouped(mcp_server_names, tenant_mcp, tool_filters=tool_filters)
             for srv, srv_tools in grouped.items():
                 tools.extend(srv_tools)
                 if srv not in mcp_connectors:

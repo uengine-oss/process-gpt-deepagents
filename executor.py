@@ -49,7 +49,6 @@ from core.agents.input_builder import (
     resolve_chat_room_id,
 )
 from core.chat.activity import (
-    build_fallback_subagent,
     fetch_child_activity_todo,
     load_activity_capabilities,
     load_subprocess_subagents,
@@ -1148,6 +1147,8 @@ class DeepAgentExecutor(AgentExecutor):
 
         subprocess_alias_map: dict[str, str] = {}
         root_proc_inst_id: str = ""
+        activity_tools: list[str] = []
+        activity_skills: list[str] = []
         if not agents:
             proc_def_id = str(row.get("proc_def_id") or "").strip()
             activity_id = str(row.get("activity_id") or "").strip()
@@ -1205,20 +1206,15 @@ class DeepAgentExecutor(AgentExecutor):
                     activity_id=activity_id,
                 )
                 if act_tools or act_skills:
-                    fallback = build_fallback_subagent(
-                        tenant_id=tenant_id,
-                        activity_tools=act_tools,
-                        activity_skills=act_skills,
+                    activity_tools = act_tools
+                    activity_skills = act_skills
+                    logger.info(
+                        "액티비티 지정 도구/스킬을 루트 딥에이전트에 부착 | proc_def_id=%s activity_id=%s tools=%s skills=%s",
+                        proc_def_id, activity_id, act_tools, act_skills,
                     )
-                    if fallback:
-                        agents = [fallback]
-                        logger.info(
-                            "서브에이전트 폴백 활성화 | proc_def_id=%s activity_id=%s tools=%s skills=%s",
-                            proc_def_id, activity_id, act_tools, act_skills,
-                        )
                 elif not is_chat:
                     logger.warning(
-                        "서브에이전트 미설정 (activity fallback 없음) | proc_def_id=%s activity_id=%s",
+                        "서브에이전트 미설정 (activity tools/skills 없음) | proc_def_id=%s activity_id=%s",
                         proc_def_id, activity_id,
                     )
 
@@ -1286,6 +1282,8 @@ class DeepAgentExecutor(AgentExecutor):
             static_subagents=build_skill_creator_subagents(task_id=task_id),
             agent_mode=agent_mode,
             is_chat=is_chat,
+            activity_tools=activity_tools,
+            activity_skills=activity_skills,
             user_context={
                 "user_jwt": user_jwt,
                 "user_email": user_email,

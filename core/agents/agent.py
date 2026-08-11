@@ -11,8 +11,9 @@ from ..llm.model import _build_model
 from ..rag.tools import get_memento_tools
 import asyncio
 
-from ..skills.skills import _get_skills
+from ..skills.skills import _get_skills, FilteredSkillsMiddleware
 from ..skills.git_providers.factory import get_provider as _get_git_provider
+from ..llm.mcp import _load_mcp_tools_grouped
 from .subagents import _build_subagents
 from ..skills.tools import (
     checkout_to_workspace,
@@ -118,6 +119,8 @@ async def build_agent(
     user_context: dict | None = None,
     agent_mode: str = "",
     is_chat: bool = True,
+    activity_tools: list[str] | None = None,
+    activity_skills: list[str] | None = None,
 ):
     tools = (
         list(extra_tools or [])
@@ -153,6 +156,25 @@ async def build_agent(
     )
     built_subagents = list(static_subagents or []) + _dynamic
 
+    # 활동(activity)에 서브에이전트 프로필 없이 tools/skills 만 지정된 경우, 별도의
+    # 폴백 서브에이전트를 만드는 대신 루트 딥에이전트에 도구/스킬을 직접 부착한다.
+    if activity_tools and tenant_mcp:
+        _activity_grouped = await _load_mcp_tools_grouped(activity_tools, tenant_mcp)
+        for _srv, _srv_tools in _activity_grouped.items():
+            tools.extend(_srv_tools)
+            if _srv not in _mcp_connectors:
+                _mcp_connectors.append(_srv)
+            _tool_names = [
+                getattr(t, "name", "") for t in _srv_tools
+                if getattr(t, "name", "")
+            ]
+            if _tool_names:
+                _mcp_tools_meta.append({
+                    "agent": "__root__",
+                    "servers": [_srv],
+                    "tools": _tool_names,
+                })
+
     _user_ctx = user_context or {}
     _info_parts = []
     if tenant_id:
@@ -182,6 +204,15 @@ async def build_agent(
         final_prompt = system_prompt + delegation_prompt
     else:
         final_prompt = system_prompt
+
+    if activity_tools or activity_skills:
+        _act_lines = ["\n\n## 액티비티 지정 도구/스킬"]
+        if activity_tools:
+            _act_lines.append(f"- 이 액티비티에 지정된 MCP 도구 서버: {', '.join(activity_tools)}")
+        if activity_skills:
+            _act_lines.append(f"- 이 액티비티에 지정된 스킬: {', '.join(activity_skills)}")
+        _act_lines.append("- 위 도구/스킬을 우선 사용해 업무를 수행하세요.")
+        final_prompt = final_prompt + "\n".join(_act_lines)
 
     # 방별 산출물 디렉터리 주입 + 프로세스별 하위 폴더(한 방에 여러 프로세스 가능).
     # 폴더명은 executor 가 **구체적인 값**을 생성해 주입한다(에이전트가 `<랜덤 id>`·`<new_id>` 같은
@@ -222,16 +253,30 @@ async def build_agent(
         except ValueError:
             container_skills.append(p)
 
+    extra_middleware = list(middleware or [])
+    # 활동 지정 스킬이 있으면 전체 스킬 목록 대신 필터링된 목록만 노출한다
+    # (SkillsMiddleware 중복 부착을 피하기 위해 skills= 자체는 비운다).
+    skills_kwarg = container_skills or None
+    if activity_skills and container_skills:
+        extra_middleware.append(
+            FilteredSkillsMiddleware(
+                backend=backend,
+                sources=container_skills,
+                allowed_skills=activity_skills,
+            )
+        )
+        skills_kwarg = None
+
     kwargs = dict(
         model=_build_model(),
         tools=tools,
         system_prompt=final_prompt,
-        skills=container_skills or None,
+        skills=skills_kwarg,
         backend=backend,
         checkpointer=checkpointer if checkpointer is not None else MemorySaver(),
     )
     if built_subagents:
         kwargs["subagents"] = built_subagents
-    kwargs["middleware"] = [_build_tool_retry_middleware(), *(middleware or [])]
+    kwargs["middleware"] = [_build_tool_retry_middleware(), *extra_middleware]
 
     return create_deep_agent(**kwargs), _mcp_connectors, _mcp_tools_meta

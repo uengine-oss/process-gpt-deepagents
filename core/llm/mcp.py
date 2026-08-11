@@ -43,12 +43,19 @@ def _mcp_connection_config(server_config: dict) -> dict:
     return conn
 
 
-async def _load_mcp_tools_grouped(server_names: list[str], tenant_mcp: dict) -> dict[str, list]:
+async def _load_mcp_tools_grouped(
+    server_names: list[str],
+    tenant_mcp: dict,
+    tool_filters: dict[str, list[str]] | None = None,
+) -> dict[str, list]:
     """지정된 MCP 서버들에서 LangChain BaseTool 목록을 서버별로 로드한다.
 
     반환값은 실제로 그 도구를 제공한 서버 이름 -> BaseTool 목록. 여러 서버를 한 번에
     로드해도 각 도구가 어느 서버에서 왔는지 유실되지 않도록, 서버별로 개별 조회한다
     (chat_room context 의 connectors 를 정확히 귀속시키기 위해 필요).
+
+    tool_filters 가 주어지면 서버별 허용 도구 이름 목록으로 추가 필터링한다
+    (해당 서버 키가 없거나 빈 리스트면 그 서버는 전체 허용).
     """
     mcp_servers = tenant_mcp.get("mcpServers", {})
     connections = {}
@@ -73,6 +80,12 @@ async def _load_mcp_tools_grouped(server_names: list[str], tenant_mcp: dict) -> 
                 removed = before - len(tools)
                 if removed:
                     logger.info("MCP 도구 임시 제거: %d개 %s (server=%s)", removed, sorted(_DISABLED_MCP_TOOLS), name)
+            allowed = (tool_filters or {}).get(name)
+            if allowed:
+                before = len(tools)
+                tools = [t for t in tools if getattr(t, "name", "") in allowed]
+                if len(tools) != before:
+                    logger.info("MCP 도구 허용목록 적용: %s → %d개 (server=%s)", allowed, len(tools), name)
             return name, tools
         except Exception as e:
             logger.error("MCP tools 로드 실패 (%s): %s", name, e)
