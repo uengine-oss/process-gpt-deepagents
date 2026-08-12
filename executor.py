@@ -73,6 +73,8 @@ from core.deterministic import try_deterministic_execution
 from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
 from core.skills.tools import _bpmn_work_dir
+from core.skills.tools import bpmn_container_base as _bpmn_container_base
+from core.sandbox.docker_sandbox import set_workspace_scope
 from core.storage.storage import (
     download_workspace_directory,
     set_tenant_id as _set_storage_tenant_id,
@@ -857,7 +859,19 @@ class DeepAgentExecutor(AgentExecutor):
         is_chat = streamer is not None
         chat_room_id = resolve_chat_room_id(extras, row if isinstance(row, dict) else {})
         # 산출물을 방별 디렉터리(.bpmn/<room>/)로 격리 — 경로 충돌/덮어쓰기 방지.
-        _skill_conversation_id.set(chat_room_id or "")
+        # chat_room_id 가 없는 워크리스트/액티비티 실행(is_chat=False)은 canonical_process_dir_name()이
+        # tenant_id 로 폴백해 매 실행이 같은 산출물 폴더를 공유하게 된다 — 그러면 이전 실행(예: 일주일 전
+        # 같은 액티비티 실행)이 남긴 파일을 이번 실행 결과로 재사용하는 사고가 난다. instance_id(process
+        # instance 또는 workitem 단위로 유일)로 폴백해 실행마다 격리한다.
+        workspace_conversation_id = chat_room_id or instance_id
+        _skill_conversation_id.set(workspace_conversation_id or "")
+        # 도구 레벨 봉쇄: ls/read_file/glob/grep 이 다른 실행의 .bpmn/<다른 방> 이나
+        # <다른 instance_id>/inputs·outputs 를 절대경로로 직접 찍어 읽는 것도 막는다
+        # (위 방 단위 폴더 격리만으론 에이전트가 의도적/우발적으로 형제 디렉토리를 열람하는 걸 못 막음).
+        _scope_prefixes = [_bpmn_container_base(workspace_conversation_id)]
+        if instance_id:
+            _scope_prefixes.append(f"/workspace/{_sanitize_ws_name(instance_id, 64)}")
+        set_workspace_scope(*_scope_prefixes)
 
         if is_chat and chat_room_id and tenant_id:
             # 이 파드가 이 방을 처음 다루는 경우(로컬에 파일이 없음) 다른 파드가 이전 턴에
@@ -1273,7 +1287,7 @@ class DeepAgentExecutor(AgentExecutor):
 
         graph, _, _sub_mcp_tools_meta = await build_agent(
             tenant_id=tenant_id,
-            conversation_id=chat_room_id or "",
+            conversation_id=workspace_conversation_id or "",
             checkpointer=checkpointer,
             subagents_raw=agents,
             tenant_mcp=tenant_mcp,

@@ -17,6 +17,7 @@ tenant_id 당 하나의 컨테이너를 재사용하며, atexit 훅으로 프로
 from __future__ import annotations
 
 import atexit
+import contextvars
 import io
 import logging
 import os
@@ -32,6 +33,10 @@ from deepagents.backends.protocol import (
     ExecuteResponse,
     FileDownloadResponse,
     FileUploadResponse,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
 )
 from deepagents.backends.sandbox import BaseSandbox
 
@@ -41,6 +46,57 @@ SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "python:3.13-slim")
 _CONTAINER_WORKSPACE = "/workspace"
 _MAX_OUTPUT_BYTES = 100_000
 _HOST_GATEWAY = "host.docker.internal"
+
+# ---------------------------------------------------------------------
+# 실행(run) 격리 스코프 — 같은 tenant 는 컨테이너/마운트를 공유하므로(위 docstring 참고),
+# ls/read_file/glob/grep 이 인자로 받은 절대경로를 그대로 열어주면 "다른 실행(예: 일주일 전
+# 같은 액티비티 실행)이 남긴 산출물"을 이번 실행 결과인 것처럼 읽어오는 사고가 난다.
+# executor 가 실행 시작 시 set_workspace_scope() 로 이번 실행의 허용 경로를 등록하면,
+# 그 경로 밖의 "다른 실행 전용" 산출물 트리(.bpmn/<다른 방>, <다른 instance_id>/inputs·outputs)
+# 접근을 거부한다. contextvar 를 쓰는 이유는 컨테이너(=DockerSandboxBackend 인스턴스)가
+# tenant 당 하나로 재사용되어 여러 실행이 동시에 같은 인스턴스를 공유하기 때문 —
+# 인스턴스 속성에 저장하면 동시 실행끼리 스코프가 뒤섞인다.
+# ---------------------------------------------------------------------
+_workspace_scope: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "sandbox_workspace_scope", default=()
+)
+
+# _instance_ws_dir()(executor.py) 가 만드는 inputs/outputs 디렉토리명은 root_proc_inst_id 등
+# UUID 를 포함한 instance_id 를 sanitize 한 값이다. checkout_to_workspace 가 만드는 저장소/스킬
+# 체크아웃 디렉토리명(예: /workspace/my-repo)과 구별하기 위해 "이름에 UUID 가 포함되어 있는가"를
+# 판별 기준으로 쓴다 — 일반 저장소 이름이 우연히 UUID 를 포함할 가능성은 사실상 없다.
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+_SCOPE_DENY_MSG = (
+    "다른 실행(run)의 산출물 경로입니다 — 이번 실행에서 만든 파일이 아닙니다. "
+    "과거 실행 결과를 재사용하지 말고 이번 실행에서 직접 조회/생성하세요."
+)
+
+
+def set_workspace_scope(*container_prefixes: str) -> None:
+    """이번 실행이 ls/read_file/glob/grep 으로 접근 가능한 /workspace 하위 경로를 등록한다.
+
+    인자를 비우면(기본값) 제한하지 않는다 — 이 함수를 호출하지 않는 기존 호출부(예:
+    executor.py 의 보조 헬퍼가 단발성으로 만드는 백엔드)는 종전처럼 무제한으로 동작한다.
+    """
+    _workspace_scope.set(tuple(p.rstrip("/") for p in container_prefixes if p))
+
+
+def _is_run_scoped_path(path: str) -> bool:
+    """다른 실행 전용 산출물 트리(.bpmn/<방>, <instance_id>/inputs·outputs)에 속한 경로인가."""
+    parts = path.strip("/").split("/")
+    if len(parts) >= 2 and parts[0] == "workspace" and parts[1] == ".bpmn":
+        return True
+    if (
+        len(parts) >= 3
+        and parts[0] == "workspace"
+        and parts[2] in ("inputs", "outputs")
+        and _UUID_RE.search(parts[1])
+    ):
+        return True
+    return False
 
 # 컨테이너로 전달할 호스트 env 화이트리스트.
 #
@@ -233,6 +289,50 @@ class DockerSandboxBackend(BaseSandbox):
     @property
     def id(self) -> str:
         return f"docker-{self._tenant_id or 'shared'}"
+
+    # ------------------------------------------------------------------
+    # 실행 격리 스코프 강제 — set_workspace_scope() 로 등록된 이번 실행의 허용 경로
+    # 밖에 있는 "다른 실행 전용" 산출물(.bpmn/<다른 방>, <다른 instance_id>/inputs·outputs)에
+    # 대한 읽기 계열 호출(ls/read/glob/grep)을 차단한다. write/edit 은 제한하지 않는다 —
+    # 에이전트가 스스로 고른 새 경로에 쓰는 것이라 다른 실행 결과를 "재사용"하는 경로가 아니고,
+    # checkout_to_workspace 가 임의 저장소/스킬을 /workspace/<repo-name>/ 에 그대로 두므로
+    # write 까지 막으면 그 정상 흐름을 깬다.
+    # ------------------------------------------------------------------
+
+    def _in_workspace_scope(self, path: str) -> bool:
+        if not path or not path.startswith(_CONTAINER_WORKSPACE):
+            return True  # /skills 등 workspace 밖은 별도 마운트로 이미 격리됨
+        if not _is_run_scoped_path(path):
+            return True  # checkout_to_workspace 저장소·uploads 등 공용 영역은 제한하지 않음
+        scope = _workspace_scope.get()
+        if not scope:
+            return True  # 스코프 미설정 호출부(레거시)는 종전처럼 무제한
+        norm = path.rstrip("/")
+        return any(norm == p or norm.startswith(p + "/") for p in scope)
+
+    def ls(self, path: str) -> LsResult:
+        if not self._in_workspace_scope(path):
+            return LsResult(entries=None, error=f"Path '{path}': {_SCOPE_DENY_MSG}")
+        return super().ls(path)
+
+    def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
+        if not self._in_workspace_scope(file_path):
+            return ReadResult(error=f"File '{file_path}': {_SCOPE_DENY_MSG}")
+        return super().read(file_path, offset, limit)
+
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        scope = _workspace_scope.get()
+        effective_path = path or (scope[0] if scope else None)
+        if effective_path is not None and not self._in_workspace_scope(effective_path):
+            return GlobResult(matches=None, error=f"Path '{effective_path}': {_SCOPE_DENY_MSG}")
+        return super().glob(pattern, effective_path)
+
+    def grep(self, pattern: str, path: str | None = None, glob: str | None = None) -> GrepResult:
+        scope = _workspace_scope.get()
+        effective_path = path or (scope[0] if scope else None)
+        if effective_path is not None and not self._in_workspace_scope(effective_path):
+            return GrepResult(error=f"Path '{effective_path}': {_SCOPE_DENY_MSG}")
+        return super().grep(pattern, effective_path, glob)
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         container = self._ensure_container()
