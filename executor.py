@@ -46,6 +46,7 @@ from core.agents.input_builder import (
     build_graph_inputs,
     build_user_message,
     collect_recent_messages,
+    extract_skill_command,
     resolve_chat_room_id,
 )
 from core.chat.activity import (
@@ -64,6 +65,7 @@ from core.chat.stream_registry import MulticastStreamer, mark_done, start_run
 from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
+from core.skills.skills import resolve_slash_skill
 from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
@@ -972,6 +974,9 @@ class DeepAgentExecutor(AgentExecutor):
                 _latest_feedback_content = str(_latest_feedback_item.get("content") or "").strip()
             else:
                 _latest_feedback_content = str(_latest_feedback_item or "").strip()
+        # 채팅모드에서 사용자가 메시지 선두에 '/skill-name' 을 입력하면, 그 스킬이 현재
+        # 테넌트에서 실제로 사용 가능할 때 해당 스킬을 강제 지정한다(아래 activity_skills 오버라이드).
+        _forced_skill_name = ""
         if _latest_feedback_content:
             _original_query = str(context.get_user_input() or "").strip()
             user_message = (
@@ -980,6 +985,16 @@ class DeepAgentExecutor(AgentExecutor):
             )
         else:
             _base_message = _offload_input_data(str(context.get_user_input() or ""), instance_id)
+            if is_chat:
+                _slash_skill, _stripped_message = extract_skill_command(_base_message)
+                if _slash_skill:
+                    _forced_skill_name = resolve_slash_skill(tenant_id, _slash_skill)
+                    if _forced_skill_name:
+                        _base_message = _stripped_message
+                        logger.info(
+                            "채팅 슬래시 커맨드로 스킬 지정 | tenant_id=%s skill=%s",
+                            tenant_id, _forced_skill_name,
+                        )
             user_message = build_user_message(
                 _base_message,
                 sources=extras.get("sources") or [],
@@ -1231,6 +1246,11 @@ class DeepAgentExecutor(AgentExecutor):
                         "서브에이전트 미설정 (activity tools/skills 없음) | proc_def_id=%s activity_id=%s",
                         proc_def_id, activity_id,
                     )
+
+        # 사용자가 채팅 메시지에 '/skill-name' 슬래시 커맨드를 입력한 경우, 액티비티 정의로
+        # 유도된 스킬 목록과 무관하게 그 스킬 하나로 반드시 실행되도록 덮어쓴다.
+        if _forced_skill_name:
+            activity_skills = [_forced_skill_name]
 
         _root_tools_by_server: dict[str, list[str]] = {}
         for _tool_name, _srv in _root_tool_servers.items():

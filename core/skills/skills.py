@@ -109,6 +109,21 @@ def _get_skills(tenant_id: str = "", provider_config_id: str = "") -> list[str] 
     return paths if paths else None
 
 
+def resolve_slash_skill(tenant_id: str, requested_name: str) -> str:
+    """슬래시 커맨드(`/skill-name`)로 지정된 스킬이 이 테넌트에서 실제로 사용 가능하면
+    이름을 그대로, 아니면 빈 문자열을 반환한다.
+
+    `/skills` API가 프론트에 노출하는 목록과 동일한 기준(`_scan_skills`)을 사용해,
+    사용자가 채팅에서 고를 수 있는 스킬만 허용한다.
+    """
+    if not requested_name:
+        return ""
+    from core.api.skills_router import _scan_skills
+
+    names = {s["name"] for s in _scan_skills(tenant_id)}
+    return requested_name if requested_name in names else ""
+
+
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
