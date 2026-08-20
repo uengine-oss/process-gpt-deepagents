@@ -24,14 +24,30 @@ def _parse_csv(value) -> list[str]:
     return []
 
 
-def _build_subagent_system_prompt(agent: dict, tenant_id: str = "") -> str:
-    username = agent.get("username") or agent.get("name", "에이전트")
-    parts = [f"You are {username}."]
+def _format_profile_traits(agent: dict) -> list[str]:
+    """프로필 dict(description/role/goal/persona)를 프롬프트용 텍스트 라인으로 변환한다."""
+    parts = []
     if desc := (agent.get("description") or "").strip():
         parts.append(desc)
     for key in ("role", "goal", "persona"):
         if val := (agent.get(key) or "").strip():
             parts.append(f"{key.capitalize()}: {val}")
+    return parts
+
+
+def _normalize_tool_filters(value) -> dict:
+    """JSON 문자열 또는 dict로 들어오는 tool_filters를 dict로 정규화한다."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _build_subagent_system_prompt(agent: dict, tenant_id: str = "") -> str:
+    username = agent.get("username") or agent.get("name", "에이전트")
+    parts = [f"You are {username}."] + _format_profile_traits(agent)
     if tenant_id:
         parts.append(f"- 테넌트 ID: {tenant_id}")
     parts.append("Reply in Korean unless the user writes in another language.")
@@ -74,14 +90,7 @@ async def _build_subagents(
         seen_names.add(name)
 
         mcp_server_names = _parse_csv(agent.get("tools"))
-        tool_filters = agent.get("tool_filters") or {}
-        if isinstance(tool_filters, str):
-            try:
-                tool_filters = json.loads(tool_filters)
-            except (ValueError, TypeError):
-                tool_filters = {}
-        if not isinstance(tool_filters, dict):
-            tool_filters = {}
+        tool_filters = _normalize_tool_filters(agent.get("tool_filters"))
         tools = []
         if mcp_server_names and tenant_mcp:
             grouped = await _load_mcp_tools_grouped(mcp_server_names, tenant_mcp, tool_filters=tool_filters)

@@ -833,15 +833,26 @@ class DeepAgentExecutor(AgentExecutor):
         _skill_tenant_id.set(tenant_id)
         _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())
         set_process_context(root_proc_inst_id, current_workitem_id, current_proc_def_id)
-        agents = extras.get("agents", [])
-        streamer = extras.get("streamer")
-        form_id = extras.get("form_id")
-        has_file = bool(extras.get("sources"))
-
         # 채팅 경로(ChatRequestContext)에서는 프론트가 보낸 run_state/human_response_answer 가
         # extras["metadata"] 안에 들어온다. worklist 경로는 extras 최상위/draft 에 둔다.
         # 두 위치를 모두 확인해 채팅에서도 HITL resume 이 트리거되게 한다.
         metadata = extras.get("metadata", {}) if isinstance(extras.get("metadata"), dict) else {}
+
+        # 프론트가 이번 대화 상대로 지정한 에이전트 프로필(role/goal/persona/tools/skills).
+        # 딥 에이전트의 루트 프롬프트·도구·스킬을 이 프로필로 커스터마이즈하는 데 쓰인다.
+        agent_profile = metadata.get("agent_profile") if isinstance(metadata.get("agent_profile"), dict) else None
+
+        def _exclude_root_profile(agent_list: list) -> list:
+            # 대화 상대 프로필은 루트 에이전트 자체가 되므로, "서브에이전트 위임" 문구·
+            # task() 위임 후보에서 자기 자신은 제외한다.
+            if not (agent_profile and agent_profile.get("id")):
+                return agent_list
+            return [a for a in agent_list if str(a.get("id") or "") != str(agent_profile["id"])]
+
+        agents = extras.get("agents", [])
+        streamer = extras.get("streamer")
+        form_id = extras.get("form_id")
+        has_file = bool(extras.get("sources"))
 
         draft = row.get("draft") if isinstance(row.get("draft"), dict) else {}
         run_state: dict[str, Any] = {}
@@ -1001,7 +1012,7 @@ class DeepAgentExecutor(AgentExecutor):
                 form_id=form_id,
                 form_fields=extras.get("form_fields"),
                 suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
-                agents=agents,
+                agents=_exclude_root_profile(agents),
             )
         recent_msgs = collect_recent_messages(extras) if is_chat else []
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).
@@ -1309,7 +1320,7 @@ class DeepAgentExecutor(AgentExecutor):
             tenant_id=tenant_id,
             conversation_id=workspace_conversation_id or "",
             checkpointer=checkpointer,
-            subagents_raw=agents,
+            subagents_raw=_exclude_root_profile(agents),
             tenant_mcp=tenant_mcp,
             extra_tools=chat_root_tools,
             middleware=[ToolResultTruncationMiddleware()],
@@ -1318,6 +1329,7 @@ class DeepAgentExecutor(AgentExecutor):
             is_chat=is_chat,
             activity_tools=activity_tools,
             activity_skills=activity_skills,
+            root_profile=agent_profile,
             user_context={
                 "user_jwt": user_jwt,
                 "user_email": user_email,
