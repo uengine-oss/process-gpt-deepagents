@@ -1341,7 +1341,10 @@ class DeepAgentExecutor(AgentExecutor):
             tenant_mcp=tenant_mcp,
             extra_tools=chat_root_tools,
             middleware=[ToolResultTruncationMiddleware()],
-            static_subagents=build_skill_creator_subagents(task_id=task_id),
+            # skill-creator 서브에이전트(단독 스킬 생성 위임 대상)는 채팅에서 사용자가
+            # "스킬 만들어줘" 라고 요청하는 흐름 전용이다. 프로세스(워크아이템) 모드는
+            # BPMN 액티비티를 실행하는 것이지 스킬을 생성하는 게 아니므로 붙이지 않는다.
+            static_subagents=build_skill_creator_subagents(task_id=task_id) if is_chat else [],
             agent_mode=agent_mode,
             is_chat=is_chat,
             activity_tools=activity_tools,
