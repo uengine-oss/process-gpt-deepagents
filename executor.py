@@ -839,6 +839,11 @@ class DeepAgentExecutor(AgentExecutor):
         metadata = extras.get("metadata", {}) if isinstance(extras.get("metadata"), dict) else {}
 
         agents = extras.get("agents", [])
+        # 서브프로세스/액티비티 능력치 폴백(아래 `if not _has_directly_assigned_agents:`)은
+        # row.user_id로 직접 배정된 에이전트가 애초에 하나도 없을 때만 타야 한다. 아래에서
+        # agents 를 승격 처리로 비워도(agents = []) 이 폴백이 잘못 트리거되지 않도록,
+        # 원래 배정 여부를 별도로 기억해둔다.
+        _has_directly_assigned_agents = bool(agents)
         streamer = extras.get("streamer")
         form_id = extras.get("form_id")
         has_file = bool(extras.get("sources"))
@@ -851,6 +856,13 @@ class DeepAgentExecutor(AgentExecutor):
         agent_profile = metadata.get("agent_profile") if isinstance(metadata.get("agent_profile"), dict) else None
         if agent_profile and len(agents) > 1:
             agent_profile = None
+
+        # 채팅처럼 명시적인 agent_profile 신호가 없는 경우(주로 프로세스/워크리스트 모드):
+        # row.user_id로 직접 배정된 에이전트가 정확히 1명이면 그 에이전트를 서브에이전트가
+        # 아니라 루트로 승격한다. 2명 이상이면(레인 협업) 기존처럼 전원 서브에이전트로 위임한다.
+        if not agent_profile and len(agents) == 1:
+            agent_profile = agents[0]
+            agents = []
 
         def _exclude_root_profile(agent_list: list) -> list:
             # 대화 상대 프로필이 루트 에이전트 자체가 된 경우, "서브에이전트 위임" 문구·
@@ -1194,7 +1206,7 @@ class DeepAgentExecutor(AgentExecutor):
         root_proc_inst_id: str = ""
         activity_tools: list[str] = []
         activity_skills: list[str] = []
-        if not agents:
+        if not _has_directly_assigned_agents:
             proc_def_id = str(row.get("proc_def_id") or "").strip()
             activity_id = str(row.get("activity_id") or "").strip()
             subprocess_agents = load_subprocess_subagents(
