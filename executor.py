@@ -1194,10 +1194,6 @@ class DeepAgentExecutor(AgentExecutor):
         root_proc_inst_id: str = ""
         activity_tools: list[str] = []
         activity_skills: list[str] = []
-        # 서브프로세스 자식 액티비티가 1개뿐이라 그 에이전트를 서브에이전트 대신 루트로
-        # 승격시킨 경우, task() 위임이 없어 자식 워크아이템 완료 이벤트가 발생하지 않는다.
-        # 이 activity_id를 기억해뒀다가 루트 응답이 나온 뒤 직접 완료 처리한다.
-        _promoted_child_activity_id: str = ""
         if not agents:
             proc_def_id = str(row.get("proc_def_id") or "").strip()
             activity_id = str(row.get("activity_id") or "").strip()
@@ -1207,6 +1203,7 @@ class DeepAgentExecutor(AgentExecutor):
                 activity_id=activity_id,
             )
             if subprocess_agents:
+                agents = subprocess_agents
                 subprocess_alias_map = {
                     re.sub(r"[^\w-]", "-", spec["name"]).lower().strip("-"): spec["alias"]
                     for spec in subprocess_agents
@@ -1222,7 +1219,7 @@ class DeepAgentExecutor(AgentExecutor):
                     "반드시 JSON으로만 출력하세요. 다른 설명 없이 JSON만 출력하세요.\n"
                     '출력 형식:\n{"free_input": "<답변 내용>"}'
                 )
-                for _spec in subprocess_agents:
+                for _spec in agents:
                     _tool_val = (_spec.get("tool") or "").strip()
                     if not _tool_val.startswith("formHandler:"):
                         continue
@@ -1247,17 +1244,6 @@ class DeepAgentExecutor(AgentExecutor):
                     except Exception:
                         logger.warning("서브에이전트 폼 정의 조회 실패 | tool=%s", _tool_val, exc_info=True)
                         _spec["description"] = (_spec.get("description") or "") + _freeform_instruction
-
-                if len(subprocess_agents) == 1:
-                    # 자식 액티비티가 1개뿐이면 위임할 다른 대상이 없으므로, 그 프로필을
-                    # 서브에이전트로 두지 않고 딥 에이전트 루트로 승격한다(채팅 모드의
-                    # "에이전트 1명이면 루트" 규칙과 동일). 대신 task() 위임이 없어지는 만큼,
-                    # 아래에서 루트의 최종 응답으로 이 자식 워크아이템을 직접 완료 처리한다.
-                    agent_profile = subprocess_agents[0]
-                    agents = []
-                    _promoted_child_activity_id = agent_profile.get("alias") or ""
-                else:
-                    agents = subprocess_agents
             else:
                 act_tools, act_skills = load_activity_capabilities(
                     tenant_id=tenant_id,
@@ -1678,68 +1664,6 @@ class DeepAgentExecutor(AgentExecutor):
                     logger.warning("chat_room context 저장 실패 | room_id=%s", chat_room_id, exc_info=True)
 
             raw_text = extract_final_text(final_state, streamed_fallback=full_response)
-
-            # 자식 액티비티 1개짜리 서브프로세스라 그 에이전트를 루트로 승격시킨 경우,
-            # task() 위임이 없어 executor.py 의 task-완료 감지(위 subprocess_alias_map
-            # 경로)가 트리거되지 않는다. 루트의 최종 응답을 그 자식 워크아이템의 결과로
-            # 간주해 동일한 완료 이벤트 시퀀스를 여기서 직접 발행한다.
-            if _promoted_child_activity_id and root_proc_inst_id:
-                try:
-                    _child_todo = fetch_child_activity_todo(root_proc_inst_id, _promoted_child_activity_id)
-                    if _child_todo:
-                        _child_todo_id = _child_todo["id"]
-                        _child_proc_inst_id = _child_todo.get("proc_inst_id")
-                        _child_form_id = _child_todo.get("form_id")
-                        _child_result_text = extract_json_text(raw_text) if _child_form_id else (raw_text or "")
-                        _child_job_id = str(uuid.uuid4())
-                        await _enqueue_status(
-                            event_queue,
-                            task_id=_child_todo_id,
-                            context_id=_child_proc_inst_id,
-                            state=TaskState.TASK_STATE_WORKING,
-                            text=json.dumps(
-                                {"goal": "최종 결과를 반환합니다.", "name": "최종 결과 반환", "role": "최종 결과 반환", "agent_profile": "/images/chat-icon.png"},
-                                ensure_ascii=False,
-                            ),
-                            event_type="task_started",
-                            job_id=_child_job_id,
-                            crew_type="result",
-                        )
-                        await _enqueue_status(
-                            event_queue,
-                            task_id=_child_todo_id,
-                            context_id=_child_proc_inst_id,
-                            state=TaskState.TASK_STATE_COMPLETED,
-                            text=_child_result_text,
-                            event_type="task_completed",
-                            job_id=_child_job_id,
-                            crew_type="result",
-                        )
-                        from processgpt_agent_sdk.event_queue_process import ProcessEventQueue as _ChildProcessEventQueue
-                        _child_eq = _ChildProcessEventQueue(
-                            todolist_id=_child_todo_id,
-                            agent_orch="",
-                            proc_inst_id=_child_proc_inst_id,
-                        )
-                        _artifact_evt = new_text_artifact_update_event(
-                            task_id=_child_todo_id,
-                            context_id=_child_proc_inst_id,
-                            name="assistant_response",
-                            text=_child_result_text,
-                            last_chunk=True,
-                        )
-                        ParseDict({"role": "assistant"}, _artifact_evt.metadata)
-                        await _child_eq.enqueue_event(_artifact_evt)
-                    else:
-                        logger.warning(
-                            "child todo 없음(루트 승격) | activity_id=%s root_proc_inst_id=%s",
-                            _promoted_child_activity_id, root_proc_inst_id,
-                        )
-                except Exception:
-                    logger.exception(
-                        "루트 승격 자식 워크아이템 완료 처리 실패 | activity_id=%s root_proc_inst_id=%s",
-                        _promoted_child_activity_id, root_proc_inst_id,
-                    )
 
             # 채팅: 스킬이 만든 hwpx 를 office-mcp 로 실체화해 기존 채팅 아티팩트(미리보기/편집)로 띄운다.
             if is_chat and streamer is not None:
