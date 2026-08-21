@@ -838,21 +838,26 @@ class DeepAgentExecutor(AgentExecutor):
         # 두 위치를 모두 확인해 채팅에서도 HITL resume 이 트리거되게 한다.
         metadata = extras.get("metadata", {}) if isinstance(extras.get("metadata"), dict) else {}
 
-        # 프론트가 이번 대화 상대로 지정한 에이전트 프로필(role/goal/persona/tools/skills).
-        # 딥 에이전트의 루트 프롬프트·도구·스킬을 이 프로필로 커스터마이즈하는 데 쓰인다.
-        agent_profile = metadata.get("agent_profile") if isinstance(metadata.get("agent_profile"), dict) else None
-
-        def _exclude_root_profile(agent_list: list) -> list:
-            # 대화 상대 프로필은 루트 에이전트 자체가 되므로, "서브에이전트 위임" 문구·
-            # task() 위임 후보에서 자기 자신은 제외한다.
-            if not (agent_profile and agent_profile.get("id")):
-                return agent_list
-            return [a for a in agent_list if str(a.get("id") or "") != str(agent_profile["id"])]
-
         agents = extras.get("agents", [])
         streamer = extras.get("streamer")
         form_id = extras.get("form_id")
         has_file = bool(extras.get("sources"))
+
+        # 프론트가 이번 대화 상대로 지정한 에이전트 프로필(role/goal/persona/tools/skills).
+        # 딥 에이전트의 루트 프롬프트·도구·스킬을 이 프로필로 커스터마이즈하는 데 쓰인다.
+        # 단, 방에 참여한 에이전트가 둘 이상이면(그룹 채팅) 특정 프로필 하나를 루트로
+        # 승격하지 않는다 — 참여 에이전트 전원이 기존 제네릭 딥 에이전트의 서브에이전트로
+        # 위임되는, 여러 에이전트 협업 시나리오이기 때문이다.
+        agent_profile = metadata.get("agent_profile") if isinstance(metadata.get("agent_profile"), dict) else None
+        if agent_profile and len(agents) > 1:
+            agent_profile = None
+
+        def _exclude_root_profile(agent_list: list) -> list:
+            # 대화 상대 프로필이 루트 에이전트 자체가 된 경우, "서브에이전트 위임" 문구·
+            # task() 위임 후보에서 자기 자신은 제외한다.
+            if not (agent_profile and agent_profile.get("id")):
+                return agent_list
+            return [a for a in agent_list if str(a.get("id") or "") != str(agent_profile["id"])]
 
         draft = row.get("draft") if isinstance(row.get("draft"), dict) else {}
         run_state: dict[str, Any] = {}
