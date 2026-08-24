@@ -52,6 +52,8 @@ from core.agents.input_builder import (
 from core.chat.activity import (
     fetch_child_activity_todo,
     load_activity_capabilities,
+    load_activity_root_agent,
+    resolve_root_agent,
     load_subprocess_subagents,
 )
 from core.chat.chat_room import (
@@ -850,19 +852,33 @@ class DeepAgentExecutor(AgentExecutor):
 
         # 프론트가 이번 대화 상대로 지정한 에이전트 프로필(role/goal/persona/tools/skills).
         # 딥 에이전트의 루트 프롬프트·도구·스킬을 이 프로필로 커스터마이즈하는 데 쓰인다.
-        # 단, 방에 참여한 에이전트가 둘 이상이면(그룹 채팅) 특정 프로필 하나를 루트로
-        # 승격하지 않는다 — 참여 에이전트 전원이 기존 제네릭 딥 에이전트의 서브에이전트로
-        # 위임되는, 여러 에이전트 협업 시나리오이기 때문이다.
         agent_profile = metadata.get("agent_profile") if isinstance(metadata.get("agent_profile"), dict) else None
-        if agent_profile and len(agents) > 1:
-            agent_profile = None
 
-        # 채팅처럼 명시적인 agent_profile 신호가 없는 경우(주로 프로세스/워크리스트 모드):
-        # row.user_id로 직접 배정된 에이전트가 정확히 1명이면 그 에이전트를 서브에이전트가
-        # 아니라 루트로 승격한다. 2명 이상이면(레인 협업) 기존처럼 전원 서브에이전트로 위임한다.
-        if not agent_profile and len(agents) == 1:
-            agent_profile = agents[0]
-            agents = []
+        # 설계자/사용자가 "누구를 루트로 쓸지" 명시적으로 지정했는지 확인한다.
+        # - 프로세스 모드: 액티비티 정의의 rootAgent (프로세스 설계 화면의 '메인 에이전트')
+        # - 채팅 모드: 프론트가 보내는 metadata.root_agent_id
+        # 미지정(None)이면 아래의 기존 자동 휴리스틱이 그대로 적용된다.
+        explicit_root_agent_id = str(metadata.get("root_agent_id") or "").strip() or None
+        if explicit_root_agent_id is None and streamer is None and _has_directly_assigned_agents:
+            try:
+                explicit_root_agent_id = load_activity_root_agent(
+                    tenant_id=tenant_id,
+                    proc_def_id=current_proc_def_id,
+                    activity_id=activity_id,
+                )
+            except Exception:
+                logger.exception(
+                    "루트 에이전트 설정 조회 실패, 자동 규칙으로 진행 | proc_def_id=%s activity_id=%s",
+                    current_proc_def_id, activity_id,
+                )
+                explicit_root_agent_id = None
+
+        agent_profile, agents = resolve_root_agent(
+            agents=agents,
+            agent_profile=agent_profile,
+            explicit_root_agent_id=explicit_root_agent_id,
+            activity_id=activity_id,
+        )
 
         def _exclude_root_profile(agent_list: list) -> list:
             # 대화 상대 프로필이 루트 에이전트 자체가 된 경우, "서브에이전트 위임" 문구·
