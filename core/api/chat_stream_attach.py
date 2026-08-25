@@ -13,6 +13,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+from core.api.tenant_auth import request_tenant_id, tenant_guard
 from core.chat.stream_registry import format_sse_message, subscribe, unsubscribe
 from core.storage.db import get_supabase
 
@@ -36,6 +37,7 @@ def _room_tenant_id(conversation_id: str) -> str:
     return ""
 
 
+@tenant_guard
 async def attach_handler(request: Request) -> JSONResponse | StreamingResponse:
     try:
         body = await request.json()
@@ -43,11 +45,13 @@ async def attach_handler(request: Request) -> JSONResponse | StreamingResponse:
         body = {}
 
     conversation_id = str(body.get("conversation_id") or "").strip()
-    tenant_id = str(body.get("tenant_id") or "").strip()
-    if not conversation_id or not tenant_id:
-        return JSONResponse({"active": False, "error": "conversation_id/tenant_id required"}, status_code=400)
+    # tenant_id 는 요청 본문이 아니라 검증된 토큰에서 온다 — 본문 값만 믿으면
+    # 방 ID 와 테넌트 ID 만 아는 외부인이 남의 스트림에 붙을 수 있다.
+    tenant_id = request_tenant_id(request)
+    if not conversation_id:
+        return JSONResponse({"active": False, "error": "conversation_id required"}, status_code=400)
 
-    # 다른 테넌트의 방에 attach 하는 것을 막는다 — /chat/stream 이 받는 tenant_id와
+    # 다른 테넌트의 방에 attach 하는 것을 막는다 — 요청자가 속한 tenant_id와
     # 방 소유 tenant_id가 일치할 때만 재접속을 허용한다.
     room_tenant_id = _room_tenant_id(conversation_id)
     if not room_tenant_id or room_tenant_id != tenant_id:

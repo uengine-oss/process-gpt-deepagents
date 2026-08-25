@@ -18,6 +18,7 @@ starlette==1.2.1
 process-gpt-agent-sdk[sse]==0.4.27
 psycopg[binary]>=3.1
 psycopg-pool>=3.2
+pyjwt>=2.8
 langgraph-checkpoint-postgres>=2.0
 python-docx>=1.2.0
 PyMuPDF>=1.24

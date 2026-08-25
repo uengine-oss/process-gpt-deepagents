@@ -19,6 +19,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from core.api.tenant_auth import (
+    auth_guard,
+    request_tenant_id,
+    request_user_id,
+    tenant_guard,
+)
+
 logger = logging.getLogger(__name__)
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -337,8 +344,9 @@ def _record_resource_pr_sync(
         return None
 
 
+@tenant_guard
 async def list_skills(request: Request) -> JSONResponse:
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     skills = _scan_skills(tenant_id)
     return JSONResponse({"skills": skills, "total": len(skills)})
 
@@ -397,9 +405,10 @@ def _resolve_inheritance_chain(
     }
 
 
+@tenant_guard
 async def get_skill_inheritance(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     config_id = ""
     if tenant_id:
@@ -417,11 +426,13 @@ async def get_skill_inheritance(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
+@auth_guard
 async def list_builtin_skills(_request: Request) -> JSONResponse:
     skills = _scan_builtin_skills()
     return JSONResponse({"skills": skills, "total": len(skills)})
 
 
+@tenant_guard
 async def commit_skill_file(request: Request) -> JSONResponse:
     """스킬 파일을 커밋한다.
 
@@ -436,7 +447,7 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     file_path = body.get("file_path", "")
     content = body.get("content")
     message = body.get("message") or f"update {file_path}"
@@ -446,8 +457,6 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     requester_id = body.get("requester_id") or None
     requester_name = body.get("requester_name") or author_name
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if not file_path or content is None:
         return JSONResponse({"error": "file_path and content are required"}, status_code=400)
 
@@ -539,11 +548,10 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     return JSONResponse({"committed": True, "branch": branch, **result, **pr_result})
 
 
+@tenant_guard
 async def list_skill_branches(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+    tenant_id = request_tenant_id(request)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -563,6 +571,7 @@ async def list_skill_branches(request: Request) -> JSONResponse:
     return JSONResponse({"branches": annotated, "default_branch": default_branch})
 
 
+@tenant_guard
 async def merge_skill_pull_request(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -575,12 +584,10 @@ async def merge_skill_pull_request(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     message = body.get("message", "")
     auto_sync = body.get("auto_sync", True)
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -651,6 +658,7 @@ async def merge_skill_pull_request(request: Request) -> JSONResponse:
     return JSONResponse({"merged": True, "number": number, **result, "sync": sync_result})
 
 
+@tenant_guard
 async def create_skill_pull_request(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -658,14 +666,12 @@ async def create_skill_pull_request(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     title = body.get("title", "")
     description = body.get("description", "")
     head = body.get("head", "")
     base = body.get("base", "main")
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if not title or not head:
         return JSONResponse({"error": "title and head are required"}, status_code=400)
 
@@ -690,6 +696,7 @@ async def create_skill_pull_request(request: Request) -> JSONResponse:
     return JSONResponse({"created": True, **result})
 
 
+@tenant_guard
 async def get_pull_request_files(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -697,9 +704,7 @@ async def get_pull_request_files(request: Request) -> JSONResponse:
     except (KeyError, ValueError):
         return JSONResponse({"error": "invalid PR number"}, status_code=400)
 
-    tenant_id = request.query_params.get("tenant_id", "")
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+    tenant_id = request_tenant_id(request)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -716,13 +721,12 @@ async def get_pull_request_files(request: Request) -> JSONResponse:
     return JSONResponse({"files": files})
 
 
+@tenant_guard
 async def list_skill_pull_requests(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     state = request.query_params.get("state", "open")
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if state not in ("open", "closed", "all"):
         return JSONResponse({"error": "state must be 'open', 'closed', or 'all'"}, status_code=400)
 
@@ -741,17 +745,16 @@ async def list_skill_pull_requests(request: Request) -> JSONResponse:
     return JSONResponse({"pull_requests": pull_requests, "total": len(pull_requests)})
 
 
+@tenant_guard
 async def list_skill_commits(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     branch = request.query_params.get("branch") or None
     try:
         limit = min(int(request.query_params.get("limit", "20")), 100)
     except ValueError:
         limit = 20
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -768,9 +771,10 @@ async def list_skill_commits(request: Request) -> JSONResponse:
     return JSONResponse({"commits": commits})
 
 
+@tenant_guard
 async def list_skill_files(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     config_id = ""
     if tenant_id:
@@ -805,6 +809,7 @@ async def list_skill_files(request: Request) -> JSONResponse:
     return JSONResponse({"skill_name": skill_name, "files": files, "count": len(files)})
 
 
+@tenant_guard
 async def export_skill(request: Request) -> Response:
     """스킬 디렉토리 전체를 zip으로 묶어 반환한다.
 
@@ -816,7 +821,7 @@ async def export_skill(request: Request) -> Response:
     import zipfile
 
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     config_id = ""
     if tenant_id:
@@ -852,6 +857,7 @@ async def export_skill(request: Request) -> Response:
     return Response(content=data, media_type="application/zip", headers=headers)
 
 
+@tenant_guard
 async def delete_skill(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -859,11 +865,9 @@ async def delete_skill(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     mode = body.get("mode", "local")  # "local" | "repo"
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if mode not in ("local", "repo"):
         return JSONResponse({"error": "mode must be 'local' or 'repo'"}, status_code=400)
 
@@ -903,6 +907,7 @@ async def delete_skill(request: Request) -> JSONResponse:
     return JSONResponse({"deleted": True, "mode": "repo", "skill_name": skill_name})
 
 
+@tenant_guard
 async def delete_skill_file(request: Request) -> JSONResponse:
     """스킬 파일을 삭제한다. 기본 브랜치 직접 삭제는 금지 → 피처 브랜치 + PR 워크플로우."""
     skill_name = request.path_params["skill_name"]
@@ -912,7 +917,7 @@ async def delete_skill_file(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     message = body.get("message") or f"delete {file_path}"
     branch = body.get("branch", "main")
     author_name = body.get("author_name") or None
@@ -920,8 +925,6 @@ async def delete_skill_file(request: Request) -> JSONResponse:
     requester_id = body.get("requester_id") or None
     requester_name = body.get("requester_name") or author_name
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -997,6 +1000,7 @@ async def delete_skill_file(request: Request) -> JSONResponse:
     return JSONResponse({"deleted": True, "branch": branch, "file_path": file_path, **result, **pr_result})
 
 
+@tenant_guard
 async def create_skill_repo(request: Request) -> JSONResponse:
     """원격 Git 레포를 생성하고 로컬 스킬 파일을 초기 커밋으로 push한다."""
     skill_name = request.path_params["skill_name"]
@@ -1005,12 +1009,11 @@ async def create_skill_repo(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
-    owner_id: str = body.get("owner_id", "")
+    tenant_id = request_tenant_id(request)
+    # 소유자는 요청 본문이 아니라 검증된 토큰에서 가져온다(위조 방지).
+    owner_id: str = request_user_id(request) or body.get("owner_id", "")
     initial_content: str | None = body.get("initial_content") or None
     initial_file_path: str = body.get("file_path") or "SKILL.md"
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -1110,6 +1113,7 @@ async def create_skill_repo(request: Request) -> JSONResponse:
     })
 
 
+@tenant_guard
 async def upload_skill(request: Request) -> JSONResponse:
     """압축 파일(.skill, .zip)을 받아 테넌트 스킬 디렉토리에 압축 해제하여 스킬로 등록한다."""
     import tempfile
@@ -1129,9 +1133,7 @@ async def upload_skill(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "multipart/form-data parsing failed"}, status_code=400)
 
-    tenant_id = form.get("tenant_id", "")
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+    tenant_id = request_tenant_id(request)
 
     upload = form.get("file")
     if upload is None:
@@ -1151,7 +1153,8 @@ async def upload_skill(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=413)
 
     skill_name_override = form.get("skill_name", "")
-    owner_id = form.get("owner_id", "")
+    # 소유자는 요청 본문이 아니라 검증된 토큰에서 가져온다(위조 방지).
+    owner_id = request_user_id(request) or form.get("owner_id", "")
 
     tmpdir = tempfile.mkdtemp(prefix="skill-upload-")
     tmp_path = Path(tmpdir)
@@ -1194,6 +1197,7 @@ async def upload_skill(request: Request) -> JSONResponse:
         await asyncio.to_thread(shutil.rmtree, tmpdir, True)
 
 
+@tenant_guard
 async def upload_skill_from_git(request: Request) -> JSONResponse:
     """Git 레포지토리 URL을 받아 테넌트 스킬 디렉토리에 clone하여 스킬로 등록한다."""
     import subprocess
@@ -1212,13 +1216,12 @@ async def upload_skill_from_git(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     repo_url = body.get("repo_url", "")
     skill_name_override = body.get("skill_name", "")
-    owner_id = body.get("owner_id", "")
+    # 소유자는 요청 본문이 아니라 검증된 토큰에서 가져온다(위조 방지).
+    owner_id = request_user_id(request) or body.get("owner_id", "")
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if not repo_url:
         return JSONResponse({"error": "repo_url is required"}, status_code=400)
     if not owner_id:
@@ -1277,6 +1280,7 @@ async def upload_skill_from_git(request: Request) -> JSONResponse:
         await asyncio.to_thread(shutil.rmtree, tmpdir, True)
 
 
+@tenant_guard
 async def create_skill_branch(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -1284,12 +1288,10 @@ async def create_skill_branch(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     new_branch = body.get("branch", "")
     from_branch = body.get("from", "main")
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if not new_branch:
         return JSONResponse({"error": "branch is required"}, status_code=400)
 
@@ -1308,16 +1310,15 @@ async def create_skill_branch(request: Request) -> JSONResponse:
     return JSONResponse({"created": True, **result})
 
 
+@tenant_guard
 async def list_remote_skill_files(request: Request) -> JSONResponse:
     """원격 Git 레포의 특정 브랜치 파일 목록을 반환한다 (로컬 디스크 미사용)."""
     skill_name = request.path_params["skill_name"]
     branch = request.query_params.get("branch", "")
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     if not branch:
         return JSONResponse({"error": "branch is required"}, status_code=400)
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -1335,17 +1336,16 @@ async def list_remote_skill_files(request: Request) -> JSONResponse:
     return JSONResponse({"skill_name": skill_name, "branch": branch, "files": files, "count": len(files)})
 
 
+@tenant_guard
 async def get_remote_skill_file(request: Request) -> JSONResponse:
     """원격 Git 레포의 특정 브랜치에서 파일 내용을 반환한다 (로컬 디스크 미사용)."""
     skill_name = request.path_params["skill_name"]
     branch = request.query_params.get("branch", "")
     file_path = request.path_params["file_path"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     if not branch:
         return JSONResponse({"error": "branch is required"}, status_code=400)
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -1379,6 +1379,7 @@ async def get_remote_skill_file(request: Request) -> JSONResponse:
     })
 
 
+@tenant_guard
 async def sync_skill(request: Request) -> JSONResponse:
     """main 브랜치를 원격에서 가져와 로컬 디스크를 갱신한다."""
     skill_name = request.path_params["skill_name"]
@@ -1387,9 +1388,7 @@ async def sync_skill(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+    tenant_id = request_tenant_id(request)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -1440,10 +1439,11 @@ async def sync_skill(request: Request) -> JSONResponse:
     })
 
 
+@tenant_guard
 async def get_skill_file(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     file_path = request.path_params["file_path"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     config_id = ""
     if tenant_id:
