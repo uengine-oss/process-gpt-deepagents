@@ -138,6 +138,36 @@ class TestChatStreamGuard:
         assert resp.headers["content-type"].startswith("text/event-stream")
         assert resp.text == "data: tenant-a\n\ndata: done\n\n"
 
+    def test_slow_sse_stream_is_not_cut_short(self):
+        """가드가 가짜 http.disconnect 를 흘리면 StreamingResponse 가 즉시 취소된다.
+
+        Starlette 의 StreamingResponse 는 receive() 로 클라이언트 끊김을 감시하다가
+        http.disconnect 를 받으면 task group 을 취소한다. 미들웨어가 버퍼링한 본문을
+        재생한 뒤 곧바로 disconnect 를 돌려주면, 실제 채팅처럼 await 가 끼는 스트림이
+        첫 청크만 나가고 끊긴다(= 프론트에 네트워크 오류).
+        """
+        import asyncio
+
+        from starlette.responses import StreamingResponse
+
+        async def stream(request: Request) -> StreamingResponse:
+            await request.json()
+
+            async def gen():
+                for i in range(3):
+                    await asyncio.sleep(0.05)
+                    yield f"data: {i}\n\n".encode()
+
+            return StreamingResponse(gen(), media_type="text/event-stream")
+
+        app = Starlette(routes=[Route("/chat/stream", stream, methods=["POST"])])
+        app.add_middleware(ChatTenantGuardMiddleware, paths=("/chat/stream",))
+        with TestClient(app) as c:
+            resp = c.post("/chat/stream", json={"message": "hi"}, headers=_auth("tenant-a"))
+
+        assert resp.status_code == 200
+        assert resp.text == "data: 0\n\ndata: 1\n\ndata: 2\n\n"
+
     def test_other_paths_are_untouched(self):
         """가드 경로가 아닌 요청은 본문·헤더 그대로 통과해야 한다."""
 

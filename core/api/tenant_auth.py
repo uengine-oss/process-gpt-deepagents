@@ -405,8 +405,14 @@ def clear_caches() -> None:
 _MAX_GUARDED_BODY = 32 * 1024 * 1024
 
 
-def _replay_receive(body: bytes):
-    """버퍼링해 둔 본문을 하위 앱에 다시 흘려보내는 receive 콜러블."""
+def _replay_receive(body: bytes, original_receive):
+    """버퍼링해 둔 본문을 하위 앱에 다시 흘려보내는 receive 콜러블.
+
+    본문을 다 돌려준 뒤에는 반드시 원래 receive 로 위임해야 한다. 여기서 곧바로
+    http.disconnect 를 만들어 돌려주면, Starlette StreamingResponse 가 그것을
+    "클라이언트가 끊었다"로 읽고(listen_for_disconnect) task group 을 취소해
+    SSE 응답이 시작하자마자 잘린다 — 채팅이 전송은 되는데 네트워크 오류로 끝나는 증상.
+    """
     sent = False
 
     async def receive():
@@ -414,7 +420,7 @@ def _replay_receive(body: bytes):
         if not sent:
             sent = True
             return {"type": "http.request", "body": body, "more_body": False}
-        return {"type": "http.disconnect"}
+        return await original_receive()
 
     return receive
 
@@ -457,17 +463,17 @@ class ChatTenantGuardMiddleware:
             body += message.get("body", b"")
             if len(body) > _MAX_GUARDED_BODY:
                 await JSONResponse({"error": "request body too large"}, status_code=413)(
-                    scope, _replay_receive(b""), send
+                    scope, receive, send
                 )
                 return
             more_body = message.get("more_body", False)
 
-        request = Request(scope, receive=_replay_receive(body))
+        request = Request(scope, receive=_replay_receive(body, receive))
         try:
             await authorize_tenant(request)
         except TenantAuthError as e:
             await JSONResponse({"error": e.message}, status_code=e.status_code)(
-                scope, _replay_receive(b""), send
+                scope, receive, send
             )
             return
 
@@ -484,4 +490,4 @@ class ChatTenantGuardMiddleware:
                 body = json.dumps(data, ensure_ascii=False).encode("utf-8")
                 downstream_scope = _scope_with_body_length(scope, len(body))
 
-        await self.app(downstream_scope, _replay_receive(body), send)
+        await self.app(downstream_scope, _replay_receive(body, receive), send)
