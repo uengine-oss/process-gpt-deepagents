@@ -4,8 +4,8 @@ import logging
 import re
 
 from deepagents import SubAgent
-from langchain.agents.middleware import ToolRetryMiddleware
 
+from .tool_retry import build_tool_retry_middleware
 from ..llm.mcp import _load_mcp_tools_grouped
 from ..skills.skills import FilteredSkillsMiddleware, _get_skills
 from ..skills.git_providers.factory import get_provider as _get_git_provider
@@ -136,7 +136,7 @@ async def _build_subagents(
             # MCP 도구(예: odoo-mcp aggregate_records/search_records) 호출이 ToolException
             # 등으로 실패해도 실행을 중단시키지 않고, 에러를 ToolMessage 로 모델에 돌려줘
             # 인자를 스스로 보정해 재시도하게 한다.
-            extra_middleware.append(ToolRetryMiddleware(max_retries=1, on_failure="continue"))
+            extra_middleware.append(build_tool_retry_middleware())
 
         subagent: SubAgent = SubAgent(
             name=name,

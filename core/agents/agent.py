@@ -2,9 +2,9 @@ import os
 from pathlib import Path
 
 from deepagents import create_deep_agent
-from langchain.agents.middleware import ToolRetryMiddleware
 from langgraph.checkpoint.memory import MemorySaver
 
+from .tool_retry import build_tool_retry_middleware
 from ..sandbox.docker_sandbox import get_or_create_sandbox
 from ..chat.hitl import get_hitl_tools
 from ..llm.model import _build_model
@@ -144,14 +144,6 @@ CUSTOM_PROFILE_SYSTEM_PROMPT = (
     + "\n\n"
     + _MCP_RETRY_RULES
 )
-
-
-def _build_tool_retry_middleware() -> ToolRetryMiddleware:
-    """MCP 도구 호출 실패(ToolException 등) 시 예외로 실행을 중단시키는 대신,
-    에러 내용을 ToolMessage 로 모델에 돌려줘 스스로 인자를 보정해 재시도하게 한다.
-    (odoo-mcp aggregate_records/search_records 의 domain·datetime 형식 오류 등)
-    """
-    return ToolRetryMiddleware(max_retries=1, on_failure="continue")
 
 
 async def build_agent(
@@ -374,6 +366,6 @@ async def build_agent(
     )
     if built_subagents:
         kwargs["subagents"] = built_subagents
-    kwargs["middleware"] = [_build_tool_retry_middleware(), *extra_middleware]
+    kwargs["middleware"] = [build_tool_retry_middleware(), *extra_middleware]
 
     return create_deep_agent(**kwargs), _mcp_connectors, _mcp_tools_meta
