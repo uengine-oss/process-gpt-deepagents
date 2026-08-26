@@ -1020,15 +1020,27 @@ async def create_skill_repo(request: Request) -> JSONResponse:
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    # 이미 레포가 있으면 중복 생성 방지
+    # 이미 레포가 있으면 중복 생성 방지.
+    # 단, 레포는 있는데 브랜치가 하나도 없는 "빈 레포"는 레포 생성 직후 초기 커밋 push 가
+    # 실패해 남은 상태다. 이때도 409 로 막아버리면 초기 커밋을 다시 넣을 방법이 없어
+    # 변경 이력·PR 화면이 영구히 "레포 없음"으로 남는다 → 초기 커밋 단계로 진행한다.
     existing = await asyncio.to_thread(provider.repo_exists, skill_name)
+    html_url = ""
     if existing:
-        return JSONResponse({"error": f"repo '{skill_name}' already exists"}, status_code=409)
+        try:
+            branches = await asyncio.to_thread(provider.list_branches, provider.username, skill_name)
+        except Exception:
+            branches = [{"name": "main"}]  # 조회 실패 시엔 보수적으로 "있음" 취급
+        if branches:
+            return JSONResponse({"error": f"repo '{skill_name}' already exists"}, status_code=409)
+        html_url = await asyncio.to_thread(provider.get_repo_html_url, provider.username, skill_name)
+        logger.info("빈 레포에 초기 커밋을 다시 시도합니다 skill=%s", skill_name)
 
-    try:
-        html_url = await asyncio.to_thread(provider.create_repo, skill_name)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    if not existing:
+        try:
+            html_url = await asyncio.to_thread(provider.create_repo, skill_name)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
 
     # GitLab은 토큰 소유자 네임스페이스에 레포를 생성하므로 html_url에서 실제 owner를 추출한다.
     # (DB의 provider.username과 실제 GitLab username이 다를 수 있음)
@@ -1176,23 +1188,46 @@ async def upload_skill(request: Request) -> JSONResponse:
             or (skill_root.name if skill_root != tmp_path else skill_name_from_filename(filename))
         )
 
+        # overwrite=true 는 "이미 등록된 스킬의 내용을 교체한다"는 명시적 의사표시다.
+        # (채팅 산출물 패널의 저장 버튼처럼 사용자가 직접 누른 경우.) 없으면 종전대로 409.
+        overwrite = str(form.get("overwrite", "")).strip().lower() in ("1", "true", "yes")
+
         dest = get_tenant_skill_dest(tenant_id, skill_name, config_id="local")
-        if dest.exists():
+        already_exists = dest.exists()
+        if already_exists and not overwrite:
             return JSONResponse(
                 {"error": f"skill '{skill_name}' already exists for tenant '{tenant_id}'"},
                 status_code=409,
             )
 
         dest.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(shutil.move, str(skill_root), str(dest))
+        # 교체는 기존 디렉터리를 백업해 두고 진행한다 — 이동이 실패해도 스킬이 사라지지 않는다.
+        backup = dest.with_name(f"{dest.name}.bak-{os.getpid()}") if already_exists else None
+        if backup is not None:
+            await asyncio.to_thread(shutil.rmtree, str(backup), True)
+            await asyncio.to_thread(shutil.move, str(dest), str(backup))
+        try:
+            await asyncio.to_thread(shutil.move, str(skill_root), str(dest))
+        except Exception as e:
+            if backup is not None and backup.exists() and not dest.exists():
+                await asyncio.to_thread(shutil.move, str(backup), str(dest))
+            return JSONResponse({"error": f"failed to write skill files: {e}"}, status_code=500)
+        if backup is not None:
+            await asyncio.to_thread(shutil.rmtree, str(backup), True)
         files = list_skill_files(dest)
 
-        try:
-            await asyncio.to_thread(_save_tenant_skill, tenant_id, skill_name, owner_id)
-        except Exception as e:
-            logger.error("tenant_skills 저장 실패 skill=%s tenant=%s: %s", skill_name, tenant_id, e)
+        # 교체(overwrite)는 이미 tenant_skills 에 행이 있으므로 다시 insert 하지 않는다
+        # (_save_tenant_skill 은 upsert 가 아니라 insert 라 중복 행이 생긴다).
+        if not already_exists:
+            try:
+                await asyncio.to_thread(_save_tenant_skill, tenant_id, skill_name, owner_id)
+            except Exception as e:
+                logger.error("tenant_skills 저장 실패 skill=%s tenant=%s: %s", skill_name, tenant_id, e)
 
-        return JSONResponse({"registered": True, "skill_name": skill_name, "files": files}, status_code=201)
+        return JSONResponse(
+            {"registered": True, "skill_name": skill_name, "files": files, "overwritten": already_exists},
+            status_code=201,
+        )
     finally:
         await asyncio.to_thread(shutil.rmtree, tmpdir, True)
 
@@ -1440,6 +1475,60 @@ async def sync_skill(request: Request) -> JSONResponse:
 
 
 @tenant_guard
+async def put_skill_file_local(request: Request) -> JSONResponse:
+    """스킬 파일 하나를 테넌트 스킬 디렉터리에 **git 없이** 직접 쓴다.
+
+    Git 공급자가 연결되지 않은 테넌트도 스킬을 편집·저장할 수 있어야 한다(버전·병합 관리는
+    git 이 연결된 경우에만 제공). git 커밋 경로(`/skills/{name}/commit`)는 provider 를
+    요구하므로, 그것과 별개의 경로가 필요하다.
+    """
+    skill_name = request.path_params["skill_name"]
+    file_path = request.path_params["file_path"]
+    tenant_id = request_tenant_id(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    content = body.get("content")
+    if not isinstance(content, str):
+        return JSONResponse({"error": "content (string) is required"}, status_code=400)
+
+    # git provider 가 있으면 그 config_id 디렉터리를, 없으면 'local' 업로드 디렉터리를 찾는다.
+    # (_find_tenant_skill_dir 는 config_id 가 주어지면 provider 경로 → local 경로 순으로 본다.)
+    config_id = "local"
+    try:
+        provider = await asyncio.to_thread(_get_provider, tenant_id)
+        config_id = provider.config_id or "local"
+    except Exception:
+        pass
+
+    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
+    if skill_dir is None:
+        return JSONResponse({"error": f"skill '{skill_name}' not found"}, status_code=404)
+
+    # path traversal 방지: resolve 후 skill_dir 하위인지 확인
+    resolved_skill = skill_dir.resolve()
+    target = (skill_dir / file_path).resolve()
+    try:
+        target.relative_to(resolved_skill)
+    except ValueError:
+        return JSONResponse({"error": "invalid file_path"}, status_code=400)
+    if target.is_dir():
+        return JSONResponse({"error": f"'{file_path}' is a directory"}, status_code=400)
+
+    try:
+        await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(target.write_text, content, "utf-8")
+    except Exception as e:
+        return JSONResponse({"error": f"failed to write file: {e}"}, status_code=500)
+
+    logger.info("스킬 파일 로컬 저장 skill=%s file=%s tenant=%s", skill_name, file_path, tenant_id)
+    return JSONResponse({"saved": True, "skill_name": skill_name, "file_path": file_path, "bytes": len(content.encode())})
+
+
+@tenant_guard
 async def get_skill_file(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     file_path = request.path_params["file_path"]
@@ -1518,5 +1607,7 @@ routes = [
     Route("/skills/{skill_name}/export", export_skill, methods=["GET"]),
     Route("/skills/{skill_name}/files", list_skill_files, methods=["GET"]),
     Route("/skills/{skill_name}/files/{file_path:path}", get_skill_file, methods=["GET"]),
+    # git 없이 로컬 스킬 디렉터리에 직접 저장(버전·병합 관리 제외)
+    Route("/skills/{skill_name}/files/{file_path:path}", put_skill_file_local, methods=["PUT"]),
     Route("/skills/{skill_name}/files/{file_path:path}", delete_skill_file, methods=["DELETE"]),
 ]

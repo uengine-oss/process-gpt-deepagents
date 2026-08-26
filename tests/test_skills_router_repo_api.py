@@ -305,3 +305,69 @@ class TestMergeSkillPullRequest:
                 json={"tenant_id": "t1", "auto_sync": False},
             )
         assert resp.json()["sync"] == {}
+
+
+# ---------------------------------------------------------------------------
+# POST /skills/{skill_name}/repo
+# ---------------------------------------------------------------------------
+
+class TestCreateSkillRepo:
+    """레포 생성 직후 초기 커밋 push 가 실패하면 '레포는 있는데 브랜치가 없는' 상태로 남는다.
+    그때 409 로 막으면 변경 이력·PR 화면이 영구히 '레포 없음' 으로 남으므로,
+    빈 레포에 한해 초기 커밋을 다시 밀어 넣을 수 있어야 한다."""
+
+    def _post(self, client, skill="my-skill"):
+        return client.post(
+            f"/skills/{skill}/repo",
+            json={"tenant_id": "t1", "initial_content": "# hi", "file_path": "SKILL.md"},
+        )
+
+    def test_creates_repo_when_missing(self, client):
+        provider = _mock_provider()
+        provider.repo_exists.return_value = None
+        provider.create_repo.return_value = "https://git.example.com/test-owner/my-skill"
+        provider.config_id = "local"
+        with (
+            patch("core.api.skills_router._get_provider", return_value=provider),
+            patch("core.api.skills_router._find_skill_dir", return_value=None),
+        ):
+            resp = self._post(client)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["pushed"] == ["SKILL.md"]
+        provider.create_repo.assert_called_once()
+
+    def test_conflicts_when_repo_has_branches(self, client):
+        provider = _mock_provider(branches=[{"name": "main", "sha": "a" * 40}])
+        provider.repo_exists.return_value = {"name": "my-skill"}
+        provider.config_id = "local"
+        with patch("core.api.skills_router._get_provider", return_value=provider):
+            resp = self._post(client)
+        assert resp.status_code == 409
+        assert "already exists" in resp.json()["error"]
+        provider.create_repo.assert_not_called()
+
+    def test_retries_initial_commit_when_repo_is_empty(self, client):
+        provider = _mock_provider()
+        provider.list_branches.return_value = []  # 커밋이 없는 빈 레포
+        provider.repo_exists.return_value = {"name": "my-skill"}
+        provider.get_repo_html_url.return_value = "https://git.example.com/test-owner/my-skill"
+        provider.config_id = "local"
+        with (
+            patch("core.api.skills_router._get_provider", return_value=provider),
+            patch("core.api.skills_router._find_skill_dir", return_value=None),
+        ):
+            resp = self._post(client)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["pushed"] == ["SKILL.md"]
+        # 이미 있는 레포이므로 다시 만들지 않고, 초기 커밋만 다시 올린다.
+        provider.create_repo.assert_not_called()
+        provider.update_file.assert_called_once()
+
+    def test_treats_branch_lookup_failure_as_existing(self, client):
+        provider = _mock_provider()
+        provider.repo_exists.return_value = {"name": "my-skill"}
+        provider.list_branches.side_effect = RuntimeError("api down")
+        provider.config_id = "local"
+        with patch("core.api.skills_router._get_provider", return_value=provider):
+            resp = self._post(client)
+        assert resp.status_code == 409

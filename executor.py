@@ -423,6 +423,24 @@ def _file_artifact_payload(path: str, content: str | None, op: str) -> dict:
     }
 
 
+# 응답이 "병합 요청(PR)을 올렸다"고 보고하는지 판단할 표식.
+# PR 을 올린 턴은 저장 버튼을 누를 일이 없으므로 기본 안내 문구로 덮어쓰면 안 된다.
+_PULL_REQUEST_MARKERS = (
+    "PR created",
+    "pull/",
+    "merge_requests/",
+    "PR #",
+    "병합 요청",
+    "병합해 주세요",
+)
+
+
+def _reports_pull_request(text: str | None) -> bool:
+    """응답 본문이 PR 생성 결과를 알리고 있으면 True."""
+    body = text or ""
+    return any(marker in body for marker in _PULL_REQUEST_MARKERS)
+
+
 async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
     """검증/완료 후 방의 모든 산출물 파일을 file_artifact(edit)로 재전송한다.
 
@@ -1809,7 +1827,10 @@ class DeepAgentExecutor(AgentExecutor):
                 try:
                     await _reemit_room_artifacts(streamer, chat_room_id or "")
                     logger.info("단독 스킬 산출물 재전송 | room=%s", chat_room_id)
-                    if "확인 후 저장" not in (raw_text or ""):
+                    # PR(병합 요청)을 올린 턴은 사용자가 저장 버튼을 누를 일이 없다. 그런데도
+                    # 이 문구로 덮어쓰면 PR 링크와 병합 위치 안내가 사라지고 "저장하라"는
+                    # 잘못된 안내만 남는다. 그런 응답은 에이전트의 원문을 그대로 둔다.
+                    if "확인 후 저장" not in (raw_text or "") and not _reports_pull_request(raw_text):
                         raw_text = "스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요."
                 except Exception:
                     logger.exception("단독 스킬 산출물 재전송 실패")

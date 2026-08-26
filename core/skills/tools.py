@@ -217,6 +217,37 @@ def _git_sb(cwd: str, *args: str) -> tuple[int, str]:
     return _sandbox_exec(f"cd {shlex.quote(cwd)} && git {parts}")
 
 
+def _try_clone_skill_repo(skill_name: str, dest: str) -> str | None:
+    """스킬 이름과 같은 Git 레포가 있으면 dest 로 클론하고 그 경로를 돌려준다.
+
+    레포가 없거나(=git 미연동 포함) 클론이 실패하면 None 을 돌려주고, 호출자는 로컬 사본
+    경로로 폴백한다. 레포가 있을 때 로컬 사본으로 작업하면 이후 publish_skill 의 PR diff 가
+    "레포 전체를 로컬본으로 교체" 가 되어 병합 관리 흐름이 의미를 잃는다.
+    """
+    try:
+        provider = _get_git_provider()
+    except ValueError:
+        return None
+    try:
+        if not provider.repo_exists(skill_name):
+            return None
+    except Exception:
+        return None
+
+    auth_url = provider.get_authenticated_clone_url(provider.username, skill_name)
+    rc, out = _sandbox_exec(
+        f"rm -rf {shlex.quote(dest)} && git clone --depth=50 {shlex.quote(auth_url)} {shlex.quote(dest)}"
+    )
+    if rc != 0:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "스킬 레포 클론 실패, 로컬 사본으로 폴백 skill=%s: %s", skill_name, out
+        )
+        return None
+    return dest
+
+
 # ---------------------------------------------------------------------------
 # Git provider 헬퍼
 # ---------------------------------------------------------------------------
@@ -351,9 +382,19 @@ def _push_skill_sandbox(
     if existing_repo:
         fetch_code, _ = _git_sb(cwd, "fetch", "origin", "main", "--depth=1")
         if fetch_code == 0:
-            _git_sb(cwd, "reset", "--soft", "FETCH_HEAD")
+            # --mixed(기본): HEAD 와 **인덱스**를 원격 커밋으로 맞추고 워킹트리는 건드리지 않는다.
+            # --soft 는 인덱스를 그대로(= git init 직후엔 빈 상태) 두기 때문에 원격 HEAD 의 모든
+            # 파일이 "삭제"로 보이고, 바뀌지 않은 파일까지 전체 교체 diff 로 커밋된다.
+            _git_sb(cwd, "reset", "--mixed", "FETCH_HEAD")
 
-    _git_sb(cwd, "add", ".")
+    if existing_repo:
+        # 기존 레포 수정: 워킹트리에 없는 원격 파일을 "삭제"로 스테이징하지 않는다.
+        # 워킹트리는 로컬 스킬 사본일 수 있고(레포에만 있는 evals/ 같은 디렉터리가 없다),
+        # 그 상태에서 `git add .` 를 하면 사용자가 요청하지 않은 파일 삭제가 PR 에 섞여
+        # 병합 시 레포 파일이 사라진다. 의도적인 삭제는 delete_skill_file 경로를 쓴다.
+        _git_sb(cwd, "add", "--ignore-removal", ".")
+    else:
+        _git_sb(cwd, "add", ".")
     verb = "update" if branch == "main" else f"add branch {branch}"
     code, out = _git_sb(cwd, "commit", "-m", f"feat: {verb} {skill_name}")
     if code != 0 and "nothing to commit" not in out:
@@ -2395,6 +2436,12 @@ def checkout_to_workspace(source: str) -> str:
     if source.startswith("/skills/"):
         p = Path(source)
         dest = f"/workspace/{p.name}"
+        # 같은 이름의 Git 레포가 있으면 로컬 사본 대신 레포를 클론한다.
+        # 로컬 사본으로 작업하면 PR diff 가 "레포 전체를 로컬본으로 교체" 가 되어
+        # 요청한 변경을 분간할 수 없고, 병합 관리 흐름이 의미를 잃는다.
+        cloned = _try_clone_skill_repo(p.name, dest)
+        if cloned is not None:
+            return cloned
         rc, out = _sandbox_exec(
             f"rm -rf {shlex.quote(dest)} && cp -r {shlex.quote(source)} {shlex.quote(dest)}"
         )
@@ -2510,14 +2557,27 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
         cwd = dest
 
     repo_info = provider.repo_exists(skill_name)
-    repo_exists = repo_info is not None
+    repo_missing = repo_info is None
 
-    if not repo_exists:
-        # 신규 레포: 생성 후 main에 초기 커밋 (PR 불필요)
+    # 레포는 있는데 브랜치가 하나도 없는 "빈 레포"는 신규와 동일하게 main 초기 커밋으로 처리한다.
+    # 레포 생성 직후 push 가 실패하면 이 상태로 남는데, PR 경로는 base 브랜치(main)가 없어
+    # 항상 실패하므로 스킬이 영구히 병합 관리 흐름에 진입하지 못한다.
+    empty_repo = False
+    if not repo_missing:
         try:
-            html_url = provider.create_repo(skill_name)
-        except RuntimeError as e:
-            return f"ERROR creating repo: {e}"
+            empty_repo = not provider.list_branches(provider.username, skill_name)
+        except Exception:
+            empty_repo = False  # 조회 실패 시엔 기존 동작(PR 경로)을 유지한다.
+
+    if repo_missing or empty_repo:
+        if repo_missing:
+            # 신규 레포: 생성 후 main에 초기 커밋 (PR 불필요)
+            try:
+                html_url = provider.create_repo(skill_name)
+            except RuntimeError as e:
+                return f"ERROR creating repo: {e}"
+        else:
+            html_url = provider.get_repo_html_url(provider.username, skill_name)
 
         clone_url = provider.get_authenticated_clone_url(provider.username, skill_name)
         return _push_skill_sandbox(
@@ -2541,7 +2601,7 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
 
 
 @tool
-def register_skill_as_tenant(skill_path: str) -> str:
+def register_skill_as_tenant(skill_path: str, overwrite: bool = False) -> str:
     """Register a packaged skill (.skill file) as a tenant skill without git.
 
     Use this when there is no git provider configured. After packaging the skill
@@ -2551,8 +2611,16 @@ def register_skill_as_tenant(skill_path: str) -> str:
     The tool extracts the archive, copies files to the tenant skill directory, and
     records the registration in the tenant_skills table. No UI upload needed.
 
+    **New skill vs. existing skill:** by default this tool refuses to touch a skill
+    that already exists, so it cannot be used to update one by accident. To apply an
+    edit to an existing skill, prefer `publish_skill` (it opens a PR for review). Only
+    when no git provider is configured, call this tool again with `overwrite=True` to
+    replace the existing skill files in place.
+
     Args:
         skill_path: Container path to the .skill (or .zip) file, e.g. /workspace/my-skill.skill
+        overwrite:  Replace the files of an already-registered skill instead of failing.
+                    The previous files are kept as a backup until the update succeeds.
     """
     import shutil as _shutil
     import tempfile as _tempfile
@@ -2587,30 +2655,47 @@ def register_skill_as_tenant(skill_path: str) -> str:
         skill_name = skill_root.name if skill_root != tmpdir else skill_name_from_filename(host_path.name)
         dest = get_tenant_skill_dest(tenant_id, skill_name, config_id="local")
 
-        if dest.exists():
-            return f"ERROR: '{skill_name}' 스킬이 이미 존재합니다 (tenant: {tenant_id}). 다른 이름을 사용하거나 기존 스킬을 삭제하세요."
+        already_registered = dest.exists()
+        if already_registered and not overwrite:
+            return (
+                f"ERROR: '{skill_name}' 스킬이 이미 존재합니다 (tenant: {tenant_id}). "
+                "기존 스킬을 수정하려면 publish_skill 로 PR 을 올리세요. "
+                "git 공급자가 없어 직접 반영해야 한다면 overwrite=True 로 다시 호출하세요."
+            )
 
+        # 덮어쓰기는 기존 파일을 백업해 두고 진행한다 — 이후 DB 단계까지 성공하면 백업을 지우고,
+        # 중간에 실패하면 백업을 되돌려 스킬이 사라지지 않게 한다.
+        backup = dest.with_name(f"{dest.name}.bak-{os.getpid()}") if already_registered else None
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
+            if backup is not None:
+                _shutil.rmtree(str(backup), ignore_errors=True)
+                _shutil.move(str(dest), str(backup))
             _shutil.move(str(skill_root), str(dest))
         except Exception as e:
+            if backup is not None and backup.exists() and not dest.exists():
+                _shutil.move(str(backup), str(dest))
             return f"ERROR: 파일 복사 실패: {e}"
     finally:
         _shutil.rmtree(str(tmpdir), ignore_errors=True)
 
     owner_id = _current_user_id.get() or ""
-    try:
-        from ..storage.db import get_supabase
-        get_supabase().table("tenant_skills").insert({
-            "tenant_id": tenant_id,
-            "skill_name": skill_name,
-            "owner_id": owner_id,
-        }).execute()
-    except Exception as e:
-        _logging.getLogger(__name__).warning("tenant_skills 등록 실패 skill=%s: %s", skill_name, e)
-        _shutil.rmtree(str(dest), ignore_errors=True)
-        return f"ERROR: DB 등록 실패로 파일을 롤백했습니다: {e}"
+    if not already_registered:
+        try:
+            from ..storage.db import get_supabase
+            get_supabase().table("tenant_skills").insert({
+                "tenant_id": tenant_id,
+                "skill_name": skill_name,
+                "owner_id": owner_id,
+            }).execute()
+        except Exception as e:
+            _logging.getLogger(__name__).warning("tenant_skills 등록 실패 skill=%s: %s", skill_name, e)
+            _shutil.rmtree(str(dest), ignore_errors=True)
+            return f"ERROR: DB 등록 실패로 파일을 롤백했습니다: {e}"
 
+    if backup is not None:
+        _shutil.rmtree(str(backup), ignore_errors=True)
+        return f"✓ '{skill_name}' 테넌트 스킬 갱신 완료 (경로: {dest})"
     return f"✓ '{skill_name}' 테넌트 스킬로 등록 완료 (경로: {dest})"
 
 

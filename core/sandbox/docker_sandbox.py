@@ -246,6 +246,8 @@ class DockerSandboxBackend(BaseSandbox):
             old = self._client.containers.get(name)
             if old.status == "running":
                 self._container = old
+                # 이전 실행에서 살아남은 컨테이너에도 safe.directory 를 보장한다.
+                self._configure_git(old)
                 return old
             old.remove(force=True)
         except docker.errors.NotFound:
@@ -270,7 +272,27 @@ class DockerSandboxBackend(BaseSandbox):
             cpu_quota=50_000,  # 50% of one CPU core
         )
         logger.info("sandbox started: %s (tenant=%s)", name, self._tenant_id)
+        self._configure_git(container)
         return container
+
+    @staticmethod
+    def _configure_git(container) -> None:
+        """/workspace 를 git 이 신뢰하도록 safe.directory 를 설정한다.
+
+        /workspace 는 호스트 볼륨 마운트라 디렉터리 소유자 uid 가 컨테이너 사용자와 다르다.
+        그러면 git 이 `fatal: detected dubious ownership in repository at '/workspace/<skill>'`
+        로 모든 명령을 거부하고, publish_skill 은 "레포는 만들어졌는데 push 는 실패" 한
+        빈 레포 상태를 남긴다. 컨테이너는 이미 격리된 일회용 환경이므로 여기서 신뢰를 넓혀도
+        호스트 git 설정에는 영향이 없다. git 이 아직 없으면 조용히 실패하고, 이후 자동 설치
+        직후 다시 호출된다.
+        """
+        try:
+            container.exec_run(
+                ["bash", "-c", "git config --system --add safe.directory '*' 2>/dev/null || true"],
+                demux=False,
+            )
+        except Exception as e:  # pragma: no cover - best effort
+            logger.debug("sandbox git safe.directory 설정 실패(무시): %s", e)
 
     def cleanup(self) -> None:
         with self._lock:
@@ -379,6 +401,8 @@ class DockerSandboxBackend(BaseSandbox):
                 f"&& apt-get install -y -qq --no-install-recommends {pkg} 2>&1 | tail -3"
             )
             container.exec_run(["bash", "-c", install_cmd], demux=False)
+            if missing == "git":
+                self._configure_git(container)
             exit_code, out = _exec(command)
 
         truncated = len(out) > _MAX_OUTPUT_BYTES

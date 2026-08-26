@@ -505,6 +505,36 @@ If the user declines, skip registration.
 
 ---
 
+### Updating a skill that already exists
+
+The paths above are for a **brand-new** skill. When the user asks you to change a skill that is
+already registered for the tenant (it appeared in `available_skills`, or you loaded it with
+`checkout_to_workspace`), the tool choice is different:
+
+1. **Default — `publish_skill`.** The repo already exists, so it pushes a feature branch and opens a
+   Pull Request. The user reviews and merges it from 스킬 상세 → 변경 이력 → 병합 요청. Say so
+   explicitly in your reply: tell them a PR was opened and where to merge it.
+2. **Only when no git provider is configured** — package the skill, then call
+   `register_skill_as_tenant` with `overwrite=True`. Without `overwrite=True` the tool refuses,
+   because it will not silently replace an existing skill.
+
+Never call `register_skill_as_tenant` **without** `overwrite=True` for an existing skill and then
+present the result as done — it returns `ERROR: ... 스킬이 이미 존재합니다` and nothing is applied.
+
+### Never report a failed tool call as success
+
+Every tool in this skill returns either a line starting with `✓` on success or a line starting with
+`ERROR:` on failure. Before you mark a todo `completed` or tell the user the work is done:
+
+- Read the tool result. If it starts with `ERROR:`, the step **failed**.
+- Do not set that todo to `completed`, and do not say "스킬을 생성했어요" / "반영했어요".
+- Report the failure to the user in plain language, quote the reason, and state what you will try
+  next (or what they need to do). If a retry with different arguments is the obvious fix — e.g.
+  `overwrite=True`, or `publish_skill` instead of `register_skill_as_tenant` — do that first and
+  report the outcome of the retry.
+
+---
+
 ### Package and Present (only if `present_files` tool is available)
 
 Check whether you have access to the `present_files` tool. If you don't, skip this step. If you do, package the skill and present the .skill file to the user:

@@ -8,16 +8,20 @@ core/chat/stream_registry.py 의 메모리 레지스트리만 사용한다.
 from __future__ import annotations
 
 import logging
+import os
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+from core.api.sse_heartbeat import DEFAULT_INTERVAL_SECONDS, with_heartbeat
 from core.api.tenant_auth import request_tenant_id, tenant_guard
 from core.chat.stream_registry import format_sse_message, subscribe, unsubscribe
 from core.storage.db import get_supabase
 
 logger = logging.getLogger(__name__)
+
+_HEARTBEAT_SECONDS = float(os.environ.get("SSE_HEARTBEAT_SECONDS", DEFAULT_INTERVAL_SECONDS))
 
 # 활성 스트림 없음은 클라이언트 관점에서 정상 상태(재접속할 대상이 없을 뿐)이므로
 # 200으로 응답한다. 404로 표현하면 매 메시지 전송마다(첫 attach 시도는 항상 "아직
@@ -74,7 +78,12 @@ async def attach_handler(request: Request) -> JSONResponse | StreamingResponse:
             # 클라이언트 연결이 끊기면(생성기 aclose) 구독자를 레지스트리에서 제거한다.
             await unsubscribe(conversation_id, queue)
 
-    return StreamingResponse(_stream(), media_type="text/event-stream")
+    # 재접속한 스트림도 원본과 똑같이 수 분씩 유휴 상태가 될 수 있다. heartbeat 가 없으면
+    # 프록시가 커넥션을 끊어 진행 상황이 다시 멈춘다.
+    return StreamingResponse(
+        with_heartbeat(_stream(), _HEARTBEAT_SECONDS),
+        media_type="text/event-stream",
+    )
 
 
 routes = [Route("/chat/stream/attach", attach_handler, methods=["POST"])]

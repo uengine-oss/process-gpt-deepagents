@@ -260,6 +260,11 @@ class GitHubProvider(GitProvider):
                 "state": p["state"],
                 "head": p["head"]["ref"],
                 "base": p["base"]["ref"],
+                # 병합된 PR 과 그냥 닫힌 PR 을 구분할 수 있어야 한다. 이 정보가 없으면
+                # 호출자가 closed 를 모두 "병합됨" 으로 표시해 변경 이력을 오해하게 된다.
+                # (목록 API 는 merged 플래그를 주지 않고 merged_at 만 준다.)
+                "merged_at": p.get("merged_at"),
+                "merged": bool(p.get("merged_at")),
             }
             for p in resp.json()
         ]

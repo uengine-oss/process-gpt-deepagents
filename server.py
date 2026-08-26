@@ -28,6 +28,7 @@ from processgpt_agent_sdk import ProcessGPTAgentServer
 from core.api.skills_router import routes as skills_routes
 from core.api.file_download import routes as file_download_routes
 from core.api.chat_stream_attach import routes as chat_stream_attach_routes
+from core.api.sse_heartbeat import install_sse_heartbeat
 from core.api.tenant_auth import ChatTenantGuardMiddleware
 from core.chat.inflight_registry import start_cancel_listener
 from core.skills.local_system_skills import seed_local_system_skills
@@ -67,6 +68,8 @@ async def main() -> None:
         *chat_stream_attach_routes,
     ])
     server.mount_chat_sse(app, path="/chat/stream")
+    # 유휴 SSE 커넥션이 프록시에서 끊겨 화면이 "생각 중..." 에 멈추는 것을 막는다.
+    install_sse_heartbeat(app, "/chat/stream", float(os.environ.get("SSE_HEARTBEAT_SECONDS", "15")))
     # /chat/stream 은 SDK 가 소유한 라우트라 데코레이터를 달 수 없다. 본문 tenant_id 가
     # 그대로 스킬 디렉토리 로드/컨테이너 마운트까지 흘러가므로 앞단에서 검증한다.
     app.add_middleware(ChatTenantGuardMiddleware, paths=("/chat/stream",))
