@@ -222,6 +222,25 @@ def _find_tenant_skill_dir(skill_name: str, tenant_id: str, config_id: str = "")
             candidate = Path(root) / tenant_id / "local" / skill_name
             if candidate.is_dir() and (candidate / "SKILL.md").exists():
                 return candidate
+
+        # 마지막으로 테넌트 하위 컬렉션을 전부 훑는다.
+        #
+        # publish_skill 이 신규 레포를 만들면 스킬 파일은 {tenant}/{provider_config_id}/{skill}
+        # 로 들어간다(_auto_register_tenant_skill). 그런데 위 분기는 config_id 를 넘겨받았을
+        # 때만 그 경로를 보므로, config_id 없이 부르는 호출부(프론트 삭제는 항상 mode="local"
+        # → config_id="")에서는 **목록에는 보이는데 삭제하면 404** 가 난다. 실제로 그렇게
+        # 지워지지 않는 스킬이 생겼다. 목록(_scan_skills)은 provider-keyed 디렉터리까지
+        # 훑으므로 여기서도 같은 범위를 봐야 한다. 탐색은 테넌트 디렉터리 안으로 한정되므로
+        # 다른 테넌트의 스킬이 걸릴 일은 없다.
+        try:
+            for collection in sorted((Path(root) / tenant_id).iterdir()):
+                if not collection.is_dir():
+                    continue
+                candidate = collection / skill_name
+                if candidate.is_dir() and (candidate / "SKILL.md").exists():
+                    return candidate
+        except OSError:
+            pass
     return None
 
 
