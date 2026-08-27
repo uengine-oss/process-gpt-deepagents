@@ -48,6 +48,32 @@ _MAX_OUTPUT_BYTES = 100_000
 _HOST_GATEWAY = "host.docker.internal"
 
 # ---------------------------------------------------------------------
+# 샌드박스 전용 브리지 네트워크 (MTU 고정)
+#
+# 기본 docker 브리지는 MTU 1500 으로 만들어진다. 그런데 이 서비스가 도는 GKE 처럼
+# 노드/파드 네트워크 MTU 가 1460 이하인 환경에서는, 컨테이너가 MSS 1460 을 광고해 놓고
+# 실제로는 그 크기의 프레임이 경로에서 통째로 드롭된다. ICMP fragmentation-needed 도
+# 막혀 있어 PMTU discovery 가 동작하지 않으므로, 작은 패킷(DNS·TCP 핸드셰이크)은 되는데
+# 큰 응답(TLS ServerHello+인증서, git pack)만 영원히 재전송되다가 ~150초 뒤
+# "Recv failure: Connection reset by peer" 로 죽는다. 실제로 같은 컨테이너에서
+# TCP_MAXSEG 를 1300 으로 낮추면 github.com TLS 핸드셰이크가 0.03초에 끝난다.
+#
+# 그래서 샌드박스 컨테이너는 기본 브리지 대신 MTU 를 낮춰 만든 전용 네트워크에 붙인다.
+# SANDBOX_NETWORK_MTU=0 으로 두면 종전처럼 기본 브리지를 쓴다.
+# ---------------------------------------------------------------------
+SANDBOX_NETWORK_NAME = os.getenv("SANDBOX_NETWORK_NAME", "deepagent-sandbox-net")
+try:
+    SANDBOX_NETWORK_MTU = int(os.getenv("SANDBOX_NETWORK_MTU", "1400") or 0)
+except ValueError:
+    SANDBOX_NETWORK_MTU = 1400
+
+# 샌드박스에서 사실상 항상 필요한 커맨드. 컨테이너를 새로 띄울 때 백그라운드로 미리 깔아
+# 첫 git 호출이 apt-get 설치(수십 초)를 대신 물지 않게 한다.
+_BOOTSTRAP_PACKAGES = ("git", "ca-certificates", "curl")
+# 사전 설치가 아직 진행 중일 때 execute() 가 기다려 주는 최대 시간(초).
+_BOOTSTRAP_WAIT_SECONDS = 120
+
+# ---------------------------------------------------------------------
 # 실행(run) 격리 스코프 — 같은 tenant 는 컨테이너/마운트를 공유하므로(위 docstring 참고),
 # ls/read_file/glob/grep 이 인자로 받은 절대경로를 그대로 열어주면 "다른 실행(예: 일주일 전
 # 같은 액티비티 실행)이 남긴 산출물"을 이번 실행 결과인 것처럼 읽어오는 사고가 난다.
@@ -84,10 +110,15 @@ def set_workspace_scope(*container_prefixes: str) -> None:
     _workspace_scope.set(tuple(p.rstrip("/") for p in container_prefixes if p))
 
 
+# core/skills/tools.py 의 BPMN_WORK_SUBDIR / CHECKOUT_SUBDIR 와 같은 값.
+# (여기서 tools 를 import 하면 샌드박스가 스킬 계층에 의존하게 되므로 리터럴로 둔다.)
+_ROOM_SCOPED_SUBDIRS = (".bpmn", ".checkouts")
+
+
 def _is_run_scoped_path(path: str) -> bool:
-    """다른 실행 전용 산출물 트리(.bpmn/<방>, <instance_id>/inputs·outputs)에 속한 경로인가."""
+    """다른 실행 전용 트리(.bpmn/<방>, .checkouts/<방>, <instance_id>/inputs·outputs)인가."""
     parts = path.strip("/").split("/")
-    if len(parts) >= 2 and parts[0] == "workspace" and parts[1] == ".bpmn":
+    if len(parts) >= 2 and parts[0] == "workspace" and parts[1] in _ROOM_SCOPED_SUBDIRS:
         return True
     if (
         len(parts) >= 3
@@ -238,17 +269,58 @@ class DockerSandboxBackend(BaseSandbox):
             pass
         return volumes
 
+    def _ensure_network(self) -> str | None:
+        """MTU 를 낮춰 잡은 샌드박스 전용 브리지 네트워크 이름을 반환한다.
+
+        생성/조회에 실패하면 None 을 돌려주고 호출자는 기본 브리지로 진행한다 —
+        네트워크를 못 만든다고 샌드박스 자체를 못 쓰게 만들 이유는 없다.
+        """
+        if not SANDBOX_NETWORK_MTU:
+            return None
+        try:
+            self._client.networks.get(SANDBOX_NETWORK_NAME)
+            return SANDBOX_NETWORK_NAME
+        except docker.errors.NotFound:
+            pass
+        except docker.errors.APIError as exc:
+            logger.warning("샌드박스 네트워크 조회 실패, 기본 브리지 사용: %s", exc)
+            return None
+        try:
+            self._client.networks.create(
+                SANDBOX_NETWORK_NAME,
+                driver="bridge",
+                options={"com.docker.network.driver.mtu": str(SANDBOX_NETWORK_MTU)},
+            )
+            logger.info(
+                "샌드박스 네트워크 생성: %s (mtu=%d)", SANDBOX_NETWORK_NAME, SANDBOX_NETWORK_MTU
+            )
+        except docker.errors.APIError as exc:
+            # 동시 기동 경합으로 이미 만들어졌을 수 있다.
+            try:
+                self._client.networks.get(SANDBOX_NETWORK_NAME)
+            except Exception:
+                logger.warning("샌드박스 네트워크 생성 실패, 기본 브리지 사용: %s", exc)
+                return None
+        return SANDBOX_NETWORK_NAME
+
     def _start_container(self) -> docker.models.containers.Container:
         name = f"deepagent-sandbox-{self._tenant_id or 'shared'}"
+        network = self._ensure_network()
 
         # 이전 실행에서 남은 중단된 컨테이너 정리
         try:
             old = self._client.containers.get(name)
             if old.status == "running":
-                self._container = old
-                # 이전 실행에서 살아남은 컨테이너에도 safe.directory 를 보장한다.
-                self._configure_git(old)
-                return old
+                if self._network_matches(old, network):
+                    self._container = old
+                    # 이전 실행에서 살아남은 컨테이너에도 safe.directory 를 보장한다.
+                    self._configure_git(old)
+                    self._bootstrap_tooling(old)
+                    return old
+                # 예전 배포가 기본 브리지(MTU 1500)로 띄워 둔 컨테이너다. 그대로 재사용하면
+                # git clone/push 가 계속 매달리므로, 일회용 컨테이너답게 버리고 다시 띄운다.
+                # /workspace 는 볼륨이라 재생성해도 산출물은 남는다.
+                logger.info("sandbox 재생성: %s 가 %s 네트워크에 없음", name, network)
             old.remove(force=True)
         except docker.errors.NotFound:
             pass
@@ -257,8 +329,7 @@ class DockerSandboxBackend(BaseSandbox):
         volumes: dict = {str(self._workspace_host): {"bind": _CONTAINER_WORKSPACE, "mode": "rw"}}
         volumes.update(self._skill_volumes())
 
-        container = self._client.containers.run(
-            SANDBOX_IMAGE,
+        run_kwargs: dict = dict(
             command=["sleep", "infinity"],
             name=name,
             detach=True,
@@ -271,9 +342,57 @@ class DockerSandboxBackend(BaseSandbox):
             cpu_period=100_000,
             cpu_quota=50_000,  # 50% of one CPU core
         )
-        logger.info("sandbox started: %s (tenant=%s)", name, self._tenant_id)
+        if network:
+            run_kwargs["network"] = network
+
+        container = self._client.containers.run(SANDBOX_IMAGE, **run_kwargs)
+        logger.info(
+            "sandbox started: %s (tenant=%s, network=%s)", name, self._tenant_id, network or "bridge"
+        )
         self._configure_git(container)
+        self._bootstrap_tooling(container)
         return container
+
+    @staticmethod
+    def _network_matches(container, network: str | None) -> bool:
+        """컨테이너가 원하는 네트워크에 붙어 있는지 확인한다."""
+        if not network:
+            return True
+        try:
+            container.reload()
+            attached = (container.attrs.get("NetworkSettings") or {}).get("Networks") or {}
+            return network in attached
+        except Exception:  # pragma: no cover - best effort
+            return True
+
+    def _bootstrap_tooling(self, container) -> None:
+        """git/curl 을 백그라운드로 미리 설치한다 (컨테이너당 1회).
+
+        샌드박스 이미지(python:3.13-slim)에는 git 이 없어서, 아무 조치가 없으면 사용자의
+        첫 git 명령이 execute() 의 자동설치 경로로 apt-get update+install(30초 이상)을
+        그대로 뒤집어쓴다. 컨테이너를 띄우는 시점에 미리 깔아 두면 그 지연이 대화 중간이
+        아니라 기동 시점으로 옮겨간다. 실패해도 execute() 의 기존 자동설치가 그대로 백업이다.
+        """
+        if getattr(container, "_deepagent_bootstrapped", False):
+            return
+        container._deepagent_bootstrapped = True
+        pkgs = " ".join(_BOOTSTRAP_PACKAGES)
+        cmd = (
+            "command -v git >/dev/null 2>&1 && exit 0; "
+            "DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; "
+            f"apt-get install -y -qq --no-install-recommends {pkgs} >/dev/null 2>&1"
+        )
+
+        def _run() -> None:
+            try:
+                container.exec_run(["bash", "-c", cmd], demux=False)
+                self._configure_git(container)
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.debug("sandbox 기본 툴 사전 설치 실패(무시): %s", exc)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        container._deepagent_bootstrap_thread = thread
+        thread.start()
 
     @staticmethod
     def _configure_git(container) -> None:
@@ -317,7 +436,7 @@ class DockerSandboxBackend(BaseSandbox):
     # 밖에 있는 "다른 실행 전용" 산출물(.bpmn/<다른 방>, <다른 instance_id>/inputs·outputs)에
     # 대한 읽기 계열 호출(ls/read/glob/grep)을 차단한다. write/edit 은 제한하지 않는다 —
     # 에이전트가 스스로 고른 새 경로에 쓰는 것이라 다른 실행 결과를 "재사용"하는 경로가 아니고,
-    # checkout_to_workspace 가 임의 저장소/스킬을 /workspace/<repo-name>/ 에 그대로 두므로
+    # checkout_to_workspace 가 이번 방의 체크아웃 트리를 새로 만들며 쓰기 때문에,
     # write 까지 막으면 그 정상 흐름을 깬다.
     # ------------------------------------------------------------------
 
@@ -325,7 +444,7 @@ class DockerSandboxBackend(BaseSandbox):
         if not path or not path.startswith(_CONTAINER_WORKSPACE):
             return True  # /skills 등 workspace 밖은 별도 마운트로 이미 격리됨
         if not _is_run_scoped_path(path):
-            return True  # checkout_to_workspace 저장소·uploads 등 공용 영역은 제한하지 않음
+            return True  # uploads 등 방과 무관한 공용 영역은 제한하지 않음
         scope = _workspace_scope.get()
         if not scope:
             return True  # 스코프 미설정 호출부(레거시)는 종전처럼 무제한
@@ -390,20 +509,40 @@ class DockerSandboxBackend(BaseSandbox):
 
         exit_code, out = _exec(command)
 
-        # 커맨드를 찾을 수 없는 경우 apt-get으로 자동 설치 후 1회 재시도
+        # 커맨드를 찾을 수 없는 경우 apt-get으로 자동 설치 후 1회 재시도.
+        # 같은 커맨드는 컨테이너당 한 번만 시도한다 — apt 를 쓸 수 없는 환경(사설 네트워크,
+        # 미러 차단 등)에서는 설치가 매번 실패하는데, 그때마다 apt-get update 를 다시 도는
+        # 것은 툴 호출마다 수십 초를 그냥 버리는 짓이다.
         match = _CMD_NOT_FOUND_RE.search(out)
         if match:
             missing = match.group(1)
-            pkg = _PACKAGE_OVERRIDES.get(missing, missing)
-            logger.info("auto-installing missing command %r (package=%r)", missing, pkg)
-            install_cmd = (
-                "DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -1 "
-                f"&& apt-get install -y -qq --no-install-recommends {pkg} 2>&1 | tail -3"
-            )
-            container.exec_run(["bash", "-c", install_cmd], demux=False)
-            if missing == "git":
-                self._configure_git(container)
-            exit_code, out = _exec(command)
+            attempted = getattr(container, "_deepagent_apt_attempted", None)
+            if attempted is None:
+                attempted = set()
+                container._deepagent_apt_attempted = attempted
+            # 사전 설치가 아직 돌고 있으면 그게 끝나기를 기다린 뒤 한 번 더 본다.
+            # 기다리지 않고 여기서 apt 를 또 부르면 dpkg 락을 두고 서로 막는다.
+            bootstrap = getattr(container, "_deepagent_bootstrap_thread", None)
+            if bootstrap is not None and bootstrap.is_alive():
+                bootstrap.join(_BOOTSTRAP_WAIT_SECONDS)
+                exit_code, out = _exec(command)
+                match = _CMD_NOT_FOUND_RE.search(out)
+                missing = match.group(1) if match else ""
+
+            if missing and missing not in attempted:
+                attempted.add(missing)
+                pkg = _PACKAGE_OVERRIDES.get(missing, missing)
+                logger.info("auto-installing missing command %r (package=%r)", missing, pkg)
+                install_cmd = (
+                    "DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -1 "
+                    f"&& apt-get install -y -qq --no-install-recommends {pkg} 2>&1 | tail -3"
+                )
+                container.exec_run(["bash", "-c", install_cmd], demux=False)
+                if missing == "git":
+                    self._configure_git(container)
+                exit_code, out = _exec(command)
+            elif missing:
+                logger.info("auto-install skipped for %r (already attempted in this sandbox)", missing)
 
         truncated = len(out) > _MAX_OUTPUT_BYTES
         if truncated:

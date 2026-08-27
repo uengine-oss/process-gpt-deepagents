@@ -31,7 +31,9 @@ def git_calls(monkeypatch):
         return 0, ""
 
     monkeypatch.setattr(skill_tools, "_git_sb", fake_git)
-    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd: (0, ""))
+    # 원격을 타는 git(fetch/push)은 _git_net_sb 로 나간다 — 같은 fake 로 받아 기록한다.
+    monkeypatch.setattr(skill_tools, "_git_net_sb", fake_git)
+    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd, **kw: (0, ""))
     return calls
 
 
@@ -81,7 +83,7 @@ def test_new_repo_stages_everything(git_calls):
 def test_clone_preferred_when_repo_exists(monkeypatch):
     """레포가 있으면 클론 경로를 쓴다(로컬 사본으로 작업하면 PR diff 가 전체 교체가 된다)."""
     execs: list[str] = []
-    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd: (execs.append(cmd), (0, ""))[1])
+    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd, **kw: (execs.append(cmd), (0, ""))[1])
 
     provider = type(
         "P", (), {
@@ -93,12 +95,12 @@ def test_clone_preferred_when_repo_exists(monkeypatch):
     monkeypatch.setattr(skill_tools, "_get_git_provider", lambda: provider)
 
     assert skill_tools._try_clone_skill_repo("nda-review", "/workspace/nda-review") == "/workspace/nda-review"
-    assert any("git clone" in c for c in execs), execs
+    assert any(" clone --depth" in c for c in execs), execs
 
 
 def test_falls_back_to_local_copy_when_no_repo(monkeypatch):
     """레포가 없으면 None → 호출자가 로컬 사본으로 폴백한다."""
-    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd: (0, ""))
+    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd, **kw: (0, ""))
     provider = type("P", (), {"username": "o", "repo_exists": lambda self, n: None})()
     monkeypatch.setattr(skill_tools, "_get_git_provider", lambda: provider)
 
@@ -107,7 +109,7 @@ def test_falls_back_to_local_copy_when_no_repo(monkeypatch):
 
 def test_falls_back_when_git_not_configured(monkeypatch):
     """git 미연동 테넌트도 기존처럼 동작해야 한다."""
-    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd: (0, ""))
+    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd, **kw: (0, ""))
     def no_git():
         raise ValueError("Git 계정이 연결되지 않았습니다")
     monkeypatch.setattr(skill_tools, "_get_git_provider", no_git)
@@ -117,7 +119,7 @@ def test_falls_back_when_git_not_configured(monkeypatch):
 
 def test_falls_back_when_clone_fails(monkeypatch):
     """클론이 실패하면 작업을 막지 않고 로컬 사본으로 폴백한다."""
-    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd: (1, "fatal: could not read"))
+    monkeypatch.setattr(skill_tools, "_sandbox_exec", lambda cmd, **kw: (1, "fatal: could not read"))
     provider = type(
         "P", (), {
             "username": "o",

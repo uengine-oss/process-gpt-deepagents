@@ -78,6 +78,7 @@ from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
 from core.skills.tools import _bpmn_work_dir
 from core.skills.tools import bpmn_container_base as _bpmn_container_base
+from core.skills.tools import checkout_container_base as _checkout_container_base
 from core.sandbox.docker_sandbox import set_workspace_scope
 from core.storage.storage import (
     download_workspace_directory,
@@ -933,6 +934,12 @@ class DeepAgentExecutor(AgentExecutor):
         # <다른 instance_id>/inputs·outputs 를 절대경로로 직접 찍어 읽는 것도 막는다
         # (위 방 단위 폴더 격리만으론 에이전트가 의도적/우발적으로 형제 디렉토리를 열람하는 걸 못 막음).
         _scope_prefixes = [_bpmn_container_base(workspace_conversation_id)]
+        # 스킬 체크아웃도 방 단위로 갈리므로(.checkouts/<room>) 이번 방 것만 열어 준다.
+        # 방 id 가 없으면 checkout base 가 /workspace 자체라, 그걸 prefix 로 넣으면 위에서
+        # 좁혀 둔 스코프가 통째로 풀린다 — 그 경우는 넣지 않는다(어차피 격리할 방이 없다).
+        _checkout_base = _checkout_container_base(workspace_conversation_id)
+        if _checkout_base != "/workspace":
+            _scope_prefixes.append(_checkout_base)
         if instance_id:
             _scope_prefixes.append(f"/workspace/{_sanitize_ws_name(instance_id, 64)}")
         set_workspace_scope(*_scope_prefixes)

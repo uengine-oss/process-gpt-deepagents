@@ -119,6 +119,45 @@ def bpmn_container_base(conversation_id: str = "") -> str:
     return f"/workspace/{BPMN_WORK_SUBDIR}/{slug}" if slug else f"/workspace/{BPMN_WORK_SUBDIR}"
 
 
+# 체크아웃(기존 스킬/저장소를 편집하려고 가져온 사본) 루트.
+#
+# 샌드박스 컨테이너와 /workspace 볼륨은 **테넌트 단위로 공유**된다. 체크아웃을
+# /workspace/<skill-name> 에 두면 같은 테넌트의 두 사용자가 같은 스킬을 동시에 편집할 때
+# 서로의 작업 디렉터리를 `rm -rf` 하고 덮어쓴다 — 한쪽이 방금 쓴 파일이 소리 없이 사라지거나,
+# 남의 수정본이 내 PR diff 에 섞여 들어간다. 신규 스킬 산출물이 이미 .bpmn/<room>/ 으로
+# 방 단위 격리되는 것과 같은 방식으로, 체크아웃도 .checkouts/<room>/ 아래로 가른다.
+CHECKOUT_SUBDIR = ".checkouts"
+
+# 방별로 갈라 두면 방 수만큼 사본이 쌓이므로 오래된 것은 걷어낸다. 체크아웃은 원본(레포 또는
+# /skills)에서 언제든 다시 만들 수 있어 지워도 잃는 것이 없다.
+try:
+    _CHECKOUT_RETENTION_DAYS = int(os.getenv("CHECKOUT_RETENTION_DAYS", "7"))
+except ValueError:
+    _CHECKOUT_RETENTION_DAYS = 7
+
+
+def checkout_container_base(conversation_id: str = "") -> str:
+    """이번 대화방(또는 실행)의 체크아웃 루트(컨테이너 경로).
+
+    대화방 id 가 없는 호출부는 종전처럼 /workspace 를 그대로 쓴다.
+    """
+    slug = _conv_slug(conversation_id or _current_conversation_id.get())
+    return f"/workspace/{CHECKOUT_SUBDIR}/{slug}" if slug else "/workspace"
+
+
+def _checkout_dest(name: str) -> str:
+    """체크아웃 대상 경로를 만들고(부모 디렉터리 생성 + 오래된 방 정리) 돌려준다."""
+    base = checkout_container_base()
+    if base != "/workspace":
+        root = f"/workspace/{CHECKOUT_SUBDIR}"
+        _sandbox_exec(
+            f"find {root} -mindepth 1 -maxdepth 1 -type d "
+            f"-mtime +{_CHECKOUT_RETENTION_DAYS} -exec rm -rf {{}} + 2>/dev/null; "
+            f"mkdir -p {shlex.quote(base)}"
+        )
+    return f"{base}/{name}"
+
+
 def canonical_process_dir_name(conversation_id: str = "") -> str:
     """Return the deterministic process directory injected into the agent prompt.
 
@@ -204,17 +243,106 @@ def _require_sandbox():
     return sandbox
 
 
-def _sandbox_exec(cmd: str) -> tuple[int, str]:
+def _sandbox_exec(cmd: str, *, timeout: int | None = None) -> tuple[int, str]:
     sandbox = _current_sandbox.get()
     if sandbox is None:
         return 1, "ERROR: sandbox not available"
-    resp = sandbox.execute(cmd)
+    resp = sandbox.execute(cmd, timeout=timeout) if timeout else sandbox.execute(cmd)
     return resp.exit_code or 0, resp.output.strip()
 
 
 def _git_sb(cwd: str, *args: str) -> tuple[int, str]:
     parts = " ".join(shlex.quote(a) for a in args)
     return _sandbox_exec(f"cd {shlex.quote(cwd)} && git {parts}")
+
+
+# ---------------------------------------------------------------------------
+# git 네트워크 작업 상한 — 샌드박스 egress 가 막힌 환경에서 매달리지 않게 한다
+#
+# 샌드박스 컨테이너에서 원격 저장소로 가는 길이 막히면(경로 MTU 불일치, 방화벽 등)
+# git 은 TCP 가 리셋될 때까지 150초 넘게 조용히 매달린다. checkout_to_workspace 는
+# 그 뒤에야 로컬 사본으로 폴백하므로 스킬을 열기만 해도 매번 2~3분이 날아가고,
+# publish_skill 은 fetch + push 로 두 번 물어 5분이 넘어간다.
+#
+# 그래서 (1) git 자체에 저속 중단 옵션을 걸고, (2) execute() 상한을 짧게 주고,
+# (3) 한 번 네트워크 장애로 판정되면 같은 컨테이너에서는 일정 시간 동안 원격 작업을
+#     아예 건너뛴다. 폴백 경로(로컬 사본)는 그대로 살아 있으므로 기능은 유지된다.
+# ---------------------------------------------------------------------------
+try:
+    _GIT_NET_TIMEOUT = int(os.getenv("GIT_NET_TIMEOUT_SECONDS", "45"))
+except ValueError:
+    _GIT_NET_TIMEOUT = 45
+
+# 15초 동안 1KB/s 미만이면 git 이 스스로 중단한다.
+_GIT_NET_OPTS = "-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15"
+
+# 원격에 닿지 못했다고 판단할 출력 패턴.
+# 전송 계층 실패만 넣는다 — git 이 붙여 주는 "unable to access" 는 403/404 같은 인증·권한
+# 오류에도 똑같이 붙어서, 그걸 넣으면 토큰이 틀린 것뿐인데 10분간 원격 작업을 막게 된다.
+_GIT_NET_FAIL_RE = re.compile(
+    r"Recv failure|Connection reset|Could not resolve host|Failed to connect"
+    r"|Operation too slow|Connection timed out|timed out after",
+    re.IGNORECASE,
+)
+
+# 네트워크 장애 판정 유지 시간(초). 일시적 장애면 이 시간 뒤 다시 시도한다.
+_GIT_EGRESS_BLOCK_TTL = 600.0
+
+_GIT_EGRESS_BLOCKED_MSG = (
+    "샌드박스에서 원격 Git 저장소에 접속할 수 없습니다(네트워크 차단). "
+    "원격 작업을 건너뜁니다."
+)
+
+
+def _git_net_blocked() -> bool:
+    """이 샌드박스에서 원격 Git 접속이 막혀 있다고 이미 판정됐는지."""
+    import time as _time
+
+    sandbox = _current_sandbox.get()
+    if sandbox is None:
+        return False
+    return getattr(sandbox, "_git_egress_blocked_until", 0.0) > _time.monotonic()
+
+
+def _mark_git_net_blocked(detail: str) -> None:
+    import logging as _logging
+    import time as _time
+
+    sandbox = _current_sandbox.get()
+    if sandbox is None:
+        return
+    sandbox._git_egress_blocked_until = _time.monotonic() + _GIT_EGRESS_BLOCK_TTL
+    _logging.getLogger(__name__).warning(
+        "샌드박스 → 원격 Git 접속 차단으로 판정, %.0f초간 원격 작업을 건너뜁니다: %s",
+        _GIT_EGRESS_BLOCK_TTL,
+        (detail or "")[:300],
+    )
+
+
+def _git_net_exec(cmd: str) -> tuple[int, str]:
+    """원격을 타는 git 명령을 시간 상한과 저속 중단 옵션을 걸고 실행한다."""
+    rc, out = _sandbox_exec(cmd, timeout=_GIT_NET_TIMEOUT)
+    if rc != 0 and _GIT_NET_FAIL_RE.search(out or ""):
+        _mark_git_net_blocked(out)
+    return rc, out
+
+
+def _git_net_sb(cwd: str, *args: str) -> tuple[int, str]:
+    """cwd 에서 원격을 타는 git 명령(fetch/push 등)을 실행한다."""
+    if _git_net_blocked():
+        return 1, _GIT_EGRESS_BLOCKED_MSG
+    parts = " ".join(shlex.quote(a) for a in args)
+    return _git_net_exec(f"cd {shlex.quote(cwd)} && git {_GIT_NET_OPTS} {parts}")
+
+
+def _clone_sb(auth_url: str, dest: str) -> tuple[int, str]:
+    """원격 저장소를 dest 로 클론한다. 네트워크가 막혀 있으면 즉시 실패로 돌려준다."""
+    if _git_net_blocked():
+        return 1, _GIT_EGRESS_BLOCKED_MSG
+    return _git_net_exec(
+        f"rm -rf {shlex.quote(dest)} && "
+        f"git {_GIT_NET_OPTS} clone --depth=50 {shlex.quote(auth_url)} {shlex.quote(dest)}"
+    )
 
 
 def _try_clone_skill_repo(skill_name: str, dest: str) -> str | None:
@@ -224,6 +352,8 @@ def _try_clone_skill_repo(skill_name: str, dest: str) -> str | None:
     경로로 폴백한다. 레포가 있을 때 로컬 사본으로 작업하면 이후 publish_skill 의 PR diff 가
     "레포 전체를 로컬본으로 교체" 가 되어 병합 관리 흐름이 의미를 잃는다.
     """
+    if _git_net_blocked():
+        return None
     try:
         provider = _get_git_provider()
     except ValueError:
@@ -235,9 +365,7 @@ def _try_clone_skill_repo(skill_name: str, dest: str) -> str | None:
         return None
 
     auth_url = provider.get_authenticated_clone_url(provider.username, skill_name)
-    rc, out = _sandbox_exec(
-        f"rm -rf {shlex.quote(dest)} && git clone --depth=50 {shlex.quote(auth_url)} {shlex.quote(dest)}"
-    )
+    rc, out = _clone_sb(auth_url, dest)
     if rc != 0:
         import logging as _logging
 
@@ -380,7 +508,15 @@ def _push_skill_sandbox(
     _git_sb(cwd, "config", "user.name", author_name)
 
     if existing_repo:
-        fetch_code, _ = _git_sb(cwd, "fetch", "origin", "main", "--depth=1")
+        fetch_code, fetch_out = _git_net_sb(cwd, "fetch", "origin", "main", "--depth=1")
+        if fetch_code != 0 and _git_net_blocked():
+            # 원격에 닿지 못하는 상태에서 계속 진행하면 아래 push 에서 같은 시간을 또 물고
+            # "레포는 있는데 PR 은 없는" 어중간한 상태만 남는다. 여기서 끊고 알린다.
+            return (
+                f"ERROR git fetch: {fetch_out}\n"
+                "샌드박스에서 원격 Git 저장소에 접속할 수 없습니다. "
+                "네트워크 설정을 확인한 뒤 다시 시도하세요."
+            )
         if fetch_code == 0:
             # --mixed(기본): HEAD 와 **인덱스**를 원격 커밋으로 맞추고 워킹트리는 건드리지 않는다.
             # --soft 는 인덱스를 그대로(= git init 직후엔 빈 상태) 두기 때문에 원격 HEAD 의 모든
@@ -411,7 +547,7 @@ def _push_skill_sandbox(
     push_args = ["push", "-u", "origin", branch]
     if not existing_repo:
         push_args.append("--force")
-    code, out = _git_sb(cwd, *push_args)
+    code, out = _git_net_sb(cwd, *push_args)
     if code != 0:
         return f"ERROR git push: {out}"
 
@@ -2388,21 +2524,24 @@ def list_git_repos() -> str:
 
 @tool
 def checkout_to_workspace(source: str) -> str:
-    """Bring a skill or Git repository into /workspace/ for editing.
+    """Bring a skill or Git repository into this conversation's workspace for editing.
 
     Call this FIRST whenever you need to read, modify, build, or run code from
     a skill or any Git repository. Never operate on /skills/ paths directly.
 
     **Source resolution order:**
-    1. Git URL (https://…, git@…)  → git clone into /workspace/<repo-name>
-    2. Absolute /skills/ path      → cp -r to /workspace/<skill-name>
-    3. Bare skill/repo name        → search /skills/<tenant-id>/<name> first;
+    1. Git URL (https://…, git@…)  → git clone into the checkout directory
+    2. Absolute /skills/ path      → cp -r into the checkout directory
+    3. Bare skill/repo name        → search /skills/<tenant-id>/… first;
                                      if not found, look up the Git repo by
                                      exact name via the configured provider and clone it.
 
-    Returns the absolute container path of the checked-out directory, e.g.:
-      /workspace/my-skill
-    On failure returns an ERROR: … string.
+    The checkout lives under a directory private to this conversation, so two
+    users editing the same skill at the same time never overwrite each other.
+
+    Returns the absolute container path of the checked-out directory — always use
+    the returned path verbatim and never assume /workspace/<name>. On failure
+    returns an ERROR: … string.
 
     **Decision rule:** Make this call autonomously based on user context.
     Do NOT ask the user which path to use — resolve it yourself using the
@@ -2424,10 +2563,8 @@ def checkout_to_workspace(source: str) -> str:
             auth_url = provider.get_authenticated_clone_url(owner, repo)
         except ValueError:
             auth_url = source.strip()
-        dest = f"/workspace/{repo}"
-        rc, out = _sandbox_exec(
-            f"rm -rf {shlex.quote(dest)} && git clone --depth=50 {shlex.quote(auth_url)} {shlex.quote(dest)}"
-        )
+        dest = _checkout_dest(repo)
+        rc, out = _clone_sb(auth_url, dest)
         if rc != 0:
             return f"ERROR: git clone 실패: {out}"
         return dest
@@ -2435,7 +2572,7 @@ def checkout_to_workspace(source: str) -> str:
     # Case 2: absolute /skills/ path
     if source.startswith("/skills/"):
         p = Path(source)
-        dest = f"/workspace/{p.name}"
+        dest = _checkout_dest(p.name)
         # 같은 이름의 Git 레포가 있으면 로컬 사본 대신 레포를 클론한다.
         # 로컬 사본으로 작업하면 PR diff 가 "레포 전체를 로컬본으로 교체" 가 되어
         # 요청한 변경을 분간할 수 없고, 병합 관리 흐름이 의미를 잃는다.
@@ -2453,12 +2590,26 @@ def checkout_to_workspace(source: str) -> str:
     name = source.strip().strip("/")
     tenant_id = _current_tenant_id.get()
 
-    # 3a: local /skills/{tenant_id}/{name}
+    # 3a: local /skills/{tenant_id}/... 아래에서 이름으로 찾는다.
+    #
+    # 디스크 배치는 {tenant_id}/{provider_config_id | "local"}/{skill-name} 이라
+    # {tenant_id}/{name} 만 보면 실제 스킬은 절대 걸리지 않는다. 그러면 이름으로 부른
+    # 체크아웃이 전부 3b(원격 조회+클론)로 새어 나가고, 원격이 느리거나 막힌 환경에서는
+    # 로컬에 멀쩡히 있는 스킬을 두고 매번 네트워크에 매달리게 된다. 한 단계 아래까지 훑는다.
     if tenant_id:
-        local_path = f"/skills/{tenant_id}/{name}"
-        rc, _ = _sandbox_exec(f"test -d {shlex.quote(local_path)}")
-        if rc == 0:
-            dest = f"/workspace/{name}"
+        t_q, n_q = shlex.quote(tenant_id), shlex.quote(name)
+        probe = (
+            f'for d in /skills/{t_q}/{n_q} /skills/{t_q}/*/{n_q}; do '
+            f'if [ -d "$d" ]; then printf %s "$d"; break; fi; done'
+        )
+        _, found = _sandbox_exec(probe)
+        local_path = found.strip()
+        if local_path:
+            dest = _checkout_dest(name)
+            # 같은 이름의 레포가 있으면 Case 2 와 같은 이유로 클론을 우선한다.
+            cloned = _try_clone_skill_repo(name, dest)
+            if cloned is not None:
+                return cloned
             rc2, out = _sandbox_exec(
                 f"rm -rf {shlex.quote(dest)} && cp -r {shlex.quote(local_path)} {shlex.quote(dest)}"
             )
@@ -2480,10 +2631,8 @@ def checkout_to_workspace(source: str) -> str:
         )
 
     auth_url = provider.get_authenticated_clone_url(provider.username, name)
-    dest = f"/workspace/{name}"
-    rc, out = _sandbox_exec(
-        f"rm -rf {shlex.quote(dest)} && git clone --depth=50 {shlex.quote(auth_url)} {shlex.quote(dest)}"
-    )
+    dest = _checkout_dest(name)
+    rc, out = _clone_sb(auth_url, dest)
     if rc != 0:
         return f"ERROR: git clone 실패: {out}"
     return dest
@@ -2500,8 +2649,10 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
     Works with any configured Git provider (GitHub, GitLab, Gitea, etc.).
 
     **Path rules (container paths):**
-      - /workspace/<skill-name>   → publish directly
-      - /skills/<tenant-id>/<skill-name> → copied to /workspace/<skill-name> first
+      - any /workspace/… directory       → publish directly (pass the exact path
+                                           `checkout_to_workspace` returned)
+      - /skills/<tenant-id>/<skill-name> → copied into this conversation's
+                                           checkout directory first
       - /skills/anthropics-skills/...    → rejected (read-only system skills)
 
     **Workflow:**
@@ -2544,11 +2695,11 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
         if not p.is_relative_to(_CONTAINER_SKILLS / tenant_id):
             return (
                 f"ERROR: '{skill_path}' 는 테넌트({tenant_id}) 소유 스킬 경로가 아닙니다. "
-                "퍼블리시 가능한 경로: /workspace/<skill-name> 또는 "
+                "퍼블리시 가능한 경로: checkout_to_workspace 가 돌려준 /workspace 하위 경로 또는 "
                 f"/skills/{tenant_id}/<skill-name>"
             )
 
-        dest = f"/workspace/{skill_name}"
+        dest = _checkout_dest(skill_name)
         rc, out = _sandbox_exec(
             f"rm -rf {shlex.quote(dest)} && cp -r {shlex.quote(skill_path)} {shlex.quote(dest)}"
         )
