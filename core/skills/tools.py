@@ -1424,6 +1424,29 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
     return _json.dumps(result, ensure_ascii=False)
 
 
+# 대화방 id / 실행 instance_id 가 그대로 디렉터리명이 된 경우를 알아보기 위한 패턴.
+_ROOM_DIR_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+_SKILL_FM_NAME_RE = re.compile(
+    r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL
+)
+
+
+def _skill_name_from_frontmatter(dir_path: str) -> str:
+    """<dir>/SKILL.md 의 frontmatter 에 적힌 name 을 돌려준다(없으면 빈 문자열)."""
+    rc, out = _sandbox_exec(f"sed -n '1,60p' {shlex.quote(dir_path.rstrip('/') + '/SKILL.md')}")
+    if rc != 0 or not out:
+        return ""
+    m = _SKILL_FM_NAME_RE.match(out if out.endswith("\n") else out + "\n")
+    block = m.group(1) if m else out
+    for line in block.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "name":
+            return _safe_name(value.strip().strip("\"'"))
+    return ""
+
+
 def _safe_name(name: str) -> str:
     """스킬 디렉터리/파일용 안전 이름. 영문은 소문자-하이픈, 한글 등 유니코드 글자는 보존
     (한글 스킬명이 'skill' 로 뭉개지지 않게 한다)."""
@@ -2682,6 +2705,24 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
 
     p = Path(skill_path)
     skill_name = p.name
+
+    # 방/실행 디렉터리를 그대로 퍼블리시하려는 경우를 막는다.
+    #
+    # 에이전트가 단독 스킬을 `<base>/skills/<name>/SKILL.md` 가 아니라 `<base>/SKILL.md`
+    # 로 떨어뜨리는 일이 있는데, 그때 디렉터리명을 스킬명으로 쓰면 **대화방 UUID 가 그대로
+    # 레포명·스킬명이 된다**(예: ohsy818/ef9ae263-371d-45c3-adff-6c6acbe71129). 예전에는
+    # 이 경로가 push 단계에서 네트워크 문제로 실패해 드러나지 않았을 뿐, 정상 네트워크에서는
+    # 쓰레기 레포와 잘못된 테넌트 스킬이 실제로 만들어진다. 프론트의 산출물 저장 경로는
+    # 이미 frontmatter 의 name 을 우선해 같은 사고를 피하고 있다 — 여기서도 같은 기준을 쓴다.
+    if _ROOM_DIR_UUID_RE.search(skill_name):
+        resolved = _skill_name_from_frontmatter(skill_path)
+        if not resolved:
+            return (
+                f"ERROR: '{skill_path}' 는 대화방/실행 디렉터리라 스킬명을 알 수 없습니다. "
+                "스킬을 `<base>/skills/<skill-name>/` 아래로 옮기거나, SKILL.md frontmatter 에 "
+                "`name:` 을 적은 뒤 그 디렉터리 경로로 다시 호출하세요."
+            )
+        skill_name = resolved
 
     if p.is_relative_to(_CONTAINER_SKILLS / "anthropics-skills"):
         return "ERROR: anthropics-skills 하위 스킬은 수정하거나 퍼블리시할 수 없습니다."
