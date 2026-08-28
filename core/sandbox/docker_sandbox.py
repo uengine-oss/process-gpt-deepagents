@@ -74,6 +74,69 @@ _BOOTSTRAP_PACKAGES = ("git", "ca-certificates", "curl")
 _BOOTSTRAP_WAIT_SECONDS = 120
 
 # ---------------------------------------------------------------------
+# 구간별 시간 상한
+#
+# 툴 호출 한 번이 언제 끝날지 알 수 없으면 대화가 통째로 멈춘다. 실제로 무한정
+# 매달릴 수 있는 구간은 네 곳이다.
+#   - 컨테이너 기동: dind 가 아직 준비되지 않으면 재시도 루프가 계속 돈다.
+#   - 도구 설치:     apt 미러가 막힌 환경에서 apt-get 이 끝나지 않는다.
+#   - 셸 실행:       사용자/에이전트가 준 명령 자체가 끝나지 않는다.
+#   - 설정 조회:     docker 데몬이 응답하지 않으면 git config 한 줄도 돌아오지 않는다.
+# 각 구간에 상한을 걸고, 넘으면 예외가 아니라 "사유가 적힌 결과"로 돌려준다 —
+# 에이전트 툴 경로에서 예외는 원인 없는 실패로만 보이고 폴백을 고를 수 없기 때문이다.
+# ---------------------------------------------------------------------
+
+def _env_seconds(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# 컨테이너 기동(dind 대기 재시도 포함) 상한.
+SANDBOX_START_TIMEOUT = _env_seconds("SANDBOX_START_TIMEOUT_SECONDS", 90)
+# 셸 명령 한 번(누락 커맨드 자동 설치 재시도까지 포함) 상한.
+SANDBOX_EXEC_TIMEOUT = _env_seconds("SANDBOX_EXEC_TIMEOUT_SECONDS", 180)
+# 누락 커맨드 자동 설치(apt-get update + install) 상한.
+SANDBOX_INSTALL_TIMEOUT = _env_seconds("SANDBOX_INSTALL_TIMEOUT_SECONDS", 120)
+# git safe.directory 적용 등 설정 조회/적용 상한.
+SANDBOX_CONFIG_TIMEOUT = _env_seconds("SANDBOX_CONFIG_TIMEOUT_SECONDS", 15)
+
+TIMEOUT_EXIT_CODE = 124
+UNAVAILABLE_EXIT_CODE = 125
+
+
+class SandboxUnavailable(RuntimeError):
+    """상한 안에 쓸 수 있는 컨테이너를 얻지 못했다."""
+
+
+def _exec_in_container(container, cmd: str, timeout: int) -> tuple[int, str, bool]:
+    """컨테이너에서 `bash -c cmd` 를 실행하고 (exit_code, output, timed_out) 을 돌려준다.
+
+    docker SDK 의 exec_run 에는 상한이 없어서 명령이 끝나지 않으면 호출 스레드가 영원히
+    잡힌다. 실행을 데몬 스레드로 밀고 join(timeout) 으로 상한을 건다 — 시간이 지나면
+    결과를 버리고 돌아온다. 컨테이너는 일회용이라 남은 프로세스는 정리 시 함께 사라진다.
+    """
+    holder: dict = {}
+
+    def _run() -> None:
+        try:
+            exit_code, output = container.exec_run(["bash", "-c", cmd], demux=False)
+            holder["exit_code"] = exit_code
+            holder["output"] = (output or b"").decode("utf-8", errors="replace")
+        except Exception as exc:  # 데몬 오류도 상한 안에서 "사유"로 돌려준다
+            holder["exit_code"] = 1
+            holder["output"] = f"ERROR: {exc}"
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return TIMEOUT_EXIT_CODE, f"ERROR: command timed out after {timeout}s", True
+    return holder.get("exit_code") or 0, holder.get("output", ""), False
+
+# ---------------------------------------------------------------------
 # 실행(run) 격리 스코프 — 같은 tenant 는 컨테이너/마운트를 공유하므로(위 docstring 참고),
 # ls/read_file/glob/grep 이 인자로 받은 절대경로를 그대로 열어주면 "다른 실행(예: 일주일 전
 # 같은 액티비티 실행)이 남긴 산출물"을 이번 실행 결과인 것처럼 읽어오는 사고가 난다.
@@ -205,8 +268,23 @@ class DockerSandboxBackend(BaseSandbox):
     # 컨테이너 생명주기
     # ------------------------------------------------------------------
 
-    def _ensure_container(self) -> docker.models.containers.Container:
-        with self._lock:
+    def _ensure_container(
+        self, *, deadline: float | None = None
+    ) -> docker.models.containers.Container:
+        """상한 안에 쓸 수 있는 컨테이너를 돌려준다. 못 얻으면 SandboxUnavailable.
+
+        락 대기도 상한에 포함한다 — 같은 테넌트의 다른 실행이 컨테이너를 띄우는 중이면
+        여기서 무한정 기다리게 되고, 그러면 호출자가 건 상한이 아무 의미가 없다.
+        """
+        if deadline is None:
+            deadline = time.monotonic() + SANDBOX_START_TIMEOUT
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+            raise SandboxUnavailable(
+                f"샌드박스 컨테이너를 {SANDBOX_START_TIMEOUT}초 안에 준비하지 못했습니다"
+                "(다른 작업이 컨테이너를 기동 중)."
+            )
+        try:
             if self._client is None:
                 self._client = _get_docker_client()
             # 기존 컨테이너가 살아있으면 재사용
@@ -219,28 +297,38 @@ class DockerSandboxBackend(BaseSandbox):
                     pass
                 self._container = None
 
-            self._container = self._start_container_with_retry()
+            self._container = self._start_container_with_retry(deadline=deadline)
             return self._container
+        finally:
+            self._lock.release()
 
     def _start_container_with_retry(
-        self, *, max_attempts: int = 10, initial_delay: float = 2.0
+        self, *, deadline: float, initial_delay: float = 2.0
     ) -> docker.models.containers.Container:
-        """dind가 아직 준비 중일 때 exponential backoff로 재시도한다."""
+        """dind가 아직 준비 중일 때 exponential backoff로 재시도한다.
+
+        재시도 횟수가 아니라 **남은 시간**으로 끊는다. 횟수로만 끊으면 backoff 합이
+        2분을 넘겨(2+3+4.5+…) 툴 호출 하나가 그만큼 매달린다.
+        """
         delay = initial_delay
-        for attempt in range(max_attempts):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 return self._start_container()
             except docker.errors.DockerException as exc:
-                if attempt >= max_attempts - 1:
-                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= delay:
+                    raise SandboxUnavailable(
+                        f"샌드박스 컨테이너를 {SANDBOX_START_TIMEOUT}초 안에 띄우지 못했습니다: {exc}"
+                    ) from exc
                 logger.warning(
-                    "Docker not ready (attempt %d/%d): %s — retrying in %.1fs",
-                    attempt + 1, max_attempts, exc, delay,
+                    "Docker not ready (attempt %d, %.0fs left): %s — retrying in %.1fs",
+                    attempt, remaining, exc, delay,
                 )
                 time.sleep(delay)
                 delay = min(delay * 1.5, 30.0)
                 self._client = _get_docker_client()
-        raise RuntimeError("unreachable")
 
     def _skill_volumes(self) -> dict:
         """이 테넌트 디렉토리와 알려진 글로벌 컬렉션만 개별 bind-mount한다.
@@ -385,7 +473,13 @@ class DockerSandboxBackend(BaseSandbox):
 
         def _run() -> None:
             try:
-                container.exec_run(["bash", "-c", cmd], demux=False)
+                _, _, timed_out = _exec_in_container(container, cmd, SANDBOX_INSTALL_TIMEOUT)
+                if timed_out:
+                    logger.warning(
+                        "sandbox 기본 툴 사전 설치가 %d초 상한을 넘겨 중단했습니다",
+                        SANDBOX_INSTALL_TIMEOUT,
+                    )
+                    return
                 self._configure_git(container)
             except Exception as exc:  # pragma: no cover - best effort
                 logger.debug("sandbox 기본 툴 사전 설치 실패(무시): %s", exc)
@@ -406,10 +500,15 @@ class DockerSandboxBackend(BaseSandbox):
         직후 다시 호출된다.
         """
         try:
-            container.exec_run(
-                ["bash", "-c", "git config --system --add safe.directory '*' 2>/dev/null || true"],
-                demux=False,
+            _, _, timed_out = _exec_in_container(
+                container,
+                "git config --system --add safe.directory '*' 2>/dev/null || true",
+                SANDBOX_CONFIG_TIMEOUT,
             )
+            if timed_out:
+                logger.warning(
+                    "sandbox git 설정 적용이 %d초 상한을 넘겨 건너뜁니다", SANDBOX_CONFIG_TIMEOUT
+                )
         except Exception as e:  # pragma: no cover - best effort
             logger.debug("sandbox git safe.directory 설정 실패(무시): %s", e)
 
@@ -476,38 +575,57 @@ class DockerSandboxBackend(BaseSandbox):
         return super().grep(pattern, effective_path, glob)
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        container = self._ensure_container()
-        _timeout = timeout or 180
+        """셸 명령을 실행한다. 총 소요는 기동 상한 + 실행 상한을 넘지 않는다.
+
+        상한을 넘기면 예외 대신 exit_code 124(시간 초과)/125(샌드박스 사용 불가)와
+        사유 문구를 돌려준다 — 호출자(스킬 도구)가 그걸 보고 로컬 경로로 폴백하고
+        사용자에게 알릴 수 있어야 하기 때문이다.
+        """
+        try:
+            container = self._ensure_container()
+        except SandboxUnavailable as exc:
+            return ExecuteResponse(output=f"ERROR: {exc}", exit_code=UNAVAILABLE_EXIT_CODE, truncated=False)
+        except docker.errors.DockerException as exc:
+            return ExecuteResponse(
+                output=f"ERROR: 샌드박스를 사용할 수 없습니다: {exc}",
+                exit_code=UNAVAILABLE_EXIT_CODE,
+                truncated=False,
+            )
+
+        _timeout = timeout or SANDBOX_EXEC_TIMEOUT
+        # 자동 설치 재시도까지 포함한 **한 호출 전체**의 마감 시각. 재시도마다 상한을
+        # 새로 주면 (첫 실행 + 사전설치 대기 + apt + 재실행) 이 상한의 몇 배가 된다.
+        deadline = time.monotonic() + _timeout
+
+        def _remaining() -> int:
+            return int(deadline - time.monotonic())
+
+        def _timeout_response() -> tuple[int, str]:
+            return TIMEOUT_EXIT_CODE, (
+                f"ERROR: command timed out after {_timeout}s — 상한을 넘겨 중단했습니다. "
+                "명령을 더 작게 나누거나 오래 걸리는 단계를 건너뛰고 다시 시도하세요."
+            )
 
         def _exec(cmd: str) -> tuple[int, str]:
-            holder: dict = {}
-
-            def _run() -> None:
-                # Don't pass workdir= to exec_run: on macOS + Colima/Docker Desktop,
-                # runc resolves the bind-mount target back to the host path and
-                # raises "current working directory is outside of container mount
-                # namespace root". cd inside bash bypasses that OCI-level check.
-                #
-                # 서브셸 여는/닫는 괄호는 반드시 **각자 자기 줄**에 둔다. cmd 와 같은 줄에
-                # ` )` 를 붙이면, cmd 가 heredoc(<<'JSON' ... JSON)으로 끝날 때 닫는 구분자
-                # 줄이 "JSON )" 로 오염돼 heredoc 이 깨진다(bash: here-document ... wanted `JSON').
-                wrapped = f"cd {_CONTAINER_WORKSPACE} && (\n{cmd}\n)"
-                exit_code, output = container.exec_run(
-                    ["bash", "-c", wrapped],
-                    demux=False,
-                )
-                holder["exit_code"] = exit_code
-                holder["output"] = (output or b"").decode("utf-8", errors="replace")
-
-            thread = threading.Thread(target=_run, daemon=True)
-            thread.start()
-            thread.join(_timeout)
-
-            if thread.is_alive():
-                return 124, f"ERROR: command timed out after {_timeout}s"
-            return holder.get("exit_code") or 0, holder.get("output", "")
+            budget = _remaining()
+            if budget <= 0:
+                return _timeout_response()
+            # Don't pass workdir= to exec_run: on macOS + Colima/Docker Desktop,
+            # runc resolves the bind-mount target back to the host path and
+            # raises "current working directory is outside of container mount
+            # namespace root". cd inside bash bypasses that OCI-level check.
+            #
+            # 서브셸 여는/닫는 괄호는 반드시 **각자 자기 줄**에 둔다. cmd 와 같은 줄에
+            # ` )` 를 붙이면, cmd 가 heredoc(<<'JSON' ... JSON)으로 끝날 때 닫는 구분자
+            # 줄이 "JSON )" 로 오염돼 heredoc 이 깨진다(bash: here-document ... wanted `JSON').
+            wrapped = f"cd {_CONTAINER_WORKSPACE} && (\n{cmd}\n)"
+            exit_code, output, timed_out = _exec_in_container(container, wrapped, budget)
+            if timed_out:
+                return _timeout_response()
+            return exit_code, output
 
         exit_code, out = _exec(command)
+        notes: list[str] = []
 
         # 커맨드를 찾을 수 없는 경우 apt-get으로 자동 설치 후 1회 재시도.
         # 같은 커맨드는 컨테이너당 한 번만 시도한다 — apt 를 쓸 수 없는 환경(사설 네트워크,
@@ -524,12 +642,19 @@ class DockerSandboxBackend(BaseSandbox):
             # 기다리지 않고 여기서 apt 를 또 부르면 dpkg 락을 두고 서로 막는다.
             bootstrap = getattr(container, "_deepagent_bootstrap_thread", None)
             if bootstrap is not None and bootstrap.is_alive():
-                bootstrap.join(_BOOTSTRAP_WAIT_SECONDS)
-                exit_code, out = _exec(command)
-                match = _CMD_NOT_FOUND_RE.search(out)
-                missing = match.group(1) if match else ""
+                wait = min(_BOOTSTRAP_WAIT_SECONDS, max(_remaining(), 0))
+                bootstrap.join(wait)
+                if bootstrap.is_alive():
+                    notes.append(
+                        f"NOTE: 기본 도구 사전 설치가 {wait}초 안에 끝나지 않아 기다리지 않고 진행했습니다."
+                    )
+                else:
+                    exit_code, out = _exec(command)
+                    match = _CMD_NOT_FOUND_RE.search(out)
+                    missing = match.group(1) if match else ""
 
-            if missing and missing not in attempted:
+            install_budget = min(SANDBOX_INSTALL_TIMEOUT, max(_remaining(), 0))
+            if missing and missing not in attempted and install_budget > 0:
                 attempted.add(missing)
                 pkg = _PACKAGE_OVERRIDES.get(missing, missing)
                 logger.info("auto-installing missing command %r (package=%r)", missing, pkg)
@@ -537,12 +662,30 @@ class DockerSandboxBackend(BaseSandbox):
                     "DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -1 "
                     f"&& apt-get install -y -qq --no-install-recommends {pkg} 2>&1 | tail -3"
                 )
-                container.exec_run(["bash", "-c", install_cmd], demux=False)
-                if missing == "git":
-                    self._configure_git(container)
-                exit_code, out = _exec(command)
-            elif missing:
+                _, _, install_timed_out = _exec_in_container(container, install_cmd, install_budget)
+                if install_timed_out:
+                    # 폴백: 설치를 포기하고 원래 결과(=커맨드 없음)를 그대로 돌려준다.
+                    # 사용자에게는 그 사실을 알려 다른 방법을 고를 수 있게 한다.
+                    logger.warning(
+                        "sandbox 자동 설치가 %d초 상한을 넘겨 중단: %s", install_budget, missing
+                    )
+                    notes.append(
+                        f"NOTE: '{missing}' 자동 설치가 {install_budget}초 상한을 넘겨 중단했습니다. "
+                        "설치 없이 진행하니, 이 명령이 필요 없는 방법으로 다시 시도하세요."
+                    )
+                else:
+                    if missing == "git":
+                        self._configure_git(container)
+                    exit_code, out = _exec(command)
+            elif missing and missing in attempted:
                 logger.info("auto-install skipped for %r (already attempted in this sandbox)", missing)
+            elif missing:
+                notes.append(
+                    f"NOTE: 남은 시간이 없어 '{missing}' 자동 설치를 건너뛰었습니다."
+                )
+
+        if notes:
+            out = f"{out}\n" + "\n".join(notes) if out else "\n".join(notes)
 
         truncated = len(out) > _MAX_OUTPUT_BYTES
         if truncated:
@@ -554,7 +697,10 @@ class DockerSandboxBackend(BaseSandbox):
         )
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        container = self._ensure_container()
+        try:
+            container = self._ensure_container()
+        except (SandboxUnavailable, docker.errors.DockerException) as exc:
+            return [FileUploadResponse(path=path, error=str(exc)) for path, _ in files]
         responses: list[FileUploadResponse] = []
         for path, content in files:
             try:
@@ -577,7 +723,10 @@ class DockerSandboxBackend(BaseSandbox):
         return responses
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-        container = self._ensure_container()
+        try:
+            container = self._ensure_container()
+        except (SandboxUnavailable, docker.errors.DockerException) as exc:
+            return [FileDownloadResponse(path=path, error=str(exc)) for path in paths]
         responses: list[FileDownloadResponse] = []
         for path in paths:
             try:

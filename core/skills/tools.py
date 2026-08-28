@@ -11,10 +11,13 @@ extract_document_structure, list_git_repos, publish_skill을 제공한다.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import os
 import re
 import shlex
+import threading
+import time
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -243,12 +246,95 @@ def _require_sandbox():
     return sandbox
 
 
+# 스킬 도구가 거는 셸 실행 상한(초). 샌드박스 기본값(SANDBOX_EXEC_TIMEOUT)과 별개로
+# 도구 호출 한 번이 사용자를 기다리게 하는 시간을 여기서 못 박는다.
+def _env_seconds(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+_SKILL_EXEC_TIMEOUT = _env_seconds("SKILL_TOOL_EXEC_TIMEOUT_SECONDS", 120)
+
+# docker_sandbox.execute() 가 상한 초과/샌드박스 불가에 쓰는 종료 코드.
+_TIMEOUT_EXIT_CODES = (124, 125)
+
+
 def _sandbox_exec(cmd: str, *, timeout: int | None = None) -> tuple[int, str]:
     sandbox = _current_sandbox.get()
     if sandbox is None:
         return 1, "ERROR: sandbox not available"
-    resp = sandbox.execute(cmd, timeout=timeout) if timeout else sandbox.execute(cmd)
+    resp = sandbox.execute(cmd, timeout=timeout or _SKILL_EXEC_TIMEOUT)
     return resp.exit_code or 0, resp.output.strip()
+
+
+# ---------------------------------------------------------------------------
+# 폴백 알림
+#
+# 상한을 넘겨 대체 경로(로컬 사본, 원격 건너뛰기 등)로 흘러갔다는 사실은 도구가 조용히
+# 삼키면 사용자에게 영원히 닿지 않는다 — 화면에는 "성공"만 보이고, 왜 결과가 다른지
+# 알 길이 없다. 호출 깊은 곳에서 남긴 메모를 도구 응답 끝에 NOTE 줄로 실어 보낸다.
+# (스트리밍 채널이 따로 없어 도구 반환 문자열이 유일한 전달 경로다.)
+# ---------------------------------------------------------------------------
+_fallback_notes: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "tools_fallback_notes", default=None
+)
+
+
+@contextlib.contextmanager
+def _fallback_notices():
+    notes: list[str] = []
+    token = _fallback_notes.set(notes)
+    try:
+        yield notes
+    finally:
+        _fallback_notes.reset(token)
+
+
+def _note_fallback(message: str) -> None:
+    notes = _fallback_notes.get()
+    if notes is None or message in notes:
+        return
+    notes.append(message)
+
+
+def _with_notes(result: str) -> str:
+    notes = _fallback_notes.get() or []
+    if not notes:
+        return result
+    return result + "\n" + "\n".join(f"NOTE: {n}" for n in notes)
+
+
+def _timed_out(rc: int, out: str) -> bool:
+    """샌드박스가 상한 초과/사용 불가로 끊은 결과인가."""
+    return rc in _TIMEOUT_EXIT_CODES or "timed out after" in (out or "")
+
+
+def _call_with_timeout(fn, timeout: float, *args, **kwargs):
+    """fn 을 데몬 스레드에서 돌리고 상한 안에 끝나지 않으면 TimeoutError 를 던진다.
+
+    DB/HTTP 클라이언트가 자체 상한을 갖고 있어도(그리고 대개 갖고 있어도) 커넥션 풀
+    고갈이나 재시도 때문에 호출이 그 상한의 몇 배로 늘어나는 경우가 있다. 호출부에서
+    한 번 더 못 박아 두면 어떤 라이브러리를 쓰든 상한이 지켜진다.
+    """
+    box: dict = {}
+
+    def _run() -> None:
+        try:
+            box["value"] = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - 호출 스레드로 그대로 옮긴다
+            box["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(f"{getattr(fn, '__name__', fn)} 이(가) {timeout:.0f}초 안에 끝나지 않았습니다")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 def _git_sb(cwd: str, *args: str) -> tuple[int, str]:
@@ -323,6 +409,10 @@ def _git_net_exec(cmd: str) -> tuple[int, str]:
     """원격을 타는 git 명령을 시간 상한과 저속 중단 옵션을 걸고 실행한다."""
     rc, out = _sandbox_exec(cmd, timeout=_GIT_NET_TIMEOUT)
     if rc != 0 and _GIT_NET_FAIL_RE.search(out or ""):
+        if _timed_out(rc, out):
+            _note_fallback(
+                f"원격 Git 작업이 {_GIT_NET_TIMEOUT}초 상한을 넘겨 중단했습니다."
+            )
         _mark_git_net_blocked(out)
     return rc, out
 
@@ -330,6 +420,7 @@ def _git_net_exec(cmd: str) -> tuple[int, str]:
 def _git_net_sb(cwd: str, *args: str) -> tuple[int, str]:
     """cwd 에서 원격을 타는 git 명령(fetch/push 등)을 실행한다."""
     if _git_net_blocked():
+        _note_fallback(_GIT_EGRESS_BLOCKED_MSG)
         return 1, _GIT_EGRESS_BLOCKED_MSG
     parts = " ".join(shlex.quote(a) for a in args)
     return _git_net_exec(f"cd {shlex.quote(cwd)} && git {_GIT_NET_OPTS} {parts}")
@@ -338,6 +429,7 @@ def _git_net_sb(cwd: str, *args: str) -> tuple[int, str]:
 def _clone_sb(auth_url: str, dest: str) -> tuple[int, str]:
     """원격 저장소를 dest 로 클론한다. 네트워크가 막혀 있으면 즉시 실패로 돌려준다."""
     if _git_net_blocked():
+        _note_fallback(_GIT_EGRESS_BLOCKED_MSG)
         return 1, _GIT_EGRESS_BLOCKED_MSG
     return _git_net_exec(
         f"rm -rf {shlex.quote(dest)} && "
@@ -353,15 +445,21 @@ def _try_clone_skill_repo(skill_name: str, dest: str) -> str | None:
     "레포 전체를 로컬본으로 교체" 가 되어 병합 관리 흐름이 의미를 잃는다.
     """
     if _git_net_blocked():
+        _note_fallback(_GIT_EGRESS_BLOCKED_MSG + " 로컬 사본으로 진행합니다.")
         return None
     try:
         provider = _get_git_provider()
-    except ValueError:
+    except ValueError as e:
+        # 설정 조회가 상한을 넘긴 경우는 "git 미연동"과 달리 사용자가 알아야 한다 —
+        # 같은 요청을 다시 하면 결과가 달라질 수 있기 때문이다.
+        if "상한" in str(e):
+            _note_fallback(f"{e} 로컬 사본으로 진행합니다.")
         return None
     try:
         if not provider.repo_exists(skill_name):
             return None
-    except Exception:
+    except Exception as e:
+        _note_fallback(f"원격 저장소 조회에 실패해 로컬 사본으로 진행합니다({e}).")
         return None
 
     auth_url = provider.get_authenticated_clone_url(provider.username, skill_name)
@@ -372,6 +470,10 @@ def _try_clone_skill_repo(skill_name: str, dest: str) -> str | None:
         _logging.getLogger(__name__).warning(
             "스킬 레포 클론 실패, 로컬 사본으로 폴백 skill=%s: %s", skill_name, out
         )
+        _note_fallback(
+            "원격 저장소 클론에 실패해 로컬 사본으로 진행합니다 — "
+            "이번 변경은 병합 요청이 아니라 로컬 사본 기준으로 만들어집니다."
+        )
         return None
     return dest
 
@@ -380,8 +482,23 @@ def _try_clone_skill_repo(skill_name: str, dest: str) -> str | None:
 # Git provider 헬퍼
 # ---------------------------------------------------------------------------
 
+# 설정 조회(tenant_git_config DB) 상한과 캐시.
+# 한 번의 도구 호출에서 provider 를 여러 번 만드는 경로가 있어(레포 존재 확인 → 클론 URL →
+# PR 생성) 매번 DB 를 두 번씩 왕복한다. DB 가 느려지면 그 왕복이 그대로 사용자 대기시간이
+# 되므로, 상한을 걸고 짧게 캐시한다(설정 변경은 TTL 안에 반영된다).
+_GIT_CONFIG_TIMEOUT = _env_seconds("GIT_CONFIG_LOOKUP_TIMEOUT_SECONDS", 15)
+_GIT_CONFIG_CACHE_TTL = 60.0
+_git_provider_cache: dict[str, tuple[float, object]] = {}
+_git_provider_cache_lock = threading.Lock()
+
+
 def _get_git_provider():
-    """현재 테넌트의 Git provider 인스턴스를 반환한다."""
+    """현재 테넌트의 Git provider 인스턴스를 반환한다.
+
+    설정 조회가 상한을 넘기면 ValueError 로 바꿔 던진다 — 호출부는 "git 미연동"과 같은
+    폴백(로컬 사본으로 계속 진행)을 이미 갖고 있으므로, 조회 지연이 대화를 멈추는 대신
+    폴백 경로로 흘러간다.
+    """
     from .git_providers.factory import get_provider
 
     tenant_id = _current_tenant_id.get()
@@ -389,7 +506,27 @@ def _get_git_provider():
         raise ValueError(
             "tenant_id가 설정되지 않았습니다. ask_user를 호출하지 말고 작업을 중단하세요."
         )
-    return get_provider(tenant_id)
+
+    now = time.monotonic()
+    with _git_provider_cache_lock:
+        cached = _git_provider_cache.get(tenant_id)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    try:
+        provider = _call_with_timeout(get_provider, _GIT_CONFIG_TIMEOUT, tenant_id)
+    except TimeoutError as e:
+        _note_fallback(
+            f"Git 설정 조회가 {_GIT_CONFIG_TIMEOUT}초 상한을 넘겨 git 없이 진행합니다."
+        )
+        raise ValueError(
+            f"Git 설정 조회가 {_GIT_CONFIG_TIMEOUT}초 상한을 넘겼습니다({e}). "
+            "ask_user를 호출하지 말고 git 없이 작업을 계속하세요."
+        ) from e
+
+    with _git_provider_cache_lock:
+        _git_provider_cache[tenant_id] = (time.monotonic() + _GIT_CONFIG_CACHE_TTL, provider)
+    return provider
 
 
 # ---------------------------------------------------------------------------
@@ -2566,6 +2703,11 @@ def checkout_to_workspace(source: str) -> str:
     the returned path verbatim and never assume /workspace/<name>. On failure
     returns an ERROR: … string.
 
+    If a step hit its time limit and a fallback path was taken (e.g. the remote
+    clone was skipped and a local copy used instead), extra lines starting with
+    `NOTE:` follow the path. Those lines are NOT part of the path — pass them on
+    to the user so they know the result came from the fallback.
+
     **Decision rule:** Make this call autonomously based on user context.
     Do NOT ask the user which path to use — resolve it yourself using the
     priority above and proceed.
@@ -2573,6 +2715,12 @@ def checkout_to_workspace(source: str) -> str:
     Args:
         source: Git URL, absolute /skills/ path, or bare skill/repo name.
     """
+    with _fallback_notices():
+        return _with_notes(_checkout_impl(source))
+
+
+def _checkout_impl(source: str) -> str:
+    """checkout_to_workspace 본체 — 컨테이너 경로 또는 ERROR 문자열을 돌려준다."""
     if _current_sandbox.get() is None:
         return "ERROR: sandbox not available."
 
@@ -2689,7 +2837,17 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
         skill_path: Docker container path to the completed skill folder.
         branch:     Optional custom branch name for the PR. If omitted, an
                     auto-generated branch name is used (skill/<name>/<timestamp>).
+
+    Lines starting with `NOTE:` may follow the result when a step hit its time
+    limit and a fallback path was taken, or when the merge request could not be
+    recorded. Always relay those lines to the user.
     """
+    with _fallback_notices():
+        return _with_notes(_publish_skill_impl(skill_path, branch))
+
+
+def _publish_skill_impl(skill_path: str, branch: str | None = None) -> str:
+    """publish_skill 본체 — 결과/에러 문자열을 돌려준다."""
     if _current_sandbox.get() is None:
         return "ERROR: sandbox not available. 스킬 퍼블리시는 Docker sandbox 환경에서만 가능합니다."
 
