@@ -327,8 +327,13 @@ def _record_resource_pr_sync(
     git_pr_number: int | None = None,
     git_pr_url: str = "",
     git_repo_url: str = "",
-) -> dict | None:
-    """resource_pull_requests 테이블에 PR 레코드를 삽입한다 (동기 버전, API 라우터용)."""
+) -> tuple[dict | None, str]:
+    """resource_pull_requests 에 PR 레코드를 삽입하고 (레코드, 실패사유) 를 돌려준다.
+
+    실패를 로그로만 남기면 PR 은 깃에 만들어졌는데 병합 요청 목록에는 없는 상태가 되고,
+    화면에서는 "요청을 올렸는데 목록이 비어 있다" 로만 보인다. 호출부가 응답에 실어
+    사용자에게 알릴 수 있도록 사유를 함께 돌려준다.
+    """
     from core.storage.db import get_supabase
 
     requester_ids = _normalize_requester_ids(requester_id)
@@ -353,14 +358,16 @@ def _record_resource_pr_sync(
         }
         resp = sb.table("resource_pull_requests").insert(row).execute()
         data = getattr(resp, "data", None)
-        return data[0] if data else None
-    except Exception:
+        if data:
+            return data[0], ""
+        return None, "삽입 결과가 비어 있습니다"
+    except Exception as e:
         logger.warning(
             "resource_pull_requests 기록 실패: resource=%s/%s branch=%s",
             resource_type, resource_id, branch_name,
             exc_info=True,
         )
-        return None
+        return None, str(e)
 
 
 @tenant_guard
@@ -545,7 +552,7 @@ async def commit_skill_file(request: Request) -> JSONResponse:
             pr_result = {"pr_created": True, **pr}
 
             # resource_pull_requests DB 기록
-            await asyncio.to_thread(
+            _, record_error = await asyncio.to_thread(
                 _record_resource_pr_sync,
                 tenant_id=tenant_id,
                 resource_type="skill",
@@ -560,6 +567,11 @@ async def commit_skill_file(request: Request) -> JSONResponse:
                 git_pr_url=pr.get("html_url", ""),
                 git_repo_url=provider.get_repo_html_url(provider.username, skill_name),
             )
+            # PR 은 만들어졌는데 기록만 실패한 경우를 응답에 남긴다 — 이 사실을 숨기면
+            # 병합 요청 목록이 비어 보이는 이유를 화면에서 알 길이 없다.
+            pr_result["pr_recorded"] = not record_error
+            if record_error:
+                pr_result["pr_record_error"] = record_error
         except Exception as e:
             logger.warning("PR 생성 실패 skill=%s branch=%s: %s", skill_name, branch, e)
             pr_result = {"pr_created": False, "pr_error": str(e)}
@@ -583,6 +595,14 @@ async def list_skill_branches(request: Request) -> JSONResponse:
             asyncio.to_thread(provider.detect_default_branch, provider.username, skill_name),
         )
     except Exception as e:
+        # 레포가 아직 없는 것(404)은 오류가 아니라 "안 만든 상태"다. 이걸 500 으로 돌려주면
+        # 화면이 "레포 생성" 안내 대신 오류를 띄우고, 반대로 인증 실패(401)까지 빈 목록으로
+        # 돌려주면 이미 있는 레포를 "없다"고 말하게 된다 — 둘을 구분해서 알린다.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 404:
+            return JSONResponse(
+                {"branches": [], "default_branch": "main", "repo_missing": True}
+            )
         logger.exception("list_branches failed for skill=%s tenant=%s", skill_name, tenant_id)
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -997,7 +1017,7 @@ async def delete_skill_file(request: Request) -> JSONResponse:
             )
             pr_result = {"pr_created": True, **pr}
 
-            await asyncio.to_thread(
+            _, record_error = await asyncio.to_thread(
                 _record_resource_pr_sync,
                 tenant_id=tenant_id,
                 resource_type="skill",
@@ -1012,6 +1032,9 @@ async def delete_skill_file(request: Request) -> JSONResponse:
                 git_pr_url=pr.get("html_url", ""),
                 git_repo_url=provider.get_repo_html_url(provider.username, skill_name),
             )
+            pr_result["pr_recorded"] = not record_error
+            if record_error:
+                pr_result["pr_record_error"] = record_error
         except Exception as e:
             logger.warning("PR 생성 실패 (delete) skill=%s branch=%s: %s", skill_name, branch, e)
             pr_result = {"pr_created": False, "pr_error": str(e)}

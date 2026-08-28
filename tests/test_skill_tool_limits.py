@@ -3,6 +3,7 @@
 DoD:
   - 도구 호출은 정해진 상한 안에 결과 또는 실패 사유를 돌려준다.
   - 상한을 넘기면 대체 경로(로컬 사본, git 없이 진행)로 폴백하고 그 사실을 알린다.
+  - 병합 요청 기록에 실패하면 발행 결과에 그 사실이 표시된다.
 """
 
 from __future__ import annotations
@@ -108,3 +109,59 @@ def test_successful_checkout_has_no_notes(sandbox, tenant, monkeypatch):
     monkeypatch.setattr(skill_tools, "_try_clone_skill_repo", lambda name, dest: None)
 
     assert skill_tools.checkout_to_workspace.func("nda-review") == "/workspace/nda-review"
+
+
+# ---------------------------------------------------------------------------
+# 병합 요청 기록 실패 보고
+# ---------------------------------------------------------------------------
+
+def _provider_with_pr():
+    return type(
+        "P", (), {
+            "username": "o",
+            "create_pull_request": lambda self, **kw: {
+                "number": 7, "html_url": "https://h/o/s/pull/7"
+            },
+        },
+    )()
+
+
+def test_publish_reports_when_merge_request_record_fails(monkeypatch):
+    """PR 은 만들어졌는데 기록만 실패한 경우, 결과 문자열에 그 사실이 남는다."""
+    monkeypatch.setattr(skill_tools, "_get_git_provider", _provider_with_pr)
+    monkeypatch.setattr(skill_tools, "_record_resource_pr", lambda **kw: None)
+
+    result = skill_tools._create_pr_after_push(
+        skill_name="s", branch="skill/s/1", base_branch="main",
+        html_url="https://h/o/s", title="feat: update s", description="",
+    )
+
+    assert "https://h/o/s/pull/7" in result
+    assert "기록하지 못했습니다" in result
+
+
+def test_publish_stays_quiet_when_record_succeeds(monkeypatch):
+    monkeypatch.setattr(skill_tools, "_get_git_provider", _provider_with_pr)
+    monkeypatch.setattr(skill_tools, "_record_resource_pr", lambda **kw: {"id": "x"})
+
+    result = skill_tools._create_pr_after_push(
+        skill_name="s", branch="skill/s/1", base_branch="main",
+        html_url="https://h/o/s", title="feat: update s", description="",
+    )
+    assert "기록하지 못했습니다" not in result
+
+
+def test_record_failure_is_noted_for_the_user(monkeypatch, tenant):
+    """DB 기록 실패는 로그로만 삼키지 않고 도구 응답에 실린다."""
+    class _Boom:
+        def table(self, *_a, **_kw):
+            raise RuntimeError("db down")
+
+    monkeypatch.setattr("core.storage.db.get_supabase", lambda: _Boom())
+
+    with skill_tools._fallback_notices():
+        assert skill_tools._record_resource_pr(
+            resource_type="skill", resource_id="s", branch_name="b",
+            base_branch="main", title="t", description="d",
+        ) is None
+        assert "병합 요청" in skill_tools._with_notes("결과")

@@ -313,9 +313,17 @@ class GitLabProvider(GitProvider):
                 "number": mr["iid"],
                 "title": mr["title"],
                 "html_url": mr["web_url"],
-                "state": mr["state"],
+                # GitLab 은 병합된 MR 의 state 가 "merged" 다. 그대로 넘기면 호출부가
+                # open/closed 만 아는 GitHub 어휘로 판정해 "열려 있지도 닫히지도 않은"
+                # MR 로 취급한다 — 목록에서 통째로 빠지는 원인이 된다.
+                "state": "open" if mr["state"] == "opened" else "closed",
                 "head": mr["source_branch"],
                 "base": mr["target_branch"],
+                "merged_at": mr.get("merged_at"),
+                "merged": mr["state"] == "merged" or bool(mr.get("merged_at")),
+                "author": (mr.get("author") or {}).get("username", ""),
+                "created_at": mr.get("created_at"),
+                "updated_at": mr.get("updated_at"),
             }
             for mr in resp.json()
         ]

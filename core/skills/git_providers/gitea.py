@@ -267,6 +267,11 @@ class GiteaProvider(GitProvider):
                 "state": p["state"],
                 "head": p["head"]["ref"],
                 "base": p["base"]["ref"],
+                "merged_at": p.get("merged_at"),
+                "merged": bool(p.get("merged_at")),
+                "author": (p.get("user") or {}).get("login", ""),
+                "created_at": p.get("created_at"),
+                "updated_at": p.get("updated_at"),
             }
             for p in resp.json()
         ]

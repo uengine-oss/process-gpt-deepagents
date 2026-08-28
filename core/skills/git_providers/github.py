@@ -265,6 +265,11 @@ class GitHubProvider(GitProvider):
                 # (목록 API 는 merged 플래그를 주지 않고 merged_at 만 준다.)
                 "merged_at": p.get("merged_at"),
                 "merged": bool(p.get("merged_at")),
+                # 기록이 누락된 PR 을 목록에 채워 넣으려면 작성자와 시각이 필요하다.
+                # 이게 없으면 복구된 항목이 "알 수 없는 사용자 · 방금" 으로만 보인다.
+                "author": (p.get("user") or {}).get("login", ""),
+                "created_at": p.get("created_at"),
+                "updated_at": p.get("updated_at"),
             }
             for p in resp.json()
         ]

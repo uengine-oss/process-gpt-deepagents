@@ -739,7 +739,7 @@ def _create_pr_after_push(
     pr_url = pr_result.get("html_url", "")
 
     # resource_pull_requests 테이블에 기록
-    _record_resource_pr(
+    record = _record_resource_pr(
         resource_type="skill",
         resource_id=skill_name,
         branch_name=branch,
@@ -751,13 +751,21 @@ def _create_pr_after_push(
         git_repo_url=html_url,
     )
 
-    return (
+    result = (
         f"PR created for '{skill_name}' → {pr_url}\n"
         f"Branch: {branch} → {base_branch}\n"
         f"PR #{pr_number}: {title}\n\n"
         f"기본 브랜치에 직접 커밋하지 않고 PR을 생성했습니다. "
         f"리뷰 후 병합해 주세요."
     )
+    if record is None:
+        # PR 자체는 만들어졌는데 목록 기록이 빠진 상태다. 조용히 넘기면 사용자는
+        # "PR 을 올렸다는데 병합 요청 탭은 비어 있다" 는 상황만 보게 된다.
+        result += (
+            "\n\n주의: 병합 요청 목록에 기록하지 못했습니다. "
+            f"위 PR 링크({pr_url})로 직접 확인해 주세요."
+        )
+    return result
 
 
 def _as_list(value: str | list[str] | None) -> list[str]:
@@ -788,6 +796,10 @@ def _record_resource_pr(
     """resource_pull_requests 테이블에 PR 레코드를 삽입한다."""
     tenant_id = _current_tenant_id.get()
     if not tenant_id:
+        _note_fallback(
+            "tenant 정보가 없어 병합 요청을 목록(DB)에 기록하지 못했습니다 — "
+            "스킬 상세의 병합 요청 탭에 바로 보이지 않을 수 있습니다."
+        )
         return None
 
     requester_ids = _normalize_requester_ids(_current_user_id.get())
@@ -814,12 +826,16 @@ def _record_resource_pr(
         resp = sb.table("resource_pull_requests").insert(row).execute()
         data = getattr(resp, "data", None)
         return data[0] if data else None
-    except Exception:
+    except Exception as e:
         import logging as _logging
         _logging.getLogger(__name__).warning(
             "resource_pull_requests 기록 실패: resource=%s/%s branch=%s",
             resource_type, resource_id, branch_name,
             exc_info=True,
+        )
+        _note_fallback(
+            f"병합 요청을 목록(DB)에 기록하지 못했습니다({e}) — "
+            "스킬 상세의 병합 요청 탭에 바로 보이지 않을 수 있습니다. PR 링크로 확인하세요."
         )
         return None
 

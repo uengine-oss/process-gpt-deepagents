@@ -42,6 +42,9 @@ def _mock_provider(
     p = MagicMock()
     p.username = "test-owner"
     p.list_branches.return_value = branches or [{"name": "main", "sha": "a" * 40}]
+    # 라우트가 기본 브랜치를 함께 조회한다. MagicMock 기본 반환값은 JSON 직렬화가 안 돼
+    # 응답 생성에서 터지므로 문자열로 고정한다.
+    p.detect_default_branch.return_value = "main"
     p.list_commits.return_value = commits or [
         {"sha": "b" * 40, "message": "init", "author": "Alice", "date": "2024-01-01T00:00:00Z"}
     ]
@@ -72,6 +75,38 @@ class TestListSkillBranches:
         assert "branches" in data
         assert data["branches"][0]["name"] == "main"
         assert len(data["branches"][0]["sha"]) == 40
+
+    def test_missing_repo_is_not_reported_as_error(self, client):
+        """레포가 아직 없으면(404) 오류가 아니라 빈 목록으로 알린다.
+
+        500 으로 돌려주면 화면이 "레포 생성" 안내 대신 오류를 띄우고, 반대로 인증 실패까지
+        빈 목록으로 뭉뚱그리면 이미 있는 레포를 "없다"고 말하게 된다.
+        """
+        import httpx
+
+        provider = _mock_provider()
+        response = httpx.Response(404, request=httpx.Request("GET", "https://api.github.com/x"))
+        provider.list_branches.side_effect = httpx.HTTPStatusError(
+            "404", request=response.request, response=response
+        )
+        with patch("core.api.skills_router._get_provider", return_value=provider):
+            resp = client.get("/skills/my-skill/branches?tenant_id=t1")
+        assert resp.status_code == 200
+        assert resp.json() == {"branches": [], "default_branch": "main", "repo_missing": True}
+
+    def test_auth_failure_is_reported_as_error(self, client):
+        """401 은 "레포 없음" 으로 뭉개지 않고 사유와 함께 실패로 알린다."""
+        import httpx
+
+        provider = _mock_provider()
+        response = httpx.Response(401, request=httpx.Request("GET", "https://api.github.com/x"))
+        provider.list_branches.side_effect = httpx.HTTPStatusError(
+            "401", request=response.request, response=response
+        )
+        with patch("core.api.skills_router._get_provider", return_value=provider):
+            resp = client.get("/skills/my-skill/branches?tenant_id=t1")
+        assert resp.status_code == 500
+        assert resp.json()["error"]
 
 
 # ---------------------------------------------------------------------------
