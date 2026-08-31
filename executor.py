@@ -1122,11 +1122,13 @@ class DeepAgentExecutor(AgentExecutor):
             if deterministic is not None:
                 deterministic_job_id = str(uuid.uuid4())
                 is_undo = deterministic.mode == "deterministic-undo"
-                card_name = (
-                    "Undo(실행 취소) 후 재실행 결과"
-                    if is_undo
-                    else "결정론적 코드 실행 결과"
-                )
+                is_undo_only = deterministic.mode == "deterministic-undo-only"
+                if is_undo_only:
+                    card_name = "Undo(실행 취소) 결과"
+                elif is_undo:
+                    card_name = "Undo(실행 취소) 후 재실행 결과"
+                else:
+                    card_name = "결정론적 코드 실행 결과"
                 await _enqueue_status(
                     event_queue,
                     task_id=task_id,
@@ -1137,7 +1139,9 @@ class DeepAgentExecutor(AgentExecutor):
                             "role": card_name,
                             "name": card_name,
                             "goal": (
-                                "고착화된 undo 코드로 이전 실행을 되돌린 뒤 새 입력으로 재실행합니다."
+                                "고착화된 undo 코드로 이전 실행을 되돌립니다. 재실행은 에이전트가 수행합니다."
+                                if is_undo_only
+                                else "고착화된 undo 코드로 이전 실행을 되돌린 뒤 새 입력으로 재실행합니다."
                                 if is_undo
                                 else "고착화된 코드로 LLM 추론 없이 재실행합니다."
                             ),
@@ -1160,16 +1164,19 @@ class DeepAgentExecutor(AgentExecutor):
                     job_id=deterministic_job_id,
                     crew_type="result",
                 )
-                artifact_evt = new_text_artifact_update_event(
-                    task_id=task_id,
-                    context_id=context_id,
-                    name="assistant_response",
-                    text=deterministic.result_text,
-                    last_chunk=True,
-                )
-                ParseDict({"role": "assistant"}, artifact_evt.metadata)
-                await event_queue.enqueue_event(artifact_evt)
-                return None
+                if not deterministic.continue_to_llm:
+                    artifact_evt = new_text_artifact_update_event(
+                        task_id=task_id,
+                        context_id=context_id,
+                        name="assistant_response",
+                        text=deterministic.result_text,
+                        last_chunk=True,
+                    )
+                    ParseDict({"role": "assistant"}, artifact_evt.metadata)
+                    await event_queue.enqueue_event(artifact_evt)
+                    return None
+                # 되돌리기만 수행한 경우: 결과 카드만 남기고 DeepAgents 실행을 계속한다.
+                # 최종 산출물은 에이전트가 만든다.
 
         job_id = str(uuid.uuid4())
 
@@ -1431,6 +1438,10 @@ class DeepAgentExecutor(AgentExecutor):
         }
 
         active_tool_calls: dict[str, str] = {}
+        # 도구 호출 인자 tool_call_id → args. tool_usage_finished 이벤트에 인자를 함께
+        # 실어야 고착화 코드 생성과 보상(undo) 생성이 성립한다. 인자 없이 결과만
+        # 남으면 되돌릴 대상을 복원할 수 없다.
+        pending_tool_args: dict[str, dict] = {}
         # write_file/edit_file tool_call_id → {path, op}. tool_end 시 파일을 읽어 file_artifact emit.
         pending_file_ops: dict[str, dict] = {}
         # subprocess 딥에이전트: task() tool_call_id → subagent_type slug
@@ -1499,6 +1510,8 @@ class DeepAgentExecutor(AgentExecutor):
                                     _tc_id = tc.get("id")
                                     if _tc_id:
                                         active_tool_calls[_tc_id] = tool_name
+                                        if isinstance(tool_args, dict):
+                                            pending_tool_args[_tc_id] = tool_args
                                     if tool_name == "request_human_input":
                                         pending_hitl_payload = normalize_hitl_payload(tool_args)
                                     # 파일 산출물 추적: write_file/edit_file 의 대상 경로를 기록해두고
@@ -1577,6 +1590,7 @@ class DeepAgentExecutor(AgentExecutor):
                                 tool_name = active_tool_calls.pop(
                                     msg.tool_call_id, getattr(msg, "name", "unknown")
                                 )
+                                tool_args_used = pending_tool_args.pop(msg.tool_call_id, {})
                                 result_content = msg.content
                                 # 채팅: 도구 결과(예: build_hwpx 실행 출력)에서 hwpx 경로를 모아 종료 시 실체화.
                                 if is_chat:
@@ -1591,8 +1605,14 @@ class DeepAgentExecutor(AgentExecutor):
                                     context_id=context_id,
                                     state=TaskState.TASK_STATE_WORKING,
                                     text=json.dumps(
-                                        {"tool": tool_name, "tool_name": tool_name, "result": result_content},
+                                        {
+                                            "tool": tool_name,
+                                            "tool_name": tool_name,
+                                            "args": tool_args_used,
+                                            "result": result_content,
+                                        },
                                         ensure_ascii=False,
+                                        default=str,
                                     ),
                                     event_type="tool_usage_finished",
                                     job_id=job_id,
