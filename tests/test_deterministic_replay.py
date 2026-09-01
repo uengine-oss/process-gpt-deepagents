@@ -7,6 +7,7 @@ import pytest
 from core.deterministic.replay import (
     _enabled_servers,
     _parameter_values,
+    _render_form_output,
     _run_code,
 )
 
@@ -346,3 +347,151 @@ def test_structured_fields_flattens_nested_json() -> None:
     assert fields["quote_item_name"] == "SKU-A-003"
     assert fields["purchase_quantity"] == 0
     assert "mcp_replen_proc_task_lead_form" not in fields  # 컨테이너 키는 값이 아니다
+
+
+# ---------------------------------------------------------------------------
+# 실행 식별자 — 지시문이 아니라 워크아이템 행에서 읽는다
+# ---------------------------------------------------------------------------
+
+_LEDGER_QUERY = """[Description]
+경비 대장에 지출 내역을 1건 등록한다.
+
+[InputData]
+{"expense_resolution_process_apply_expense_form": {"applicant": "최민석",
+ "account_code": "TRV", "amount": 38000, "used_at": "2026-09-05",
+ "purpose": "본사 회의 택시비"}}"""
+
+_LEDGER_ROW = {
+    "id": "020e927a-6ed8-4c3b-9d47-1c2929e67f31",
+    "proc_inst_id": "expense_resolution_process.0118b1ab",
+    "query": _LEDGER_QUERY,
+}
+
+
+def test_runtime_identifiers_come_from_the_workitem_row() -> None:
+    """proc_inst_id·todo_id 는 지시문에 없다. 행에서 읽지 않으면 되찾을 길이 없다."""
+    spec = {
+        "parameters": [
+            {"name": "applicant", "type": "string", "example": "박지은"},
+            {"name": "proc_inst_id", "type": "string", "example": "expense…5ee72ce5",
+             "runtime": "proc_inst_id"},
+            {"name": "todo_id", "type": "string", "example": "", "runtime": "id"},
+        ]
+    }
+    assert _parameter_values(_LEDGER_QUERY, spec, _LEDGER_ROW) == {
+        "applicant": "최민석",
+        "proc_inst_id": "expense_resolution_process.0118b1ab",
+        "todo_id": "020e927a-6ed8-4c3b-9d47-1c2929e67f31",
+    }
+
+
+def test_identifier_slots_no_longer_swallow_business_values() -> None:
+    """`runtime` 이 없던 시절 이 자리들은 위치 폴백으로 떨어졌다.
+
+    그 결과 proc_inst_id 컬럼에 신청자 이름이, todo_id 컬럼에 계정과목이 들어갔다.
+    조용히 틀리는 것이 아니라 확신 있게 틀렸다.
+    """
+    without_binding = {
+        "parameters": [
+            {"name": "applicant", "type": "string", "example": "박지은"},
+            {"name": "query_7", "type": "string", "example": "expense…5ee72ce5"},
+            {"name": "query_8", "type": "string", "example": ""},
+        ]
+    }
+    wrong = _parameter_values(_LEDGER_QUERY, without_binding, _LEDGER_ROW)
+    assert wrong["query_7"] == "최민석"  # 예전 동작을 고정해 둔다
+
+    with_binding = {
+        "parameters": [
+            {"name": "applicant", "type": "string", "example": "박지은"},
+            {"name": "proc_inst_id", "type": "string", "example": "…", "runtime": "proc_inst_id"},
+            {"name": "todo_id", "type": "string", "example": "", "runtime": "id"},
+        ]
+    }
+    fixed = _parameter_values(_LEDGER_QUERY, with_binding, _LEDGER_ROW)
+    assert fixed["proc_inst_id"] == _LEDGER_ROW["proc_inst_id"]
+    assert fixed["todo_id"] == _LEDGER_ROW["id"]
+
+
+def test_missing_identity_falls_back_to_the_agent() -> None:
+    """행에 그 식별자가 없으면 굳힌 코드를 쓰지 않는다.
+
+    호출부가 이 예외를 폴백 신호로 받아 DeepAgents 실행으로 되돌린다 — 빈 값으로
+    실제 도구를 부르는 것보다 낫다.
+    """
+    spec = {"parameters": [{"name": "todo_id", "type": "string", "example": "x",
+                            "runtime": "id"}]}
+    with pytest.raises(ValueError):
+        _parameter_values(_LEDGER_QUERY, spec, {"proc_inst_id": "pi"})
+
+
+# ---------------------------------------------------------------------------
+# 폼 산출물 — 도구 호출만 재현하면 워크아이템이 빈 산출물로 완료된다
+# ---------------------------------------------------------------------------
+
+_RESULTS = [{"kind": "mcp_call", "tool": "execute_sql", "server": "supabase", "data": None}]
+
+
+def test_constant_field_is_reproduced_as_is() -> None:
+    template = {"form_id": "f", "fields": {"status": {"const": "등록 완료"}}}
+    assert _render_form_output(template, {"applicant": "정수연"}, _RESULTS) == {
+        "f": {"status": "등록 완료"}
+    }
+
+
+def test_templated_field_is_rendered_with_this_run_inputs() -> None:
+    """표본의 값이 아니라 **이번 실행의** 입력으로 렌더해야 한다."""
+    template = {
+        "form_id": "f",
+        "fields": {"ledger_result": {"template": "신청자 ${applicant}, 금액 ${amount} 등록"}},
+    }
+    assert _render_form_output(
+        template, {"applicant": "정수연", "amount": 42000}, _RESULTS
+    ) == {"f": {"ledger_result": "신청자 정수연, 금액 42000 등록"}}
+
+
+def test_unreproducible_field_falls_back_to_what_actually_happened() -> None:
+    """표본마다 문구가 달랐던 필드는 굳히지 않는다.
+
+    표본 하나의 문장을 굳히면 그 표본의 사실(그때의 신청자)이 다음 실행에 남는다.
+    지어내지 않고 이번 실행에서 관측된 것만 적는다.
+    """
+    template = {"form_id": "f", "fields": {"ledger_result": None}}
+    rendered = _render_form_output(template, {"applicant": "정수연"}, _RESULTS)
+    text = rendered["f"]["ledger_result"]
+    assert "execute_sql(supabase)" in text
+    assert "정수연" in text
+    assert "LLM 추론 없이" in text
+
+
+def test_a_broken_field_does_not_sink_the_whole_form() -> None:
+    """렌더가 깨지는 필드 하나 때문에 폼 전체를 포기하지 않는다."""
+    template = {
+        "form_id": "f",
+        "fields": {
+            "ok_field": {"template": "신청자 ${applicant}"},
+            "broken": {"template": "${사라진_파라미터}"},
+        },
+    }
+    rendered = _render_form_output(template, {"applicant": "정수연"}, _RESULTS)
+    assert rendered["f"]["ok_field"] == "신청자 정수연"
+    assert "LLM 추론 없이" in rendered["f"]["broken"]
+
+
+def test_old_records_without_a_template_yield_no_form_output() -> None:
+    """이 변경 이전에 굳은 레코드에는 템플릿이 없다. 억지로 지어내지 않는다."""
+    assert _render_form_output(None, {"a": "b"}, _RESULTS) is None
+    assert _render_form_output({"fields": {}}, {}, _RESULTS) is None
+
+
+def test_the_execution_card_is_not_a_submittable_result() -> None:
+    """실행 카드의 crew_type 은 `result` 가 아니어야 한다.
+
+    프론트는 `result` 를 "제출할 수 있는 산출물"로 읽어 채택 버튼을 붙이고
+    (`EventTimeline.isSubmittableTask`), 생성기는 표본의 폼 산출물을 그 값으로 찾는다.
+    이 카드가 싣는 것은 폼 값이 아니라 실행 방식과 도구 호출 결과다. `result` 로 두면
+    채택 버튼이 둘이 되고, 그중 하나는 누르는 순간 폼에 실행 로그 JSON 을 밀어 넣는다.
+    """
+    from executor import _DETERMINISTIC_CARD_CREW_TYPE
+
+    assert _DETERMINISTIC_CARD_CREW_TYPE != "result"

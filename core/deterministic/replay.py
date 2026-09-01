@@ -12,6 +12,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from string import Template
 from typing import Any
 
 from .work_history import normalize_events, to_log_entries
@@ -31,10 +32,20 @@ class DeterministicExecution:
     # 되돌리기만 수행하고 재실행은 LLM에 맡길 때 True. 호출자는 결과 카드를 띄운 뒤
     # DeepAgents 그래프 실행을 계속해야 한다.
     continue_to_llm: bool = False
+    # 워크아이템의 폼 산출물 `{폼아이디: {필드: 값}}`. 에이전트 경로의 `최종 결과 반환`
+    # 이벤트가 싣는 것과 같은 모양이다. 이것이 없으면 워크아이템이 산출물 없이 완료되어
+    # 다음 활동이 입력을 못 받는다.
+    form_output: dict[str, Any] | None = None
 
     @property
     def result_text(self) -> str:
         return json.dumps(self.output, ensure_ascii=False)
+
+    @property
+    def form_output_text(self) -> str | None:
+        if self.form_output is None:
+            return None
+        return json.dumps(self.form_output, ensure_ascii=False)
 
 
 
@@ -105,7 +116,9 @@ def _field_lookup(fields: dict[str, Any], names: tuple[str, ...]) -> str | None:
     return None
 
 
-def _parameter_values(query: str, specification: Any) -> dict[str, Any]:
+def _parameter_values(
+    query: str, specification: Any, row: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Extract replay values without an LLM.
 
     생성기가 파라미터마다 남긴 ``label``이 1차 열쇠다. 그 이름표는 값이 관측될 때
@@ -118,6 +131,12 @@ def _parameter_values(query: str, specification: Any) -> dict[str, Any]:
 
     이름표가 없으면 파라미터 이름 자체를 이름표로 삼고, 그마저 없으면 타입에 맞는
     값을 지시문에 나온 순서대로 집는다.
+
+    `runtime` 이 붙은 파라미터만은 지시문을 아예 보지 않는다. `proc_inst_id`·`todo_id`
+    처럼 실행 때 정해지는 값이라 지시문에 적혀 있지 않고, 그런데도 이름표가 없어 위치
+    폴백까지 흘러가 **엉뚱한 값을 확신 있게** 채운다. 실제로 경비 대장의 proc_inst_id
+    자리에 신청자 이름이, todo_id 자리에 계정과목이 들어간 적이 있다. 이 값들의 출처는
+    지금 실행 중인 워크아이템 행 하나뿐이다.
     """
     params = specification.get("parameters", []) if isinstance(specification, dict) else []
     values: dict[str, Any] = {}
@@ -136,6 +155,15 @@ def _parameter_values(query: str, specification: Any) -> dict[str, Any]:
     for param in params:
         name = str(param.get("name") or "")
         if not name:
+            continue
+        runtime_key = str(param.get("runtime") or "").strip()
+        if runtime_key:
+            identity = (row or {}).get(runtime_key)
+            if identity is None or not str(identity).strip():
+                raise ValueError(
+                    f"워크아이템에서 실행 식별자를 찾을 수 없습니다: {name}({runtime_key})"
+                )
+            values[name] = str(identity)
             continue
         ptype = str(param.get("type") or "string").lower()
         observed = str(param.get("label") or "").strip()
@@ -351,6 +379,69 @@ async def _run_code(
     return await _run_locally(code, inputs, mcp_config)
 
 
+
+def _execution_summary(inputs: dict[str, Any], results: list[Any]) -> str:
+    """이번 실행에서 실제로 일어난 일을 한 문단으로 적는다.
+
+    표본마다 문구가 달랐던 필드는 템플릿으로 접히지 않는다. 그렇다고 표본 하나의
+    문장을 굳히면 그 표본의 사실(그때의 신청자, 그때의 시각)이 다음 실행에 그대로
+    남아 조용히 틀린다. 지어내지 않고 관측된 것만 적는다 — 무엇을 불렀고 무엇이
+    성공했으며 어떤 입력으로 했는지.
+    """
+    steps: list[str] = []
+    for result in results or []:
+        if not isinstance(result, dict):
+            continue
+        kind = str(result.get("kind") or "")
+        if kind == "mcp_call":
+            steps.append(f"{result.get('tool')}({result.get('server')})")
+        elif kind == "shell":
+            steps.append("셸 명령")
+        elif kind:
+            steps.append(kind)
+    lines = ["고착화된 코드로 LLM 추론 없이 실행했습니다."]
+    if steps:
+        lines.append(f"- 실행: {', '.join(steps)} — {len(steps)}건 성공")
+    if inputs:
+        joined = ", ".join(f"{key}={value}" for key, value in inputs.items())
+        lines.append(f"- 입력: {joined}")
+    return "\n".join(lines)
+
+
+def _render_form_output(
+    template: Any, inputs: dict[str, Any], results: list[Any]
+) -> dict[str, Any] | None:
+    """저장된 산출물 템플릿을 이번 실행의 입력으로 렌더한다.
+
+    필드마다 생성 단계가 정해 둔 셋 중 하나를 따른다. `const` 는 그대로, `template` 은
+    렌더, `None` 은 실행 요약으로 채운다. 렌더가 깨지는 필드 하나 때문에 폼 전체를
+    포기하지는 않는다 — 그 필드만 실행 요약으로 떨어뜨린다.
+    """
+    if not isinstance(template, dict):
+        return None
+    form_id = str(template.get("form_id") or "")
+    fields = template.get("fields")
+    if not form_id or not isinstance(fields, dict):
+        return None
+
+    summary = _execution_summary(inputs, results)
+    body: dict[str, Any] = {}
+    for key, spec in fields.items():
+        if isinstance(spec, dict) and "const" in spec:
+            body[key] = spec["const"]
+            continue
+        if isinstance(spec, dict) and isinstance(spec.get("template"), str):
+            try:
+                body[key] = Template(spec["template"]).substitute(inputs)
+                continue
+            except (KeyError, ValueError):
+                logger.warning(
+                    "산출물 필드 렌더 실패 | field=%s — 실행 요약으로 대체", key
+                )
+        body[key] = summary
+    return {form_id: body}
+
+
 async def try_deterministic_execution(
     row: dict[str, Any], tenant_mcp: dict[str, Any]
 ) -> DeterministicExecution | None:
@@ -437,7 +528,9 @@ async def try_deterministic_execution(
     # 같은 일을 더 싸게 하는 최적화이지 업무 처리의 전제가 아니다 — 여기서 예외를
     # 올리면 워크아이템이 통째로 멈춘다.
     try:
-        inputs = _parameter_values(str(row.get("query") or ""), record.get("parameters") or {})
+        inputs = _parameter_values(
+            str(row.get("query") or ""), record.get("parameters") or {}, row
+        )
         forward = await _run_code(record["code"], inputs, config, tenant_id)
     except Exception:
         logger.warning(
@@ -468,8 +561,18 @@ async def try_deterministic_execution(
         "undo_results": undo_results,
         "results": forward.get("results") or [],
     }
+    form_output = _render_form_output(
+        record.get("output_template"), inputs, output["results"]
+    )
+    if form_output is None:
+        # 옛 레코드에는 템플릿이 없다. 폼을 비운 채 완료시키면 다음 활동이 굶으므로,
+        # 최소한 이번 실행의 사실이라도 남긴다 — 폼 아이디를 모르니 실행기가 워크아이템
+        # 정의에서 찾도록 필드 없는 산출물로 넘긴다.
+        logger.info(
+            "산출물 템플릿 없음 | todo=%s — 실행 요약만 남긴다", row.get("id"),
+        )
     logger.info(
         "결정론적 실행 완료 | todo=%s mode=%s undo=%d forward=%d",
         row.get("id"), mode, len(undo_results), len(output["results"]),
     )
-    return DeterministicExecution(mode=mode, output=output)
+    return DeterministicExecution(mode=mode, output=output, form_output=form_output)

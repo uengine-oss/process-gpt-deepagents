@@ -496,6 +496,14 @@ async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
                 continue
 
 
+
+# 결정론적 실행 카드의 crew_type. `result` 를 쓰면 안 된다 — 프론트는 그 값을 "제출할
+# 수 있는 산출물"로 읽어 채택 버튼을 붙이고(`EventTimeline.isSubmittableTask`), 생성기는
+# 표본의 폼 산출물을 그 값으로 찾는다. 이 카드가 싣는 것은 폼 값이 아니라 실행 방식과
+# 도구 호출 결과라서, `result` 로 두면 채택 버튼이 둘이 되고 그중 하나는 누르는 순간
+# 폼에 실행 로그 JSON 을 밀어 넣는다. 폼 값은 뒤따르는 `최종 결과 반환` 이 싣는다.
+_DETERMINISTIC_CARD_CREW_TYPE = "deterministic"
+
 async def _enqueue_status(
     event_queue: EventQueue,
     *,
@@ -1152,7 +1160,7 @@ class DeepAgentExecutor(AgentExecutor):
                     ),
                     event_type="task_started",
                     job_id=deterministic_job_id,
-                    crew_type="result",
+                    crew_type=_DETERMINISTIC_CARD_CREW_TYPE,
                 )
                 await _enqueue_status(
                     event_queue,
@@ -1162,14 +1170,50 @@ class DeepAgentExecutor(AgentExecutor):
                     text=deterministic.result_text,
                     event_type="task_completed",
                     job_id=deterministic_job_id,
-                    crew_type="result",
+                    crew_type=_DETERMINISTIC_CARD_CREW_TYPE,
                 )
                 if not deterministic.continue_to_llm:
+                    # 에이전트 경로와 같은 자리에 `최종 결과 반환` 을 하나 더 띄운다.
+                    # 워크아이템의 폼 산출물은 이 이벤트와 최종 artifact 로만 전달되고,
+                    # 위의 결과 카드는 실행 방식만 보여 준다. 이걸 빼면 코드가 제대로
+                    # 돌았는데도 폼이 빈 채로 워크아이템이 완료되어 다음 활동이 굶는다.
+                    final_text = deterministic.form_output_text or deterministic.result_text
+                    if deterministic.form_output_text:
+                        result_job_id = str(uuid.uuid4())
+                        await _enqueue_status(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            state=TaskState.TASK_STATE_WORKING,
+                            text=json.dumps(
+                                {
+                                    "goal": "최종 결과를 반환합니다.",
+                                    "name": "최종 결과 반환",
+                                    "role": "최종 결과 반환",
+                                    "agent_profile": "/images/chat-icon.png",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            event_type="task_started",
+                            job_id=result_job_id,
+                            crew_type="result",
+                        )
+                        _save_step_output(final_text, instance_id, activity_id)
+                        await _enqueue_status(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            state=TaskState.TASK_STATE_COMPLETED,
+                            text=final_text,
+                            event_type="task_completed",
+                            job_id=result_job_id,
+                            crew_type="result",
+                        )
                     artifact_evt = new_text_artifact_update_event(
                         task_id=task_id,
                         context_id=context_id,
                         name="assistant_response",
-                        text=deterministic.result_text,
+                        text=final_text,
                         last_chunk=True,
                     )
                     ParseDict({"role": "assistant"}, artifact_evt.metadata)
