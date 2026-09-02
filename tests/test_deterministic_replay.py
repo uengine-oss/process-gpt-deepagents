@@ -74,7 +74,7 @@ from core.deterministic.replay import (  # noqa: E402
     _needs_workspace,
     _structured_fields,
     _parse_result,
-    _previous_event_logs,
+    _previous_undo_plan,
     try_deterministic_execution,
 )
 
@@ -117,22 +117,38 @@ class _Query:
         return type("R", (), {"data": self._rows})()
 
 
-def test_previous_event_logs_include_context_for_the_undo_generator() -> None:
-    """무엇을 되돌릴지는 부수효과가 정하지만, 어떻게 되돌릴지는 절차를 알아야 정해진다."""
+def test_the_undo_plan_comes_from_observation() -> None:
+    """되돌릴 내용은 관측이 정한다 — INSERT 한 행은 넣은 값 전부를 조건으로 지운다."""
     tables = {
         "todolist": [{"id": "prev", "rework_count": 0, "updated_at": "t"}],
         "events": [
             _event("read_file", {"file_path": "/skills/inv/SKILL.md"}, "t1"),
-            _event("execute", {"command": "python3 load.py --qty 20"}, "t2"),
+            _event("db_exec", {"sql": "INSERT INTO ledger (applicant, amount) VALUES (\'김철수\', 100)"}, "t2"),
         ],
     }
     db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
 
-    logs = _previous_event_logs(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
-    kinds = [entry["kind"] for entry in logs]
-    assert kinds == [wh.SKILL_READ, wh.SHELL]
-    assert logs[1]["log_data"]["args"]["command"] == "python3 load.py --qty 20"
-    assert "args" not in logs[0]   # 읽기는 되돌릴 대상이 아니다
+    plan = _previous_undo_plan(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
+    assert plan is not None
+    steps = plan["undo_steps"]
+    assert len(steps) == 1                       # 읽기는 되돌릴 대상이 아니다
+    assert steps[0]["args"]["sql"] == (
+        "DELETE FROM ledger WHERE applicant = \'김철수\' AND amount = 100"
+    )
+    assert "ledger" in steps[0]["describes"]     # 무엇을 되돌렸는지 남는다
+
+
+def test_an_irreversible_action_yields_no_plan() -> None:
+    """셸 실행은 되돌릴 방법이 이력에 없다. 절반만 되돌리느니 계획을 만들지 않는다."""
+    tables = {
+        "todolist": [{"id": "prev", "rework_count": 0, "updated_at": "t"}],
+        "events": [
+            _event("db_exec", {"sql": "INSERT INTO ledger (a) VALUES (1)"}, "t1"),
+            _event("execute", {"command": "python3 load.py --qty 20"}, "t2"),
+        ],
+    }
+    db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
+    assert _previous_undo_plan(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1}) is None
 
 
 def test_activity_without_effects_yields_no_undo_input() -> None:
@@ -141,7 +157,7 @@ def test_activity_without_effects_yields_no_undo_input() -> None:
         "events": [_event("db_exec", {"sql": "SELECT 1"}, "t1")],
     }
     db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
-    assert _previous_event_logs(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1}) == []
+    assert _previous_undo_plan(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +255,7 @@ async def test_undo_failure_hands_the_whole_rework_to_the_agent(monkeypatch) -> 
     record = {"code": "print(1)", "parameters": {"parameters": []},
               "deactivated_at": None, "compensation": "print(1)"}
     monkeypatch.setattr("core.storage.db.get_supabase", lambda: _Recorder(record))
-    monkeypatch.setattr(replay, "_previous_event_logs", lambda db, row: [{"kind": "shell"}])
+    monkeypatch.setattr(replay, "_previous_undo_plan", lambda db, row: {"undo_steps": [{"kind": "file_delete", "path": "/x"}]})
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("보상 실패")
@@ -258,7 +274,7 @@ async def test_undo_succeeds_then_forward_fails_keeps_the_undo(monkeypatch) -> N
     record = {"code": "print(1)", "parameters": {"parameters": []},
               "deactivated_at": None, "compensation": "print(1)"}
     monkeypatch.setattr("core.storage.db.get_supabase", lambda: _Recorder(record))
-    monkeypatch.setattr(replay, "_previous_event_logs", lambda db, row: [{"kind": "shell"}])
+    monkeypatch.setattr(replay, "_previous_undo_plan", lambda db, row: {"undo_steps": [{"kind": "file_delete", "path": "/x"}]})
 
     calls = {"n": 0}
 
@@ -495,3 +511,128 @@ def test_the_execution_card_is_not_a_submittable_result() -> None:
     from executor import _DETERMINISTIC_CARD_CREW_TYPE
 
     assert _DETERMINISTIC_CARD_CREW_TYPE != "result"
+
+
+# --------------------------------------------------------------------------
+# 앞 액티비티의 산출물에서 읽는 자리
+# --------------------------------------------------------------------------
+#
+# 값은 액티비티 경계를 넘어서도 흐른다. 에이전트는 그것을
+# `get_related_workitem_outputs` 로 읽어 썼다. 앞 워크아이템의 완료 시각처럼 지시문에
+# 적히지 않는 값이 여기 해당하고, 그런 자리가 하나라도 있으면 지금까지는 고착화 자체가
+# 보류됐다.
+
+_RELATED = [
+    {
+        "workitemId": "b221404c",
+        "procInstId": "expense_resolution_process.7203b5a3",
+        "activityId": "register_expense_ledger",
+        "activityName": "경비 대장 등록",
+        "endDate": "2026-09-01T11:55:47.027549",
+        "output": {
+            "expense_resolution_process_register_expense_ledger_form": {
+                "ledger_result": "expense_ledger INSERT 1건 실행 완료",
+            }
+        },
+    },
+    {
+        "workitemId": "a0000000",
+        "procInstId": "expense_resolution_process.7203b5a3",
+        "activityId": "apply_expense",
+        "activityName": "경비 신청",
+        "endDate": "2026-09-01T11:40:00.000000",
+        "output": {"expense_resolution_process_apply_expense_form": {"applicant": "최민석"}},
+    },
+]
+
+_UPSTREAM_SPEC = {
+    "parameters": [
+        {"name": "applicant", "type": "string", "example": "박지은"},
+        {
+            "name": "ledger_time",
+            "type": "string",
+            "example": "2026-09-01T02:46:44Z",
+            "upstream": {"activity_id": "register_expense_ledger", "path": ["endDate"]},
+        },
+    ]
+}
+
+
+def test_upstream_parameters_are_read_from_the_previous_activity() -> None:
+    values = _parameter_values(_LEDGER_QUERY, _UPSTREAM_SPEC, _LEDGER_ROW, _RELATED)
+    assert values["ledger_time"] == "2026-09-01T11:55:47.027549"
+    assert values["applicant"] == "최민석"
+
+
+def test_upstream_parameters_reach_into_the_previous_form_output() -> None:
+    spec = {
+        "parameters": [{
+            "name": "ledger_result",
+            "type": "string",
+            "example": "…",
+            "upstream": {
+                "activity_id": "register_expense_ledger",
+                "path": [
+                    "output",
+                    "expense_resolution_process_register_expense_ledger_form",
+                    "ledger_result",
+                ],
+            },
+        }]
+    }
+    values = _parameter_values(_LEDGER_QUERY, spec, _LEDGER_ROW, _RELATED)
+    assert values["ledger_result"] == "expense_ledger INSERT 1건 실행 완료"
+
+
+def test_a_missing_upstream_output_falls_back_to_the_agent() -> None:
+    """앞 액티비티가 아직 산출물을 내지 않았으면 굳힌 코드를 쓰지 않는다.
+
+    지시문을 뒤져 비슷한 값을 대신 채우면, 그 값으로 실제 도구를 부른다. 호출부가 이
+    예외를 폴백 신호로 받아 DeepAgents 실행으로 되돌린다.
+    """
+    with pytest.raises(ValueError):
+        _parameter_values(_LEDGER_QUERY, _UPSTREAM_SPEC, _LEDGER_ROW, [])
+    with pytest.raises(ValueError):
+        _parameter_values(_LEDGER_QUERY, _UPSTREAM_SPEC, _LEDGER_ROW, [_RELATED[1]])
+
+
+def test_upstream_binding_does_not_scan_the_instruction() -> None:
+    """이 자리는 지시문을 보지 않는다 — 위치 폴백이 엉뚱한 값을 집을 여지를 없앤다."""
+    spec = {
+        "parameters": [{
+            "name": "ledger_time",
+            "type": "string",
+            "example": "…",
+            "upstream": {"activity_id": "register_expense_ledger", "path": ["endDate"]},
+        }]
+    }
+    values = _parameter_values(_LEDGER_QUERY, spec, _LEDGER_ROW, _RELATED)
+    # 지시문의 첫 문자열 값(신청자)이 아니라 앞 액티비티의 완료 시각이다.
+    assert values["ledger_time"] == "2026-09-01T11:55:47.027549"
+
+
+def test_related_outputs_are_only_fetched_when_a_parameter_needs_them() -> None:
+    """대부분의 활동은 지시문과 워크아이템 행만으로 채워진다. 매번 조회하지 않는다."""
+    from core.deterministic.replay import _needs_upstream
+
+    assert _needs_upstream(_UPSTREAM_SPEC) is True
+    assert _needs_upstream({"parameters": [{"name": "applicant", "type": "string"}]}) is False
+    assert _needs_upstream(None) is False
+
+
+def test_instruction_placeholders_do_not_hide_the_structured_input() -> None:
+    """지시문의 [Instruction] 에는 `{used_at}` 같은 자리표시자가 흔히 들어 있다.
+
+    첫 `{` 부터 마지막 `}` 까지를 한 덩어리로 집으면 JSON 파싱이 통째로 실패해 구조화
+    입력이 빈 것으로 보인다. 그러면 후보 문자열이 지시문의 따옴표를 순서대로 긁는 쪽으로
+    떨어져 **칸 이름**(`..._form`)을 값으로 집는다.
+    """
+    from core.deterministic.replay import _structured_fields
+
+    query = (
+        "[Instruction]\n출력 파일 경로를 expense/{used_at}_{applicant}.md 로 고정한다.\n\n"
+        '[InputData]\n{"form": {"applicant": "최민석", "used_at": "2026-09-05"}}'
+    )
+    assert _structured_fields(query) == {"applicant": "최민석", "used_at": "2026-09-05"}
+    spec = {"parameters": [{"name": "applicant", "type": "string", "example": "박지은"}]}
+    assert _parameter_values(query, spec)["applicant"] == "최민석"

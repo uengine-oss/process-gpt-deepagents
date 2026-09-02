@@ -15,7 +15,8 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
-from .work_history import normalize_events, to_log_entries
+from .compensation import undo_plan
+from .work_history import normalize_events
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,51 @@ def _enabled_servers(tenant_mcp: dict[str, Any]) -> dict[str, Any]:
     return {"mcpServers": servers}
 
 
+def _json_objects(text: str):
+    """텍스트에 박힌 JSON 객체들을 찾는다.
+
+    첫 `{` 부터 마지막 `}` 까지를 한 덩어리로 집으면 안 된다. 지시문의 [Instruction]
+    에는 `expense/{used_at}_{applicant}.md` 같은 자리표시자가 흔히 들어 있어, 그것까지
+    한 덩어리에 들어가면 JSON 파싱이 통째로 실패한다. 그러면 구조화 입력이 빈 것으로
+    보이고, 실행기는 지시문의 따옴표를 순서대로 긁어 **칸 이름**을 값으로 집는다.
+
+    중괄호 균형을 세어 객체 하나씩 자른다. 파싱되지 않는 덩어리는 건너뛰고 다음 `{`
+    부터 다시 본다.
+    """
+    index, length = 0, len(text or "")
+    while index < length:
+        if text[index] != "{":
+            index += 1
+            continue
+        depth, cursor, in_string, escaped = 0, index, False, False
+        while cursor < length:
+            char = text[cursor]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    cursor += 1
+                    break
+            cursor += 1
+        try:
+            parsed = json.loads(text[index:cursor])
+        except (ValueError, TypeError):
+            index += 1
+            continue
+        yield parsed
+        index = cursor
+
+
 def _structured_fields(query: str) -> dict[str, Any]:
     """워크아이템 지시문에 실린 구조화 입력(`[InputData]` JSON)을 키→값으로 편다.
 
@@ -78,11 +124,8 @@ def _structured_fields(query: str) -> dict[str, Any]:
             for item in node:
                 _walk(item)
 
-    for match in re.finditer(r"\{.*\}", query or "", re.DOTALL):
-        try:
-            _walk(json.loads(match.group()))
-        except (ValueError, TypeError):
-            continue
+    for parsed in _json_objects(query or ""):
+        _walk(parsed)
     return fields
 
 
@@ -116,8 +159,80 @@ def _field_lookup(fields: dict[str, Any], names: tuple[str, ...]) -> str | None:
     return None
 
 
+def related_workitem_outputs(db: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
+    """같은 루트 프로세스에서 이미 완료된 다른 워크아이템의 산출물.
+
+    에이전트가 `get_related_workitem_outputs` 로 읽던 것과 **같은 자료를 같은 모양으로**
+    돌려준다. 고착화 생성기는 표본을 모을 때 같은 조회로 "이 값이 앞 액티비티의
+    산출물에서 왔는가"를 관측했다. 모양이 갈리면 관측한 자리와 읽는 자리가 달라져
+    조용히 틀린다.
+    """
+    query = db.table("todolist").select(
+        "id, proc_inst_id, activity_id, activity_name, end_date, output"
+    ).eq("tenant_id", row.get("tenant_id")).not_.is_("output", "null")
+    root_id = row.get("root_proc_inst_id")
+    if root_id:
+        query = query.eq("root_proc_inst_id", root_id)
+    elif row.get("proc_inst_id"):
+        query = query.eq("proc_inst_id", row.get("proc_inst_id"))
+    else:
+        return []
+    if row.get("id"):
+        query = query.neq("id", row["id"])
+    rows = query.order("end_date", desc=True).execute().data or []
+    return [
+        {
+            "workitemId": item.get("id"),
+            "procInstId": item.get("proc_inst_id"),
+            "activityId": item.get("activity_id"),
+            "activityName": item.get("activity_name"),
+            "endDate": item.get("end_date"),
+            "output": item.get("output"),
+        }
+        for item in rows
+    ]
+
+
+def _descend(node: Any, key: Any) -> Any:
+    """산출물 한 겹을 들어간다. JSON 문자열로 저장된 칸은 풀어서 들어간다."""
+    if isinstance(node, str):
+        try:
+            node = json.loads(node)
+        except ValueError:
+            return None
+    if isinstance(node, dict):
+        return node.get(key)
+    if isinstance(node, list) and isinstance(key, int) and -len(node) <= key < len(node):
+        return node[key]
+    return None
+
+
+def _upstream_value(binding: dict[str, Any], related: list[dict[str, Any]]) -> Any:
+    """앞 액티비티의 산출물에서 값을 읽는다.
+
+    같은 액티비티가 여러 번 돌았으면(재작업) 가장 최근에 끝난 것을 쓴다 — 조회가
+    이미 최근순이므로 먼저 맞는 것이 그것이다. 자리가 비어 있으면 값을 지어내지 않고
+    None을 돌려준다. 호출자가 실패로 보고 에이전트에게 넘긴다.
+    """
+    activity_id = str(binding.get("activity_id") or "")
+    for record in related or []:
+        if str(record.get("activityId") or "") != activity_id:
+            continue
+        node: Any = record
+        for key in binding.get("path") or []:
+            node = _descend(node, key)
+            if node is None:
+                break
+        if node is not None and str(node).strip():
+            return node
+    return None
+
+
 def _parameter_values(
-    query: str, specification: Any, row: dict[str, Any] | None = None
+    query: str,
+    specification: Any,
+    row: dict[str, Any] | None = None,
+    related: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Extract replay values without an LLM.
 
@@ -131,6 +246,11 @@ def _parameter_values(
 
     이름표가 없으면 파라미터 이름 자체를 이름표로 삼고, 그마저 없으면 타입에 맞는
     값을 지시문에 나온 순서대로 집는다.
+
+    `upstream` 이 붙은 파라미터는 앞 액티비티의 산출물에서 읽는다. 값이 액티비티
+    경계를 넘어 흐르는 자리다 — 앞 워크아이템의 완료 시각처럼 지시문에 적히지 않는
+    값이 여기 해당한다. 어느 액티비티의 어느 자리인지는 생성 단계에서 표본 전부를
+    대조해 정해 둔 것이므로, 여기서 다시 찾아 헤매지 않는다.
 
     `runtime` 이 붙은 파라미터만은 지시문을 아예 보지 않는다. `proc_inst_id`·`todo_id`
     처럼 실행 때 정해지는 값이라 지시문에 적혀 있지 않고, 그런데도 이름표가 없어 위치
@@ -155,6 +275,16 @@ def _parameter_values(
     for param in params:
         name = str(param.get("name") or "")
         if not name:
+            continue
+        upstream = param.get("upstream")
+        if isinstance(upstream, dict):
+            value = _upstream_value(upstream, related or [])
+            if value is None:
+                raise ValueError(
+                    f"앞 단계 산출물에서 파라미터를 찾을 수 없습니다: "
+                    f"{name}({upstream.get('activity_id')})"
+                )
+            values[name] = value
             continue
         runtime_key = str(param.get("runtime") or "").strip()
         if runtime_key:
@@ -220,7 +350,12 @@ def _parameter_values(
     return values
 
 
-def _previous_event_logs(db: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
+def _needs_upstream(specification: Any) -> bool:
+    params = specification.get("parameters", []) if isinstance(specification, dict) else []
+    return any(isinstance(param.get("upstream"), dict) for param in params)
+
+
+def _previous_undo_plan(db: Any, row: dict[str, Any]) -> dict[str, Any] | None:
     query = db.table("todolist").select("id,rework_count,updated_at")
     root_id = row.get("root_proc_inst_id")
     if root_id:
@@ -245,12 +380,12 @@ def _previous_event_logs(db: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
         .data
         or []
     )
-    # 맥락 행위(읽은 스킬·파일, 조회)도 함께 넘긴다. 무엇을 되돌릴지는 부수효과가
-    # 정하지만, 어떤 순서로 어떻게 되돌릴지는 그 절차를 알아야 정할 수 있다.
+    # 무엇을 어떻게 되돌릴지는 관측이 정한다. 되돌릴 수 없는 행위가 하나라도 섞여
+    # 있으면 계획을 만들지 않는다 — 절반만 되돌린 세상은 되돌리지 않은 세상보다 나쁘다.
     trace = normalize_events(events)
     if not any(action.has_effect for action in trace):
-        return []
-    return to_log_entries(trace)
+        return None
+    return undo_plan(trace)
 
 
 def _parse_result(stdout: str, failure: str) -> dict[str, Any]:
@@ -485,11 +620,19 @@ async def try_deterministic_execution(
 
     undo_results: list[Any] = []
     if rework_count > 0 and record.get("compensation"):
-        event_logs = await asyncio.to_thread(_previous_event_logs, db, row)
-        if event_logs:
+        plan = await asyncio.to_thread(_previous_undo_plan, db, row)
+        if plan is None:
+            # 이전 실행에 되돌릴 수 없는 행위가 섞여 있다. 되돌렸다고 표시하지 않고
+            # 재작업 전체를 에이전트에게 넘긴다.
+            logger.info(
+                "되돌리기 계획 없음 | todo=%s — 재작업 전체를 DeepAgents가 담당",
+                row.get("id"),
+            )
+            return None
+        if plan.get("undo_steps"):
             try:
                 undo = await _run_code(
-                    record["compensation"], {"event_logs": event_logs}, config, tenant_id
+                    record["compensation"], plan, config, tenant_id
                 )
             except Exception:
                 # 되돌리기에 실패했다면 이전 실행의 흔적이 어디까지 남았는지 알 수 없다.
@@ -528,8 +671,16 @@ async def try_deterministic_execution(
     # 같은 일을 더 싸게 하는 최적화이지 업무 처리의 전제가 아니다 — 여기서 예외를
     # 올리면 워크아이템이 통째로 멈춘다.
     try:
+        specification = record.get("parameters") or {}
+        # 앞 액티비티의 산출물은 필요할 때만 읽는다. 대부분의 활동은 지시문과 워크아이템
+        # 행만으로 입력이 채워진다.
+        related = (
+            await asyncio.to_thread(related_workitem_outputs, db, row)
+            if _needs_upstream(specification)
+            else []
+        )
         inputs = _parameter_values(
-            str(row.get("query") or ""), record.get("parameters") or {}, row
+            str(row.get("query") or ""), specification, row, related
         )
         forward = await _run_code(record["code"], inputs, config, tenant_id)
     except Exception:
