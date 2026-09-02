@@ -80,12 +80,25 @@ _READ_TOOLS = {
     "read_file", "read", "view", "view_file", "cat", "open_file", "read_text_file",
     "get_file", "fetch_file", "load_file",
 }
-_WRITE_TOOLS = {
-    "write_file", "edit_file", "create_file", "update_file", "append_file", "write",
-    "apply_patch", "patch_file", "str_replace", "str_replace_editor", "multi_edit",
-    "notebook_edit", "write_process_definition", "update_process_definition", "save_file",
-    "delete_file", "remove_file", "move_file", "rename_file", "copy_file", "mkdir",
+# 파일을 바꾸는 도구. 조작 종류별로 나눈다 — 삭제·이동을 쓰기로 뭉뚱그리면 되돌리기가
+# "만든 파일을 지운다"로 잘못 읽어, 지워진 파일을 **또 지우려** 든다. completion 의
+# `work_history` 와 같은 구분이어야 한다: 굳힐 때의 판정과 되돌릴 때의 판정이 갈리면
+# "되돌릴 수 있다"고 저장해 놓고 엉뚱한 것을 되돌린다.
+_FILE_OPS = {
+    "write": (
+        "write_file", "create_file", "update_file", "append_file", "write", "save_file",
+        "write_process_definition", "update_process_definition",
+    ),
+    "edit": (
+        "edit_file", "apply_patch", "patch_file", "str_replace", "str_replace_editor",
+        "multi_edit", "notebook_edit",
+    ),
+    "delete": ("delete_file", "remove_file", "rm", "unlink"),
+    "move": ("move_file", "rename_file", "mv", "rename"),
+    "copy": ("copy_file", "cp"),
+    "mkdir": ("mkdir", "make_directory", "create_directory"),
 }
+_WRITE_TOOLS = {name for names in _FILE_OPS.values() for name in names}
 _PATH_ARG_KEYS = ("file_path", "path", "filepath", "filename", "file", "target_file", "notebook_path")
 _CONTENT_ARG_KEYS = ("content", "text", "contents", "data", "body", "definition")
 _INSPECT_TOOLS = {
@@ -232,6 +245,15 @@ def classify(tool: str, args: dict[str, Any]) -> str:
     return _classify_by_verb(tool)
 
 
+def _file_op(tool: str, canonical: dict[str, Any]) -> str:
+    """파일 조작의 종류. 이름으로 못 가리면 인자 모양으로 민다."""
+    names = _tail_names(tool)
+    for op, tools in _FILE_OPS.items():
+        if names & set(tools):
+            return op
+    return "edit" if "old_string" in canonical else "write"
+
+
 def _canonical_args(kind: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
     args = args or {}
     if kind == SHELL:
@@ -257,7 +279,7 @@ def _canonical_args(kind: str, tool: str, args: dict[str, Any]) -> dict[str, Any
                 if isinstance(args.get(new_key), str):
                     canonical["new_string"] = args[new_key]
                     break
-            canonical["mode"] = "edit" if "old_string" in canonical else "write"
+            canonical["op"] = _file_op(tool, canonical)
         return canonical
     if kind == DELEGATE:
         return {
@@ -372,25 +394,6 @@ def normalize_events(events: Iterable[dict[str, Any]] | None) -> list[Action]:
         )
         (finished if is_finished else started).append(action)
     return finished or started
-
-
-def to_log_entries(actions: Iterable[Action]) -> list[dict[str, Any]]:
-    """보상 코드에 넘길 이력 표현. completion 쪽 생성 프롬프트와 같은 모양이어야 한다."""
-    entries: list[dict[str, Any]] = []
-    for action in actions:
-        entry: dict[str, Any] = {
-            "timestamp": action.timestamp,
-            "kind": action.kind,
-            "tool_name": action.tool,
-        }
-        if action.has_effect:
-            entry["args"] = action.raw_args
-            entry["canonical_args"] = action.args
-            entry["log_data"] = {"tool_name": action.tool, "args": action.raw_args}
-        else:
-            entry["summary"] = {k: v for k, v in action.args.items() if isinstance(v, str)}
-        entries.append(entry)
-    return entries
 
 
 def needs_sandbox(actions: Iterable[Action]) -> bool:
