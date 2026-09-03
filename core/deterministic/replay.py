@@ -15,7 +15,7 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
-from .compensation import undo_plan
+from .compensation import UNDO_DELETE_FILE, UNDO_RESTORE_FILE, UNDO_TOOL, invert
 from .work_history import normalize_events
 
 logger = logging.getLogger(__name__)
@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 # 원시 동작으로 판별한다 — 저장된 이력이 없는 옛 레코드에도 통한다.
 _WORKSPACE_PRIMITIVES = {"run_shell", "write_file", "edit_file", "read_file"}
 _CONTAINER_SCRATCH = "/workspace/.deterministic"
+# fastmcp 설치는 네트워크를 타므로 넉넉히 준다. 컨테이너당 한 번이다.
+_MCP_INSTALL_TIMEOUT = 180
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,10 @@ class DeterministicExecution:
     # 이벤트가 싣는 것과 같은 모양이다. 이것이 없으면 워크아이템이 산출물 없이 완료되어
     # 다음 활동이 입력을 못 받는다.
     form_output: dict[str, Any] | None = None
+    # 되돌리기가 아직 **끝나지 않은 채** 에이전트에게 넘어갈 때, 에이전트가 재작업보다
+    # 먼저 수행해야 할 되돌리기 지시문. 호출자는 이것을 에이전트 입력 맨 앞에 붙여야
+    # 한다. 비어 있지 않다는 것은 곧 "보상이 아직 안 됐다"는 뜻이다.
+    undo_directive: str = ""
 
     @property
     def result_text(self) -> str:
@@ -355,7 +361,46 @@ def _needs_upstream(specification: Any) -> bool:
     return any(isinstance(param.get("upstream"), dict) for param in params)
 
 
-def _previous_undo_plan(db: Any, row: dict[str, Any]) -> dict[str, Any] | None:
+# 재작업 직전 실행을 되돌릴 수 있는가에 대한 판정. 네 갈래를 구분한다 — 특히 **되돌릴
+# 것이 없다**와 **되돌릴 수 없다**를 뭉뚱그리면 안 된다. 앞의 것은 그대로 재실행해도
+# 되지만, 뒤의 것을 같은 취급하면 되돌리기를 건너뛴 채 순방향 코드가 덧씌워져 같은
+# 값이 두 번 반영된다.
+UNDO_NONE = "nothing"           # 이전 실행에 되돌릴 부수효과가 없었다
+UNDO_PLAN = "plan"              # 관측에서 되돌리기 계획이 나왔다
+UNDO_IMPOSSIBLE = "impossible"  # 되돌릴 수 없는 행위가 섞여 있다
+UNDO_UNKNOWN = "unknown"        # 이전 실행이 무엇을 했는지 읽을 수 없다
+
+
+@dataclass(frozen=True)
+class UndoDecision:
+    """이전 실행을 되돌릴 수 있는가. 사유까지 함께 든다 — 기록에 남겨야 한다."""
+
+    status: str
+    plan: dict[str, Any] | None = None
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def blocks_replay(self) -> bool:
+        """재작업 전체를 에이전트에게 넘겨야 하는가.
+
+        되돌릴 근거가 없으면 다시 실행하지 않는다. 근거 없이 재실행하는 것이 곧
+        중복 반영이다.
+        """
+        return self.status in (UNDO_IMPOSSIBLE, UNDO_UNKNOWN)
+
+    @property
+    def summary(self) -> str:
+        if self.status == UNDO_IMPOSSIBLE:
+            return "이전 실행에 되돌릴 수 없는 행위가 있습니다."
+        if self.status == UNDO_UNKNOWN:
+            return "이전 실행이 무엇을 했는지 읽을 수 없습니다."
+        if self.status == UNDO_NONE:
+            return "이전 실행에 되돌릴 부수효과가 없습니다."
+        return "이전 실행을 되돌릴 수 있습니다."
+
+
+def _previous_run_events(db: Any, row: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """재작업 직전 회차의 이력. 그 회차를 찾지 못하면 None."""
     query = db.table("todolist").select("id,rework_count,updated_at")
     root_id = row.get("root_proc_inst_id")
     if root_id:
@@ -368,10 +413,10 @@ def _previous_undo_plan(db: Any, row: dict[str, Any]) -> dict[str, Any] | None:
         .order("rework_count", desc=True).limit(1).execute().data or []
     )
     if not previous:
-        return []
+        return None
     # event_type으로 미리 거르지 않는다. 런타임마다 "도구 사용이 끝났다"를 뜻하는
     # 타입 이름이 다르고, 하나로 못박으면 다른 러너의 이력이 통째로 사라진다.
-    events = (
+    return (
         db.table("events")
         .select("timestamp,event_type,data")
         .eq("todo_id", previous[0]["id"])
@@ -380,12 +425,140 @@ def _previous_undo_plan(db: Any, row: dict[str, Any]) -> dict[str, Any] | None:
         .data
         or []
     )
-    # 무엇을 어떻게 되돌릴지는 관측이 정한다. 되돌릴 수 없는 행위가 하나라도 섞여
-    # 있으면 계획을 만들지 않는다 — 절반만 되돌린 세상은 되돌리지 않은 세상보다 나쁘다.
+
+
+def _previous_undo_decision(db: Any, row: dict[str, Any]) -> UndoDecision:
+    """직전 실행을 되돌릴 수 있는지 관측으로 판정한다.
+
+    되돌릴 수 없는 행위가 하나라도 섞여 있으면 계획을 만들지 않는다 — 절반만 되돌린
+    세상은 되돌리지 않은 세상보다 나쁘다.
+    """
+    events = _previous_run_events(db, row)
+    if events is None:
+        return UndoDecision(UNDO_UNKNOWN, reasons=("이전 회차의 워크아이템을 찾지 못했습니다.",))
+    if not events:
+        return UndoDecision(UNDO_UNKNOWN, reasons=("이전 실행의 이력이 남아 있지 않습니다.",))
     trace = normalize_events(events)
+    if not trace:
+        return UndoDecision(UNDO_UNKNOWN, reasons=("이전 실행의 이력을 행위로 읽지 못했습니다.",))
     if not any(action.has_effect for action in trace):
-        return None
-    return undo_plan(trace)
+        # 조회와 읽기만 한 활동. 되돌릴 것이 없으므로 그대로 다시 수행해도 된다.
+        return UndoDecision(UNDO_NONE)
+    steps, reasons = invert(trace)
+    if reasons:
+        return UndoDecision(UNDO_IMPOSSIBLE, reasons=tuple(reasons))
+    if not steps:
+        return UndoDecision(UNDO_UNKNOWN, reasons=("되돌릴 단계를 만들지 못했습니다.",))
+    return UndoDecision(UNDO_PLAN, plan={"undo_steps": [step.as_dict() for step in steps]})
+
+
+# 되돌리기가 끝나지 않은 채 재작업이 에이전트에게 넘어간 상태. "되돌릴 게 없어서 넘겼다"
+# (deterministic-skipped)와 반드시 구분해야 한다 — 이쪽은 되돌릴 것이 **남아 있다**.
+MODE_UNDO_PENDING = "deterministic-undo-pending"
+
+# 되돌리기 지시문에 실을 파일 내용의 상한. 이보다 길면 지시문에 그대로 싣지 않는다 —
+# 잘린 내용으로 복원하면 되돌리지 않은 것보다 나쁘다.
+_MAX_RESTORE_CONTENT = 4000
+
+
+def _describe_undo_step(index: int, step: dict[str, Any]) -> str:
+    """되돌리기 한 단계를 에이전트가 그대로 수행할 수 있게 적는다."""
+    kind = str(step.get("kind") or "")
+    if kind == UNDO_TOOL:
+        args = json.dumps(step.get("args") or {}, ensure_ascii=False)
+        return f"{index}. MCP 도구 `{step.get('tool')}` 를 다음 인자로 호출: {args}"
+    if kind == UNDO_DELETE_FILE:
+        return f"{index}. 파일 삭제: `{step.get('path')}`"
+    if kind == UNDO_RESTORE_FILE:
+        path = step.get("path")
+        content = str(step.get("content") or "")
+        if len(content) > _MAX_RESTORE_CONTENT:
+            # 잘린 내용으로 복원하면 되돌리지 않은 것보다 나쁘다. 짐작을 시키지 않는다.
+            return (
+                f"{index}. 파일 `{path}` 을 덮어쓰기 전 내용으로 복원해야 하는데, 그 내용이"
+                " 너무 길어 여기에 싣지 못했습니다. 짐작해서 복원하지 말고, 이 단계를"
+                " 되돌리지 못했다는 사실을 결과에 적고 작업을 중단하십시오."
+            )
+        return f"{index}. 파일 `{path}` 을 아래 내용으로 되돌려 쓰기:\n```\n{content}\n```"
+    return f"{index}. {step.get('describes') or kind}: {json.dumps(step, ensure_ascii=False)}"
+
+
+def _undo_directive(plan: dict[str, Any] | None, reason: str, failure: str = "") -> str:
+    """되돌리기를 에이전트가 이어받게 하는 지시문. 계획이 없으면 빈 문자열.
+
+    보상이 끝나기 전에 재작업을 시작하면 같은 값이 두 번 반영된다. 실행기가 보상 코드를
+    돌리지 못했다면 그 일은 사라지는 것이 아니라 **에이전트에게 넘어가는 것**이다.
+    지시문 없이 넘기면 에이전트는 되돌릴 것이 있었다는 사실 자체를 모른 채 재작업만 한다.
+    """
+    steps = (plan or {}).get("undo_steps") or []
+    if not steps:
+        return ""
+    lines = [
+        "[필수 선행 작업 — 이전 실행 되돌리기]",
+        "이 워크아이템은 재작업입니다. 이전 회차가 남긴 아래 부수효과를 **먼저 되돌린 뒤에만**"
+        " 이번 회차의 작업을 시작하십시오.",
+        f"사유: {reason}",
+    ]
+    if failure:
+        lines.append(f"실행기 오류: {failure}")
+    lines.append("")
+    lines.append("되돌릴 단계(적힌 순서대로 수행):")
+    lines.extend(
+        _describe_undo_step(index, step)
+        for index, step in enumerate(steps, start=1)
+        if isinstance(step, dict)
+    )
+    lines.extend(
+        [
+            "",
+            "규칙:",
+            "- 위 되돌리기를 모두 끝내기 전에는 이번 회차의 작업(파일 생성·수정, 도구 호출,"
+            " 산출물 작성)을 절대 시작하지 마십시오.",
+            "- 이미 되돌려져 있는 단계는 건너뛰되, 건너뛴 이유를 결과에 적으십시오.",
+            "- 한 단계라도 수행할 수 없으면 재작업을 진행하지 마십시오. 무엇을 왜 되돌리지"
+            " 못했는지 결과에 적고 거기서 멈추십시오 — 되돌려지지 않은 것 위에 다시 작업하는"
+            " 것보다, 멈춰서 사람이 보게 하는 편이 낫습니다.",
+            "- 되돌리기를 마친 뒤에야 아래 원래 작업 지시를 수행하십시오.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _handed_to_agent(
+    reason: str,
+    details: tuple[str, ...] = (),
+    note: str = "이전 실행을 되돌릴 근거가 없어 재작업 전체를 에이전트가 수행합니다.",
+    undo_directive: str = "",
+    undo_plan: dict[str, Any] | None = None,
+) -> DeterministicExecution:
+    """재작업을 통째로 에이전트가 맡는다는 사실을 결과 카드로 남긴다.
+
+    조용히 넘기면 "되돌릴 것이 없었다"와 "되돌릴 수 없었다"가 기록에서 구분되지 않는다.
+    구분이 없으면 다음에 같은 일이 생겨도 무엇을 고쳐야 할지 알 수 없다.
+
+    되돌릴 것이 **남아 있는** 채로 넘기는 경우(`undo_directive`)는 모드까지 갈라 놓는다.
+    호출자가 그 지시문을 에이전트 입력 앞에 붙여야 보상이 재작업보다 먼저 일어난다.
+    """
+    mode = MODE_UNDO_PENDING if undo_directive else "deterministic-skipped"
+    output: dict[str, Any] = {
+        "ok": True,
+        "execution_mode": mode,
+        "llm_calls": 0,
+        "undo_results": [],
+        "results": [],
+        "reason": reason,
+        "details": list(details),
+        "note": note,
+    }
+    if undo_directive:
+        output["undo_pending"] = True
+        output["undo_steps"] = list((undo_plan or {}).get("undo_steps") or [])
+    return DeterministicExecution(
+        mode=mode,
+        output=output,
+        continue_to_llm=True,
+        undo_directive=undo_directive,
+    )
 
 
 def _parse_result(stdout: str, failure: str) -> dict[str, Any]:
@@ -426,6 +599,38 @@ def _needs_workspace(code: str) -> bool:
     return False
 
 
+def _ensure_sandbox_mcp_runtime(backend: Any) -> None:
+    """샌드박스 안에 fastmcp 를 깔아 둔다. MCP 호출이 섞인 코드에 한해 한 번만.
+
+    샌드박스 이미지는 python:3.13-slim 이라 fastmcp 가 없다. 그래서 파일 조작과 MCP
+    호출이 **함께** 있는 코드 — 파일을 되돌리면서 DB 도 되돌리는 보상 코드가 딱 이
+    모양이다 — 는 `ModuleNotFoundError: No module named 'fastmcp'` 로 통째로 죽는다.
+    호스트에서 대신 돌릴 수는 없다. `/workspace` 가 다른 것을 가리켜 엉뚱한 파일을
+    건드리기 때문이다. 그러니 샌드박스 쪽에 런타임을 맞춘다.
+
+    실패해도 예외를 올리지 않는다. 여기서 막는 대신 실제 실행이 실패하게 두어야,
+    호출자의 폴백(되돌리기를 에이전트에게 넘기기)이 그대로 동작한다.
+    """
+    if getattr(backend, "_deterministic_mcp_ready", False):
+        return
+    try:
+        response = backend.execute(
+            "python3 -c 'import fastmcp' 2>/dev/null || "
+            "pip install --quiet --disable-pip-version-check fastmcp",
+            timeout=_MCP_INSTALL_TIMEOUT,
+        )
+        if response.exit_code:
+            logger.warning(
+                "샌드박스에 fastmcp 설치 실패(%s) — MCP 단계가 있으면 실행이 실패합니다: %s",
+                response.exit_code, (response.output or "")[-300:],
+            )
+            return
+    except Exception:
+        logger.warning("샌드박스 fastmcp 준비 실패 — 실행을 그대로 시도합니다", exc_info=True)
+        return
+    backend._deterministic_mcp_ready = True
+
+
 async def _run_in_sandbox(
     tenant_id: str, code: str, inputs: dict[str, Any], mcp_config: dict[str, Any]
 ) -> dict[str, Any]:
@@ -444,6 +649,9 @@ async def _run_in_sandbox(
     backend = get_or_create_sandbox(
         tenant_id, workspace_host=base / "workspace", skills_host=skills_host
     )
+
+    if "call_tool(" in code and (mcp_config.get("mcpServers") or {}):
+        await asyncio.to_thread(_ensure_sandbox_mcp_runtime, backend)
 
     script_path = f"{_CONTAINER_SCRATCH}/run_{uuid.uuid4().hex}.py"
     inputs_path = f"{script_path[:-3]}.json"
@@ -506,10 +714,52 @@ async def _run_locally(code: str, inputs: dict[str, Any], mcp_config: dict[str, 
             Path(path).unlink(missing_ok=True)
 
 
+# 옛 실행 골격은 도구를 부르기 전에 `await client.ping()` 으로 연결을 확인했다. ping 은 MCP
+# 스펙의 선택 기능이라 구현하지 않은 서버가 "Method not found" 를 돌려주는데, 그러면 도구를
+# 불러 보지도 못하고 실행이 통째로 죽는다(같은 서버를 에이전트는 잘 쓴다 — 에이전트 쪽
+# 클라이언트는 ping 을 하지 않는다). 골격은 고쳤지만 **이미 저장된 코드**에는 그 줄이 남아
+# 있고, 그 코드는 활동을 다시 굳히기 전에는 갱신되지 않는다. 실행 직전에 무력화한다.
+_LEGACY_PING = re.compile(r"^([ \t]*)await client\.ping\(\)[ \t]*$", re.MULTILINE)
+
+
+def _drop_legacy_ping(code: str) -> str:
+    patched, count = _LEGACY_PING.subn(r"\1pass  # ping 제거(선택 기능 — 미구현 서버에서 실패)", code)
+    if count:
+        logger.info("저장된 코드의 ping 확인 %d줄을 건너뜁니다 — 도구 호출로 바로 갑니다", count)
+    return patched
+
+
+# 되돌리기 단계 중 워크스페이스가 실제로 필요한 것들.
+_WORKSPACE_UNDO_STEPS = {"file_delete", "file_restore"}
+
+
+def _plan_needs_workspace(inputs: dict[str, Any]) -> bool | None:
+    """이번에 **실행할 단계**가 워크스페이스를 쓰는가. 단계 목록이 없으면 None.
+
+    보상 골격은 파일 단계를 처리하는 디스패처를 늘 품고 있다 — `write_file(...)` 호출이
+    코드 어딘가에 있다는 뜻이다. 그래서 코드 텍스트로만 판정하면 **모든 보상 코드가**
+    실제로는 MCP 호출 하나만 할 때에도 샌드박스로 간다. 샌드박스는 순방향 코드가 한 번도
+    가 본 적 없는 길이라(순방향은 파일을 안 만지면 로컬에서 돈다), 보상만 골라서 험한
+    길로 보내는 셈이었다. 돌릴 단계가 파일을 안 건드리면 로컬에서 돈다.
+    """
+    steps = (inputs or {}).get("undo_steps")
+    if not isinstance(steps, list):
+        return None
+    return any(
+        str(step.get("kind") or "") in _WORKSPACE_UNDO_STEPS
+        for step in steps
+        if isinstance(step, dict)
+    )
+
+
 async def _run_code(
     code: str, inputs: dict[str, Any], mcp_config: dict[str, Any], tenant_id: str = ""
 ) -> dict[str, Any]:
-    if _needs_workspace(code):
+    code = _drop_legacy_ping(code)
+    needs_workspace = _plan_needs_workspace(inputs)
+    if needs_workspace is None:
+        needs_workspace = _needs_workspace(code)
+    if needs_workspace:
         return await _run_in_sandbox(tenant_id, code, inputs, mcp_config)
     return await _run_locally(code, inputs, mcp_config)
 
@@ -619,30 +869,63 @@ async def try_deterministic_execution(
     tenant_id = str(row.get("tenant_id") or "")
 
     undo_results: list[Any] = []
-    if rework_count > 0 and record.get("compensation"):
-        plan = await asyncio.to_thread(_previous_undo_plan, db, row)
-        if plan is None:
-            # 이전 실행에 되돌릴 수 없는 행위가 섞여 있다. 되돌렸다고 표시하지 않고
-            # 재작업 전체를 에이전트에게 넘긴다.
+    undo_status = ""
+    if rework_count > 0:
+        # 보상 코드가 저장돼 있는지부터 보지 않는다. 없으면 되돌리기를 통째로 건너뛰고
+        # 순방향만 도는데, 그것이 곧 중복 반영이다. 되돌릴 것이 있었는지는 저장된
+        # 코드가 아니라 **이전 실행의 관측**이 정한다.
+        decision = await asyncio.to_thread(_previous_undo_decision, db, row)
+        undo_status = decision.status
+        if decision.blocks_replay:
             logger.info(
-                "되돌리기 계획 없음 | todo=%s — 재작업 전체를 DeepAgents가 담당",
-                row.get("id"),
+                "되돌리기 불가 | todo=%s status=%s 사유: %s — 재작업 전체를 DeepAgents가 담당",
+                row.get("id"), decision.status, "; ".join(decision.reasons) or "(없음)",
             )
-            return None
-        if plan.get("undo_steps"):
+            return _handed_to_agent(decision.summary, decision.reasons)
+        if decision.status == UNDO_PLAN:
+            if not record.get("compensation"):
+                # 되돌릴 수는 있는데 되돌릴 코드가 없다. 이 활동이 굳기 전에 보상이
+                # 만들어지지 않은 경우다. 되돌리기를 건너뛰고 재작업만 하면 같은 값이
+                # 두 번 반영된다 — 관측으로 만든 되돌리기 계획을 그대로 에이전트에게
+                # 넘겨, 재작업보다 **먼저** 수행하게 한다.
+                reason = "이전 실행을 되돌릴 코드가 저장돼 있지 않습니다."
+                logger.info(
+                    "보상 코드 없음 | todo=%s undo_steps=%d — 되돌리기부터 DeepAgents가 담당",
+                    row.get("id"), len((decision.plan or {}).get("undo_steps") or []),
+                )
+                return _handed_to_agent(
+                    reason,
+                    ("이 활동에 보상 코드가 없습니다.",),
+                    note="되돌리기를 에이전트가 먼저 수행한 뒤에 재작업합니다.",
+                    undo_directive=_undo_directive(decision.plan, reason),
+                    undo_plan=decision.plan,
+                )
             try:
                 undo = await _run_code(
-                    record["compensation"], plan, config, tenant_id
+                    record["compensation"], decision.plan, config, tenant_id
                 )
-            except Exception:
-                # 되돌리기에 실패했다면 이전 실행의 흔적이 어디까지 남았는지 알 수 없다.
-                # 그 위에 고착화 코드를 덧씌우면 중복 반영이 된다. 재작업 전체를
-                # 에이전트에게 넘긴다 — 고착화 이전과 같은 동작이다.
+            except Exception as error:
+                # 보상 코드가 죽었다고 해서 되돌릴 일이 사라지는 것은 아니다. 여기서
+                # 그냥 재작업으로 넘어가면 되돌려지지 않은 세상 위에 같은 값이 두 번
+                # 반영된다. 되돌리기는 **없어지지 않고 에이전트에게 넘어간다** — 관측으로
+                # 만든 계획을 지시문으로 실어, 재작업보다 먼저 수행하게 한다.
+                failure = str(error)[-500:]
+                reason = "이전 실행을 되돌리는 코드가 실패했습니다."
                 logger.warning(
-                    "보상 코드 실행 실패 | todo=%s — 재작업 전체를 DeepAgents가 담당",
-                    row.get("id"), exc_info=True,
+                    "보상 코드 실행 실패 | todo=%s undo_steps=%d — 되돌리기부터 DeepAgents가 담당",
+                    row.get("id"), len((decision.plan or {}).get("undo_steps") or []),
+                    exc_info=True,
                 )
-                return None
+                return _handed_to_agent(
+                    reason,
+                    (
+                        "되돌리기가 어디까지 적용됐는지 알 수 없습니다.",
+                        f"실행기 오류: {failure}",
+                    ),
+                    note="되돌리기를 에이전트가 먼저 마친 뒤에 재작업합니다.",
+                    undo_directive=_undo_directive(decision.plan, reason, failure),
+                    undo_plan=decision.plan,
+                )
             undo_results = undo.get("results") or []
 
     if not is_active:
@@ -712,6 +995,10 @@ async def try_deterministic_execution(
         "undo_results": undo_results,
         "results": forward.get("results") or [],
     }
+    if undo_status:
+        # 되돌릴 것이 없었는지, 되돌린 것인지를 기록에 남긴다. 결과만 보면 둘 다
+        # "그냥 다시 실행됨"으로 보인다.
+        output["undo_status"] = undo_status
     form_output = _render_form_output(
         record.get("output_template"), inputs, output["results"]
     )

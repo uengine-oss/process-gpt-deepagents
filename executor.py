@@ -72,7 +72,7 @@ from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _ski
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
-from core.deterministic import try_deterministic_execution
+from core.deterministic import MODE_UNDO_PENDING, try_deterministic_execution
 # 우리 기능(프로세스 생성 HITL 캡처/이름도출)에서 사용하는 contextvar — incoming 에는 없으나 유지.
 from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
@@ -1131,7 +1131,19 @@ class DeepAgentExecutor(AgentExecutor):
                 deterministic_job_id = str(uuid.uuid4())
                 is_undo = deterministic.mode == "deterministic-undo"
                 is_undo_only = deterministic.mode == "deterministic-undo-only"
-                if is_undo_only:
+                # 되돌릴 근거가 없어 재작업 전체를 에이전트가 맡는 경우. 카드를 띄우지
+                # 않으면 "되돌릴 것이 없었다"와 "되돌릴 수 없었다"가 기록에서 구분되지
+                # 않는다 — 사람이 보는 자리에 사유가 남아야 한다.
+                is_skipped = deterministic.mode == "deterministic-skipped"
+                # 되돌릴 것이 남아 있는 채로 넘어온 경우. 사람이 보는 자리에 "보류"가 아니라
+                # "에이전트가 되돌린다"로 남아야, 재작업 결과를 검수할 때 무엇을 확인해야
+                # 하는지가 보인다.
+                is_undo_pending = deterministic.mode == MODE_UNDO_PENDING
+                if is_undo_pending:
+                    card_name = "이전 실행 되돌리기 — 에이전트가 수행"
+                elif is_skipped:
+                    card_name = "재작업 되돌리기 보류"
+                elif is_undo_only:
                     card_name = "Undo(실행 취소) 결과"
                 elif is_undo:
                     card_name = "Undo(실행 취소) 후 재실행 결과"
@@ -1147,7 +1159,11 @@ class DeepAgentExecutor(AgentExecutor):
                             "role": card_name,
                             "name": card_name,
                             "goal": (
-                                "고착화된 undo 코드로 이전 실행을 되돌립니다. 재실행은 에이전트가 수행합니다."
+                                str(deterministic.output.get("note") or "")
+                                + " 사유: "
+                                + str(deterministic.output.get("reason") or "")
+                                if is_skipped or is_undo_pending
+                                else "고착화된 undo 코드로 이전 실행을 되돌립니다. 재실행은 에이전트가 수행합니다."
                                 if is_undo_only
                                 else "고착화된 undo 코드로 이전 실행을 되돌린 뒤 새 입력으로 재실행합니다."
                                 if is_undo
@@ -1221,6 +1237,16 @@ class DeepAgentExecutor(AgentExecutor):
                     return None
                 # 되돌리기만 수행한 경우: 결과 카드만 남기고 DeepAgents 실행을 계속한다.
                 # 최종 산출물은 에이전트가 만든다.
+                if deterministic.undo_directive:
+                    # 보상이 아직 끝나지 않았다. 되돌리기(또는 사람 확인) 지시를 작업 지시
+                    # **앞에** 붙여, 그것을 먼저 마치고 나서 재작업하게 한다. 이 줄이 없으면
+                    # 되돌려지지 않은 세상 위에 재작업이 얹혀 같은 값이 두 번 반영된다.
+                    user_message = f"{deterministic.undo_directive}\n\n{user_message}"
+                    logger.info(
+                        "되돌리기 지시를 에이전트 입력에 주입 | todo=%s mode=%s steps=%d",
+                        row.get("id"), deterministic.mode,
+                        len(deterministic.output.get("undo_steps") or []),
+                    )
 
         job_id = str(uuid.uuid4())
 

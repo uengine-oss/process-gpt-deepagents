@@ -74,7 +74,11 @@ from core.deterministic.replay import (  # noqa: E402
     _needs_workspace,
     _structured_fields,
     _parse_result,
-    _previous_undo_plan,
+    _previous_undo_decision,
+    UNDO_IMPOSSIBLE,
+    UNDO_NONE,
+    UNDO_PLAN,
+    UNDO_UNKNOWN,
     try_deterministic_execution,
 )
 
@@ -128,14 +132,86 @@ def test_the_undo_plan_comes_from_observation() -> None:
     }
     db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
 
-    plan = _previous_undo_plan(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
-    assert plan is not None
-    steps = plan["undo_steps"]
+    decision = _previous_undo_decision(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
+    assert decision.status == UNDO_PLAN
+    steps = decision.plan["undo_steps"]
     assert len(steps) == 1                       # 읽기는 되돌릴 대상이 아니다
     assert steps[0]["args"]["sql"] == (
         "DELETE FROM ledger WHERE applicant = \'김철수\' AND amount = 100"
     )
     assert "ledger" in steps[0]["describes"]     # 무엇을 되돌렸는지 남는다
+
+
+def _frozen_run_event(results, timestamp="t1", mode="deterministic"):
+    """고착화 실행이 남기는 완료 이벤트. 도구 이벤트가 아니라 결과 봉투 하나다."""
+    return {
+        "event_type": "task_completed",
+        "timestamp": timestamp,
+        "data": json.dumps(
+            {"ok": True, "execution_mode": mode, "llm_calls": 0,
+             "undo_results": [], "results": results},
+            ensure_ascii=False,
+        ),
+    }
+
+
+def test_a_frozen_run_leaves_a_history_that_can_still_be_undone() -> None:
+    """한 번 굳은 활동은 `tool_usage_finished` 를 남기지 않는다.
+
+    그 이력을 못 읽으면 이후 모든 재작업이 "되돌릴 것이 없다"로 읽혀, 되돌리기를
+    건너뛴 채 순방향 코드가 덧씌워진다 — 같은 행이 두 번 들어간다.
+    """
+    tables = {
+        "todolist": [{"id": "prev", "rework_count": 0, "updated_at": "t"}],
+        "events": [_frozen_run_event([
+            {"kind": "shell", "command": "date '+%Y-%m-%d'", "cwd": "/w", "output": "2026-09-03"},
+            {"kind": "mcp_call", "tool": "execute_sql", "server": "pg",
+             "args": {"sql": "INSERT INTO ledger (applicant) VALUES ('김철수')"}, "data": None},
+            {"kind": "file_write", "op": "write", "path": "/w/a.md", "bytes": 3},
+        ])],
+    }
+    db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
+    decision = _previous_undo_decision(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
+    assert decision.status == UNDO_PLAN
+    steps = decision.plan["undo_steps"]
+    # 되돌리기는 역순이다. 값을 찍기만 한 셸은 되돌릴 대상이 아니다.
+    assert [step["kind"] for step in steps] == ["file_delete", "mcp_call"]
+    assert steps[1]["args"]["sql"] == "DELETE FROM ledger WHERE applicant = '김철수'"
+
+
+def test_a_frozen_run_without_recorded_arguments_is_not_read_as_harmless() -> None:
+    """인자를 남기지 않은 옛 골격의 결과. 무엇을 넣었는지 모르면 되돌릴 수도 없다."""
+    tables = {
+        "todolist": [{"id": "prev", "rework_count": 0, "updated_at": "t"}],
+        "events": [_frozen_run_event([
+            {"kind": "mcp_call", "tool": "execute_sql", "data": None},
+        ])],
+    }
+    db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
+    decision = _previous_undo_decision(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
+    assert decision.status == UNDO_IMPOSSIBLE
+    assert decision.blocks_replay is True
+
+
+def test_a_frozen_run_that_only_read_has_nothing_to_undo() -> None:
+    tables = {
+        "todolist": [{"id": "prev", "rework_count": 0, "updated_at": "t"}],
+        "events": [_frozen_run_event([
+            {"kind": "mcp_call", "tool": "execute_sql", "args": {"sql": "SELECT 1"}, "data": []},
+        ])],
+    }
+    db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
+    decision = _previous_undo_decision(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
+    assert decision.status == UNDO_NONE
+
+
+def test_a_card_without_forward_work_does_not_hide_the_agent_run() -> None:
+    """되돌리기만 하고 넘긴 회차에는 카드와 에이전트 이력이 함께 남는다."""
+    trace = wh.normalize_events([
+        _frozen_run_event([], "t1", mode="deterministic-undo-only"),
+        _event("write_file", {"file_path": "/w/a.md", "content": "x"}, "t2"),
+    ])
+    assert [action.kind for action in trace] == [wh.FILE_WRITE]
 
 
 def test_an_irreversible_action_yields_no_plan() -> None:
@@ -148,16 +224,35 @@ def test_an_irreversible_action_yields_no_plan() -> None:
         ],
     }
     db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
-    assert _previous_undo_plan(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1}) is None
+    decision = _previous_undo_decision(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
+    assert decision.status == UNDO_IMPOSSIBLE
+    assert any("셸" in reason for reason in decision.reasons)   # 사유가 기록에 남는다
 
 
-def test_activity_without_effects_yields_no_undo_input() -> None:
+def test_nothing_to_undo_is_not_the_same_as_cannot_undo() -> None:
+    """둘을 뭉뚱그리면 되돌릴 수 없는 실행 위에 순방향 코드가 덧씌워진다."""
     tables = {
         "todolist": [{"id": "prev", "rework_count": 0, "updated_at": "t"}],
         "events": [_event("db_exec", {"sql": "SELECT 1"}, "t1")],
     }
     db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
-    assert _previous_undo_plan(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1}) is None
+    decision = _previous_undo_decision(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
+    assert decision.status == UNDO_NONE
+    assert decision.blocks_replay is False       # 되돌릴 것이 없으면 그대로 재실행한다
+
+
+@pytest.mark.parametrize("tables", [
+    # 이전 회차의 워크아이템을 못 찾은 경우
+    {"todolist": [], "events": []},
+    # 이력이 통째로 비어 있는 경우
+    {"todolist": [{"id": "prev", "rework_count": 0, "updated_at": "t"}], "events": []},
+])
+def test_an_unreadable_history_is_never_read_as_nothing_to_undo(tables) -> None:
+    """읽지 못한 것을 "한 일이 없다"로 읽으면 그 위에 덧씌운다."""
+    db = type("DB", (), {"table": lambda self, name: _Query(tables[name])})()
+    decision = _previous_undo_decision(db, {"proc_inst_id": "pi", "activity_id": "act", "rework_count": 1})
+    assert decision.status == UNDO_UNKNOWN
+    assert decision.blocks_replay is True
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +325,48 @@ class _Recorder:
         return _Query([self._record])
 
 
+def test_a_compensation_with_no_file_steps_runs_beside_the_process() -> None:
+    """MCP 호출만 하는 되돌리기를 샌드박스로 보내지 않는다.
+
+    보상 골격은 파일 단계를 처리하는 디스패처를 늘 품고 있어서, 코드 텍스트로 판정하면
+    **모든 보상**이 샌드박스로 간다. 순방향 코드는 파일을 안 건드리면 로컬에서 도는데,
+    보상만 골라 그 길로 보내면 샌드박스에만 있는 문제를 보상 혼자 다 뒤집어쓴다.
+    """
+    from core.deterministic.replay import _plan_needs_workspace
+
+    sql_only = {"undo_steps": [
+        {"kind": "mcp_call", "tool": "execute_sql", "args": {"query": "DELETE FROM t WHERE id = 1"}},
+    ]}
+    with_file = {"undo_steps": [{"kind": "file_delete", "path": "/workspace/a.md"}]}
+
+    assert _plan_needs_workspace(sql_only) is False       # 로컬에서 돈다
+    assert _plan_needs_workspace(with_file) is True       # 파일을 건드리면 샌드박스
+    assert _plan_needs_workspace({"applicant": "홍길동"}) is None   # 순방향은 코드로 판정
+
+
+def test_stored_code_keeps_running_when_the_server_has_no_ping() -> None:
+    """옛 골격의 `await client.ping()` 은 실행 직전에 걷어낸다.
+
+    ping 은 MCP 스펙의 선택 기능이다. 구현하지 않은 서버가 "Method not found" 를 돌려주는데,
+    그것 때문에 도구를 불러 보지도 못하고 보상 코드 전체가 죽고 있었다.
+    """
+    import ast
+
+    from core.deterministic.replay import _drop_legacy_ping
+
+    source = (
+        "async def call_tool(server, tool, args):\n"
+        "    client = await _client_from_server_key(server)\n"
+        "    async with client:\n"
+        "        await client.ping()\n"
+        "        return await client.call_tool(tool, args)\n"
+    )
+    patched = _drop_legacy_ping(source)
+    assert "client.ping()" not in patched
+    assert "client.call_tool(tool, args)" in patched   # 실제 호출은 그대로 남는다
+    ast.parse(patched)                                 # 빈 블록이 되지 않는다
+
+
 @pytest.mark.asyncio
 async def test_execution_failure_falls_back_to_the_agent(monkeypatch) -> None:
     """고착화는 최적화다. 실패하면 워크아이템을 멈추지 않고 에이전트에게 넘긴다."""
@@ -248,22 +385,97 @@ async def test_execution_failure_falls_back_to_the_agent(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_undo_failure_hands_the_whole_rework_to_the_agent(monkeypatch) -> None:
-    """되돌리기가 실패했다면 어디까지 남았는지 모른다. 그 위에 재실행을 얹지 않는다."""
+async def test_undo_failure_hands_the_undo_itself_to_the_agent(monkeypatch) -> None:
+    """보상 코드가 죽어도 되돌릴 일은 사라지지 않는다. 되돌리기째로 에이전트에게 넘긴다.
+
+    여기서 재작업만 넘기면 되돌려지지 않은 세상 위에 같은 값이 두 번 반영된다.
+    """
     import core.deterministic.replay as replay
 
     record = {"code": "print(1)", "parameters": {"parameters": []},
               "deactivated_at": None, "compensation": "print(1)"}
     monkeypatch.setattr("core.storage.db.get_supabase", lambda: _Recorder(record))
-    monkeypatch.setattr(replay, "_previous_undo_plan", lambda db, row: {"undo_steps": [{"kind": "file_delete", "path": "/x"}]})
+    monkeypatch.setattr(
+        replay, "_previous_undo_decision",
+        lambda db, row: replay.UndoDecision(
+            replay.UNDO_PLAN,
+            plan={"undo_steps": [
+                {"kind": "file_delete", "path": "/x", "describes": "파일 삭제: /x"},
+                {"kind": "mcp_call", "tool": "query", "args": {"sql": "DELETE FROM t"},
+                 "describes": "query: DELETE FROM t"},
+            ]},
+        ),
+    )
+
+    calls = {"n": 0}
 
     async def _boom(*args, **kwargs):
+        calls["n"] += 1
         raise RuntimeError("보상 실패")
 
     monkeypatch.setattr(replay, "_run_code", _boom)
     row = {"proc_def_id": "pd", "activity_id": "act", "tenant_id": "tn",
            "query": "", "id": "w1", "rework_count": 1}
-    assert await try_deterministic_execution(row, {"mcpServers": {}}) is None
+    result = await try_deterministic_execution(row, {"mcpServers": {}})
+    assert result is not None
+    assert result.mode == replay.MODE_UNDO_PENDING      # "되돌릴 게 없었다"와 구분된다
+    assert result.continue_to_llm is True
+    assert result.output["results"] == []               # 순방향은 돌지 않았다
+    assert calls["n"] == 1                              # 보상만 시도했다
+    assert result.output["undo_pending"] is True
+    # 에이전트가 그대로 수행할 수 있게 단계가 지시문에 실려 있어야 한다.
+    directive = result.undo_directive
+    assert "/x" in directive and "DELETE FROM t" in directive
+    assert "먼저 되돌린 뒤에만" in directive
+
+
+@pytest.mark.asyncio
+async def test_missing_compensation_code_still_hands_over_the_undo_plan(monkeypatch) -> None:
+    """보상 코드가 저장돼 있지 않아도 관측으로 만든 되돌리기 계획은 에이전트가 이어받는다."""
+    import core.deterministic.replay as replay
+
+    record = {"code": "print(1)", "parameters": {"parameters": []},
+              "deactivated_at": None, "compensation": None}
+    monkeypatch.setattr("core.storage.db.get_supabase", lambda: _Recorder(record))
+    monkeypatch.setattr(
+        replay, "_previous_undo_decision",
+        lambda db, row: replay.UndoDecision(
+            replay.UNDO_PLAN,
+            plan={"undo_steps": [{"kind": "file_delete", "path": "/x", "describes": "파일 삭제: /x"}]},
+        ),
+    )
+
+    async def _never(*args, **kwargs):
+        raise AssertionError("보상 코드가 없는데 무언가를 실행했다")
+
+    monkeypatch.setattr(replay, "_run_code", _never)
+    row = {"proc_def_id": "pd", "activity_id": "act", "tenant_id": "tn",
+           "query": "", "id": "w1", "rework_count": 1}
+    result = await try_deterministic_execution(row, {"mcpServers": {}})
+    assert result is not None
+    assert result.mode == replay.MODE_UNDO_PENDING
+    assert result.continue_to_llm is True
+    assert "/x" in result.undo_directive
+
+
+@pytest.mark.asyncio
+async def test_unknown_history_has_no_undo_directive(monkeypatch) -> None:
+    """되돌릴 계획 자체가 없으면 지시문도 없다 — 없는 단계를 지어내지 않는다."""
+    import core.deterministic.replay as replay
+
+    record = {"code": "print(1)", "parameters": {"parameters": []},
+              "deactivated_at": None, "compensation": "print(1)"}
+    monkeypatch.setattr("core.storage.db.get_supabase", lambda: _Recorder(record))
+    monkeypatch.setattr(
+        replay, "_previous_undo_decision",
+        lambda db, row: replay.UndoDecision(replay.UNDO_UNKNOWN, reasons=("이력 없음",)),
+    )
+    row = {"proc_def_id": "pd", "activity_id": "act", "tenant_id": "tn",
+           "query": "", "id": "w1", "rework_count": 1}
+    result = await try_deterministic_execution(row, {"mcpServers": {}})
+    assert result is not None
+    assert result.mode == "deterministic-skipped"
+    assert result.undo_directive == ""
 
 
 @pytest.mark.asyncio
@@ -274,7 +486,12 @@ async def test_undo_succeeds_then_forward_fails_keeps_the_undo(monkeypatch) -> N
     record = {"code": "print(1)", "parameters": {"parameters": []},
               "deactivated_at": None, "compensation": "print(1)"}
     monkeypatch.setattr("core.storage.db.get_supabase", lambda: _Recorder(record))
-    monkeypatch.setattr(replay, "_previous_undo_plan", lambda db, row: {"undo_steps": [{"kind": "file_delete", "path": "/x"}]})
+    monkeypatch.setattr(
+        replay, "_previous_undo_decision",
+        lambda db, row: replay.UndoDecision(
+            replay.UNDO_PLAN, plan={"undo_steps": [{"kind": "file_delete", "path": "/x"}]}
+        ),
+    )
 
     calls = {"n": 0}
 
@@ -300,7 +517,10 @@ async def test_undo_succeeds_then_forward_fails_keeps_the_undo(monkeypatch) -> N
 
 @pytest.mark.parametrize("tool,args,expected", [
     ("execute", {"command": "python3 import.py"}, wh.SHELL),
-    ("bash", {"command": "ls"}, wh.SHELL),
+    ("bash", {"command": "ls"}, wh.INSPECT),                 # 세상을 바꾸지 않는 셸
+    ("bash", {"command": "date '+%Y'"}, wh.INSPECT),
+    ("bash", {"command": "mkdir -p x && date"}, wh.SHELL),   # 절 하나만 바꿔도 바꾸는 것
+    ("bash", {"command": "echo ok > f"}, wh.SHELL),
     ("run_it", {"command": "make build", "cwd": "/workspace"}, wh.SHELL),
     ("write_file", {"file_path": "/workspace/out.csv", "content": "a,b"}, wh.FILE_WRITE),
     ("edit_file", {"file_path": "/workspace/a.py", "old_string": "x", "new_string": "y"}, wh.FILE_WRITE),
@@ -314,7 +534,7 @@ async def test_undo_succeeds_then_forward_fails_keeps_the_undo(monkeypatch) -> N
     ("db_exec", {"sql": "UPDATE t SET a = 1"}, wh.MCP_CALL),
     ("send_email_tool", {"to": "a@b.com"}, wh.MCP_CALL),
     ("mcp__fs__read_file", {"path": "/skills/x/SKILL.md"}, wh.SKILL_READ),
-    ("sandbox.execute", {"command": "echo hi"}, wh.SHELL),
+    ("sandbox.execute", {"command": "echo hi"}, wh.INSPECT),
     ("printer", {"command": "print", "copies": 3, "tray": "A4"}, wh.MCP_CALL),
 ])
 def test_classification_matches_the_generator_side(tool, args, expected) -> None:

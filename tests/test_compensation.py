@@ -13,16 +13,19 @@
 
 from __future__ import annotations
 
+import json as _json
+
 import pytest
 
 from core.deterministic.compensation import (
     UNDO_DELETE_FILE,
     UNDO_RESTORE_FILE,
+    UNDO_TOOL,
     invert,
     undo_plan,
 )
 from core.deterministic.sql_undo import invert_sql
-from core.deterministic.work_history import to_action
+from core.deterministic.work_history import normalize_events, to_action
 
 
 def _trace(*calls):
@@ -129,3 +132,37 @@ def test_the_plan_is_shaped_for_the_stored_executor():
     step = plan["undo_steps"][0]
     assert step["kind"] == "mcp_call" and step["tool"] == "db_exec"
     assert step["describes"]          # 무엇을 되돌렸는지 결과에 남길 문구
+
+
+# ---------------------------------------------------------------------------
+# 고착화 실행이 남긴 이력 — 두 사본이 같은 결론을 내야 한다
+# ---------------------------------------------------------------------------
+
+# 굳은 활동을 재작업할 때의 표본. 실행 골격이 단계마다 돌려준 결과가 완료 이벤트 하나에
+# 통째로 실린다. 이것을 못 읽으면 "되돌릴 것이 없다"로 읽혀 순방향 코드가 덧씌워진다.
+_FROZEN_RUN = {
+    "event_type": "task_completed",
+    "timestamp": "2026-09-03T00:00:01",
+    "data": _json.dumps({
+        "ok": True, "execution_mode": "deterministic", "llm_calls": 0, "undo_results": [],
+        "results": [
+            {"kind": "shell", "command": "date '+%Y-%m-%d'", "cwd": "/w", "output": "2026-09-03"},
+            {"kind": "mcp_call", "tool": "db_exec", "server": "pg",
+             "args": {"sql": "INSERT INTO ledger (applicant, amount) VALUES ('한지민', 29000)"},
+             "data": None},
+            {"kind": "file_write", "op": "write", "path": "/w/a.md", "bytes": 3},
+        ],
+    }, ensure_ascii=False),
+}
+
+
+def test_a_frozen_runs_history_undoes_to_the_same_plan_on_both_sides():
+    """두 사본이 갈리면 굳힐 때 "되돌릴 수 있다"고 저장한 것을 실행기가 못 되돌린다."""
+    steps, reasons = invert(normalize_events([_FROZEN_RUN]))
+    assert reasons == []
+    # 되돌리기는 역순. 값을 찍기만 한 셸은 되돌릴 대상이 아니다.
+    assert [step.kind for step in steps] == [UNDO_DELETE_FILE, UNDO_TOOL]
+    assert steps[0].path == "/w/a.md"
+    assert steps[1].args["sql"] == (
+        "DELETE FROM ledger WHERE applicant = '한지민' AND amount = 29000"
+    )
