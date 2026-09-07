@@ -1627,6 +1627,181 @@ async def get_skill_file(request: Request) -> JSONResponse:
     })
 
 
+# ---------------------------------------------------------------------------
+# 병합 전 검증 (pre-merge verification)
+#
+# "이 병합 요청을 병합하면 기존 동작이 깨지는가" 를 병합 전에 답한다.
+# 리뷰어가 PR 화면에서 실행하면, 저장된 주요 시나리오를 base(변경 전)/head(변경 후)
+# 두 벌로 돌려 채점하고, 통과하던 단계가 깨진 것을 골라낸다.
+# 오케스트레이션은 core/skills/pr_verification.py 가 결정론적으로 수행한다.
+# ---------------------------------------------------------------------------
+
+# 진행 중인 검증 태스크. 같은 PR 에 중복 실행이 겹치지 않게 잡아 둔다.
+_verification_tasks: dict[str, "asyncio.Task"] = {}
+
+
+def _find_pr_record(tenant_id: str, skill_name: str, number: int) -> dict | None:
+    """git PR 번호로 resource_pull_requests 행을 찾는다."""
+    from core.storage.db import get_supabase
+
+    rows = (
+        get_supabase()
+        .table("resource_pull_requests")
+        .select("id,resource_type,resource_id,branch_name,base_branch,status,git_pr_number")
+        .eq("tenant_id", tenant_id)
+        .eq("resource_type", "skill")
+        .eq("resource_id", skill_name)
+        .eq("git_pr_number", number)
+        .limit(1)
+        .execute()
+    )
+    return (rows.data or [None])[0]
+
+
+def _verification_payload(tenant_id: str, run: dict | None) -> dict:
+    """회차 + (완료된 경우) variant 별 결과를 화면이 쓰는 형태로 만든다."""
+    if not run:
+        return {"run": None, "results": []}
+    from core.skills import pr_verification as prv
+
+    results = prv.run_results(tenant_id, run["id"]) if run.get("status") == "succeeded" else []
+    return {"run": run, "results": results}
+
+
+@tenant_guard
+async def start_pr_verification(request: Request) -> JSONResponse:
+    """병합 요청 검증을 시작한다(백그라운드). 이미 돌고 있으면 그 회차를 그대로 돌려준다."""
+    skill_name = request.path_params["skill_name"]
+    number = request.path_params["number"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import pr_verification as prv
+
+    pr = await asyncio.to_thread(_find_pr_record, tenant_id, skill_name, number)
+    if not pr:
+        return JSONResponse(
+            {"error": f"#{number} 병합 요청 기록을 찾을 수 없습니다."}, status_code=404
+        )
+
+    existing = await asyncio.to_thread(prv.latest_run_for_pr, tenant_id, pr["id"])
+    if existing and existing.get("status") == "running":
+        return JSONResponse(_verification_payload(tenant_id, existing))
+
+    created = await asyncio.to_thread(
+        prv.create_run, tenant_id=tenant_id, pr=pr, created_by=request_user_id(request) or ""
+    )
+    if created.get("error"):
+        return JSONResponse(
+            {"error": created["error"], "message": created["message"]}, status_code=409
+        )
+
+    run = created["run"]
+    task = asyncio.create_task(
+        prv.execute_run(
+            tenant_id=tenant_id, run=run, cases=created["cases"], suite_id=created["suite_id"]
+        )
+    )
+    _verification_tasks[run["id"]] = task
+    task.add_done_callback(lambda _t, rid=run["id"]: _verification_tasks.pop(rid, None))
+
+    return JSONResponse(_verification_payload(tenant_id, run), status_code=202)
+
+
+@tenant_guard
+async def get_pr_verification(request: Request) -> JSONResponse:
+    """이 병합 요청의 최신 검증 결과(진행 상태 포함)를 돌려준다."""
+    skill_name = request.path_params["skill_name"]
+    number = request.path_params["number"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import eval_backfill as ebf, eval_tools, pr_verification as prv
+
+    pr = await asyncio.to_thread(_find_pr_record, tenant_id, skill_name, number)
+    if not pr:
+        return JSONResponse(
+            {"error": f"#{number} 병합 요청 기록을 찾을 수 없습니다."}, status_code=404
+        )
+
+    def _load() -> dict:
+        run = prv.latest_run_for_pr(tenant_id, pr["id"])
+        payload = _verification_payload(tenant_id, run)
+        # 검증에 쓰이는(또는 쓰일) 시나리오도 함께 준다 — 아직 실행 전이어도 화면이
+        # "무엇을 검증하게 되는지" 를 보여줄 수 있어야 한다.
+        suite_id = eval_tools.find_suite(tenant_id, pr["resource_id"], pr["resource_type"])
+        payload["cases"] = eval_tools.load_suite_cases(suite_id) if suite_id else []
+        # 케이스 기준으로 판단한다 — 시나리오 확보 회차가 스위트 행을 먼저 만들어 두므로,
+        # 스위트 존재만 보면 아직 시나리오가 없는데도 "있다" 로 보인다.
+        payload["has_suite"] = bool(payload["cases"])
+        # 시나리오가 없을 때 화면이 "생성 중/실패" 를 같은 폴링으로 볼 수 있게 함께 싣는다.
+        payload["backfill"] = ebf.latest_run(
+            tenant_id, pr["resource_id"], pr["resource_type"]
+        )
+        return payload
+
+    try:
+        return JSONResponse(await asyncio.to_thread(_load))
+    except Exception as e:
+        logger.exception("병합 전 검증 조회 실패 skill=%s pr=%s", skill_name, number)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@tenant_guard
+async def start_eval_backfill(request: Request) -> JSONResponse:
+    """시나리오가 없는 스킬에 회귀 테스트 시나리오를 만들어 붙인다(백그라운드).
+
+    기준은 **PR 의 base 브랜치**다 — 변경 후(head)를 보고 만들면 바뀐 동작을 기준선으로
+    굳혀 버려서 그 검증이 아무것도 잡아내지 못한다(core/skills/eval_backfill.py).
+    """
+    skill_name = request.path_params["skill_name"]
+    number = request.path_params["number"]
+    tenant_id = request_tenant_id(request)
+
+    # replace=true 는 "지금 시나리오가 미덥지 않으니 다시 만들어라" 는 리뷰어의 명시적 지시다.
+    # 이 플래그가 없으면 기존 스위트는 그대로 지켜진다(create_run 의 suite_exists).
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    replace = bool((body or {}).get("replace"))
+
+    from core.skills import eval_backfill as ebf
+
+    pr = await asyncio.to_thread(_find_pr_record, tenant_id, skill_name, number)
+    if not pr:
+        return JSONResponse(
+            {"error": f"#{number} 병합 요청 기록을 찾을 수 없습니다."}, status_code=404
+        )
+
+    existing = await asyncio.to_thread(
+        ebf.latest_run, tenant_id, pr["resource_id"], pr["resource_type"]
+    )
+    if existing and existing.get("status") == "running":
+        return JSONResponse({"backfill": existing})
+
+    created = await asyncio.to_thread(
+        ebf.create_run,
+        tenant_id=tenant_id,
+        resource_id=pr["resource_id"],
+        resource_type=pr["resource_type"] or "skill",
+        base_ref=pr.get("base_branch") or "main",
+        created_by=request_user_id(request) or "",
+        replace=replace,
+    )
+    if created.get("error"):
+        return JSONResponse(
+            {"error": created["error"], "message": created["message"]}, status_code=409
+        )
+
+    run = created["run"]
+    task = asyncio.create_task(
+        ebf.execute_run(tenant_id=tenant_id, run=run, suite_id=created["suite_id"])
+    )
+    _verification_tasks[run["id"]] = task
+    task.add_done_callback(lambda _t, rid=run["id"]: _verification_tasks.pop(rid, None))
+
+    return JSONResponse({"backfill": run}, status_code=202)
+
+
 routes = [
     Route("/skills", list_skills, methods=["GET"]),
     Route("/skills-builtin", list_builtin_skills, methods=["GET"]),
@@ -1646,6 +1821,9 @@ routes = [
     Route("/skills/{skill_name}/pull-requests", create_skill_pull_request, methods=["POST"]),
     Route("/skills/{skill_name}/pull-requests/{number:int}/files", get_pull_request_files, methods=["GET"]),
     Route("/skills/{skill_name}/pull-requests/{number:int}/merge", merge_skill_pull_request, methods=["POST"]),
+    Route("/skills/{skill_name}/pull-requests/{number:int}/verification", get_pr_verification, methods=["GET"]),
+    Route("/skills/{skill_name}/pull-requests/{number:int}/verification", start_pr_verification, methods=["POST"]),
+    Route("/skills/{skill_name}/pull-requests/{number:int}/verification/scenarios", start_eval_backfill, methods=["POST"]),
     Route("/skills/{skill_name}/export", export_skill, methods=["GET"]),
     Route("/skills/{skill_name}/files", list_skill_files, methods=["GET"]),
     Route("/skills/{skill_name}/files/{file_path:path}", get_skill_file, methods=["GET"]),
