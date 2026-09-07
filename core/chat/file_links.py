@@ -57,16 +57,71 @@ def file_name_of(path: str) -> str:
     return str(path).rstrip("/").rsplit("/", 1)[-1] or "첨부파일"
 
 
+# 링크가 가리킬 주소의 기본 모양.
+#
+# 이 서버는 클러스터 안에서 8888 포트로 돌고, 바깥에서는 게이트웨이가
+# `/process-gpt-deepagents/**` 로 넘겨 준다. 그래서 `http://localhost:8888` 같은
+# 안쪽 주소를 링크에 실으면 **휴대폰에서도 브라우저에서도 열리지 않는다.**
+#
+# 조직마다 도메인 앞부분이 다르므로 조직 이름을 끼워 넣는다.
+DEFAULT_PUBLIC_BASE = "https://{tenant}.process-gpt.io/process-gpt-deepagents"
+
+
+def public_download_base(tenant_id: Optional[str], env: Optional[dict] = None) -> str:
+    """
+    내려받기 링크에 쓸 바깥 주소.
+
+    고르는 순서
+      1. `DEEPAGENTS_PUBLIC_BASE_URL` — 도메인이 다른 설치를 위해. `{tenant}` 를
+         쓰면 조직 이름으로 바뀐다.
+      2. `SELF_BASE_URL` — 이미 쓰이던 값. 있으면 존중한다.
+      3. 기본 모양(위)
+    조직을 모르면 안쪽 주소로 둔다 — 지어낸 도메인보다 낫다.
+    """
+    import os
+
+    source = env if env is not None else os.environ
+    tenant = (tenant_id or "").strip()
+
+    template = (source.get("DEEPAGENTS_PUBLIC_BASE_URL") or "").strip()
+    if template:
+        return template.replace("{tenant}", tenant).rstrip("/")
+
+    explicit = (source.get("SELF_BASE_URL") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+
+    if tenant:
+        return DEFAULT_PUBLIC_BASE.replace("{tenant}", tenant)
+
+    port = (source.get("PORT") or "8888").strip()
+    return f"http://localhost:{port}"
+
+
 def apply_links(text: str, links: dict) -> str:
     """
     경로를 링크로 바꾼다.
 
     긴 경로부터 바꾼다. 짧은 경로가 긴 경로의 일부일 때 순서가 어긋나면 이미
     만든 링크 안쪽이 다시 치환되어 깨진다.
+
+    에이전트가 경로를 이미 마크다운 링크로 감싸 내놓는 경우가 있다.
+
+        [MobileCheck.docx](sandbox:/workspace/.bpmn/방/MobileCheck.docx)
+
+    이때 경로 글자만 갈아끼우면 링크 안에 링크가 생긴다. 마크다운은 첫 번째
+    `)` 에서 주소를 끊으므로 눌러도 아무 데도 가지 않는다 — 파랗게 보이기만
+    한다. 그래서 감싼 링크가 있으면 **통째로** 바꾼다.
     """
     out = text
     for path in sorted(links, key=len, reverse=True):
-        out = out.replace(path, links[path])
+        target = re.escape(path)
+        # 감싸고 있는 마크다운 링크까지 함께. `sandbox:` 같은 접두사도 지운다.
+        wrapped = re.compile(r"\[[^\]\n]*\]\(\s*[a-z]*:?" + target + r"\s*\)")
+        out = wrapped.sub(lambda _m, v=links[path]: v, out)
+        # 남은 맨 경로. 앞에 붙은 `sandbox:` 도 함께 지운다.
+        bare = re.compile(r"(?:sandbox:)?" + target)
+        out = bare.sub(lambda _m, v=links[path]: v, out)
     return out
 
 

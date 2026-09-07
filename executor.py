@@ -390,7 +390,7 @@ async def _materialize_chat_file_links(tenant_id: str, text: str) -> str:
     실패는 베스트에포트다. 링크를 못 만들어도 답변 자체는 그대로 보인다 —
     경로가 남는 것이 답변이 통째로 사라지는 것보다 낫다.
     """
-    from core.chat.file_links import find_document_paths, materialize
+    from core.chat.file_links import find_document_paths, materialize, public_download_base
 
     if not find_document_paths(text):
         return text
@@ -405,7 +405,9 @@ async def _materialize_chat_file_links(tenant_id: str, text: str) -> str:
 
     from pathlib import PurePosixPath
 
-    base_url = (os.environ.get("SELF_BASE_URL") or f"http://localhost:{os.environ.get('PORT', '8888')}").rstrip("/")
+    # 클러스터 안쪽 주소를 실으면 휴대폰에서도 브라우저에서도 열리지 않는다.
+    # 게이트웨이를 지나는 바깥 주소로 만든다.
+    base_url = public_download_base(tenant_id)
     backend = get_or_create_sandbox(
         tenant_id,
         workspace_host=_AGENT_BASE_DIR / "workspace",

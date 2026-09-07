@@ -147,3 +147,85 @@ def test_괄호나_따옴표는_경로에_넣지_않는다():
 def test_파일_이름을_링크_글자로_쓴다():
     assert file_name_of("/workspace/.bpmn/r/Team Overview.docx") == "Team Overview.docx"
     assert file_name_of("/workspace/") == "workspace"
+
+
+# ---------------------------------------------------------------------------
+# 링크가 가리킬 주소
+#
+# 이 서버는 클러스터 안에서 8888 로 돌고 바깥에서는 게이트웨이가 넘겨 준다.
+# 안쪽 주소를 실으면 휴대폰에서도 브라우저에서도 열리지 않는다.
+# ---------------------------------------------------------------------------
+
+from core.chat.file_links import public_download_base  # noqa: E402
+
+
+def test_조직_주소로_링크를_만든다():
+    base = public_download_base("uengine", env={})
+
+    assert base == "https://uengine.process-gpt.io/process-gpt-deepagents"
+
+
+def test_설치마다_다른_도메인을_넣을_수_있다():
+    base = public_download_base(
+        "acme", env={"DEEPAGENTS_PUBLIC_BASE_URL": "https://{tenant}.example.com/da"}
+    )
+
+    assert base == "https://acme.example.com/da"
+
+
+def test_이미_쓰이던_SELF_BASE_URL_을_존중한다():
+    base = public_download_base("uengine", env={"SELF_BASE_URL": "https://fixed.example/"})
+
+    assert base == "https://fixed.example"
+
+
+def test_조직을_모르면_안쪽_주소로_둔다():
+    """지어낸 도메인으로 링크를 만드는 것보다 낫다."""
+    assert public_download_base("", env={}) == "http://localhost:8888"
+    assert public_download_base(None, env={"PORT": "9000"}) == "http://localhost:9000"
+
+
+def test_안쪽_주소가_링크에_실리지_않는다():
+    """이것이 실제로 사람들을 막던 지점이다."""
+    base = public_download_base("uengine", env={})
+
+    assert "localhost" not in base
+
+
+# ---------------------------------------------------------------------------
+# 에이전트가 이미 링크로 감싸 내놓는 경우
+#
+# 실기기에서 나온 실제 답변이 이랬다.
+#     다운로드: [MobileCheck.docx](sandbox:/workspace/.bpmn/방/MobileCheck.docx)
+# 경로 글자만 갈아끼우면 링크 안에 링크가 생기고, 마크다운은 첫 `)` 에서 주소를
+# 끊는다. 파랗게 보이지만 눌러도 아무 데도 가지 않는다.
+# ---------------------------------------------------------------------------
+
+
+def test_이미_감싼_링크는_통째로_바꾼다():
+    path = "/workspace/.bpmn/room/MobileCheck.docx"
+    text = f"다운로드: [MobileCheck.docx](sandbox:{path})"
+
+    out = _run(text, {path: "https://uengine.process-gpt.io/d/tok"})
+
+    assert out == "다운로드: [MobileCheck.docx](https://uengine.process-gpt.io/d/tok)"
+    assert "sandbox:" not in out
+    assert "](http" in out and out.count("](") == 1, "링크 안에 링크가 남았다"
+
+
+def test_감싼_글자가_달라도_바꾼다():
+    path = "/workspace/a.docx"
+    text = f"[여기서 받으세요]({path})"
+
+    out = _run(text, {path: "u"})
+
+    assert out == "[a.docx](u)"
+
+
+def test_맨_경로에_붙은_sandbox_접두사도_지운다():
+    path = "/workspace/a.docx"
+
+    out = _run(f"파일: sandbox:{path}", {path: "u"})
+
+    assert out == "파일: [a.docx](u)"
+    assert "sandbox:" not in out
