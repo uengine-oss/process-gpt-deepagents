@@ -11,9 +11,11 @@ from ..llm.model import _build_model
 from ..rag.tools import get_memento_tools
 import asyncio
 
+from ..skills.eval_tools import get_skill_eval_tools
 from ..skills.skills import _get_skills, FilteredSkillsMiddleware
 from ..skills.git_providers.factory import get_provider as _get_git_provider
 from ..llm.mcp import _load_mcp_tools_grouped
+from .skill_eval_gate import SkillEvalGateMiddleware
 from .subagents import _build_subagents, _format_profile_traits, _normalize_tool_filters, _parse_csv
 from ..skills.tools import (
     checkout_to_workspace,
@@ -85,25 +87,49 @@ _WEB_FETCH_RULES = (
 # 스킬/프로세스 생성이라는 "파워유저" 워크플로 전용 섹션. 대화 상대로 커스텀 프로필이 지정된
 # 경우(root_profile)에는 배제한다 — 그런 프로필로 BPMN·스킬 생성을 시키는 경우는 상정하지 않는다.
 _SKILL_CREATION_DELEGATION = (
-    "## 단독 스킬 생성 (프로세스가 아니라 '스킬' 자체를 만들어 달라고 할 때) — 최우선 판별\n"
-    "**무엇보다 먼저, 이 요청이 '스킬 생성'인지 '프로세스 생성'인지부터 판별한다.** "
-    "사용자 문장에 '스킬'/'skill' 을 만들어·생성해 달라는 의도가 있으면(예: '~하는 스킬 만들어줘', '~ 스킬 생성', 'skill 만들어줘') "
+    "## 단독 스킬 생성 (프로세스가 아니라 \'스킬\' 자체를 만들어 달라고 할 때) — 최우선 판별\n"
+    "**무엇보다 먼저, 이 요청이 \'스킬 생성\'인지 \'프로세스 생성\'인지부터 판별한다.** "
+    "사용자 문장에 \'스킬\'/\'skill\' 을 만들어·생성해 달라는 의도가 있으면(예: \'~하는 스킬 만들어줘\', \'~ 스킬 생성\', \'skill 만들어줘\') "
     "**이것은 스킬 생성이다. 프로세스 생성이 아니다.** "
     "**⚠️ 파일/문서(json·pdf·xlsx 등)가 업로드되어 있어도 판단이 바뀌지 않는다** — 업로드 문서는 스킬이 참고할 "
     "**지식/데이터**일 뿐이며, 그것 때문에 프로세스 생성으로 바꾸지 마라. 업로드가 있다는 이유로 프로세스 컨설팅(번호 매긴 업무 흐름 "
-    "'1) … → 2) …' 제시)이나 승인/반려 질문을 절대 시작하지 마라. \n"
-    "이때 **프로세스 생성 절차(컨설팅·process-definition.json·폼·DMN·에이전트·검증)를 시작하지 말고** "
-    "`skill-creator` 서브에이전트에 `task()` 로 위임해 정식 스킬(YAML frontmatter `name`/`description` + progressive disclosure SOP 절차)을 만든다. "
-    "업로드 문서의 내용이 필요하면 `search_documents`(임베딩됨)로 읽어 스킬의 references/ 로 반영한다. "
-    "결과 파일은 반드시 **이번 대화 전용 산출물 경로(아래 '📁' 섹션의 base) 바로 아래 `skills/<safe-name>/SKILL.md`** "
-    "(및 부속 파일: scripts/·references/ 등)로 `write_file` 한다 — 즉 최종 경로는 `<base>/skills/<safe-name>/SKILL.md` 이며 "
-    "**프로세스 폴더(process-…)는 만들지 않는다.** 이 경로여야 프론트 산출물 패널이 표시하고 사용자가 저장할 수 있다. "
-    "(`/workspace/.bpmn/skills/...` 처럼 base 를 빼고 쓰지 말 것 — 반드시 이 대화의 base 아래여야 한다.) "
-    "완료하면 채팅엔 **'스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요.'** 한 줄만 남긴다"
+    "\'1) … → 2) …\' 제시)이나 승인/반려 질문을 절대 시작하지 마라. \n"
+    "이때 **프로세스 생성 절차(컨설팅·process-definition.json·폼·DMN·에이전트·검증)를 시작하지 않는다.** "
+    "(process-definition.json·폼·DMN·에이전트·검증은 만들지 않으며 **프로세스 폴더(process-…)도 만들지 않는다.**) "
+    "아래 \'BPMN/프로세스 생성\' 절차는 사용자가 명시적으로 프로세스/워크플로/BPMN 을 만들라고 한 경우에만 적용된다.\n\n"
+
+    "### 스킬 생성은 아래 6단계를 순서대로 **직접** 수행한다 (건너뛰기 금지)\n"
+    "이 파이프라인 전체를 `general-purpose` 같은 범용 서브에이전트에 통째로 위임하지 마라. "
+    "**서브에이전트에는 `task()` 도구가 없어서, 위임하는 순간 아래 3·4단계(테스트 실행·채점)를 영원히 수행할 수 없게 된다.** "
+    "`test-runner`·`evaluator` 는 이 루트 에이전트만 호출할 수 있다.\n"
+    "1. **초안 작성** — `<base>/skills/<safe-name>/SKILL.md` 에 정식 스킬(YAML frontmatter `name`/`description` + "
+    "progressive disclosure SOP 절차)을 `write_file` 한다. 업로드 문서 내용이 필요하면 `search_documents`(임베딩됨)로 읽어 "
+    "`references/` 에 반영한다. 참고 문서의 storage 경로가 주어졌다면 그 전에 `task(subagent_type=\'rule-extractor\')` 로 "
+    "규칙을 먼저 추출한다.\n"
+    "2. **테스트 시나리오 작성** — `<base>/skills/<safe-name>/evals/evals.json` 에 실제 사용자가 말할 법한 시나리오를 "
+    "**2건 이상** 쓴다. 각 항목은 `{\"id\",\"name\",\"prompt\",\"expected_output\",\"files\",\"assertions\"}` 이며 "
+    "`assertions` 는 객관적으로 검증 가능한 문장 **2건 이상**이다. 그 다음 `plan_skill_eval(skill_path)` 를 호출해 "
+    "이번 회차의 iteration 번호와 각 실행의 `outputs_dir` 를 받는다.\n"
+    "3. **테스트 실행** — `plan_skill_eval` 이 돌려준 `runs` 항목을 **하나도 빠짐없이, 전부 같은 턴에** "
+    "`task(subagent_type=\'test-runner\')` 로 띄운다(스킬을 붙인 `with_skill` 과 대조군 `without_skill` 을 함께). "
+    "task 설명에는 받은 `skill_path`·`prompt`·`outputs_dir`·`variant` 를 그대로 적는다.\n"
+    "4. **채점** — 실행이 끝나면 시나리오마다 `task(subagent_type=\'evaluator\')` 로 assertion 을 채점해 "
+    "`plan_skill_eval` 이 알려준 `grading.json` 경로에 저장하게 한다.\n"
+    "5. **완료 게이트** — `complete_skill_creation(skill_path)` 를 호출한다. 이 도구가 성공을 돌려주기 전에는 "
+    "**사용자에게 스킬 생성 완료를 알리지 마라.** ERROR 가 나오면 그 안의 `next_steps` 를 그대로 수행하고 다시 호출한다. "
+    "(이 도구가 시나리오와 채점 결과를 저장한다. **이 시나리오가 나중에 이 스킬의 병합 요청을 검토할 때 "
+    "\'변경 전 vs 변경 후\' 를 비교하는 검증의 입력이 되므로**, 이 단계를 건너뛴 스킬은 병합 전에 기존 동작이 "
+    "깨지는지 확인할 수단이 없다.)\n"
+    "6. **보고** — 게이트를 통과한 뒤에만 채팅에 **\'스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요.\'** 한 줄과 "
+    "테스트 통과율(스킬 적용 vs 대조군)을 짧게 남긴다"
     "— 단, **병합 요청(PR)을 올린 경우에는 이 문구를 쓰지 말고** PR 링크와 어디서 병합하는지"
-    "(스킬 상세 → 변경 이력 → 병합 요청)를 알려라. 그 경우 저장 버튼을 누를 일이 없다. "
-    "(process-definition.json·폼·DMN·에이전트·검증은 만들지 않는다). "
-    "아래 'BPMN/프로세스 생성' 절차는 사용자가 명시적으로 프로세스/워크플로/BPMN 을 만들라고 한 경우에만 적용된다.\n\n"
+    "(스킬 상세 → 변경 이력 → 병합 요청)를 알려라. 그 경우 저장 버튼을 누를 일이 없다.\n"
+    "결과 파일은 반드시 **이번 대화 전용 산출물 경로(아래 \'📁\' 섹션의 base) 바로 아래 `skills/<safe-name>/`** 에 만든다 — "
+    "즉 최종 경로는 `<base>/skills/<safe-name>/SKILL.md` 다. 이 경로여야 프론트 산출물 패널이 표시하고 사용자가 저장할 수 있다. "
+    "(`/workspace/.bpmn/skills/...` 처럼 base 를 빼고 쓰지 말 것 — 반드시 이 대화의 base 아래여야 한다.) "
+    "테스트 실행 산출물은 스킬 폴더가 아니라 `plan_skill_eval` 이 알려주는 `.skill-evals/` 아래에 둔다 — "
+    "스킬 폴더에 넣으면 저장되는 스킬 패키지에 섞인다.\n\n"
+
 )
 
 # 마찬가지로 BPMN/프로세스 생성 전용 — root_profile 이 있을 때는 배제한다.
@@ -190,6 +216,12 @@ async def build_agent(
     # HITL 도구와 달리 DRAFT 모드에서도 제외하지 않고 항상 제공한다.
     # tools += get_strategy_tools()
     # tools += get_web_tools()
+    # 스킬 평가/회귀 도구는 스킬 생성 절차(_SKILL_CREATION_DELEGATION)를 안내받는 대화에서만
+    # 의미가 있다. 워크아이템 실행(is_chat=False)이나 커스텀 프로필 대화에는 붙이지 않는다 —
+    # 그쪽은 스킬을 만들지 않으므로 도구 목록만 늘어난다.
+    if is_chat and not root_profile:
+        tools += get_skill_eval_tools()
+
     backend = get_or_create_sandbox(tenant_id, workspace_host=_BASE_DIR / "workspace", skills_host=_SKILLS_DIR)
     _skill_sandbox.set(backend)
     _skill_user_name.set((user_context or {}).get("user_name") or "")
@@ -368,6 +400,11 @@ async def build_agent(
     )
     if built_subagents:
         kwargs["subagents"] = built_subagents
+    # 스킬 생성 테스트 게이트: SKILL.md 만 쓰고 test-runner/evaluator 없이 턴을 끝내려 하면
+    # 모델 노드로 되돌린다. 스킬 생성 절차를 안내받는 대화(is_chat, 커스텀 프로필 아님)에만 붙인다.
+    if is_chat and not root_profile:
+        extra_middleware.append(SkillEvalGateMiddleware())
+
     kwargs["middleware"] = [build_tool_retry_middleware(), *extra_middleware]
 
     return create_deep_agent(**kwargs), _mcp_connectors, _mcp_tools_meta

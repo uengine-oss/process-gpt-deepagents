@@ -93,6 +93,11 @@ logger = logging.getLogger(__name__)
 _FILE_TOOL_NAMES = ("write_file", "edit_file", "write_process_definition", "update_process_definition")
 _FILE_ARTIFACT_MAX_BYTES = 400_000  # 미리보기에 과한 대용량 파일은 잘라 보냄
 
+# 스킬 평가(test-runner/evaluator) 실행 산출물 디렉터리. 회차마다 outputs/·grading.json 이
+# 수십 개씩 쌓이는 내부 작업 파일이라 사용자 산출물 패널에 띄우지 않는다 — 결과 요약은
+# complete_skill_creation 이 DB(skill_eval_runs/_results)에 남긴다.
+_EVAL_RUN_PATH_MARKER = "/.skill-evals/"
+
 # 채팅 산출물에서 스킬이 만든 hwpx 컨테이너 경로를 잡아내기 위한 패턴.
 _HWPX_PATH_RE = re.compile(r"/workspace/[^\s\"']+\.hwpx")
 
@@ -1592,7 +1597,12 @@ class DeepAgentExecutor(AgentExecutor):
                                             pending_task_calls[_tc_id] = _subagent_slug
                                     if streamer and tool_name in _FILE_TOOL_NAMES:
                                         _fp = (tool_args.get("file_path") or tool_args.get("path") or "") if isinstance(tool_args, dict) else ""
-                                        if _fp and _tc_id and str(_fp).startswith("/workspace"):
+                                        if (
+                                            _fp
+                                            and _tc_id
+                                            and str(_fp).startswith("/workspace")
+                                            and _EVAL_RUN_PATH_MARKER not in str(_fp)
+                                        ):
                                             pending_file_ops[_tc_id] = {
                                                 "path": str(_fp),
                                                 "op": "create" if tool_name in ("write_file", "write_process_definition") else "edit",
