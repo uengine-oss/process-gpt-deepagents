@@ -216,10 +216,12 @@ async def build_agent(
     # HITL 도구와 달리 DRAFT 모드에서도 제외하지 않고 항상 제공한다.
     # tools += get_strategy_tools()
     # tools += get_web_tools()
-    # 스킬 평가/회귀 도구는 스킬 생성 절차(_SKILL_CREATION_DELEGATION)를 안내받는 대화에서만
-    # 의미가 있다. 워크아이템 실행(is_chat=False)이나 커스텀 프로필 대화에는 붙이지 않는다 —
-    # 그쪽은 스킬을 만들지 않으므로 도구 목록만 늘어난다.
-    if is_chat and not root_profile:
+    # 스킬 평가/회귀 도구는 채팅 대화 전반에 붙인다. 처음에는 "커스텀 프로필 대화는 스킬을
+    # 만들지 않는다" 고 보고 root_profile 일 때 제외했는데, 실측에서 정반대였다 — 정의체계도
+    # 메인 채팅은 담당 에이전트가 루트로 승격돼 **항상 root_profile 이 잡히고**, 스킬은 바로
+    # 거기서 만들어진다. 그 결과 스킬을 만드는 자리에서만 게이트와 도구가 빠져 있었다.
+    # 워크아이템 실행(is_chat=False)에는 여전히 붙이지 않는다.
+    if is_chat:
         tools += get_skill_eval_tools()
 
     backend = get_or_create_sandbox(tenant_id, workspace_host=_BASE_DIR / "workspace", skills_host=_SKILLS_DIR)
@@ -400,9 +402,10 @@ async def build_agent(
     )
     if built_subagents:
         kwargs["subagents"] = built_subagents
-    # 스킬 생성 테스트 게이트: SKILL.md 만 쓰고 test-runner/evaluator 없이 턴을 끝내려 하면
-    # 모델 노드로 되돌린다. 스킬 생성 절차를 안내받는 대화(is_chat, 커스텀 프로필 아님)에만 붙인다.
-    if is_chat and not root_profile:
+    # 스킬 생성 테스트 게이트: SKILL.md 만 쓰고 테스트 없이 턴을 끝내려 하면 모델 노드로
+    # 되돌린다. 채팅 대화 전반에 붙인다(위 도구 부착과 같은 이유 — 스킬은 root_profile 이
+    # 잡힌 메인 채팅에서 만들어진다). 스킬을 만들지 않은 턴에는 아무 일도 하지 않는다.
+    if is_chat:
         extra_middleware.append(SkillEvalGateMiddleware())
 
     kwargs["middleware"] = [build_tool_retry_middleware(), *extra_middleware]

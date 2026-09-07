@@ -436,6 +436,82 @@ def test_스킬_생성이_아닌_대화에는_개입하지_않는다(ws):
     assert mw.after_model(state, None) is None
 
 
+def test_skills_폴더_밖에_쓴_SKILL_md_도_스킬_생성으로_본다(ws):
+    """실측 사례: 에이전트가 `<room>/<name>/SKILL.md` (중간 skills/ 없음)에 썼다.
+
+    경로 규칙은 프롬프트가 시키는 것일 뿐이라 지켜지지 않을 수 있고, 그때 게이트가
+    침묵하면 테스트 없이 완료로 끝난다 — 이 미들웨어가 막으려던 바로 그 상황이다.
+    """
+    mw = SkillEvalGateMiddleware()
+    off_convention = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "write_file",
+            "args": {
+                "file_path": f"/workspace/.bpmn/{ROOM}/meeting-room-booking-review/SKILL.md",
+                "content": "---",
+            },
+            "id": "call_1",
+        }],
+    )
+    state = {"messages": [
+        HumanMessage(content="회의실 예약 검토 스킬 만들어줘"),
+        off_convention,
+        ToolMessage(content="ok", name="write_file", tool_call_id="call_1"),
+        _final_answer(),
+    ]}
+
+    out = mw.after_model(state, None)
+    assert out is not None, "skills/ 밖 경로라는 이유로 게이트가 침묵했다"
+    assert out["jump_to"] == "model"
+    assert "meeting-room-booking-review" in out["messages"][0].content
+
+
+def test_서브에이전트가_만든_스킬도_작업_폴더로_알아챈다(ws):
+    """실측 사례: SKILL.md 를 `task()` 로 위임해 만들면 루트 스레드엔 task 만 남는다.
+
+    쓰기 호출이 서브에이전트 쪽에 있어 메시지만 봐서는 스킬 생성을 못 알아보고,
+    게이트가 침묵한 채 테스트 없이 완료로 끝났다.
+    """
+    _write_skill(ws)  # 서브에이전트가 남긴 결과물이 작업 폴더에 있다.
+    mw = SkillEvalGateMiddleware()
+    delegated = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "task",
+            "args": {"subagent_type": "general-purpose", "description": "스킬 초안 작성"},
+            "id": "call_1",
+        }],
+    )
+    state = {"messages": [
+        HumanMessage(content="회의실 예약 검토 스킬 만들어줘"),
+        delegated,
+        ToolMessage(content="완료", name="task", tool_call_id="call_1"),
+        _final_answer(),
+    ]}
+
+    out = mw.after_model(state, None)
+    assert out is not None, "위임으로 만든 스킬이라 게이트가 침묵했다"
+    assert out["jump_to"] == "model"
+
+
+def test_읽기만_한_턴에는_작업_폴더에_스킬이_있어도_개입하지_않는다(ws):
+    """같은 방에서 나중에 스킬을 묻기만 하는 턴까지 막으면 대화가 진행되지 않는다."""
+    _write_skill(ws)
+    mw = SkillEvalGateMiddleware()
+    state = {"messages": [
+        HumanMessage(content="아까 만든 스킬 설명해줘"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "read_file", "args": {"file_path": "x"}, "id": "c1"}],
+        ),
+        ToolMessage(content="...", name="read_file", tool_call_id="c1"),
+        _final_answer("이 스킬은 …"),
+    ]}
+
+    assert mw.after_model(state, None) is None
+
+
 def test_아직_도구를_부르는_중이면_개입하지_않는다(ws):
     mw = SkillEvalGateMiddleware()
     state = {"messages": [

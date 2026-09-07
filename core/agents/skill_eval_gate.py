@@ -33,8 +33,15 @@ logger = logging.getLogger(__name__)
 # 이 미들웨어가 끼워 넣은 메시지 표식 — 개입 횟수를 셀 때 쓴다.
 _NUDGE_MARKER = "[skill-eval-gate]"
 
-# `<...>/skills/<skill-name>/SKILL.md` 에서 스킬 루트를 뽑는다.
-_SKILL_MD_RE = re.compile(r"^(?P<dir>.*/skills/[^/]+)/SKILL\.md$", re.IGNORECASE)
+# SKILL.md 를 쓴 폴더가 곧 스킬 루트다.
+#
+# 처음에는 `<...>/skills/<name>/SKILL.md` 만 인식했는데, 그 경로 규칙은 프롬프트가
+# 시키는 것일 뿐 모델이 늘 지키지 않는다 — 실제로 에이전트가
+# `/workspace/.bpmn/<room>/<name>/SKILL.md` (중간 `skills/` 없음)에 쓰는 바람에
+# 게이트가 스킬 생성 턴으로 보지 못했고, 테스트 없이 "스킬을 생성했어요" 로 끝났다.
+# 이 미들웨어의 존재 이유가 "프롬프트를 안 지켜도 막는 것" 이므로, 경로 규칙 준수를
+# 전제하지 않는다. 쓰기(write/edit)로 만들어진 SKILL.md 는 어디에 있든 스킬 저작이다.
+_SKILL_MD_RE = re.compile(r"^(?P<dir>.+)/SKILL\.md$", re.IGNORECASE)
 
 # 게이트를 통과했다고 인정하는 도구.
 _GATE_TOOLS = ("complete_skill_creation", "complete_skill_regression")
@@ -75,6 +82,48 @@ def _last_written_skill_dir(messages: list[Any]) -> str:
     return found
 
 
+# 스킬 저작으로 볼 만한 도구. 읽기만 한 턴(질문·설명)에는 개입하지 않기 위한 조건이다.
+_AUTHORING_TOOLS = ("write_file", "edit_file", "task")
+
+
+def _authored_something(messages: list[Any]) -> bool:
+    return any(
+        call.get("name") in _AUTHORING_TOOLS
+        for msg in messages
+        if isinstance(msg, AIMessage)
+        for call in _tool_calls(msg)
+    )
+
+
+def _skill_dir_in_workspace() -> str:
+    """이 대화 작업 폴더에 만들어져 있는 스킬 폴더(SKILL.md 가 있는 곳).
+
+    루트 메시지만 봐서는 스킬 생성을 놓친다 — `task()` 로 위임하면 SKILL.md 를 쓴
+    write_file 은 **서브에이전트의 메시지**에 남고 루트 스레드에는 task 호출만 보인다.
+    실측에서 이 경로로 만들어진 스킬이 게이트를 그대로 통과했다. 그래서 메시지에서
+    못 찾으면 작업 폴더를 직접 본다 — 누가 썼든 결과물은 같은 자리에 남는다.
+    """
+    try:
+        from ..skills.tools import _bpmn_work_dir
+
+        base = _bpmn_work_dir()
+    except Exception:  # 작업 폴더를 알 수 없으면 판단하지 않는다.
+        return ""
+    if not base.is_dir():
+        return ""
+
+    found: list[Any] = []
+    for path in base.glob("**/SKILL.md"):
+        # 평가 실행 산출물 안에 복사된 사본은 스킬 원본이 아니다.
+        if any(part in (".skill-evals", "outputs") for part in path.parts):
+            continue
+        found.append(path)
+    if not found:
+        return ""
+    newest = max(found, key=lambda p: p.stat().st_mtime)
+    return str(newest.parent)
+
+
 def _gate_passed(messages: list[Any]) -> bool:
     """게이트 도구가 성공(ERROR 아님)으로 반환된 적이 있는가."""
     for msg in messages:
@@ -113,7 +162,8 @@ class SkillEvalGateMiddleware(AgentMiddleware):
     """스킬을 만들어 놓고 테스트 없이 턴을 끝내려 하면 모델 노드로 되돌린다.
 
     개입 조건(모두 만족할 때만):
-      1. 이 스레드에서 `<...>/skills/<name>/SKILL.md` 를 write/edit 했다.
+      1. 이 스레드에서 SKILL.md 를 write/edit 했거나(경로 규칙과 무관),
+         무언가를 저작한 턴이면서 이 대화 작업 폴더에 SKILL.md 가 있다(서브에이전트 위임).
       2. 마지막 AI 메시지에 도구 호출이 없다(= 턴을 끝내려 한다).
       3. `complete_skill_creation`/`complete_skill_regression` 이 성공한 적이 없다.
       4. 사용자가 테스트 생략을 요청하지 않았다.
@@ -135,6 +185,8 @@ class SkillEvalGateMiddleware(AgentMiddleware):
             return None  # 아직 도구를 부르는 중 — 턴이 끝나지 않았다.
 
         skill_dir = _last_written_skill_dir(messages)
+        if not skill_dir and _authored_something(messages):
+            skill_dir = _skill_dir_in_workspace()
         if not skill_dir:
             return None  # 스킬 생성 턴이 아니다.
 
