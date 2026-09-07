@@ -28,6 +28,7 @@ from processgpt_agent_sdk import ProcessGPTAgentServer
 from core.api.skills_router import routes as skills_routes
 from core.api.file_download import routes as file_download_routes
 from core.api.chat_stream_attach import routes as chat_stream_attach_routes
+from core.api.chat_stop import routes as chat_stop_routes
 from core.chat.inflight_registry import start_cancel_listener
 from core.skills.local_system_skills import seed_local_system_skills
 from executor import DeepAgentExecutor
@@ -64,6 +65,7 @@ async def main() -> None:
         *skills_routes,
         *file_download_routes,
         *chat_stream_attach_routes,
+        *chat_stop_routes,
     ])
     server.mount_chat_sse(app, path="/chat/stream")
 

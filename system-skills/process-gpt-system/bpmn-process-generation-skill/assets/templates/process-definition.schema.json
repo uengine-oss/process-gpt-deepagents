@@ -1,5 +1,5 @@
 {
-  "_comment": "ProcessGPT 프로세스 정의 JSON 스키마 예시. 이 파일은 참고용 예시이며 실제 산출물은 .bpmn/process-definition.json 입니다. 주석(_comment)은 실제 산출물에 넣지 마세요(JSON 주석/설명 금지). id는 영문 소문자+언더스코어, 이름/설명은 한글.",
+  "_comment": "ProcessGPT 프로세스 정의 JSON 스키마 예시. 이 파일은 참고용 예시이며 실제 산출물은 <프로세스폴더>/process-definition.json 입니다. 주석(_comment)은 실제 산출물에 넣지 마세요(JSON 주석/설명 금지). id는 영문 소문자+언더스코어, 이름/설명은 한글.",
 
   "megaProcessId": "인사관리",
   "majorProcessId": "근태관리",

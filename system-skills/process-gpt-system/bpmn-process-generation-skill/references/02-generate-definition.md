@@ -4,7 +4,7 @@
 
 > 이 규칙은 ProcessGPT 의 `process_definition_prompt.py` / `process_generation_messages.py` 의 생성 전용(Create-Only) 규칙을 옮긴 것입니다. 임의로 바꾸지 마세요.
 
-산출물: `.bpmn/process-definition.json` (이후 4·5·6단계에서 같은 파일을 계속 업데이트)
+산출물: `<프로세스폴더>/process-definition.json` (이후 단계에서 같은 파일을 계속 업데이트)
 
 전체 스키마 예시는 [assets/templates/process-definition.schema.json](../assets/templates/process-definition.schema.json) 에 있습니다. 이 reference 와 함께 보세요.
 
@@ -12,7 +12,7 @@
 
 ## 작업 정의 (생성 전용)
 
-- 너의 작업은 단 하나: **합의된 흐름 초안(`.bpmn/01-consulting.md`)에 기반해 프로세스 정의 JSON 한 개를 생성**하는 것.
+- 너의 작업은 단 하나: **1단계에서 사용자가 승인한 흐름 초안에 기반해 프로세스 정의 JSON 한 개를 생성**하는 것.
 - 질의(askProcessDef) 응답이나 수정(modifications) 형식은 이 단계에서 쓰지 않는다. (수정 형식은 4~6단계 업데이트 시 사용 — 아래 "프로세스 변경" 참조)
 - `{"processDefinition":{...}}` 처럼 중첩 래퍼로 감싸지 말 것. **최상위에 `processDefinitionId`, `processDefinitionName`, `elements`** 가 있어야 한다.
 - 창작이 아니라, 합의된 흐름을 **안정적이고 일관된 BPMN 구조로 정리**하는 것이 목표. 명시적 근거 없는 새 단계/새 역할/새 게이트웨이를 만들지 말 것.
@@ -211,17 +211,17 @@
 
 ## 출력 형식
 
-- 산출물 `.bpmn/process-definition.json`에 **valid JSON 객체 1개**를 `Write` 도구로 저장한다. 마크다운/설명/코드펜스/주석 없이 순수 JSON.
+- 산출물 `<프로세스폴더>/process-definition.json` 에 **valid JSON 객체 1개**를 `write_file` 로 저장한다. 마크다운/설명/코드펜스/주석 없이 순수 JSON.
 - 설명이 필요하면 JSON 의 `description`/`instruction`/`trigger` 같은 **필드 값(문자열)** 안에 넣는다.
 - 파일에 쓴 뒤, 사용자에게는 자연어로 요약해 보여준다 (사용자에게 raw JSON 을 들이밀지 말 것):
 
-> "프로세스 정의를 만들었어요. **[프로세스명]** — 시작은 [트리거], 단계는 ①~ ②~ ③~ 이고, [분기설명] 갈림길이 있습니다. 역할은 [역할목록] 입니다. (`.bpmn/process-definition.json`)"
+> "프로세스 정의를 만들었어요. **[프로세스명]** — 시작은 [트리거], 단계는 ①~ ②~ ③~ 이고, [분기설명] 갈림길이 있습니다. 역할은 [역할목록] 입니다."
 
 ---
 
 ## 프로세스 변경(수정) 형식 — 4~6단계에서 사용
 
-2단계는 **새로 생성**이지만 이후 단계는 기존 JSON을 **수정**한다. 기존 요소를 바꿀 때는 전체 재생성이 아니라 `Edit` 도구로 요소 ID 기준 해당 필드만 갱신한다(old_string 을 충분히 구체적으로 잡아 다른 요소를 건드리지 않게 한다). 개념적으로는 ProcessGPT의 `modifications` 형식과 동일하다:
+1단계는 **새로 생성**이지만 이후 단계는 기존 JSON을 **수정**한다. 기존 요소를 바꿀 때는 전체 재생성이 아니라 `edit_file` 로 요소 ID 기준 해당 필드만 갱신한다(old_string 을 충분히 구체적으로 잡아 다른 요소를 건드리지 않게 한다). 개념적으로는 ProcessGPT의 `modifications` 형식과 동일하다:
 
 ```json
 {
@@ -239,7 +239,7 @@
 - Sequence 는 replace 없음 — add 또는 delete 만.
 - 기존 요소의 위치/이름을 임의로 바꾸지 않는다.
 
-> 이 skill에서는 modifications를 `Edit` 도구로 필요한 필드만 정밀 치환합니다. 요소 추가·삭제 같은 구조 변경만 완전한 객체를 `Write`로 다시 씁니다.
+> 이 skill에서는 modifications를 `edit_file` 로 필요한 필드만 정밀 치환합니다. 요소 추가·삭제 같은 구조 변경만 완전한 객체를 `write_file` 로 다시 씁니다.
 
 ---
 

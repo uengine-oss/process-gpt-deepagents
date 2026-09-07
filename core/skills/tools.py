@@ -166,20 +166,35 @@ def write_upload_to_workspace(file_name: str, content: bytes) -> str:
     return f"/workspace/uploads/{safe}"
 
 
+_SKILL_NAME = "bpmn-process-generation-skill"
+
+
 def _skill_scripts_dir() -> Path | None:
-    """bpmn-process-generation-skill 의 scripts 디렉토리(호스트)를 찾는다 (검증/flatten 재사용)."""
-    repo_skills = Path(__file__).parent.parent.parent / "skills"
-    for c in sorted(repo_skills.glob("**/bpmn-process-generation-skill/scripts")):
-        if c.is_dir():
-            return c
+    """bpmn-process-generation-skill 의 scripts 디렉토리(호스트)를 찾는다 (검증/flatten 재사용).
+
+    번들 원본(`system-skills/process-gpt-system/`)을 **항상 먼저** 본다. 예전에는
+    `skills/**` 를 glob 해 사전순 첫 히트를 썼는데, 개발 환경에 남은 테넌트 사본
+    (`skills/<tenant>/bpmn-process-generation-skill/`)이 'p'(process-gpt-system)보다
+    앞서 잡혀 **오래된 검증 스크립트가 로드**되는 일이 있었다. 원본을 고정 우선으로
+    두면 어떤 환경에서도 같은 검증기를 쓴다.
+    """
+    from .local_system_skills import SYSTEM_COLLECTION_NAME, _resolve_skills_root
+
+    base = Path(__file__).parent.parent.parent
+    candidates = [
+        base / "system-skills" / SYSTEM_COLLECTION_NAME / _SKILL_NAME / "scripts",
+    ]
     try:
-        from .skills import _get_skills
-        for p in (_get_skills(_current_tenant_id.get()) or []):
-            sc = Path(p) / "scripts"
-            if sc.is_dir():
-                return sc
+        candidates.append(_resolve_skills_root() / SYSTEM_COLLECTION_NAME / _SKILL_NAME / "scripts")
     except Exception:
         pass
+    for c in candidates:
+        if c.is_dir():
+            return c
+    # 최후 폴백: 어디든 남아있는 사본(사전순 고정).
+    for c in sorted((base / "skills").glob(f"**/{_SKILL_NAME}/scripts")):
+        if c.is_dir():
+            return c
     return None
 
 
@@ -1781,7 +1796,9 @@ def _capture_selection_to_manifest(answer: str) -> None:
     room = _bpmn_work_dir()
     if not room.exists():
         return
-    proc_dirs = sorted([d for d in room.glob("process-*") if d.is_dir()]) or [room]
+    # 이번 생성 시도의 폴더만 대상으로 한다. 예전 시도가 남긴 stale `process-*` 폴더에
+    # 선택 결과를 병합하면 완료 단계가 엉뚱한 프로세스에 스킬/에이전트를 붙인다.
+    proc_dirs = process_work_dirs(room, _current_conversation_id.get()) or [room]
     for d in proc_dirs:
         mf = d / "manifest.json"
         man: dict = {}

@@ -1,14 +1,16 @@
-﻿# 07 – Forms: 액티비티 입력 폼(HTML) 생성 + JSON 반영
+﻿# 07 – Forms: 액티비티 입력 폼 생성 + JSON 반영
 
-> 📁 **경로 주의**: 아래 `.bpmn/forms/...` 는 **현재 작업 디렉토리(cwd) 하위의 `.bpmn/forms/`** 를 뜻한다(여러 프로세스면 `.bpmn/<NN>-<slug>/forms/`).
+> 📁 **경로·확장자 주의**: 폼은 `<프로세스폴더>/forms/<activity_id>.form` 에 만든다.
+> 확장자는 **`.form`** 이고 파일명(stem)은 **activity id 와 정확히 같아야** 한다 — 이 규칙으로
+> 폼과 액티비티가 매칭된다.
 
 **목적**: 각 UserActivity 에서 사람이 입력할 **폼(HTML)** 을 만든다. 폼은 정해진 컴포넌트 태그와 그리드 규칙을 그대로 따라야 한다(프론트가 이 규격으로 렌더). 만든 폼을 Activity 의 `tool` 에 `formHandler:<form_id>` 로 연결한다.
 
 > 이 규칙은 pdf2bpmn 의 폼 생성기(FormDesignGenerator 스타일) 컴포넌트 규격을 옮긴 것입니다. 전체 컴포넌트 목록은 [assets/templates/form-components.md](../assets/templates/form-components.md) 참조.
 
 산출물:
-- `.bpmn/forms/<activity_id>.html` (Activity 마다 1개)
-- `process-definition.json` 업데이트 (`activity.tool = "formHandler:<form_id>"`)
+- `<프로세스폴더>/forms/<activity_id>.form` (UserActivity 마다 1개)
+- `process-definition.json` 업데이트 (`activity.tool = "formHandler:<activity_id>"`)
 
 ---
 
@@ -78,7 +80,12 @@
 
 ## form_id 규칙
 
-`form_id` 는 영문 소문자·언더스코어. 권장 형식: `<프로세스id>_<activity_id>_form` (하이픈은 `_` 로). 예: `leave_request_apply_leave_form`.
+작성 시점에는 **`form_id` = `activity_id`** 를 쓴다. 즉 `"tool": "formHandler:<activity_id>"`.
+저장용 최종 id(`<프로세스uuid>_<activity_id>_form`)는 마무리 단계가 자동으로 치환하므로
+**직접 uuid 를 지어내지 마라.** 참조정보(08)도 같은 규칙으로 `<activity_id>.<field_name>`
+을 쓰면 된다.
+
+`activity_id` 는 영문 소문자·언더스코어여야 한다(02 규칙과 동일).
 
 폴백(정보 부족) 최소 폼:
 ```html
@@ -95,16 +102,17 @@
 
 ## 프로세스 정의 JSON 반영
 
-- 각 Activity 에 `"tool": "formHandler:<form_id>"` 를 설정한다.
-- 폼 HTML 은 `.bpmn/forms/<activity_id>.html` 로 저장.
-- (참조정보 단계를 위해) 각 폼의 `form_id` 와 필드 `name` 목록을 기억해 둔다 — 6단계 inputData/conditionData 가 `<form_id>.<field_name>` 형식을 쓴다.
+- 각 Activity 에 `"tool": "formHandler:<activity_id>"` 를 설정한다.
+- 폼은 `<프로세스폴더>/forms/<activity_id>.form` 로 저장(`write_file`).
+- (참조정보 단계를 위해) 각 폼의 필드 `name` 목록을 기억해 둔다 — 참조정보(08)가
+  `<activity_id>.<field_name>` 형식을 쓴다.
 
 ---
 
-> **이 단계는 자동 실행이다.** 3단계 답변 직후 별도 확인 없이 모든 UserActivity 폼을 생성한다. 폼 생성 결과를 여기서 따로 길게 보고하지 말고(중간 멈춤 금지), 곧바로 6단계(참조정보)로 이어간 뒤 **마지막에 한 번** 통합 요약한다.
+> **이 단계는 자동 실행이다.** 2단계 답변 직후 별도 확인 없이 모든 UserActivity 폼을 생성한다. 폼 생성 결과를 여기서 따로 길게 보고하지 말고(중간 멈춤 금지), 곧바로 참조정보(08)로 이어간다.
 
 ## 다음 단계 연결 (자동)
 
-폼을 모두 만들고 `activity.tool` 을 연결했으면, **확인 질문 없이 곧바로** [08-reference-info.md](08-reference-info.md) 를 로드해 6단계(참조정보 연결)로 진입한다. 폼만 따로 요약·확인하지 않는다 — 최종 요약은 8단계 "완료 안내" 에서 폼·참조정보를 함께 보고한다.
+폼을 모두 만들고 `activity.tool` 을 연결했으면, **확인 질문 없이 곧바로** [08-reference-info.md](08-reference-info.md) 를 로드해 참조정보 연결로 진입한다. 폼만 따로 요약·확인하지 않는다.
 
 > 사용자가 나중에 특정 폼을 고치고 싶다고 하면 해당 파일만 다시 만든다(최종 요약에서 "수정 가능" 안내).

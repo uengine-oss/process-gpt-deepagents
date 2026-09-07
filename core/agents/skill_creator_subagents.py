@@ -4,7 +4,8 @@ build_skill_creator_subagents()를 호출해 SubAgent 목록을 얻은 뒤
 build_agent(static_subagents=...) 로 전달한다.
 
 포함된 서브에이전트:
-  repo-scout      — skill 생성 전 Git 레포에 동일 스킬이 있는지 탐색
+  skill-creator   — SKILL.md(+부속 파일)를 지정된 경로에 작성
+  repo-scout      — skill 생성 전 Git 레포에 동일 스킬이 있는지 탐색 (현재 파이프라인에서는 제외)
   rule-extractor  — Supabase storage 문서를 60/40 분할해 규칙 추출
   test-runner     — eval 프롬프트를 스킬 유무에 따라 실행하고 출력 저장
   evaluator       — grader.md 지침으로 assertion 채점 및 grading.json 생성
@@ -12,6 +13,7 @@ build_agent(static_subagents=...) 로 전달한다.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from deepagents import SubAgent
@@ -22,6 +24,8 @@ from ..skills.tools import (
     list_git_repos,
 )
 from ..storage.storage import download_file
+
+logger = logging.getLogger(__name__)
 
 _BASE_DIR = Path(__file__).parent.parent.parent
 
@@ -92,6 +96,77 @@ Decision rules:
   descriptions only.
 - Do NOT create, push, or modify any repository.
 - Return ONLY the JSON block as your final answer.
+"""
+
+
+# ---------------------------------------------------------------------------
+# 스킬 작성 서브에이전트 시스템 프롬프트
+# ---------------------------------------------------------------------------
+
+_SKILL_CREATOR_SYSTEM = """You are the **skill-creator sub-agent**. You author one reusable Agent Skill as
+files on disk and return a short receipt. You never save to a database, never
+publish to Git, and never talk to the end user.
+
+## Inputs (given in the task description)
+
+  - `output_path`: ABSOLUTE path of the SKILL.md to write
+    (e.g. `/workspace/.bpmn/<room>/process-<id>/skills/<safe-name>/SKILL.md`).
+    Write exactly there — do not invent a different directory.
+  - `skill_name`: the skill's name (may be Korean).
+  - `purpose` / `context`: what the skill must do, plus the activities, roles,
+    inputs and outputs it supports. Use every detail you are given.
+
+## Steps
+
+1. If a reference skill (`/skills/anthropics-skills/skill-creator/SKILL.md`) is
+   readable and you are unsure about format, skim it. Otherwise go straight on —
+   do NOT run its evaluation/benchmark pipeline. No evals, no test runs.
+2. `write_file` the SKILL.md at `output_path` using the template below.
+3. Only if the procedure genuinely needs them, add supporting files next to it
+   (`references/<topic>.md`, `scripts/<name>.py`). Keep it to at most two.
+4. Return one line: `created: <output_path>` plus the frontmatter name.
+
+## SKILL.md template (follow exactly)
+
+```markdown
+---
+name: <skill name — same as skill_name>
+description: <2~4 sentences, Korean. What it does, and the concrete user
+  phrasings/situations that should trigger it. Be specific enough that another
+  agent can decide correctly from this line alone.>
+---
+
+# <skill name>
+
+## 언제 쓰나
+- <trigger 1>
+- <trigger 2>
+
+## 입력
+- <what the performer needs before starting — form fields, documents, prior outputs>
+
+## 절차
+1. <step — imperative, checkable>
+2. <step>
+3. <step>
+
+## 출력 계약
+- <named output 1>: <format/criteria>
+- <named output 2>: <format/criteria>
+
+## 주의
+- <pitfall / rule to never break>
+```
+
+## Rules
+
+- Korean body text. `name` may be Korean; the **directory name in
+  `output_path` is fixed by the caller** — never rename it.
+- Concrete over generic: no "적절히 처리한다" filler. Every step must be
+  something a person or agent can actually execute and verify.
+- Placeholders (`TODO`, `<...>` left unfilled, empty sections) are failures.
+- Do not create process definitions, forms, DMN, or agent profiles — that is the
+  caller's job. You produce the skill files only.
 """
 
 
@@ -408,7 +483,18 @@ Then follow the grading instructions below precisely.
 def _build_evaluator_system(skill_creator_path: Path) -> str:
     """grader.md 내용을 포함한 평가 서브에이전트 시스템 프롬프트를 빌드한다."""
     grader_path = skill_creator_path / "agents" / "grader.md"
-    grader_instructions = grader_path.read_text() if grader_path.exists() else ""
+    # encoding 을 명시하지 않으면 Windows 로컬 실행에서 cp949 로 열려 UnicodeDecodeError 가
+    # 나고, 그 예외가 build_skill_creator_subagents → executor 까지 올라가 채팅 턴 전체가
+    # 실패한다. 파일이 깨져 있어도 서브에이전트 구성을 막지 않도록 errors 도 완화한다.
+    try:
+        grader_instructions = (
+            grader_path.read_text(encoding="utf-8", errors="replace")
+            if grader_path.exists()
+            else ""
+        )
+    except OSError:
+        logger.warning("skill-creator grader.md 읽기 실패 — 평가 지침 없이 진행", exc_info=True)
+        grader_instructions = ""
 
     task_suffix = f"""
 ---
@@ -480,6 +566,21 @@ def build_skill_creator_subagents(
         "tools": [list_git_repos],
     }
 
+    skill_creator: SubAgent = {
+        "name": "skill-creator",
+        "description": (
+            "Authors ONE reusable Agent Skill (SKILL.md, plus optional references/ or "
+            "scripts/) at an absolute output path you provide. Use this whenever a skill "
+            "has to be created — standalone skill requests, and the skill candidates "
+            "selected during BPMN process generation. "
+            "Pass `output_path` (absolute path of the SKILL.md to write), `skill_name`, "
+            "and rich `context` (the activities, roles, inputs and outputs the skill "
+            "supports) in the task description. It writes the files and returns a one-line "
+            "receipt — it does not save to a database, publish to Git, or run evals."
+        ),
+        "system_prompt": _SKILL_CREATOR_SYSTEM,
+    }
+
     rule_extractor: SubAgent = {
         "name": "rule-extractor",
         "description": (
@@ -528,4 +629,4 @@ def build_skill_creator_subagents(
     # 스킬은 워크스페이스에 SKILL.md 로 생성되고 프론트가 저장(zip 업로드)하므로 git 접근이 없어야 한다.
     # → list_git_repos/checkout 호출로 step 을 낭비하지 않도록 repo-scout 을 제외한다.
     _ = repo_scout  # 정의는 유지(향후 git 연동 옵션용)하되 파이프라인에선 제외.
-    return [rule_extractor, test_runner, evaluator]
+    return [skill_creator, rule_extractor, test_runner, evaluator]

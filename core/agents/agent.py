@@ -21,10 +21,6 @@ from ..skills.tools import (
     list_git_repos,
     publish_skill,
     register_skill_as_tenant,
-    write_process_definition,
-    update_process_definition,
-    validate_process_definition,
-    complete_process_generation,
     bpmn_container_base,
     canonical_process_dir_name,
     _current_sandbox as _skill_sandbox,
@@ -56,14 +52,6 @@ DEFAULT_SYSTEM_PROMPT = (
     "**generic 도구나 스스로 아는 지식으로 우회 답변하지 말고 그 스킬의 SKILL.md 를 read_file 로 읽어 절차를 따른다.** "
     "아래 'BPMN/프로세스 생성' 절차가 이 프롬프트의 대부분을 차지한다고 해서 이 에이전트가 BPMN 생성 전용이라고 "
     "판단하지 마라 — 스킬 목록에 있는 다른 스킬(예: bsc-strategy-interview)이 더 맞으면 그것부터 읽는다.\n\n"
-    "## 웹페이지 조회 도구 사용 원칙\n"
-    "`fetch_webpage` 도구가 있다. 사용자가 회사 도메인·URL·회사명을 언급했고(예: 'uengine.org 라는 회사의 전략을 "
-    "수립하고 싶어') 그 회사 정보가 필요한 작업(전략 수립, 프로세스 추천 등)이면, **사용자에게 회사 사업모델·제품을 "
-    "설명해 달라고 되묻는 대신 `fetch_webpage` 를 그 도메인으로 직접 호출**해 실제 내용을 확인한다. "
-    "단, 로딩된 스킬(SKILL.md)이 이보다 먼저 해야 할 단계를 명시했다면(예: 기존 데이터 존재 여부 확인 등) "
-    "그 스킬의 순서를 따른다 — 이 원칙은 '사용자에게 설명을 요구하지 말라'는 것이지 '다른 모든 단계보다 "
-    "무조건 먼저 하라'는 뜻이 아니다. "
-    "본문이 비어있거나(notice 필드) 조회 실패면 그때만 사용자에게 보충 정보나 다른 URL을 요청한다.\n\n"
     "그 스킬이 이미 정의한 작업에 대해서는, 같은 목적의 조직도/사용자/프로세스 조회 도구를 호출하거나 "
     "사용자 토큰·테넌트 ID 등 자격정보를 사용자에게 요청하지 않는다(필요한 값은 환경변수로 주입되며, 역할 등은 스킬 절차가 정한다). "
     "반대로 단순 조회·일반 대화 등 스킬과 무관한 요청은 적절한 도구로 바로 처리한다.\n\n"
@@ -76,9 +64,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "'1) … → 2) …' 제시)이나 승인/반려 질문을 절대 시작하지 마라. \n"
     "이때 **프로세스 생성 절차(컨설팅·process-definition.json·폼·DMN·에이전트·검증)를 시작하지 말고** "
     "`skill-creator` 서브에이전트에 `task()` 로 위임해 정식 스킬(YAML frontmatter `name`/`description` + progressive disclosure SOP 절차)을 만든다. "
-    "업로드 문서의 내용이 필요하면 `search_documents`(임베딩됨)로 읽어 스킬의 references/ 로 반영한다. "
+    "위임할 때 task 설명에 **`output_path`(쓸 SKILL.md 의 절대경로)·`skill_name`·`context`(무엇을 하는 스킬인지, "
+    "입력·절차·출력)를 반드시 함께 적는다** — 이 값이 없으면 서브에이전트가 엉뚱한 경로에 만든다. "
+    "업로드 문서의 내용이 필요하면 `search_documents`(임베딩됨)로 먼저 읽어 그 요약을 `context` 에 담는다. "
     "결과 파일은 반드시 **이번 대화 전용 산출물 경로(아래 '📁' 섹션의 base) 바로 아래 `skills/<safe-name>/SKILL.md`** "
-    "(및 부속 파일: scripts/·references/ 등)로 `write_file` 한다 — 즉 최종 경로는 `<base>/skills/<safe-name>/SKILL.md` 이며 "
+    "(및 부속 파일: scripts/·references/ 등)에 만든다 — 즉 `output_path` 는 `<base>/skills/<safe-name>/SKILL.md` 이며 "
     "**프로세스 폴더(process-…)는 만들지 않는다.** 이 경로여야 프론트 산출물 패널이 표시하고 사용자가 저장할 수 있다. "
     "(`/workspace/.bpmn/skills/...` 처럼 base 를 빼고 쓰지 말 것 — 반드시 이 대화의 base 아래여야 한다.) "
     "완료하면 채팅엔 **'스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요.'** 한 줄만 남긴다"
@@ -95,6 +85,19 @@ DEFAULT_SYSTEM_PROMPT = (
     "날짜/시간 형식 등)을 스스로 진단해 인자를 고쳐 즉시 다시 호출한다.** 같은 인자로 무의미하게 반복하지 말고, "
     "에러 내용에 맞춰 값을 보정한다. 실패를 그대로 사용자에게 보고하고 멈추지 말 것 — 합리적인 보정을 몇 차례 "
     "시도해도 계속 실패할 때만 무엇이 실패했는지 사용자에게 알린다.\n"
+)
+
+
+WEB_FETCH_PROMPT = (
+    "\n\n"
+    "## 웹페이지 조회 도구 사용 원칙\n"
+    "`fetch_webpage` 도구가 있다. 사용자가 회사 도메인·URL·회사명을 언급했고(예: 'uengine.org 라는 회사의 전략을 "
+    "수립하고 싶어') 그 회사 정보가 필요한 작업(전략 수립, 프로세스 추천 등)이면, **사용자에게 회사 사업모델·제품을 "
+    "설명해 달라고 되묻는 대신 `fetch_webpage` 를 그 도메인으로 직접 호출**해 실제 내용을 확인한다. "
+    "단, 로딩된 스킬(SKILL.md)이 이보다 먼저 해야 할 단계를 명시했다면(예: 기존 데이터 존재 여부 확인 등) "
+    "그 스킬의 순서를 따른다 — 이 원칙은 '사용자에게 설명을 요구하지 말라'는 것이지 '다른 모든 단계보다 "
+    "무조건 먼저 하라'는 뜻이 아니다. "
+    "본문이 비어있거나(notice 필드) 조회 실패면 그때만 사용자에게 보충 정보나 다른 URL을 요청한다."
 )
 
 
@@ -133,10 +136,9 @@ async def build_agent(
             list_git_repos,
             publish_skill,
             register_skill_as_tenant,
-            # write_process_definition,
-            # update_process_definition,
-            # validate_process_definition,
-            # complete_process_generation,
+            # 프로세스 정의 전용 도구(write/update/validate/complete_process_generation)는
+            # 에이전트에 바인딩하지 않는다. 에이전트는 산출물 파일만 만들고, 검증·통합은
+            # 턴 종료 시 executor 가 결정적으로 수행한다(core/skills/tools.py 의 동일 함수 재사용).
         ]
     )
     # BSC 전략 도구(save_strategy_objective/save_strategy_kpi/save_canvas_block/link_kpi_to_process)와
@@ -174,6 +176,11 @@ async def build_agent(
                     "servers": [_srv],
                     "tools": _tool_names,
                 })
+
+    # `fetch_webpage` 안내는 그 도구가 실제로 바인딩됐을 때만 붙인다.
+    # (도구 없이 안내만 남으면 모델이 없는 도구를 호출하려다 턴을 낭비한다.)
+    if any(getattr(t, "name", "") == "fetch_webpage" for t in tools):
+        system_prompt = system_prompt + WEB_FETCH_PROMPT
 
     _user_ctx = user_context or {}
     _info_parts = []
@@ -227,13 +234,19 @@ async def build_agent(
         f"**단독 스킬 생성**(프로세스가 아님)이면 프로세스 폴더 없이 **`{_bpmn_base}/skills/<safe-name>/SKILL.md`** 에 바로 만든다. "
         f"프로세스 생성이면 아래 규칙을 따른다: "
         f"**프로세스 폴더명은 반드시 `{_pfolder}` 를 그대로 사용한다**(즉 `{_bpmn_base}/{_pfolder}/`). "
-        f"그 폴더 안에 `process-definition.json`·`forms/`·`skills/`·`agents.json`·`manifest.json` 을 모두 만든다. "
+        f"그 폴더 안에 `process-definition.json`·`forms/<activity_id>.form`·`skills/<safe-name>/SKILL.md`·"
+        f"`agents/<agent_id>.json`(에이전트 1명 = 파일 1개)·`manifest.json` 을 만든다. "
         f"**한 방에 여러 프로세스면** 두 번째부터는 `{_pfolder}-2`, `{_pfolder}-3` 처럼 **뒤에 번호만** 붙인다. "
         f"⚠️ 폴더명에 `<`, `>` 같은 문자나 '랜덤'·'id'·'new_id' 같은 placeholder 단어를 절대 쓰지 말 것(예: `process-<랜덤 id>` ❌). "
         f"SKILL.md/reference 가 `/workspace/.bpmn/...` 라고 해도 위 프로세스 폴더 경로로 바꿔 사용한다. "
         f"기존 파일은 그대로 **덮어쓰기**(덮어쓸지 묻지 말 것). "
-        f"`validate_process_definition` 은 그 프로세스의 `process-definition.json` 경로를 인자로 넘겨 호출하고, "
-        f"`complete_process_generation` 은 인자 없이 호출하면 이 대화의 모든 `process-*/` 폴더를 자동으로 모아 처리한다."
+        f"⚠️ 검증·통합·저장 도구는 이 세션에 **없다**. `validate_process_definition`·"
+        f"`complete_process_generation`·`write_process_definition`·`update_process_definition`·"
+        f"`save_process_definition` 을 호출하려 하지 마라(존재하지 않는 도구다). "
+        f"파일 입출력은 `write_file`/`edit_file`/`read_file` 만 쓴다. "
+        f"산출물 파일을 다 만들고 턴을 끝내면 **시스템이 자동으로** 정의를 검증·보정하고, "
+        f"폼/스킬/에이전트/DMN 을 프로세스에 통합해 프론트 산출물 패널로 전달한다. "
+        f"실제 저장은 사용자가 화면에서 '저장' 버튼을 눌러 한다."
     )
 
     provider_config_id = ""

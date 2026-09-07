@@ -178,6 +178,7 @@ def build_graph_inputs(
     checkpoint_thread_id: str,
     recent_messages: list[dict[str, Any]] | None = None,
     has_checkpoint: bool = False,
+    has_pending_interrupt: bool = False,
 ) -> tuple[Any, bool]:
     """그래프 실행 입력과 use_graph_resume 플래그를 반환한다.
 
@@ -190,12 +191,19 @@ def build_graph_inputs(
         has_checkpoint: 이 thread_id 에 이미 누적된 체크포인트 상태가 있으면 True.
             지속 체크포인터(공유 메모리/Postgres) 사용 시, 이미 누적된 대화에 또 history 를
             주입하면 메시지가 중복되므로, 이 경우 새 사용자 메시지만 넘긴다.
+        has_pending_interrupt: 이 thread_id 의 체크포인트에 **실제로 재개 대기 중인
+            interrupt** 가 있으면 True. 이것이 없는데 `Command(resume=...)` 를 보내면
+            LangGraph 는 오류를 내지 않고 **그래프를 처음부터 다시 실행**해 같은 질문으로
+            새 interrupt 를 만든다 → executor 가 중복 HITL 로 억제 → 사용자 화면에는
+            아무 응답도 안 나오고 멈춘 것처럼 보인다(서버 재시작/InMemorySaver 유실,
+            다중 파드 라우팅 등에서 발생). 그래서 재개는 반드시 이 값이 True 일 때만 한다.
     """
     use_graph_resume = bool(
         checkpointer is not None
         and checkpoint_thread_id
         and human_answer_stripped
         and str(run_state.get("tool_name") or "") == "request_human_input"
+        and has_pending_interrupt
     )
 
     if use_graph_resume:

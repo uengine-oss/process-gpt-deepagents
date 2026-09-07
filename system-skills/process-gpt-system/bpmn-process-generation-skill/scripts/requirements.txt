@@ -1,6 +1,3 @@
-# 서비스(ProcessGPT deepagent) 모드 후처리 — 저장 + 검증
-supabase>=2.4.0
-httpx>=0.24.0
 # 검증 자동교정(LLM) 단계에서만 사용. 환경에 맞는 것만 있으면 됨.
 #  - LLM_PROXY_URL/OPENAI_API_KEY 경로 → openai
 #  - ANTHROPIC_API_KEY 경로 → anthropic

@@ -164,16 +164,28 @@ async def prefetch_git_skills(repo_urls: list[str] | None = None) -> int:
         from .git_providers.factory import get_provider_from_url
         provider = get_provider_from_url(url)
 
+        # 이미 디스크에 있는 SKILL.md 는 다시 받지 않는다.
+        # 이 함수는 **채팅 턴마다** 호출되므로, 매번 전부 내려받으면 턴마다 스킬 수만큼
+        # 네트워크 요청이 나간다(익명 GitHub rate limit 소진 + 지연). 게다가 그 요청은
+        # `asyncio.to_thread` 안의 `urlopen(timeout=60)` 이라 **취소되지 않는다** — 느려지면
+        # 그 턴이 취소에도 반응하지 않는 좀비가 되어 이후 턴의 HITL 재개까지 망가진다.
+        # 새 스킬이 추가된 경우만 받으면 되므로 존재 여부로 거른다(갱신은 재기동/삭제 후 재시작).
         fetch_tasks = []
         disk_paths: list[Path] = []
         for skill_name, repo_dir_path in skill_map.items():
             disk_path = Path(root) / slug / skill_name / "SKILL.md"
+            if disk_path.is_file():
+                continue
             fetch_tasks.append(
                 asyncio.to_thread(
                     provider.fetch_file, owner, repo, branch, f"{repo_dir_path}/SKILL.md"
                 )
             )
             disk_paths.append(disk_path)
+
+        if not fetch_tasks:
+            logger.debug("git-skills: %s 는 이미 최신(다운로드 생략)", slug)
+            continue
 
         contents = await asyncio.gather(*fetch_tasks, return_exceptions=True)
         for disk_path, content in zip(disk_paths, contents):

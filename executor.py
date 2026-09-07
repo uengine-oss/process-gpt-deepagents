@@ -61,6 +61,7 @@ from core.chat.chat_room import (
     build_initial_chat_room_context,
 )
 from core.chat.stream_registry import MulticastStreamer, mark_done, start_run
+from core.chat.tool_arg_stream import ToolArgTextStreamer
 from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
@@ -85,7 +86,9 @@ logger = logging.getLogger(__name__)
 
 # deepagent 가 샌드박스 workspace 에 생성/수정하는 산출물 파일을 프론트(Claude Desktop식 파일 UI)로
 # 실시간 전달하기 위한 설정. write_file/edit_file 도구가 건드린 /workspace 하위 파일을 file_artifact 로 보낸다.
-_FILE_TOOL_NAMES = ("write_file", "edit_file", "write_process_definition", "update_process_definition")
+# 에이전트에게 바인딩된 파일 도구는 deepagents 기본 도구뿐이다(프로세스 정의 전용
+# write/update 도구는 더 이상 부착하지 않는다 — core/agents/agent.py 참고).
+_FILE_TOOL_NAMES = ("write_file", "edit_file")
 _FILE_ARTIFACT_MAX_BYTES = 400_000  # 미리보기에 과한 대용량 파일은 잘라 보냄
 
 # 채팅 산출물에서 스킬이 만든 hwpx 컨테이너 경로를 잡아내기 위한 패턴.
@@ -96,6 +99,21 @@ _WS_BINARY_FILE_RE = re.compile(
     r"/workspace/[^\s\"']+\.(?:pdf|docx?|xlsx?|pptx?)",
     re.IGNORECASE,
 )
+
+
+def _validation_failure_summary(failures: list[dict], max_items: int = 3) -> str:
+    """검증 실패 목록을 사용자에게 보여줄 짧은 불릿으로 요약한다."""
+    lines: list[str] = []
+    for failure in failures:
+        for defect in (failure.get("defects") or [])[:max_items]:
+            if not isinstance(defect, dict):
+                continue
+            detail = str(defect.get("detail") or defect.get("type") or "").strip()
+            if detail:
+                lines.append(f"- {detail}")
+    if not lines:
+        return "- 정의 구조 검사에서 결함이 남아 있습니다."
+    return "\n".join(lines[:max_items])
 
 
 def _ws_file_meta(path: str) -> tuple[str, str]:
@@ -352,6 +370,59 @@ async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> 
     return json.dumps(obj, ensure_ascii=False)
 
 
+async def _materialize_chat_file_links(tenant_id: str, text: str) -> str:
+    """
+    채팅 답변에 남은 샌드박스 문서 경로를 내려받기 링크로 바꾼다.
+
+    규칙(무엇을 잡고 어떻게 바꿀지)은 core.chat.file_links 에 있다. 여기서는
+    샌드박스에서 파일을 꺼내 내려받기 토큰을 발급하는 일만 한다.
+
+    실패는 베스트에포트다. 링크를 못 만들어도 답변 자체는 그대로 보인다 —
+    경로가 남는 것이 답변이 통째로 사라지는 것보다 낫다.
+    """
+    from core.chat.file_links import find_document_paths, materialize
+
+    if not find_document_paths(text):
+        return text
+
+    try:
+        from core.agents.agent import _BASE_DIR as _AGENT_BASE_DIR, _SKILLS_DIR as _AGENT_SKILLS_DIR
+        from core.sandbox.docker_sandbox import get_or_create_sandbox
+        from core.api.file_download import register_file
+    except Exception:
+        logger.warning("채팅 파일 링크: 모듈 로드 실패", exc_info=True)
+        return text
+
+    from pathlib import PurePosixPath
+
+    base_url = (os.environ.get("SELF_BASE_URL") or f"http://localhost:{os.environ.get('PORT', '8888')}").rstrip("/")
+    backend = get_or_create_sandbox(
+        tenant_id,
+        workspace_host=_AGENT_BASE_DIR / "workspace",
+        skills_host=_AGENT_SKILLS_DIR,
+    )
+
+    async def _resolve(container_path: str):
+        try:
+            results = await asyncio.to_thread(backend.download_files, [container_path])
+            res = results[0] if results else None
+            content = getattr(res, "content", None) if res else None
+            if content is None or getattr(res, "error", None):
+                # 지어낸 주소로 링크를 만들지 않는다. 눌렀는데 아무것도 안
+                # 나오는 것이 경로가 보이는 것보다 나쁘다.
+                logger.warning("채팅 파일 링크: 샌드박스에 파일 없음 | path=%s", container_path)
+                return None
+            name = PurePosixPath(container_path).name
+            token = await register_file(content, name)
+            logger.info("채팅 파일 링크 발급 | %s → 토큰 URL", container_path)
+            return f"{base_url}/api/internal/download/{token}"
+        except Exception:
+            logger.warning("채팅 파일 링크 실패 | path=%s", container_path, exc_info=True)
+            return None
+
+    return await materialize(text, _resolve)
+
+
 async def _emit_chat_hwpx_artifacts(streamer, tenant_id: str, texts: list[str], collected: set[str] | None = None) -> None:
     """채팅 경로: 스킬이 샌드박스에 만든 hwpx 를 office-mcp 로 실체화(storage 업로드 + HTML 변환)하고,
     기존 채팅 파이프라인(onToolEnd → pushHwpxArtifact)이 인식하는 tool_end 이벤트로 내보낸다.
@@ -525,7 +596,11 @@ async def _emit_human_asked(
     }
 
     if is_duplicate:
-        logger.info("중복 HITL 요청 억제 | task_id=%s", task_id)
+        # 같은 질문을 다시 물은 경우다. 여기서 done 마커만 보내고 끝내면 어시스턴트 메시지가
+        # 하나도 남지 않아, 사용자 화면에는 "답변했는데 아무 반응이 없는" 멈춘 상태로 보인다.
+        # 억제(= 새 run_state 로 갱신하지 않음)는 유지하되, 질문 본문은 반드시 남겨 사용자가
+        # 다시 답할 수 있게 한다.
+        logger.info("중복 HITL 요청 억제 | task_id=%s question=%.80s", task_id, question)
         if streamer:
             hitl_content = json.dumps(
                 {
@@ -539,6 +614,15 @@ async def _emit_human_asked(
                 ensure_ascii=False,
             )
             await streamer.send_json({"type": "done", "content": hitl_content})
+        dup_evt = new_text_artifact_update_event(
+            task_id=task_id,
+            context_id=context_id,
+            name="assistant_response",
+            text=f"{question}\n\n{context_text}",
+            last_chunk=True,
+        )
+        ParseDict({"role": "assistant"}, dup_evt.metadata)
+        await event_queue.enqueue_event(dup_evt)
         return {"status": "waiting_for_human", "run_state": dict(run_state)}
 
     await _enqueue_status(
@@ -889,9 +973,19 @@ class DeepAgentExecutor(AgentExecutor):
                 logger.warning("워크스페이스 하이드레이션 실패(무시하고 진행) | room_id=%s", chat_room_id, exc_info=True)
 
         if is_chat and chat_room_id:
-            # 같은 chat_room_id 에 아직 끝나지 않은 이전 turn이 있으면 취소하고 끝날 때까지
+            # 같은 chat_room_id 에 아직 끝나지 않은 이전 turn이 있으면 정리하고 끝날 때까지
             # 기다린다 — 두 graph.astream() 실행이 동시에 체크포인트를 쓰는 레이스를 막는다.
-            await supersede_previous_turn(chat_room_id)
+            #
+            # 단, 이번 요청이 **HITL 응답**이면 이전 turn 을 취소하면 안 된다. 프론트는
+            # 백엔드가 interrupt 를 다 처리하기 전(도구 호출 이벤트 시점)에 이미 HITL 패널을
+            # 그리므로, 사용자가 바로 승인하면 이전 turn 이 아직 실행 중이다. 그걸 취소하면
+            # interrupt 체크포인트가 남지 않아 재개가 불가능해지고, 화면에는
+            # "새 메시지로 대체되어 이전 응답이 취소되었습니다" 오류만 남는다.
+            _is_hitl_answer = bool(
+                human_answer_stripped
+                and str(run_state.get("tool_name") or "") == "request_human_input"
+            )
+            await supersede_previous_turn(chat_room_id, cancel=not _is_hitl_answer)
             current_task = asyncio.current_task()
             if current_task is not None:
                 await set_inflight_and_claim(chat_room_id, current_task, event_queue)
@@ -1109,15 +1203,24 @@ class DeepAgentExecutor(AgentExecutor):
 
         # 이 thread 에 이미 누적된 체크포인트가 있는지 확인 — 있으면 history 재주입을 생략해
         # 메시지 중복을 막는다(지속 체크포인터가 history 를 이미 들고 있으므로).
+        # 재개 대기 중인 interrupt 가 실제로 남아 있는지까지 확인한다. 없는데 Command(resume=)
+        # 를 보내면 LangGraph 는 오류 없이 그래프를 처음부터 재실행해 같은 질문으로 새 interrupt
+        # 를 만들고, 그걸 executor 가 중복 HITL 로 억제해 사용자에겐 빈 응답만 남는다.
         has_checkpoint = False
+        has_pending_interrupt = False
         if checkpointer is not None and checkpoint_thread_id:
             try:
                 _cfg = {"configurable": {"thread_id": checkpoint_thread_id}}
                 _tup = await checkpointer.aget_tuple(_cfg)
                 has_checkpoint = _tup is not None
+                has_pending_interrupt = any(
+                    len(_w) > 1 and _w[1] == "__interrupt__"
+                    for _w in (getattr(_tup, "pending_writes", None) or [])
+                )
             except Exception:
                 logger.warning("체크포인트 존재 확인 실패 | thread_id=%s", checkpoint_thread_id, exc_info=True)
                 has_checkpoint = False
+                has_pending_interrupt = False
 
         inputs, use_graph_resume = build_graph_inputs(
             user_message,
@@ -1127,15 +1230,17 @@ class DeepAgentExecutor(AgentExecutor):
             checkpoint_thread_id=checkpoint_thread_id,
             recent_messages=recent_msgs,
             has_checkpoint=has_checkpoint,
+            has_pending_interrupt=has_pending_interrupt,
         )
 
         if use_graph_resume:
             logger.info("HITL 그래프 재개 | thread_id=%s task_id=%s", checkpoint_thread_id, task_id)
         elif human_answer_stripped:
             logger.info(
-                "HITL 비-그래프 재개 | task_id=%s pending_field=%s",
+                "HITL 비-그래프 재개 | task_id=%s pending_field=%s pending_interrupt=%s",
                 task_id,
                 run_state.get("pending_field") or "human_response",
+                has_pending_interrupt,
             )
 
         if human_answer_stripped:
@@ -1338,6 +1443,12 @@ class DeepAgentExecutor(AgentExecutor):
         }
 
         active_tool_calls: dict[str, str] = {}
+        # request_human_input 의 인자(질문·초안 본문)를 쓰는 동안 화면에 흘려보내기 위한
+        # 스트리머. 이 도구는 사용자에게 보여줄 본문이 통째로 **인자 안에** 들어가고
+        # 어시스턴트 content 는 비어 있어서, 중계하지 않으면 몇 분간 "생각 중..." 만 뜬다.
+        # key = tool_call index(스트리밍 청크는 id 없이 index 로만 온다).
+        hitl_arg_streamers: dict[int, ToolArgTextStreamer] = {}
+        hitl_arg_indexes: set[int] = set()
         # write_file/edit_file tool_call_id → {path, op}. tool_end 시 파일을 읽어 file_artifact emit.
         pending_file_ops: dict[str, dict] = {}
         # subprocess 딥에이전트: task() tool_call_id → subagent_type slug
@@ -1378,6 +1489,24 @@ class DeepAgentExecutor(AgentExecutor):
                             full_response += text
                             if streamer:
                                 await streamer.send_json({"type": "token", "content": text})
+                        # HITL 질문/초안은 도구 인자로만 오므로 별도로 흘려보낸다.
+                        # 화면 표시 전용이라 full_response 에는 넣지 않는다 — 최종 메시지
+                        # 본문은 HITL 패널이 대신하고, 여기에 섞으면 저장 내용이 중복된다.
+                        if streamer:
+                            for _tcc in (getattr(msg, "tool_call_chunks", None) or []):
+                                if not isinstance(_tcc, dict):
+                                    continue
+                                _idx = _tcc.get("index")
+                                if _idx is None:
+                                    continue
+                                if (_tcc.get("name") or "") == "request_human_input":
+                                    hitl_arg_indexes.add(_idx)
+                                    hitl_arg_streamers.setdefault(_idx, ToolArgTextStreamer())
+                                if _idx not in hitl_arg_indexes:
+                                    continue
+                                _delta = hitl_arg_streamers[_idx].feed(_tcc.get("args") or "")
+                                if _delta:
+                                    await streamer.send_json({"type": "token", "content": _delta})
 
                 elif stream_evt == "updates":
                     interrupt_payload = find_interrupt_payload(data)
@@ -1419,12 +1548,10 @@ class DeepAgentExecutor(AgentExecutor):
                                         if _fp and _tc_id and str(_fp).startswith("/workspace"):
                                             pending_file_ops[_tc_id] = {
                                                 "path": str(_fp),
-                                                "op": "create" if tool_name in ("write_file", "write_process_definition") else "edit",
+                                                "op": "create" if tool_name == "write_file" else "edit",
                                                 "inline": (
                                                     tool_args.get("content")
                                                     if tool_name == "write_file"
-                                                    else json.dumps(tool_args.get("definition"), ensure_ascii=False, indent=2)
-                                                    if tool_name == "write_process_definition"
                                                     else None
                                                 ),
                                             }
@@ -1637,6 +1764,14 @@ class DeepAgentExecutor(AgentExecutor):
                 except Exception:
                     logger.warning("채팅 hwpx 아티팩트 emit 실패", exc_info=True)
 
+            # 채팅: 그 밖의 문서(docx·pdf·xlsx·pptx)는 답변에 컨테이너 경로만 남아
+            # 받을 길이 없었다. 내려받기 링크로 바꿔 준다.
+            if is_chat:
+                try:
+                    raw_text = await _materialize_chat_file_links(tenant_id, raw_text)
+                except Exception:
+                    logger.warning("채팅 파일 링크 실체화 실패 — 원본 유지", exc_info=True)
+
             # 도구 출력에서 못 잡았을 때 대비: 최종 텍스트에 요약/출력계약 JSON 이 있으면 결과 카드용 이벤트 emit.
             if streamer and not process_result_sent:
                 _pr_final = _detect_process_result(raw_text)
@@ -1708,30 +1843,46 @@ class DeepAgentExecutor(AgentExecutor):
                                 "defects": _vobj.get("remaining_defects") or [],
                             })
                     if _validation_failures:
+                        # 정상적인 실패 경로다(예외 아님). 예외로 올려 스택트레이스를 남기는
+                        # 대신 사용자에게 무엇이 걸렸는지 한 줄로 알려주고 이 턴을 마친다.
                         complete_called = True  # 이번 턴의 무검증 재시도 방지
                         logger.error(
                             "auto-complete 검증 실패 | room=%s failures=%s",
                             chat_room_id,
                             _validation_failures,
                         )
-                        raw_text = "프로세스 실행 검증을 통과하지 못해 결과 전달을 중단했습니다. 자동 보정 후 다시 검증합니다."
-                        raise RuntimeError("process validation failed before auto-complete")
-                    _cres = await asyncio.to_thread(_cpg.invoke, {})
-                    logger.info("auto-complete(폴백) | room=%s result=%.140s", chat_room_id, str(_cres))
-                    complete_called = True
-                    if not str(_cres or "").startswith("ERROR"):
-                        await _reemit_room_artifacts(streamer, chat_room_id or "")
-                        await streamer.send_json({"type": "plan_todos", "todos": [
-                            {"content": "1. 프로세스 초안 설계 & JSON 생성", "status": "completed"},
-                            {"content": "2. 스킬·에이전트·DMN 선택 & 생성", "status": "completed"},
-                            {"content": "3. 입력 폼 & 참조정보 생성", "status": "completed"},
-                            {"content": "4. 프로세스 검증 & 자동 보정", "status": "completed"},
-                            {"content": "5. 결과 통합 & 완료", "status": "completed"},
-                        ]})
-                        if "확인 후 저장" not in (raw_text or ""):
-                            raw_text = "프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요."
+                        raw_text = (
+                            "프로세스 정의가 검증을 통과하지 못해 결과 전달을 보류했어요.\n"
+                            + _validation_failure_summary(_validation_failures)
+                            + "\n어떻게 고칠지 알려주시면 이어서 수정할게요."
+                        )
+                    else:
+                        _cres = await asyncio.to_thread(_cpg.invoke, {})
+                        logger.info("auto-complete | room=%s result=%.140s", chat_room_id, str(_cres))
+                        complete_called = True
+                        if str(_cres or "").startswith("ERROR"):
+                            raw_text = (
+                                "프로세스 산출물을 통합하는 중 문제가 생겨 결과 전달을 보류했어요. "
+                                "다시 시도하거나 수정할 부분을 알려주세요."
+                            )
+                        else:
+                            await _reemit_room_artifacts(streamer, chat_room_id or "")
+                            await streamer.send_json({"type": "plan_todos", "todos": [
+                                {"content": "1. 프로세스 초안 설계 & JSON 생성", "status": "completed"},
+                                {"content": "2. 스킬·에이전트·DMN 선택 & 생성", "status": "completed"},
+                                {"content": "3. 입력 폼 & 참조정보 생성", "status": "completed"},
+                                {"content": "4. 프로세스 검증 & 자동 보정", "status": "completed"},
+                                {"content": "5. 결과 통합 & 완료", "status": "completed"},
+                            ]})
+                            if "확인 후 저장" not in (raw_text or ""):
+                                raw_text = "프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요."
                 except Exception:
-                    logger.exception("auto-complete(폴백) 실패")
+                    logger.exception("auto-complete 실패")
+                    complete_called = True
+                    raw_text = (
+                        "프로세스 마무리 처리 중 오류가 발생했어요. "
+                        "잠시 후 다시 시도하거나 수정할 부분을 알려주세요."
+                    )
 
             # 단독 스킬 생성: process-definition.json 이 없어 위 complete 폴백을 타지 않으므로,
             # 방 산출물(base/skills/*/SKILL.md)을 file_artifact 로 재전송해 프론트 패널 표시 + 저장을 보장한다.
@@ -1745,6 +1896,20 @@ class DeepAgentExecutor(AgentExecutor):
                         raw_text = "스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요."
                 except Exception:
                     logger.exception("단독 스킬 산출물 재전송 실패")
+
+            # 빈 턴 방지: 모델이 아무 텍스트도 내지 않고(도구 호출도 없이) 끝난 경우
+            # 빈 어시스턴트 메시지가 저장돼 사용자 화면에는 "답변했는데 반응이 없는" 상태로 보인다.
+            # HITL 응답 직후 재개가 헛돌 때 특히 잘 생긴다 — 무슨 일이 있었는지 짧게라도 남긴다.
+            if not str(raw_text or "").strip():
+                logger.warning(
+                    "빈 응답으로 턴 종료 | room=%s resume=%s pending_interrupt=%s",
+                    chat_room_id, use_graph_resume, has_pending_interrupt,
+                )
+                raw_text = (
+                    "이어서 진행하지 못했어요. 한 번만 더 알려주시면 그 지점부터 계속할게요."
+                    if human_answer_stripped
+                    else "요청을 처리하지 못했어요. 다시 말씀해 주세요."
+                )
 
             await _enqueue_status(
                 event_queue,

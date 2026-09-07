@@ -148,8 +148,11 @@ ask_user = StructuredTool.from_function(
         "사람 개입(HITL)이 필요할 때 호출하는 도구. "
         "명시적 인간 승인, 민감 정보 확인, 모호한 요청 명확화, 선택지 제시 등 "
         "모든 사용자 입력이 필요한 상황에서 사용한다. "
-        "정해진 선택지 중 고르게 하는 질문이면 반드시 options 파라미터를 채워라 — "
-        "context에 선택지를 텍스트로 나열해도 화면에는 선택 UI로 반영되지 않는다. "
+        "정해진 선택지 중 고르게 하는 질문이면 options 파라미터를 채워라 — "
+        "그냥 프로즈로 나열하면 화면에 선택 UI로 반영되지 않는다. "
+        "단, **로딩된 스킬(SKILL.md)이 question 텍스트 형식을 명시했다면 그 형식을 그대로 따른다** "
+        "(예: bpmn-process-generation-skill 의 `[스킬]`/`[에이전트]`/`[DMN]` 섹션 + `• 라벨: 설명`). "
+        "그 형식도 프런트엔드가 선택 UI로 렌더하며, 스킬은 선택 결과를 그 형식으로 되받아 처리한다. "
         "내부에서 LangGraph interrupt()를 발생시켜 그래프 실행을 일시 중단한다. "
         "단, GitHub 토큰·GitHub 인증 정보는 시스템이 자동으로 관리하므로 "
         "이 도구로 요청하지 마세요."
@@ -179,7 +182,15 @@ def is_duplicate_hitl_request(
     question: str,
     pending_field: str,
 ) -> bool:
-    """중복된 HITL 요청인지 확인한다 (같은 필드·같은 질문이 이미 pending 상태)."""
+    """중복된 HITL 요청인지 확인한다 (같은 필드·같은 질문이 이미 pending 상태).
+
+    ⚠️ 비교는 `question` 만으로 한다 — 프론트가 되돌려주는 `run_state.last_question` 에
+    질문만 담기기 때문이다(본문까지 합쳐 비교하면 절대 일치하지 않아 억제가 무력화된다).
+    그 대신 프로세스 생성 스킬의 컨설팅 승인처럼 **질문 문구가 고정된** 경우에는, 초안만
+    바뀐 정상 재질문도 여기서 True 가 될 수 있다. 그래서 억제 분기는 턴을 조용히 끝내지
+    않고 질문 본문을 어시스턴트 메시지로 남긴다(executor `_emit_human_asked`) — 사용자는
+    바뀐 초안을 그대로 보고 다시 답할 수 있다.
+    """
     if not isinstance(previous_run_state, dict):
         return False
     prev_field = str(previous_run_state.get("pending_field") or "").strip().lower()

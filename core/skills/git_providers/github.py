@@ -14,10 +14,15 @@ _API = "https://api.github.com"
 class GitHubProvider(GitProvider):
 
     def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
+        # 토큰이 비어 있으면 Authorization 헤더 자체를 넣지 않는다. `Bearer ` 처럼 값이 빈
+        # 헤더는 httpx/urllib 이 "Illegal header value" 로 거절해, 공개 레포(anthropics/skills)
+        # 인덱싱조차 매번 실패한다(→ skill-creator 등 번들 스킬이 안 받아짐).
+        # 익명 호출은 rate limit 만 낮을 뿐 공개 레포 읽기에는 문제가 없다.
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        token = str(self.token or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
 
     # ------------------------------------------------------------------
 
@@ -79,10 +84,11 @@ class GitHubProvider(GitProvider):
 
     def fetch_file(self, owner: str, repo: str, branch: str, path: str) -> bytes:
         url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-        req = Request(
-            url,
-            headers={"Authorization": f"Bearer {self.token}", "User-Agent": "process-gpt-deepagents/1.0"},
-        )
+        raw_headers = {"User-Agent": "process-gpt-deepagents/1.0"}
+        token = str(self.token or "").strip()
+        if token:
+            raw_headers["Authorization"] = f"Bearer {token}"
+        req = Request(url, headers=raw_headers)
         with urlopen(req, timeout=60) as r:
             return r.read()
 
