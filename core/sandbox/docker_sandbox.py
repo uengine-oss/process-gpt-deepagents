@@ -48,6 +48,95 @@ _MAX_OUTPUT_BYTES = 100_000
 _HOST_GATEWAY = "host.docker.internal"
 
 # ---------------------------------------------------------------------
+# 샌드박스 전용 브리지 네트워크 (MTU 고정)
+#
+# 기본 docker 브리지는 MTU 1500 으로 만들어진다. 그런데 이 서비스가 도는 GKE 처럼
+# 노드/파드 네트워크 MTU 가 1460 이하인 환경에서는, 컨테이너가 MSS 1460 을 광고해 놓고
+# 실제로는 그 크기의 프레임이 경로에서 통째로 드롭된다. ICMP fragmentation-needed 도
+# 막혀 있어 PMTU discovery 가 동작하지 않으므로, 작은 패킷(DNS·TCP 핸드셰이크)은 되는데
+# 큰 응답(TLS ServerHello+인증서, git pack)만 영원히 재전송되다가 ~150초 뒤
+# "Recv failure: Connection reset by peer" 로 죽는다. 실제로 같은 컨테이너에서
+# TCP_MAXSEG 를 1300 으로 낮추면 github.com TLS 핸드셰이크가 0.03초에 끝난다.
+#
+# 그래서 샌드박스 컨테이너는 기본 브리지 대신 MTU 를 낮춰 만든 전용 네트워크에 붙인다.
+# SANDBOX_NETWORK_MTU=0 으로 두면 종전처럼 기본 브리지를 쓴다.
+# ---------------------------------------------------------------------
+SANDBOX_NETWORK_NAME = os.getenv("SANDBOX_NETWORK_NAME", "deepagent-sandbox-net")
+try:
+    SANDBOX_NETWORK_MTU = int(os.getenv("SANDBOX_NETWORK_MTU", "1400") or 0)
+except ValueError:
+    SANDBOX_NETWORK_MTU = 1400
+
+# 샌드박스에서 사실상 항상 필요한 커맨드. 컨테이너를 새로 띄울 때 백그라운드로 미리 깔아
+# 첫 git 호출이 apt-get 설치(수십 초)를 대신 물지 않게 한다.
+_BOOTSTRAP_PACKAGES = ("git", "ca-certificates", "curl")
+# 사전 설치가 아직 진행 중일 때 execute() 가 기다려 주는 최대 시간(초).
+_BOOTSTRAP_WAIT_SECONDS = 120
+
+# ---------------------------------------------------------------------
+# 구간별 시간 상한
+#
+# 툴 호출 한 번이 언제 끝날지 알 수 없으면 대화가 통째로 멈춘다. 실제로 무한정
+# 매달릴 수 있는 구간은 네 곳이다.
+#   - 컨테이너 기동: dind 가 아직 준비되지 않으면 재시도 루프가 계속 돈다.
+#   - 도구 설치:     apt 미러가 막힌 환경에서 apt-get 이 끝나지 않는다.
+#   - 셸 실행:       사용자/에이전트가 준 명령 자체가 끝나지 않는다.
+#   - 설정 조회:     docker 데몬이 응답하지 않으면 git config 한 줄도 돌아오지 않는다.
+# 각 구간에 상한을 걸고, 넘으면 예외가 아니라 "사유가 적힌 결과"로 돌려준다 —
+# 에이전트 툴 경로에서 예외는 원인 없는 실패로만 보이고 폴백을 고를 수 없기 때문이다.
+# ---------------------------------------------------------------------
+
+def _env_seconds(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# 컨테이너 기동(dind 대기 재시도 포함) 상한.
+SANDBOX_START_TIMEOUT = _env_seconds("SANDBOX_START_TIMEOUT_SECONDS", 90)
+# 셸 명령 한 번(누락 커맨드 자동 설치 재시도까지 포함) 상한.
+SANDBOX_EXEC_TIMEOUT = _env_seconds("SANDBOX_EXEC_TIMEOUT_SECONDS", 180)
+# 누락 커맨드 자동 설치(apt-get update + install) 상한.
+SANDBOX_INSTALL_TIMEOUT = _env_seconds("SANDBOX_INSTALL_TIMEOUT_SECONDS", 120)
+# git safe.directory 적용 등 설정 조회/적용 상한.
+SANDBOX_CONFIG_TIMEOUT = _env_seconds("SANDBOX_CONFIG_TIMEOUT_SECONDS", 15)
+
+TIMEOUT_EXIT_CODE = 124
+UNAVAILABLE_EXIT_CODE = 125
+
+
+class SandboxUnavailable(RuntimeError):
+    """상한 안에 쓸 수 있는 컨테이너를 얻지 못했다."""
+
+
+def _exec_in_container(container, cmd: str, timeout: int) -> tuple[int, str, bool]:
+    """컨테이너에서 `bash -c cmd` 를 실행하고 (exit_code, output, timed_out) 을 돌려준다.
+
+    docker SDK 의 exec_run 에는 상한이 없어서 명령이 끝나지 않으면 호출 스레드가 영원히
+    잡힌다. 실행을 데몬 스레드로 밀고 join(timeout) 으로 상한을 건다 — 시간이 지나면
+    결과를 버리고 돌아온다. 컨테이너는 일회용이라 남은 프로세스는 정리 시 함께 사라진다.
+    """
+    holder: dict = {}
+
+    def _run() -> None:
+        try:
+            exit_code, output = container.exec_run(["bash", "-c", cmd], demux=False)
+            holder["exit_code"] = exit_code
+            holder["output"] = (output or b"").decode("utf-8", errors="replace")
+        except Exception as exc:  # 데몬 오류도 상한 안에서 "사유"로 돌려준다
+            holder["exit_code"] = 1
+            holder["output"] = f"ERROR: {exc}"
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return TIMEOUT_EXIT_CODE, f"ERROR: command timed out after {timeout}s", True
+    return holder.get("exit_code") or 0, holder.get("output", ""), False
+
+# ---------------------------------------------------------------------
 # 실행(run) 격리 스코프 — 같은 tenant 는 컨테이너/마운트를 공유하므로(위 docstring 참고),
 # ls/read_file/glob/grep 이 인자로 받은 절대경로를 그대로 열어주면 "다른 실행(예: 일주일 전
 # 같은 액티비티 실행)이 남긴 산출물"을 이번 실행 결과인 것처럼 읽어오는 사고가 난다.
@@ -84,10 +173,15 @@ def set_workspace_scope(*container_prefixes: str) -> None:
     _workspace_scope.set(tuple(p.rstrip("/") for p in container_prefixes if p))
 
 
+# core/skills/tools.py 의 BPMN_WORK_SUBDIR / CHECKOUT_SUBDIR 와 같은 값.
+# (여기서 tools 를 import 하면 샌드박스가 스킬 계층에 의존하게 되므로 리터럴로 둔다.)
+_ROOM_SCOPED_SUBDIRS = (".bpmn", ".checkouts")
+
+
 def _is_run_scoped_path(path: str) -> bool:
-    """다른 실행 전용 산출물 트리(.bpmn/<방>, <instance_id>/inputs·outputs)에 속한 경로인가."""
+    """다른 실행 전용 트리(.bpmn/<방>, .checkouts/<방>, <instance_id>/inputs·outputs)인가."""
     parts = path.strip("/").split("/")
-    if len(parts) >= 2 and parts[0] == "workspace" and parts[1] == ".bpmn":
+    if len(parts) >= 2 and parts[0] == "workspace" and parts[1] in _ROOM_SCOPED_SUBDIRS:
         return True
     if (
         len(parts) >= 3
@@ -174,8 +268,23 @@ class DockerSandboxBackend(BaseSandbox):
     # 컨테이너 생명주기
     # ------------------------------------------------------------------
 
-    def _ensure_container(self) -> docker.models.containers.Container:
-        with self._lock:
+    def _ensure_container(
+        self, *, deadline: float | None = None
+    ) -> docker.models.containers.Container:
+        """상한 안에 쓸 수 있는 컨테이너를 돌려준다. 못 얻으면 SandboxUnavailable.
+
+        락 대기도 상한에 포함한다 — 같은 테넌트의 다른 실행이 컨테이너를 띄우는 중이면
+        여기서 무한정 기다리게 되고, 그러면 호출자가 건 상한이 아무 의미가 없다.
+        """
+        if deadline is None:
+            deadline = time.monotonic() + SANDBOX_START_TIMEOUT
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+            raise SandboxUnavailable(
+                f"샌드박스 컨테이너를 {SANDBOX_START_TIMEOUT}초 안에 준비하지 못했습니다"
+                "(다른 작업이 컨테이너를 기동 중)."
+            )
+        try:
             if self._client is None:
                 self._client = _get_docker_client()
             # 기존 컨테이너가 살아있으면 재사용
@@ -188,28 +297,38 @@ class DockerSandboxBackend(BaseSandbox):
                     pass
                 self._container = None
 
-            self._container = self._start_container_with_retry()
+            self._container = self._start_container_with_retry(deadline=deadline)
             return self._container
+        finally:
+            self._lock.release()
 
     def _start_container_with_retry(
-        self, *, max_attempts: int = 10, initial_delay: float = 2.0
+        self, *, deadline: float, initial_delay: float = 2.0
     ) -> docker.models.containers.Container:
-        """dind가 아직 준비 중일 때 exponential backoff로 재시도한다."""
+        """dind가 아직 준비 중일 때 exponential backoff로 재시도한다.
+
+        재시도 횟수가 아니라 **남은 시간**으로 끊는다. 횟수로만 끊으면 backoff 합이
+        2분을 넘겨(2+3+4.5+…) 툴 호출 하나가 그만큼 매달린다.
+        """
         delay = initial_delay
-        for attempt in range(max_attempts):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 return self._start_container()
             except docker.errors.DockerException as exc:
-                if attempt >= max_attempts - 1:
-                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= delay:
+                    raise SandboxUnavailable(
+                        f"샌드박스 컨테이너를 {SANDBOX_START_TIMEOUT}초 안에 띄우지 못했습니다: {exc}"
+                    ) from exc
                 logger.warning(
-                    "Docker not ready (attempt %d/%d): %s — retrying in %.1fs",
-                    attempt + 1, max_attempts, exc, delay,
+                    "Docker not ready (attempt %d, %.0fs left): %s — retrying in %.1fs",
+                    attempt, remaining, exc, delay,
                 )
                 time.sleep(delay)
                 delay = min(delay * 1.5, 30.0)
                 self._client = _get_docker_client()
-        raise RuntimeError("unreachable")
 
     def _skill_volumes(self) -> dict:
         """이 테넌트 디렉토리와 알려진 글로벌 컬렉션만 개별 bind-mount한다.
@@ -238,15 +357,58 @@ class DockerSandboxBackend(BaseSandbox):
             pass
         return volumes
 
+    def _ensure_network(self) -> str | None:
+        """MTU 를 낮춰 잡은 샌드박스 전용 브리지 네트워크 이름을 반환한다.
+
+        생성/조회에 실패하면 None 을 돌려주고 호출자는 기본 브리지로 진행한다 —
+        네트워크를 못 만든다고 샌드박스 자체를 못 쓰게 만들 이유는 없다.
+        """
+        if not SANDBOX_NETWORK_MTU:
+            return None
+        try:
+            self._client.networks.get(SANDBOX_NETWORK_NAME)
+            return SANDBOX_NETWORK_NAME
+        except docker.errors.NotFound:
+            pass
+        except docker.errors.APIError as exc:
+            logger.warning("샌드박스 네트워크 조회 실패, 기본 브리지 사용: %s", exc)
+            return None
+        try:
+            self._client.networks.create(
+                SANDBOX_NETWORK_NAME,
+                driver="bridge",
+                options={"com.docker.network.driver.mtu": str(SANDBOX_NETWORK_MTU)},
+            )
+            logger.info(
+                "샌드박스 네트워크 생성: %s (mtu=%d)", SANDBOX_NETWORK_NAME, SANDBOX_NETWORK_MTU
+            )
+        except docker.errors.APIError as exc:
+            # 동시 기동 경합으로 이미 만들어졌을 수 있다.
+            try:
+                self._client.networks.get(SANDBOX_NETWORK_NAME)
+            except Exception:
+                logger.warning("샌드박스 네트워크 생성 실패, 기본 브리지 사용: %s", exc)
+                return None
+        return SANDBOX_NETWORK_NAME
+
     def _start_container(self) -> docker.models.containers.Container:
         name = f"deepagent-sandbox-{self._tenant_id or 'shared'}"
+        network = self._ensure_network()
 
         # 이전 실행에서 남은 중단된 컨테이너 정리
         try:
             old = self._client.containers.get(name)
             if old.status == "running":
-                self._container = old
-                return old
+                if self._network_matches(old, network):
+                    self._container = old
+                    # 이전 실행에서 살아남은 컨테이너에도 safe.directory 를 보장한다.
+                    self._configure_git(old)
+                    self._bootstrap_tooling(old)
+                    return old
+                # 예전 배포가 기본 브리지(MTU 1500)로 띄워 둔 컨테이너다. 그대로 재사용하면
+                # git clone/push 가 계속 매달리므로, 일회용 컨테이너답게 버리고 다시 띄운다.
+                # /workspace 는 볼륨이라 재생성해도 산출물은 남는다.
+                logger.info("sandbox 재생성: %s 가 %s 네트워크에 없음", name, network)
             old.remove(force=True)
         except docker.errors.NotFound:
             pass
@@ -255,8 +417,7 @@ class DockerSandboxBackend(BaseSandbox):
         volumes: dict = {str(self._workspace_host): {"bind": _CONTAINER_WORKSPACE, "mode": "rw"}}
         volumes.update(self._skill_volumes())
 
-        container = self._client.containers.run(
-            SANDBOX_IMAGE,
+        run_kwargs: dict = dict(
             command=["sleep", "infinity"],
             name=name,
             detach=True,
@@ -269,8 +430,87 @@ class DockerSandboxBackend(BaseSandbox):
             cpu_period=100_000,
             cpu_quota=50_000,  # 50% of one CPU core
         )
-        logger.info("sandbox started: %s (tenant=%s)", name, self._tenant_id)
+        if network:
+            run_kwargs["network"] = network
+
+        container = self._client.containers.run(SANDBOX_IMAGE, **run_kwargs)
+        logger.info(
+            "sandbox started: %s (tenant=%s, network=%s)", name, self._tenant_id, network or "bridge"
+        )
+        self._configure_git(container)
+        self._bootstrap_tooling(container)
         return container
+
+    @staticmethod
+    def _network_matches(container, network: str | None) -> bool:
+        """컨테이너가 원하는 네트워크에 붙어 있는지 확인한다."""
+        if not network:
+            return True
+        try:
+            container.reload()
+            attached = (container.attrs.get("NetworkSettings") or {}).get("Networks") or {}
+            return network in attached
+        except Exception:  # pragma: no cover - best effort
+            return True
+
+    def _bootstrap_tooling(self, container) -> None:
+        """git/curl 을 백그라운드로 미리 설치한다 (컨테이너당 1회).
+
+        샌드박스 이미지(python:3.13-slim)에는 git 이 없어서, 아무 조치가 없으면 사용자의
+        첫 git 명령이 execute() 의 자동설치 경로로 apt-get update+install(30초 이상)을
+        그대로 뒤집어쓴다. 컨테이너를 띄우는 시점에 미리 깔아 두면 그 지연이 대화 중간이
+        아니라 기동 시점으로 옮겨간다. 실패해도 execute() 의 기존 자동설치가 그대로 백업이다.
+        """
+        if getattr(container, "_deepagent_bootstrapped", False):
+            return
+        container._deepagent_bootstrapped = True
+        pkgs = " ".join(_BOOTSTRAP_PACKAGES)
+        cmd = (
+            "command -v git >/dev/null 2>&1 && exit 0; "
+            "DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1; "
+            f"apt-get install -y -qq --no-install-recommends {pkgs} >/dev/null 2>&1"
+        )
+
+        def _run() -> None:
+            try:
+                _, _, timed_out = _exec_in_container(container, cmd, SANDBOX_INSTALL_TIMEOUT)
+                if timed_out:
+                    logger.warning(
+                        "sandbox 기본 툴 사전 설치가 %d초 상한을 넘겨 중단했습니다",
+                        SANDBOX_INSTALL_TIMEOUT,
+                    )
+                    return
+                self._configure_git(container)
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.debug("sandbox 기본 툴 사전 설치 실패(무시): %s", exc)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        container._deepagent_bootstrap_thread = thread
+        thread.start()
+
+    @staticmethod
+    def _configure_git(container) -> None:
+        """/workspace 를 git 이 신뢰하도록 safe.directory 를 설정한다.
+
+        /workspace 는 호스트 볼륨 마운트라 디렉터리 소유자 uid 가 컨테이너 사용자와 다르다.
+        그러면 git 이 `fatal: detected dubious ownership in repository at '/workspace/<skill>'`
+        로 모든 명령을 거부하고, publish_skill 은 "레포는 만들어졌는데 push 는 실패" 한
+        빈 레포 상태를 남긴다. 컨테이너는 이미 격리된 일회용 환경이므로 여기서 신뢰를 넓혀도
+        호스트 git 설정에는 영향이 없다. git 이 아직 없으면 조용히 실패하고, 이후 자동 설치
+        직후 다시 호출된다.
+        """
+        try:
+            _, _, timed_out = _exec_in_container(
+                container,
+                "git config --system --add safe.directory '*' 2>/dev/null || true",
+                SANDBOX_CONFIG_TIMEOUT,
+            )
+            if timed_out:
+                logger.warning(
+                    "sandbox git 설정 적용이 %d초 상한을 넘겨 건너뜁니다", SANDBOX_CONFIG_TIMEOUT
+                )
+        except Exception as e:  # pragma: no cover - best effort
+            logger.debug("sandbox git safe.directory 설정 실패(무시): %s", e)
 
     def cleanup(self) -> None:
         with self._lock:
@@ -295,7 +535,7 @@ class DockerSandboxBackend(BaseSandbox):
     # 밖에 있는 "다른 실행 전용" 산출물(.bpmn/<다른 방>, <다른 instance_id>/inputs·outputs)에
     # 대한 읽기 계열 호출(ls/read/glob/grep)을 차단한다. write/edit 은 제한하지 않는다 —
     # 에이전트가 스스로 고른 새 경로에 쓰는 것이라 다른 실행 결과를 "재사용"하는 경로가 아니고,
-    # checkout_to_workspace 가 임의 저장소/스킬을 /workspace/<repo-name>/ 에 그대로 두므로
+    # checkout_to_workspace 가 이번 방의 체크아웃 트리를 새로 만들며 쓰기 때문에,
     # write 까지 막으면 그 정상 흐름을 깬다.
     # ------------------------------------------------------------------
 
@@ -303,7 +543,7 @@ class DockerSandboxBackend(BaseSandbox):
         if not path or not path.startswith(_CONTAINER_WORKSPACE):
             return True  # /skills 등 workspace 밖은 별도 마운트로 이미 격리됨
         if not _is_run_scoped_path(path):
-            return True  # checkout_to_workspace 저장소·uploads 등 공용 영역은 제한하지 않음
+            return True  # uploads 등 방과 무관한 공용 영역은 제한하지 않음
         scope = _workspace_scope.get()
         if not scope:
             return True  # 스코프 미설정 호출부(레거시)는 종전처럼 무제한
@@ -335,51 +575,117 @@ class DockerSandboxBackend(BaseSandbox):
         return super().grep(pattern, effective_path, glob)
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        container = self._ensure_container()
-        _timeout = timeout or 180
+        """셸 명령을 실행한다. 총 소요는 기동 상한 + 실행 상한을 넘지 않는다.
+
+        상한을 넘기면 예외 대신 exit_code 124(시간 초과)/125(샌드박스 사용 불가)와
+        사유 문구를 돌려준다 — 호출자(스킬 도구)가 그걸 보고 로컬 경로로 폴백하고
+        사용자에게 알릴 수 있어야 하기 때문이다.
+        """
+        try:
+            container = self._ensure_container()
+        except SandboxUnavailable as exc:
+            return ExecuteResponse(output=f"ERROR: {exc}", exit_code=UNAVAILABLE_EXIT_CODE, truncated=False)
+        except docker.errors.DockerException as exc:
+            return ExecuteResponse(
+                output=f"ERROR: 샌드박스를 사용할 수 없습니다: {exc}",
+                exit_code=UNAVAILABLE_EXIT_CODE,
+                truncated=False,
+            )
+
+        _timeout = timeout or SANDBOX_EXEC_TIMEOUT
+        # 자동 설치 재시도까지 포함한 **한 호출 전체**의 마감 시각. 재시도마다 상한을
+        # 새로 주면 (첫 실행 + 사전설치 대기 + apt + 재실행) 이 상한의 몇 배가 된다.
+        deadline = time.monotonic() + _timeout
+
+        def _remaining() -> int:
+            return int(deadline - time.monotonic())
+
+        def _timeout_response() -> tuple[int, str]:
+            return TIMEOUT_EXIT_CODE, (
+                f"ERROR: command timed out after {_timeout}s — 상한을 넘겨 중단했습니다. "
+                "명령을 더 작게 나누거나 오래 걸리는 단계를 건너뛰고 다시 시도하세요."
+            )
 
         def _exec(cmd: str) -> tuple[int, str]:
-            holder: dict = {}
-
-            def _run() -> None:
-                # Don't pass workdir= to exec_run: on macOS + Colima/Docker Desktop,
-                # runc resolves the bind-mount target back to the host path and
-                # raises "current working directory is outside of container mount
-                # namespace root". cd inside bash bypasses that OCI-level check.
-                #
-                # 서브셸 여는/닫는 괄호는 반드시 **각자 자기 줄**에 둔다. cmd 와 같은 줄에
-                # ` )` 를 붙이면, cmd 가 heredoc(<<'JSON' ... JSON)으로 끝날 때 닫는 구분자
-                # 줄이 "JSON )" 로 오염돼 heredoc 이 깨진다(bash: here-document ... wanted `JSON').
-                wrapped = f"cd {_CONTAINER_WORKSPACE} && (\n{cmd}\n)"
-                exit_code, output = container.exec_run(
-                    ["bash", "-c", wrapped],
-                    demux=False,
-                )
-                holder["exit_code"] = exit_code
-                holder["output"] = (output or b"").decode("utf-8", errors="replace")
-
-            thread = threading.Thread(target=_run, daemon=True)
-            thread.start()
-            thread.join(_timeout)
-
-            if thread.is_alive():
-                return 124, f"ERROR: command timed out after {_timeout}s"
-            return holder.get("exit_code") or 0, holder.get("output", "")
+            budget = _remaining()
+            if budget <= 0:
+                return _timeout_response()
+            # Don't pass workdir= to exec_run: on macOS + Colima/Docker Desktop,
+            # runc resolves the bind-mount target back to the host path and
+            # raises "current working directory is outside of container mount
+            # namespace root". cd inside bash bypasses that OCI-level check.
+            #
+            # 서브셸 여는/닫는 괄호는 반드시 **각자 자기 줄**에 둔다. cmd 와 같은 줄에
+            # ` )` 를 붙이면, cmd 가 heredoc(<<'JSON' ... JSON)으로 끝날 때 닫는 구분자
+            # 줄이 "JSON )" 로 오염돼 heredoc 이 깨진다(bash: here-document ... wanted `JSON').
+            wrapped = f"cd {_CONTAINER_WORKSPACE} && (\n{cmd}\n)"
+            exit_code, output, timed_out = _exec_in_container(container, wrapped, budget)
+            if timed_out:
+                return _timeout_response()
+            return exit_code, output
 
         exit_code, out = _exec(command)
+        notes: list[str] = []
 
-        # 커맨드를 찾을 수 없는 경우 apt-get으로 자동 설치 후 1회 재시도
+        # 커맨드를 찾을 수 없는 경우 apt-get으로 자동 설치 후 1회 재시도.
+        # 같은 커맨드는 컨테이너당 한 번만 시도한다 — apt 를 쓸 수 없는 환경(사설 네트워크,
+        # 미러 차단 등)에서는 설치가 매번 실패하는데, 그때마다 apt-get update 를 다시 도는
+        # 것은 툴 호출마다 수십 초를 그냥 버리는 짓이다.
         match = _CMD_NOT_FOUND_RE.search(out)
         if match:
             missing = match.group(1)
-            pkg = _PACKAGE_OVERRIDES.get(missing, missing)
-            logger.info("auto-installing missing command %r (package=%r)", missing, pkg)
-            install_cmd = (
-                "DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -1 "
-                f"&& apt-get install -y -qq --no-install-recommends {pkg} 2>&1 | tail -3"
-            )
-            container.exec_run(["bash", "-c", install_cmd], demux=False)
-            exit_code, out = _exec(command)
+            attempted = getattr(container, "_deepagent_apt_attempted", None)
+            if attempted is None:
+                attempted = set()
+                container._deepagent_apt_attempted = attempted
+            # 사전 설치가 아직 돌고 있으면 그게 끝나기를 기다린 뒤 한 번 더 본다.
+            # 기다리지 않고 여기서 apt 를 또 부르면 dpkg 락을 두고 서로 막는다.
+            bootstrap = getattr(container, "_deepagent_bootstrap_thread", None)
+            if bootstrap is not None and bootstrap.is_alive():
+                wait = min(_BOOTSTRAP_WAIT_SECONDS, max(_remaining(), 0))
+                bootstrap.join(wait)
+                if bootstrap.is_alive():
+                    notes.append(
+                        f"NOTE: 기본 도구 사전 설치가 {wait}초 안에 끝나지 않아 기다리지 않고 진행했습니다."
+                    )
+                else:
+                    exit_code, out = _exec(command)
+                    match = _CMD_NOT_FOUND_RE.search(out)
+                    missing = match.group(1) if match else ""
+
+            install_budget = min(SANDBOX_INSTALL_TIMEOUT, max(_remaining(), 0))
+            if missing and missing not in attempted and install_budget > 0:
+                attempted.add(missing)
+                pkg = _PACKAGE_OVERRIDES.get(missing, missing)
+                logger.info("auto-installing missing command %r (package=%r)", missing, pkg)
+                install_cmd = (
+                    "DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -1 "
+                    f"&& apt-get install -y -qq --no-install-recommends {pkg} 2>&1 | tail -3"
+                )
+                _, _, install_timed_out = _exec_in_container(container, install_cmd, install_budget)
+                if install_timed_out:
+                    # 폴백: 설치를 포기하고 원래 결과(=커맨드 없음)를 그대로 돌려준다.
+                    # 사용자에게는 그 사실을 알려 다른 방법을 고를 수 있게 한다.
+                    logger.warning(
+                        "sandbox 자동 설치가 %d초 상한을 넘겨 중단: %s", install_budget, missing
+                    )
+                    notes.append(
+                        f"NOTE: '{missing}' 자동 설치가 {install_budget}초 상한을 넘겨 중단했습니다. "
+                        "설치 없이 진행하니, 이 명령이 필요 없는 방법으로 다시 시도하세요."
+                    )
+                else:
+                    if missing == "git":
+                        self._configure_git(container)
+                    exit_code, out = _exec(command)
+            elif missing and missing in attempted:
+                logger.info("auto-install skipped for %r (already attempted in this sandbox)", missing)
+            elif missing:
+                notes.append(
+                    f"NOTE: 남은 시간이 없어 '{missing}' 자동 설치를 건너뛰었습니다."
+                )
+
+        if notes:
+            out = f"{out}\n" + "\n".join(notes) if out else "\n".join(notes)
 
         truncated = len(out) > _MAX_OUTPUT_BYTES
         if truncated:
@@ -391,7 +697,10 @@ class DockerSandboxBackend(BaseSandbox):
         )
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        container = self._ensure_container()
+        try:
+            container = self._ensure_container()
+        except (SandboxUnavailable, docker.errors.DockerException) as exc:
+            return [FileUploadResponse(path=path, error=str(exc)) for path, _ in files]
         responses: list[FileUploadResponse] = []
         for path, content in files:
             try:
@@ -414,7 +723,10 @@ class DockerSandboxBackend(BaseSandbox):
         return responses
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-        container = self._ensure_container()
+        try:
+            container = self._ensure_container()
+        except (SandboxUnavailable, docker.errors.DockerException) as exc:
+            return [FileDownloadResponse(path=path, error=str(exc)) for path in paths]
         responses: list[FileDownloadResponse] = []
         for path in paths:
             try:

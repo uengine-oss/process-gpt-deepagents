@@ -9,6 +9,22 @@ from langgraph.types import Command
 # [user][이름]: 또는 [assistant][이름][agentId=...]: 형식 파싱
 _MSG_RE = re.compile(r'\[(user|assistant)\](?:\[[^\]]*\])*:\s*')
 
+# 메시지 선두의 '/skill-name' 슬래시 커맨드
+_SKILL_CMD_RE = re.compile(r'^/([A-Za-z0-9][\w\-]*)\s*')
+
+
+def extract_skill_command(text: str) -> tuple[str, str]:
+    """메시지 선두의 '/skill-name' 슬래시 커맨드를 파싱한다.
+
+    Returns:
+        (skill_name, remaining_text) — 슬래시 커맨드가 없으면 ("", 원본 text).
+    """
+    stripped = text.lstrip()
+    m = _SKILL_CMD_RE.match(stripped)
+    if not m:
+        return "", text
+    return m.group(1), stripped[m.end():].strip()
+
 
 def _field_example_value(field: dict[str, Any]) -> Any:
     """폼 필드 정의로부터 출력 예시 값을 만든다. 다중 입력 모드 필드는 행(row) 객체의 배열로 표현한다."""

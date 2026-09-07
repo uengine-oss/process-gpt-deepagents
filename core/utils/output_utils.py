@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import json
 import re
+from difflib import SequenceMatcher
 from typing import Any
+
+# langchain(1.3.4)/deepagents(0.6.8) 에이전트 루프가 도구 호출 없는 응답 뒤에도
+# 종료로 판단하지 못하고 한 턴을 더 돌아, 이미 낸 최종 답변을 다시 요약해 내는
+# 사례가 관측됐다(LiteLLM 로그로 확인: 두 번째 호출의 프롬프트에 첫 번째 답변
+# 전체가 컨텍스트로 포함됨). 그 결과 마지막 assistant 메시지의 content 가
+# "거의 같은 내용을 담은 text 블록 여러 개"로 남는다. 프레임워크 쪽 루프 종료
+# 판정 버그이므로 여기서 근본 수정은 어렵고, 저장 직전에 마지막 블록만 남기는
+# 방어 로직으로 사용자에게 중복 노출되는 것만 막는다.
+_DUPLICATE_TEXT_BLOCK_SIMILARITY_THRESHOLD = 0.5
 
 
 def _iter_balanced_json_objects(text: str):
@@ -88,6 +98,31 @@ def _last_assistant_message(messages: list[Any]) -> Any | None:
     return None
 
 
+def _text_blocks_look_like_full_restatement(parts: list[str]) -> bool:
+    """마지막 블록이 앞선 블록들을 사실상 다시 요약/반복한 것인지 판단.
+
+    각 블록이 그 자체로 상당한 분량(대충 하나의 완결된 답변으로 볼 만한 길이)이고,
+    마지막 블록이 그 앞의 어느 블록과도 내용이 크게 겹치면(문자 단위 유사도 임계치
+    이상) "같은 답을 다시 냈다"로 본다. 어느 조건 하나라도 안 맞으면(예: 첫 블록이
+    아주 짧은 인사말/전환 문구, 혹은 블록들이 서로 다른 내용을 이어 쓴 정상적인 긴
+    답변) 원래대로 이어붙인다 — 정상적인 다중 텍스트 블록 답변을 잘라내는 회귀를
+    피하기 위함.
+    """
+    if len(parts) < 2:
+        return False
+    last = parts[-1].strip()
+    if len(last) < 80:  # 너무 짧은 마지막 블록은 "반복 요약"으로 보기 어렵다
+        return False
+    for earlier in parts[:-1]:
+        earlier = earlier.strip()
+        if len(earlier) < 80:
+            continue
+        ratio = SequenceMatcher(None, earlier, last).ratio()
+        if ratio >= _DUPLICATE_TEXT_BLOCK_SIMILARITY_THRESHOLD:
+            return True
+    return False
+
+
 def _extract_plain_text(content: Any) -> str:
     if content is None:
         return ""
@@ -100,6 +135,8 @@ def _extract_plain_text(content: Any) -> str:
                 parts.append(block)
             elif isinstance(block, dict) and block.get("type") == "text":
                 parts.append(str(block.get("text") or ""))
+        if _text_blocks_look_like_full_restatement(parts):
+            return parts[-1]
         return "".join(parts)
     return str(content)
 

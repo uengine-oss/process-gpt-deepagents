@@ -1857,7 +1857,7 @@ wheels = [
 
 [[package]]
 name = "process-gpt-agent-sdk"
-version = "0.4.25"
+version = "0.4.27"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "a2a-sdk" },
@@ -1868,9 +1868,9 @@ dependencies = [
     { name = "supabase" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/14/3d/77a482c5b4e5b37357b4a3ae5278095bb490d008e408493de03bcfc0a0ca/process_gpt_agent_sdk-0.4.25.tar.gz", hash = "sha256:e0b191dc97045cad0389f74077acbcc2137a95bc45841bc94573661677f85faf", size = 39475, upload-time = "2026-08-10T06:17:28.138Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b2/40/2c4868edf3403171af13d7f9e1c1544d782aa36ca8090e7841683b9db060/process_gpt_agent_sdk-0.4.27.tar.gz", hash = "sha256:9800aa90b8693a3a2e8f7237ba5cc6d0366ef4b549bfceb5c1213d381f1f542c", size = 40940, upload-time = "2026-08-20T03:03:01.644Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fd/49/215992186e7e5bcb9b3e7ccbc8fe44272b40b26cb3e7c7aef51ac3c68d66/process_gpt_agent_sdk-0.4.25-py3-none-any.whl", hash = "sha256:ef3b1ba43223772406d270980884963abeec93dd3da5b21f203a9cfa3aff84b9", size = 40504, upload-time = "2026-08-10T06:17:26.534Z" },
+    { url = "https://files.pythonhosted.org/packages/20/0c/702223ccd10d75e4cda5f1f12802eec2f59edfea8c0e3ae7ecf0e68c2f6e/process_gpt_agent_sdk-0.4.27-py3-none-any.whl", hash = "sha256:77da9830c9f3731dbd984be1407c5e82d6154e2ddf8e4568219f1d577c73e566", size = 41435, upload-time = "2026-08-20T03:03:00.151Z" },
 ]
 
 [package.optional-dependencies]
@@ -1901,6 +1901,7 @@ dependencies = [
     { name = "protobuf" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
+    { name = "pyjwt" },
     { name = "pymupdf" },
     { name = "python-docx" },
     { name = "python-dotenv" },
@@ -1926,16 +1927,17 @@ requires-dist = [
     { name = "langchain", specifier = "==1.3.4" },
     { name = "langchain-anthropic", specifier = "==1.4.4" },
     { name = "langchain-core", specifier = "==1.4.2" },
-    { name = "langchain-mcp-adapters", specifier = ">=0.1" },
+    { name = "langchain-mcp-adapters", specifier = "==0.2.2" },
     { name = "langchain-openai", specifier = "==1.2.2" },
     { name = "langgraph", specifier = "==1.2.4" },
     { name = "langgraph-checkpoint", specifier = "==4.1.1" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=2.0" },
-    { name = "mcp", specifier = ">=1.0" },
-    { name = "process-gpt-agent-sdk", extras = ["sse"], specifier = "==0.4.25" },
+    { name = "mcp", specifier = "==1.27.2" },
+    { name = "process-gpt-agent-sdk", extras = ["sse"], specifier = "==0.4.27" },
     { name = "protobuf", specifier = "==6.33.6" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "psycopg-pool", specifier = ">=3.2" },
+    { name = "pyjwt", specifier = ">=2.8" },
     { name = "pymupdf", specifier = ">=1.24" },
     { name = "python-docx", specifier = ">=1.2.0" },
     { name = "python-dotenv", specifier = "==1.2.2" },

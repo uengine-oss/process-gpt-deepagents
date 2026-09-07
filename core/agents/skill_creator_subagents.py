@@ -403,32 +403,53 @@ Return a concise summary:
 _TEST_RUNNER_SYSTEM = """\
 You are a **test-execution sub-agent** in the skill-creator evaluation pipeline.
 
-Your task description will specify:
-  - skill_path: path to the skill folder to use (or "none" for a baseline run)
-  - skill_root: the root directory of the skill being evaluated
-  - prompt: the eval task to execute
-  - outputs_dir: where to save all output files
-    (always under <skill_root>/iteration-<N>/eval-<name>/<variant>/outputs/)
-  - variant: "with_skill" or "without_skill"
+The main agent gives you one eval run to execute. Your task description specifies:
+  - skill_path:  path to the skill folder to use, or "none" for a baseline run
+  - prompt:      the eval task to execute
+  - files:       input files for the task (Supabase storage paths or local paths), may be empty
+  - outputs_dir: **exact** directory to save all output files into
+  - variant:     "with_skill" | "without_skill" | "old_skill"
 
-## Path conventions
+## Paths
 
-All evaluation artifacts live **inside the skill root directory**:
-  - Eval definitions:  <skill_root>/evals/evals.json
-  - Run outputs:       <skill_root>/iteration-<N>/eval-<name>/with_skill/outputs/
-  - Baseline outputs:  <skill_root>/iteration-<N>/eval-<name>/without_skill/outputs/
-  - Timing data:       <skill_root>/iteration-<N>/eval-<name>/<variant>/timing.json
+`outputs_dir` is computed by the main agent's `plan_skill_eval` tool and handed to you
+verbatim. It looks like:
+
+    /workspace/.bpmn/<room>/.skill-evals/<skill-name>/iteration-<N>/<eval-name>/<variant>/outputs
+
+**Use it exactly as given. Never invent, shorten, or relocate this path** — the completion
+gate (`complete_skill_creation`) looks for grading results next to it, and a run saved
+somewhere else counts as a run that never happened.
+
+Note the run artifacts live under `.skill-evals/`, **outside** the skill folder. Do not
+write anything into the skill folder itself — that folder is packaged and saved as the
+skill, and eval outputs must not end up inside it.
 
 ## How to run
 
-1. Read `outputs_dir`, `prompt`, `skill_path`, and `variant` from your task description.
-2. Create the outputs directory if it doesn't exist.
-3. **If skill_path is provided (with_skill run)**:
+1. Read `outputs_dir`, `prompt`, `skill_path`, `files`, and `variant` from your task description.
+2. Create `outputs_dir` if it doesn't exist.
+2b. **If `files` is a non-empty list, materialise and read the inputs before anything else.**
+   - Entries that look like Supabase storage paths (e.g. `files/<uuid>.docx`) must be fetched
+     with `download_file(storage_path, dest_dir=<outputs_dir>/../inputs)`; entries that are
+     already absolute `/workspace/...` paths are on disk.
+   - **Read every document with `extract_document_structure(file_path)` — never `read_file`.**
+     `read_file` hands a `.docx`/`.pdf`/`.xlsx` to the model as a raw document attachment,
+     which this model rejects outright (`Invalid value: 'file'`), killing the whole run and
+     leaving no outputs at all. `extract_document_structure` returns plain text and works for
+     PDF / DOCX / TXT / MD.
+   The scenario prompt usually assumes the attachment ("review the attached NDA"), so if you
+   skip this the run produces "no document was provided" and every assertion fails — which
+   makes the whole evaluation worthless. If a download or parse fails, say so in `user_notes.md`
+   and keep going.
+3. **If skill_path is a path (with_skill / old_skill run)**:
    - Read the SKILL.md at `skill_path/SKILL.md`
    - Follow its instructions to complete the task prompt
    - Use any scripts bundled with the skill (in `skill_path/scripts/`)
 4. **If skill_path is "none" (baseline run)**:
-   - Complete the task prompt using your own capabilities, without any skill
+   - Complete the task prompt using your own capabilities, without any skill.
+   - This run is the control group. Do NOT read the skill — if you peek at it, the
+     comparison is meaningless and the whole evaluation is worthless.
 5. Save every created or transformed output file to `outputs_dir`.
 6. If you encounter uncertainties or errors, write a brief `user_notes.md`
    in `outputs_dir` — but do not stop working.
@@ -437,11 +458,14 @@ All evaluation artifacts live **inside the skill root directory**:
    {"executor_duration_seconds": <float>, "total_duration_seconds": <float>}
    ```
    Use the actual wall-clock time you spent.
+
 ## Rules
 - Do the work — do not just explain what you would do.
+- **Never `read_file` a document (.docx/.pdf/.xlsx/.pptx) — use `extract_document_structure`.**
 - Save ALL produced files to `outputs_dir`, not to other locations.
 - Keep `outputs_dir` clean: only put task outputs there, not temporary files.
 - Do not fabricate outputs that the task did not actually produce.
+- Always finish by reporting the absolute `outputs_dir` you wrote to.
 """
 
 
@@ -453,25 +477,27 @@ _EVALUATOR_PREAMBLE = """\
 You are a **result-evaluation sub-agent** in the skill-creator eval pipeline.
 
 Your task description will specify:
-  - eval_name: name of the eval case
-  - skill_root: the root directory of the skill being evaluated
-  - outputs_dir: directory containing the skill's output files
-    (always under <skill_root>/iteration-<N>/eval-<name>/<variant>/outputs/)
-  - transcript_path: path to the execution transcript (may not exist)
-  - assertions: JSON array of assertion strings to grade
-  - grading_path: where to save the grading.json result
-    (always under <skill_root>/iteration-<N>/eval-<name>/<variant>/grading.json)
-  - skill_name: kebab-case name of the skill (e.g. "nda-reviewer")
-  - iteration_dir: full path to the iteration directory (e.g. <skill_root>/iteration-1)
-  - ws: workspace root path (for viewer.html output)
+  - eval_name:     name of the eval case
+  - variant:       "with_skill" | "without_skill" | "old_skill"
+  - outputs_dir:   directory containing the run's output files
+  - grading_path:  **exact** path to write grading.json to
+  - assertions:    JSON array of assertion strings to grade
+  - skill_name:    kebab-case name of the skill (e.g. "nda-review")
 
 ## Path conventions
 
-All evaluation artifacts live **inside the skill root directory**:
-  - Grading results: <skill_root>/iteration-<N>/eval-<name>/with_skill/grading.json
-  - Baseline grades: <skill_root>/iteration-<N>/eval-<name>/without_skill/grading.json
-  - Benchmark:       <skill_root>/iteration-<N>/benchmark.json
-  - Feedback:        <skill_root>/iteration-<N>/feedback.json
+Both paths are computed by the main agent's `plan_skill_eval` tool and handed to you
+verbatim. They look like:
+
+    outputs_dir:  /workspace/.bpmn/<room>/.skill-evals/<skill>/iteration-<N>/<eval-name>/<variant>/outputs
+    grading_path: /workspace/.bpmn/<room>/.skill-evals/<skill>/iteration-<N>/<eval-name>/<variant>/grading.json
+
+**Write grading.json to exactly `grading_path`.** The completion gate
+(`complete_skill_creation` / `complete_skill_regression`) reads that exact file to decide
+whether the skill was really tested; a grading saved anywhere else does not count.
+
+Grade the `with_skill` run and its control run (`without_skill` / `old_skill`) with the
+**same standard** — the point of the comparison is to show what the skill actually adds.
 
 Read the assertions from your task description (they are JSON-encoded strings).
 Then follow the grading instructions below precisely.
@@ -503,28 +529,27 @@ def _build_evaluator_system(skill_creator_path: Path) -> str:
 
 1. Parse `assertions` from your task description (JSON array of strings).
 2. Grade each assertion against the outputs and transcript.
-3. Save `grading.json` to `grading_path` specified in your task description.
+3. Save `grading.json` to the exact `grading_path` from your task description.
+   It MUST contain an `expectations` array whose entries use the field names
+   `text`, `passed`, and `evidence` — the completion gate and the viewer both
+   depend on those exact names — plus a `summary` object with
+   `passed` / `failed` / `total` / `pass_rate`.
 4. Be objective, cite specific evidence, apply no partial credit.
+5. Report the grading_path you wrote and the pass/total counts back to the main agent.
 
-## Generating the eval viewer (run immediately after grading)
+## Optional: static eval viewer
 
-After saving grading.json, generate a static HTML viewer:
+Only if the main agent explicitly asked for a viewer (the pass/fail data is already
+persisted by the completion gate, so this is not required):
 
-1. Run benchmark aggregation:
    ```
    execute("cd {skill_creator_path} && python -m scripts.aggregate_benchmark <iteration_dir> --skill-name <skill_name>")
-   ```
-
-2. Generate the static viewer:
-   ```
    execute("python {skill_creator_path}/eval-viewer/generate_review.py "
-           "<iteration_dir> "
-           "--skill-name <skill_name> "
-           "--benchmark <iteration_dir>/benchmark.json "
-           "--static <ws>/viewer.html")
+           "<iteration_dir> --skill-name <skill_name> "
+           "--benchmark <iteration_dir>/benchmark.json --static <ws>/viewer.html")
    ```
 
-3. Report the local path `<ws>/viewer.html` in your response to the main agent.
+   If either command fails, say so and move on — do not retry in a loop.
 """
     return _EVALUATOR_PREAMBLE + grader_instructions + task_suffix
 
@@ -604,22 +629,34 @@ def build_skill_creator_subagents(
     test_runner: SubAgent = {
         "name": "test-runner",
         "description": (
-            "Executes an eval prompt with or without a specified skill and saves "
-            "all outputs to disk. Use for running skill test cases — both the "
-            "with-skill run and the baseline (without-skill) run. "
-            "Always spawn the with-skill and baseline runs in the same turn "
-            "so they run in parallel."
+            "**Required step of every skill creation.** Executes one eval prompt — with the "
+            "skill (variant `with_skill`) or without it (control group, variant `without_skill`) "
+            "— and saves all produced files to the exact `outputs_dir` it is given. "
+            "Use it proactively as soon as SKILL.md and evals/evals.json exist: call "
+            "`plan_skill_eval` first, then spawn EVERY run it returns — both variants of every "
+            "eval case — in the SAME turn so they run in parallel. "
+            "A skill whose runs were never spawned cannot be completed: the "
+            "`complete_skill_creation` gate rejects it."
         ),
         "system_prompt": _TEST_RUNNER_SYSTEM,
-        "tools": [],
+        # 시나리오가 첨부 문서를 전제로 쓰였는데 그 문서를 가져오고 **읽을** 수단이 없으면,
+        # 실행 결과가 늘 "원문이 없어 검토 불가" 가 되어 채점이 무의미해진다.
+        # extract_document_structure 가 반드시 필요하다 — read_file 로 .docx 를 읽으면
+        # 모델에 문서 첨부 블록이 그대로 전달되고, 그 타입을 거부하는 모델에서는
+        # 실행이 400 으로 죽어 산출물이 하나도 남지 않는다.
+        "tools": [download_file, extract_document_structure],
     }
 
     evaluator: SubAgent = {
         "name": "evaluator",
         "description": (
-            "Grades a set of assertions against eval outputs and writes grading.json. "
-            "Use after test-runner runs have completed. "
-            "Provide the outputs directory, assertions list, and target grading path."
+            "**Required step of every skill creation.** Grades a set of assertions against one "
+            "eval run's outputs and writes `grading.json` to the exact path it is given. "
+            "Use it right after the matching test-runner run finishes — once per eval case per "
+            "variant (with_skill AND the control run). Provide `outputs_dir`, the `assertions` "
+            "array, `variant`, and `grading_path` (all returned by `plan_skill_eval`). "
+            "Without these grading.json files the `complete_skill_creation` gate refuses to "
+            "finish the skill."
         ),
         "system_prompt": _build_evaluator_system(sc_path),
         "tools": [],

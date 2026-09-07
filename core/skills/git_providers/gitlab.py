@@ -313,9 +313,17 @@ class GitLabProvider(GitProvider):
                 "number": mr["iid"],
                 "title": mr["title"],
                 "html_url": mr["web_url"],
-                "state": mr["state"],
+                # GitLab 은 병합된 MR 의 state 가 "merged" 다. 그대로 넘기면 호출부가
+                # open/closed 만 아는 GitHub 어휘로 판정해 "열려 있지도 닫히지도 않은"
+                # MR 로 취급한다 — 목록에서 통째로 빠지는 원인이 된다.
+                "state": "open" if mr["state"] == "opened" else "closed",
                 "head": mr["source_branch"],
                 "base": mr["target_branch"],
+                "merged_at": mr.get("merged_at"),
+                "merged": mr["state"] == "merged" or bool(mr.get("merged_at")),
+                "author": (mr.get("author") or {}).get("username", ""),
+                "created_at": mr.get("created_at"),
+                "updated_at": mr.get("updated_at"),
             }
             for mr in resp.json()
         ]
@@ -327,7 +335,9 @@ class GitLabProvider(GitProvider):
             headers=self._headers(),
             timeout=15,
         )
-        if resp.status_code not in (202, 204):
+        # 이미 없는 레포(404)는 '삭제 완료'와 같게 다룬다. DELETE 는 멱등해야 하고,
+        # 여기서 예외를 던지면 호출부가 로컬 정리까지 건너뛰어 스킬이 영영 안 지워진다.
+        if resp.status_code not in (202, 204, 404):
             raise RuntimeError(f"GitLab 프로젝트 삭제 실패: {resp.status_code} {resp.text[:200]}")
 
     def get_pull_request_files(self, owner: str, repo: str, number: int) -> list[dict]:

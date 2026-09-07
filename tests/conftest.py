@@ -16,6 +16,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "gitea: integration test requiring GITEA_TOKEN env var"
     )
+    config.addinivalue_line(
+        "markers", "real_tenant_auth: run against the real /skills tenant guard (no identity stub)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -67,3 +70,35 @@ def github_test_repo(github_provider):
         github_provider.delete_repo(github_provider.username, repo_name)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# 스킬 API 테넌트 인증
+# ---------------------------------------------------------------------------
+# /skills* 는 이제 검증된 JWT 에서 테넌트를 얻는다(core/api/tenant_auth.py).
+# 기존 라우터 테스트는 토큰을 보내지 않으므로, 기본적으로 테스트용 신원을 주입한다.
+# 가드 자체를 검증하는 테스트는 `@pytest.mark.real_tenant_auth` 로 이 스텁을 끈다.
+
+TEST_USER_ID = "00000000-0000-0000-0000-0000000000aa"
+TEST_TENANT_IDS = frozenset({"t1", "tenant1"})
+
+
+@pytest.fixture(autouse=True)
+def stub_tenant_auth(request, monkeypatch):
+    if request.node.get_closest_marker("real_tenant_auth"):
+        yield
+        return
+
+    from core.api import tenant_auth
+
+    async def _fake_resolve_identity(_request):
+        return tenant_auth.RequestIdentity(
+            user_id=TEST_USER_ID,
+            email="test@example.com",
+            tenant_ids=TEST_TENANT_IDS,
+        )
+
+    monkeypatch.setattr(tenant_auth, "resolve_identity", _fake_resolve_identity)
+    tenant_auth.clear_caches()
+    yield
+    tenant_auth.clear_caches()

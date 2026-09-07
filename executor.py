@@ -46,11 +46,14 @@ from core.agents.input_builder import (
     build_graph_inputs,
     build_user_message,
     collect_recent_messages,
+    extract_skill_command,
     resolve_chat_room_id,
 )
 from core.chat.activity import (
     fetch_child_activity_todo,
     load_activity_capabilities,
+    load_activity_root_agent,
+    resolve_root_agent,
     load_subprocess_subagents,
 )
 from core.chat.chat_room import (
@@ -65,16 +68,18 @@ from core.chat.tool_arg_stream import ToolArgTextStreamer
 from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
+from core.skills.skills import resolve_slash_skill
 from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
-from core.deterministic import try_deterministic_execution
+from core.deterministic import MODE_UNDO_PENDING, try_deterministic_execution
 # 우리 기능(프로세스 생성 HITL 캡처/이름도출)에서 사용하는 contextvar — incoming 에는 없으나 유지.
 from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
 from core.skills.tools import _bpmn_work_dir
 from core.skills.tools import bpmn_container_base as _bpmn_container_base
+from core.skills.tools import checkout_container_base as _checkout_container_base
 from core.sandbox.docker_sandbox import set_workspace_scope
 from core.storage.storage import (
     download_workspace_directory,
@@ -90,6 +95,11 @@ logger = logging.getLogger(__name__)
 # write/update 도구는 더 이상 부착하지 않는다 — core/agents/agent.py 참고).
 _FILE_TOOL_NAMES = ("write_file", "edit_file")
 _FILE_ARTIFACT_MAX_BYTES = 400_000  # 미리보기에 과한 대용량 파일은 잘라 보냄
+
+# 스킬 평가(test-runner/evaluator) 실행 산출물 디렉터리. 회차마다 outputs/·grading.json 이
+# 수십 개씩 쌓이는 내부 작업 파일이라 사용자 산출물 패널에 띄우지 않는다 — 결과 요약은
+# complete_skill_creation 이 DB(skill_eval_runs/_results)에 남긴다.
+_EVAL_RUN_PATH_MARKER = "/.skill-evals/"
 
 # 채팅 산출물에서 스킬이 만든 hwpx 컨테이너 경로를 잡아내기 위한 패턴.
 _HWPX_PATH_RE = re.compile(r"/workspace/[^\s\"']+\.hwpx")
@@ -490,6 +500,24 @@ def _file_artifact_payload(path: str, content: str | None, op: str) -> dict:
     }
 
 
+# 응답이 "병합 요청(PR)을 올렸다"고 보고하는지 판단할 표식.
+# PR 을 올린 턴은 저장 버튼을 누를 일이 없으므로 기본 안내 문구로 덮어쓰면 안 된다.
+_PULL_REQUEST_MARKERS = (
+    "PR created",
+    "pull/",
+    "merge_requests/",
+    "PR #",
+    "병합 요청",
+    "병합해 주세요",
+)
+
+
+def _reports_pull_request(text: str | None) -> bool:
+    """응답 본문이 PR 생성 결과를 알리고 있으면 True."""
+    body = text or ""
+    return any(marker in body for marker in _PULL_REQUEST_MARKERS)
+
+
 async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
     """검증/완료 후 방의 모든 산출물 파일을 file_artifact(edit)로 재전송한다.
 
@@ -543,6 +571,14 @@ async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
             except Exception:
                 continue
 
+
+
+# 결정론적 실행 카드의 crew_type. `result` 를 쓰면 안 된다 — 프론트는 그 값을 "제출할
+# 수 있는 산출물"로 읽어 채택 버튼을 붙이고(`EventTimeline.isSubmittableTask`), 생성기는
+# 표본의 폼 산출물을 그 값으로 찾는다. 이 카드가 싣는 것은 폼 값이 아니라 실행 방식과
+# 도구 호출 결과라서, `result` 로 두면 채택 버튼이 둘이 되고 그중 하나는 누르는 순간
+# 폼에 실행 로그 JSON 을 밀어 넣는다. 폼 값은 뒤따르는 `최종 결과 반환` 이 싣는다.
+_DETERMINISTIC_CARD_CREW_TYPE = "deterministic"
 
 async def _enqueue_status(
     event_queue: EventQueue,
@@ -915,15 +951,57 @@ class DeepAgentExecutor(AgentExecutor):
         _skill_tenant_id.set(tenant_id)
         _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())
         set_process_context(root_proc_inst_id, current_workitem_id, current_proc_def_id)
-        agents = extras.get("agents", [])
-        streamer = extras.get("streamer")
-        form_id = extras.get("form_id")
-        has_file = bool(extras.get("sources"))
-
         # 채팅 경로(ChatRequestContext)에서는 프론트가 보낸 run_state/human_response_answer 가
         # extras["metadata"] 안에 들어온다. worklist 경로는 extras 최상위/draft 에 둔다.
         # 두 위치를 모두 확인해 채팅에서도 HITL resume 이 트리거되게 한다.
         metadata = extras.get("metadata", {}) if isinstance(extras.get("metadata"), dict) else {}
+
+        agents = extras.get("agents", [])
+        # 서브프로세스/액티비티 능력치 폴백(아래 `if not _has_directly_assigned_agents:`)은
+        # row.user_id로 직접 배정된 에이전트가 애초에 하나도 없을 때만 타야 한다. 아래에서
+        # agents 를 승격 처리로 비워도(agents = []) 이 폴백이 잘못 트리거되지 않도록,
+        # 원래 배정 여부를 별도로 기억해둔다.
+        _has_directly_assigned_agents = bool(agents)
+        streamer = extras.get("streamer")
+        form_id = extras.get("form_id")
+        has_file = bool(extras.get("sources"))
+
+        # 프론트가 이번 대화 상대로 지정한 에이전트 프로필(role/goal/persona/tools/skills).
+        # 딥 에이전트의 루트 프롬프트·도구·스킬을 이 프로필로 커스터마이즈하는 데 쓰인다.
+        agent_profile = metadata.get("agent_profile") if isinstance(metadata.get("agent_profile"), dict) else None
+
+        # 설계자/사용자가 "누구를 루트로 쓸지" 명시적으로 지정했는지 확인한다.
+        # - 프로세스 모드: 액티비티 정의의 rootAgent (프로세스 설계 화면의 '메인 에이전트')
+        # - 채팅 모드: 프론트가 보내는 metadata.root_agent_id
+        # 미지정(None)이면 아래의 기존 자동 휴리스틱이 그대로 적용된다.
+        explicit_root_agent_id = str(metadata.get("root_agent_id") or "").strip() or None
+        if explicit_root_agent_id is None and streamer is None and _has_directly_assigned_agents:
+            try:
+                explicit_root_agent_id = load_activity_root_agent(
+                    tenant_id=tenant_id,
+                    proc_def_id=current_proc_def_id,
+                    activity_id=activity_id,
+                )
+            except Exception:
+                logger.exception(
+                    "루트 에이전트 설정 조회 실패, 자동 규칙으로 진행 | proc_def_id=%s activity_id=%s",
+                    current_proc_def_id, activity_id,
+                )
+                explicit_root_agent_id = None
+
+        agent_profile, agents = resolve_root_agent(
+            agents=agents,
+            agent_profile=agent_profile,
+            explicit_root_agent_id=explicit_root_agent_id,
+            activity_id=activity_id,
+        )
+
+        def _exclude_root_profile(agent_list: list) -> list:
+            # 대화 상대 프로필이 루트 에이전트 자체가 된 경우, "서브에이전트 위임" 문구·
+            # task() 위임 후보에서 자기 자신은 제외한다.
+            if not (agent_profile and agent_profile.get("id")):
+                return agent_list
+            return [a for a in agent_list if str(a.get("id") or "") != str(agent_profile["id"])]
 
         draft = row.get("draft") if isinstance(row.get("draft"), dict) else {}
         run_state: dict[str, Any] = {}
@@ -953,6 +1031,12 @@ class DeepAgentExecutor(AgentExecutor):
         # <다른 instance_id>/inputs·outputs 를 절대경로로 직접 찍어 읽는 것도 막는다
         # (위 방 단위 폴더 격리만으론 에이전트가 의도적/우발적으로 형제 디렉토리를 열람하는 걸 못 막음).
         _scope_prefixes = [_bpmn_container_base(workspace_conversation_id)]
+        # 스킬 체크아웃도 방 단위로 갈리므로(.checkouts/<room>) 이번 방 것만 열어 준다.
+        # 방 id 가 없으면 checkout base 가 /workspace 자체라, 그걸 prefix 로 넣으면 위에서
+        # 좁혀 둔 스코프가 통째로 풀린다 — 그 경우는 넣지 않는다(어차피 격리할 방이 없다).
+        _checkout_base = _checkout_container_base(workspace_conversation_id)
+        if _checkout_base != "/workspace":
+            _scope_prefixes.append(_checkout_base)
         if instance_id:
             _scope_prefixes.append(f"/workspace/{_sanitize_ws_name(instance_id, 64)}")
         set_workspace_scope(*_scope_prefixes)
@@ -1066,6 +1150,9 @@ class DeepAgentExecutor(AgentExecutor):
                 _latest_feedback_content = str(_latest_feedback_item.get("content") or "").strip()
             else:
                 _latest_feedback_content = str(_latest_feedback_item or "").strip()
+        # 채팅모드에서 사용자가 메시지 선두에 '/skill-name' 을 입력하면, 그 스킬이 현재
+        # 테넌트에서 실제로 사용 가능할 때 해당 스킬을 강제 지정한다(아래 activity_skills 오버라이드).
+        _forced_skill_name = ""
         if _latest_feedback_content:
             _original_query = str(context.get_user_input() or "").strip()
             user_message = (
@@ -1074,13 +1161,23 @@ class DeepAgentExecutor(AgentExecutor):
             )
         else:
             _base_message = _offload_input_data(str(context.get_user_input() or ""), instance_id)
+            if is_chat:
+                _slash_skill, _stripped_message = extract_skill_command(_base_message)
+                if _slash_skill:
+                    _forced_skill_name = resolve_slash_skill(tenant_id, _slash_skill)
+                    if _forced_skill_name:
+                        _base_message = _stripped_message
+                        logger.info(
+                            "채팅 슬래시 커맨드로 스킬 지정 | tenant_id=%s skill=%s",
+                            tenant_id, _forced_skill_name,
+                        )
             user_message = build_user_message(
                 _base_message,
                 sources=extras.get("sources") or [],
                 form_id=form_id,
                 form_fields=extras.get("form_fields"),
                 suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
-                agents=agents,
+                agents=_exclude_root_profile(agents),
             )
         recent_msgs = collect_recent_messages(extras) if is_chat else []
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).
@@ -1132,11 +1229,25 @@ class DeepAgentExecutor(AgentExecutor):
             if deterministic is not None:
                 deterministic_job_id = str(uuid.uuid4())
                 is_undo = deterministic.mode == "deterministic-undo"
-                card_name = (
-                    "Undo(실행 취소) 후 재실행 결과"
-                    if is_undo
-                    else "결정론적 코드 실행 결과"
-                )
+                is_undo_only = deterministic.mode == "deterministic-undo-only"
+                # 되돌릴 근거가 없어 재작업 전체를 에이전트가 맡는 경우. 카드를 띄우지
+                # 않으면 "되돌릴 것이 없었다"와 "되돌릴 수 없었다"가 기록에서 구분되지
+                # 않는다 — 사람이 보는 자리에 사유가 남아야 한다.
+                is_skipped = deterministic.mode == "deterministic-skipped"
+                # 되돌릴 것이 남아 있는 채로 넘어온 경우. 사람이 보는 자리에 "보류"가 아니라
+                # "에이전트가 되돌린다"로 남아야, 재작업 결과를 검수할 때 무엇을 확인해야
+                # 하는지가 보인다.
+                is_undo_pending = deterministic.mode == MODE_UNDO_PENDING
+                if is_undo_pending:
+                    card_name = "이전 실행 되돌리기 — 에이전트가 수행"
+                elif is_skipped:
+                    card_name = "재작업 되돌리기 보류"
+                elif is_undo_only:
+                    card_name = "Undo(실행 취소) 결과"
+                elif is_undo:
+                    card_name = "Undo(실행 취소) 후 재실행 결과"
+                else:
+                    card_name = "결정론적 코드 실행 결과"
                 await _enqueue_status(
                     event_queue,
                     task_id=task_id,
@@ -1147,7 +1258,13 @@ class DeepAgentExecutor(AgentExecutor):
                             "role": card_name,
                             "name": card_name,
                             "goal": (
-                                "고착화된 undo 코드로 이전 실행을 되돌린 뒤 새 입력으로 재실행합니다."
+                                str(deterministic.output.get("note") or "")
+                                + " 사유: "
+                                + str(deterministic.output.get("reason") or "")
+                                if is_skipped or is_undo_pending
+                                else "고착화된 undo 코드로 이전 실행을 되돌립니다. 재실행은 에이전트가 수행합니다."
+                                if is_undo_only
+                                else "고착화된 undo 코드로 이전 실행을 되돌린 뒤 새 입력으로 재실행합니다."
                                 if is_undo
                                 else "고착화된 코드로 LLM 추론 없이 재실행합니다."
                             ),
@@ -1158,7 +1275,7 @@ class DeepAgentExecutor(AgentExecutor):
                     ),
                     event_type="task_started",
                     job_id=deterministic_job_id,
-                    crew_type="result",
+                    crew_type=_DETERMINISTIC_CARD_CREW_TYPE,
                 )
                 await _enqueue_status(
                     event_queue,
@@ -1168,18 +1285,67 @@ class DeepAgentExecutor(AgentExecutor):
                     text=deterministic.result_text,
                     event_type="task_completed",
                     job_id=deterministic_job_id,
-                    crew_type="result",
+                    crew_type=_DETERMINISTIC_CARD_CREW_TYPE,
                 )
-                artifact_evt = new_text_artifact_update_event(
-                    task_id=task_id,
-                    context_id=context_id,
-                    name="assistant_response",
-                    text=deterministic.result_text,
-                    last_chunk=True,
-                )
-                ParseDict({"role": "assistant"}, artifact_evt.metadata)
-                await event_queue.enqueue_event(artifact_evt)
-                return None
+                if not deterministic.continue_to_llm:
+                    # 에이전트 경로와 같은 자리에 `최종 결과 반환` 을 하나 더 띄운다.
+                    # 워크아이템의 폼 산출물은 이 이벤트와 최종 artifact 로만 전달되고,
+                    # 위의 결과 카드는 실행 방식만 보여 준다. 이걸 빼면 코드가 제대로
+                    # 돌았는데도 폼이 빈 채로 워크아이템이 완료되어 다음 활동이 굶는다.
+                    final_text = deterministic.form_output_text or deterministic.result_text
+                    if deterministic.form_output_text:
+                        result_job_id = str(uuid.uuid4())
+                        await _enqueue_status(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            state=TaskState.TASK_STATE_WORKING,
+                            text=json.dumps(
+                                {
+                                    "goal": "최종 결과를 반환합니다.",
+                                    "name": "최종 결과 반환",
+                                    "role": "최종 결과 반환",
+                                    "agent_profile": "/images/chat-icon.png",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            event_type="task_started",
+                            job_id=result_job_id,
+                            crew_type="result",
+                        )
+                        _save_step_output(final_text, instance_id, activity_id)
+                        await _enqueue_status(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            state=TaskState.TASK_STATE_COMPLETED,
+                            text=final_text,
+                            event_type="task_completed",
+                            job_id=result_job_id,
+                            crew_type="result",
+                        )
+                    artifact_evt = new_text_artifact_update_event(
+                        task_id=task_id,
+                        context_id=context_id,
+                        name="assistant_response",
+                        text=final_text,
+                        last_chunk=True,
+                    )
+                    ParseDict({"role": "assistant"}, artifact_evt.metadata)
+                    await event_queue.enqueue_event(artifact_evt)
+                    return None
+                # 되돌리기만 수행한 경우: 결과 카드만 남기고 DeepAgents 실행을 계속한다.
+                # 최종 산출물은 에이전트가 만든다.
+                if deterministic.undo_directive:
+                    # 보상이 아직 끝나지 않았다. 되돌리기(또는 사람 확인) 지시를 작업 지시
+                    # **앞에** 붙여, 그것을 먼저 마치고 나서 재작업하게 한다. 이 줄이 없으면
+                    # 되돌려지지 않은 세상 위에 재작업이 얹혀 같은 값이 두 번 반영된다.
+                    user_message = f"{deterministic.undo_directive}\n\n{user_message}"
+                    logger.info(
+                        "되돌리기 지시를 에이전트 입력에 주입 | todo=%s mode=%s steps=%d",
+                        row.get("id"), deterministic.mode,
+                        len(deterministic.output.get("undo_steps") or []),
+                    )
 
         job_id = str(uuid.uuid4())
 
@@ -1268,7 +1434,7 @@ class DeepAgentExecutor(AgentExecutor):
         root_proc_inst_id: str = ""
         activity_tools: list[str] = []
         activity_skills: list[str] = []
-        if not agents:
+        if not _has_directly_assigned_agents:
             proc_def_id = str(row.get("proc_def_id") or "").strip()
             activity_id = str(row.get("activity_id") or "").strip()
             subprocess_agents = load_subprocess_subagents(
@@ -1337,6 +1503,11 @@ class DeepAgentExecutor(AgentExecutor):
                         proc_def_id, activity_id,
                     )
 
+        # 사용자가 채팅 메시지에 '/skill-name' 슬래시 커맨드를 입력한 경우, 액티비티 정의로
+        # 유도된 스킬 목록과 무관하게 그 스킬 하나로 반드시 실행되도록 덮어쓴다.
+        if _forced_skill_name:
+            activity_skills = [_forced_skill_name]
+
         _root_tools_by_server: dict[str, list[str]] = {}
         for _tool_name, _srv in _root_tool_servers.items():
             _root_tools_by_server.setdefault(_srv, []).append(_tool_name)
@@ -1394,15 +1565,19 @@ class DeepAgentExecutor(AgentExecutor):
             tenant_id=tenant_id,
             conversation_id=workspace_conversation_id or "",
             checkpointer=checkpointer,
-            subagents_raw=agents,
+            subagents_raw=_exclude_root_profile(agents),
             tenant_mcp=tenant_mcp,
             extra_tools=chat_root_tools,
             middleware=[ToolResultTruncationMiddleware()],
-            static_subagents=build_skill_creator_subagents(task_id=task_id),
+            # skill-creator 서브에이전트(단독 스킬 생성 위임 대상)는 채팅에서 사용자가
+            # "스킬 만들어줘" 라고 요청하는 흐름 전용이다. 프로세스(워크아이템) 모드는
+            # BPMN 액티비티를 실행하는 것이지 스킬을 생성하는 게 아니므로 붙이지 않는다.
+            static_subagents=build_skill_creator_subagents(task_id=task_id) if is_chat else [],
             agent_mode=agent_mode,
             is_chat=is_chat,
             activity_tools=activity_tools,
             activity_skills=activity_skills,
+            root_profile=agent_profile,
             user_context={
                 "user_jwt": user_jwt,
                 "user_email": user_email,
@@ -1449,6 +1624,10 @@ class DeepAgentExecutor(AgentExecutor):
         # key = tool_call index(스트리밍 청크는 id 없이 index 로만 온다).
         hitl_arg_streamers: dict[int, ToolArgTextStreamer] = {}
         hitl_arg_indexes: set[int] = set()
+        # 도구 호출 인자 tool_call_id → args. tool_usage_finished 이벤트에 인자를 함께
+        # 실어야 고착화 코드 생성과 보상(undo) 생성이 성립한다. 인자 없이 결과만
+        # 남으면 되돌릴 대상을 복원할 수 없다.
+        pending_tool_args: dict[str, dict] = {}
         # write_file/edit_file tool_call_id → {path, op}. tool_end 시 파일을 읽어 file_artifact emit.
         pending_file_ops: dict[str, dict] = {}
         # subprocess 딥에이전트: task() tool_call_id → subagent_type slug
@@ -1535,6 +1714,8 @@ class DeepAgentExecutor(AgentExecutor):
                                     _tc_id = tc.get("id")
                                     if _tc_id:
                                         active_tool_calls[_tc_id] = tool_name
+                                        if isinstance(tool_args, dict):
+                                            pending_tool_args[_tc_id] = tool_args
                                     if tool_name == "request_human_input":
                                         pending_hitl_payload = normalize_hitl_payload(tool_args)
                                     # 파일 산출물 추적: write_file/edit_file 의 대상 경로를 기록해두고
@@ -1545,7 +1726,12 @@ class DeepAgentExecutor(AgentExecutor):
                                             pending_task_calls[_tc_id] = _subagent_slug
                                     if streamer and tool_name in _FILE_TOOL_NAMES:
                                         _fp = (tool_args.get("file_path") or tool_args.get("path") or "") if isinstance(tool_args, dict) else ""
-                                        if _fp and _tc_id and str(_fp).startswith("/workspace"):
+                                        if (
+                                            _fp
+                                            and _tc_id
+                                            and str(_fp).startswith("/workspace")
+                                            and _EVAL_RUN_PATH_MARKER not in str(_fp)
+                                        ):
                                             pending_file_ops[_tc_id] = {
                                                 "path": str(_fp),
                                                 "op": "create" if tool_name == "write_file" else "edit",
@@ -1611,6 +1797,7 @@ class DeepAgentExecutor(AgentExecutor):
                                 tool_name = active_tool_calls.pop(
                                     msg.tool_call_id, getattr(msg, "name", "unknown")
                                 )
+                                tool_args_used = pending_tool_args.pop(msg.tool_call_id, {})
                                 result_content = msg.content
                                 # 채팅: 도구 결과(예: build_hwpx 실행 출력)에서 hwpx 경로를 모아 종료 시 실체화.
                                 if is_chat:
@@ -1625,8 +1812,14 @@ class DeepAgentExecutor(AgentExecutor):
                                     context_id=context_id,
                                     state=TaskState.TASK_STATE_WORKING,
                                     text=json.dumps(
-                                        {"tool": tool_name, "tool_name": tool_name, "result": result_content},
+                                        {
+                                            "tool": tool_name,
+                                            "tool_name": tool_name,
+                                            "args": tool_args_used,
+                                            "result": result_content,
+                                        },
                                         ensure_ascii=False,
+                                        default=str,
                                     ),
                                     event_type="tool_usage_finished",
                                     job_id=job_id,
@@ -1892,7 +2085,10 @@ class DeepAgentExecutor(AgentExecutor):
                 try:
                     await _reemit_room_artifacts(streamer, chat_room_id or "")
                     logger.info("단독 스킬 산출물 재전송 | room=%s", chat_room_id)
-                    if "확인 후 저장" not in (raw_text or ""):
+                    # PR(병합 요청)을 올린 턴은 사용자가 저장 버튼을 누를 일이 없다. 그런데도
+                    # 이 문구로 덮어쓰면 PR 링크와 병합 위치 안내가 사라지고 "저장하라"는
+                    # 잘못된 안내만 남는다. 그런 응답은 에이전트의 원문을 그대로 둔다.
+                    if "확인 후 저장" not in (raw_text or "") and not _reports_pull_request(raw_text):
                         raw_text = "스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요."
                 except Exception:
                     logger.exception("단독 스킬 산출물 재전송 실패")
