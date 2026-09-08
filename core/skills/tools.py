@@ -796,6 +796,28 @@ def _normalize_requester_ids(requester_id: str | list[str] | None) -> list[str]:
     return _as_list(requester_id) or [str(_uuid.UUID(int=0))]
 
 
+def _skill_owner_id(sb, tenant_id: str, skill_name: str) -> str | None:
+    """이 스킬을 검토할 사람(소유자). 못 찾으면 None — 조회 실패가 PR 기록을 막지는 않는다."""
+    try:
+        resp = (
+            sb.table("tenant_skills")
+            .select("owner_id")
+            .eq("tenant_id", tenant_id)
+            .eq("skill_name", skill_name)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(resp, "data", None) or []
+        return (rows[0].get("owner_id") or None) if rows else None
+    except Exception:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "스킬 소유자 조회 실패 skill=%s tenant=%s", skill_name, tenant_id, exc_info=True
+        )
+        return None
+
+
 def _record_resource_pr(
     *,
     resource_type: str,
@@ -824,6 +846,11 @@ def _record_resource_pr(
         from ..storage.db import get_supabase
         sb = get_supabase()
         row = {
+            # 이 요청을 검토할 사람을 행에 남긴다. 비워 두면 "누가 봐야 하는 요청인지" 를
+            # 화면이 매번 소유자 테이블과 대조해 유추해야 한다.
+            "reviewer_id": (
+                _skill_owner_id(sb, tenant_id, resource_id) if resource_type == "skill" else None
+            ),
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "resource_id": resource_id,

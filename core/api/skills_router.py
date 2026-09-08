@@ -290,6 +290,26 @@ def _get_provider(tenant_id: str):
     return get_provider(tenant_id)
 
 
+def _skill_owner_id(sb, tenant_id: str, skill_name: str) -> str | None:
+    """이 스킬을 검토할 사람(소유자). 못 찾으면 None — 조회 실패가 PR 기록을 막지는 않는다."""
+    try:
+        resp = (
+            sb.table("tenant_skills")
+            .select("owner_id")
+            .eq("tenant_id", tenant_id)
+            .eq("skill_name", skill_name)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(resp, "data", None) or []
+        return (rows[0].get("owner_id") or None) if rows else None
+    except Exception:
+        logger.warning(
+            "스킬 소유자 조회 실패 skill=%s tenant=%s", skill_name, tenant_id, exc_info=True
+        )
+        return None
+
+
 def _save_tenant_skill(tenant_id: str, skill_name: str, owner_id: str) -> None:
     """tenant_skills 테이블에 스킬 등록 정보를 저장한다. 에이전트 도구로 노출하지 않는다."""
     from core.storage.db import get_supabase
@@ -342,6 +362,11 @@ def _record_resource_pr_sync(
     try:
         sb = get_supabase()
         row = {
+            # 검토할 사람(스킬 소유자)을 행에 남긴다 — 화면이 소유자 테이블과 대조해
+            # 유추하지 않아도 "누가 봐야 하는 요청인지" 가 기록으로 남는다.
+            "reviewer_id": (
+                _skill_owner_id(sb, tenant_id, resource_id) if resource_type == "skill" else None
+            ),
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "resource_id": resource_id,
