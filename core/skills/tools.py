@@ -493,6 +493,51 @@ def _try_clone_skill_repo(skill_name: str, dest: str) -> str | None:
     return dest
 
 
+def _is_room_draft_dir(path: str) -> bool:
+    """이 경로가 방 산출물 작업 디렉터리(.bpmn/<room>/...) 안인가.
+
+    체크아웃(.checkouts/<room>/...)과 달리 git 이력이 없는 초안 자리다.
+    """
+    s = str(path or "").replace("\\", "/")
+    return f"/{BPMN_WORK_SUBDIR}/" in s or s.endswith(f"/{BPMN_WORK_SUBDIR}")
+
+
+def _rebase_draft_onto_checkout(
+    draft_dir: str, skill_name: str, provider
+) -> tuple[str, str]:
+    """방 초안의 파일을 원격 레포 클론 위에 얹고 그 체크아웃 경로를 돌려준다.
+
+    돌려주는 값은 (경로, 에러문자열) 이며 둘 중 하나만 채워진다. 클론하지 못하면 경로 대신
+    에러를 돌려준다 — 초안 그대로 발행하면 기존 이력과 무관한 커밋이 되어 병합 요청을
+    만들 수 없기 때문에, 조용히 진행하는 것보다 실패로 알리는 편이 낫다.
+    """
+    dest = _checkout_dest(skill_name)
+    if str(dest).rstrip("/") == str(draft_dir).rstrip("/"):
+        return draft_dir, ""
+
+    auth_url = provider.get_authenticated_clone_url(provider.username, skill_name)
+    rc, out = _clone_sb(auth_url, dest)
+    if rc != 0:
+        return "", (
+            f"ERROR: '{skill_name}' 레포를 체크아웃하지 못해 발행을 중단했습니다: {out}\n"
+            "이 경로는 대화방 산출물 초안이라 git 이력이 없어, 그대로 발행하면 기존 내용을 "
+            "덮어써 병합 요청을 만들 수 없습니다. 네트워크를 확인한 뒤 다시 시도하거나 "
+            "checkout_to_workspace 가 돌려준 경로에서 수정해 주세요."
+        )
+
+    # 초안 파일만 얹는다(.git 은 클론한 것을 그대로 둔다). 초안에 없는 원격 파일은 지우지
+    # 않는다 — 사용자가 요청하지 않은 삭제가 PR 에 섞이지 않게 하려는 것으로,
+    # _push_skill_sandbox 의 `add --ignore-removal` 과 같은 판단이다.
+    rc, out = _sandbox_exec(
+        f"cd {shlex.quote(draft_dir)} && "
+        f"find . -mindepth 1 -maxdepth 1 ! -name .git "
+        f"-exec cp -R {{}} {shlex.quote(dest)}/ ';'"
+    )
+    if rc != 0:
+        return "", f"ERROR: 초안 파일을 체크아웃으로 옮기지 못했습니다: {out}"
+    return dest, ""
+
+
 # ---------------------------------------------------------------------------
 # Git provider 헬퍼
 # ---------------------------------------------------------------------------
@@ -602,12 +647,20 @@ def _auto_register_tenant_skill(cwd: str, skill_name: str, html_url: str) -> str
     skills_root = Path(first) if os.path.isabs(first) else (_BASE_DIR / first).resolve()
     skill_dir = skills_root / tenant_id / config_id / skill_name
 
+    # 이미 같은 스킬이 깔려 있으면 지우지 말고 백업해 두고 교체한다. 예전에는 곧바로
+    # rmtree 후 copytree 했는데, 뒤이은 DB 단계가 실패하면 그 삭제가 되돌려지지 않아
+    # 멀쩡히 등록돼 있던 스킬 디렉터리만 사라졌다.
+    already_registered = skill_dir.exists()
+    backup = skill_dir.with_name(f"{skill_dir.name}.bak-{os.getpid()}") if already_registered else None
     try:
         skill_dir.parent.mkdir(parents=True, exist_ok=True)
-        if skill_dir.exists():
-            _shutil.rmtree(skill_dir)
+        if backup is not None:
+            _shutil.rmtree(str(backup), ignore_errors=True)
+            _shutil.move(str(skill_dir), str(backup))
         _shutil.copytree(str(host_src), str(skill_dir))
     except Exception as e:
+        if backup is not None and backup.exists() and not skill_dir.exists():
+            _shutil.move(str(backup), str(skill_dir))
         return (
             f"Published '{skill_name}' → {html_url}\n"
             f"WARNING: 파일 sync 실패로 자동 등록을 건너뜁니다: {e}"
@@ -616,19 +669,38 @@ def _auto_register_tenant_skill(cwd: str, skill_name: str, html_url: str) -> str
     owner_id = _current_user_id.get() or ""
     try:
         from ..storage.db import get_supabase
-        get_supabase().table("tenant_skills").insert({
-            "tenant_id": tenant_id,
-            "skill_name": skill_name,
-            "owner_id": owner_id,
-        }).execute()
+        sb = get_supabase()
+        # 저장 버튼(register_skill_as_tenant)으로 먼저 등록해 둔 스킬을 뒤늦게 Git 으로
+        # 발행하는 것은 막다른 길이 아니라 정상 경로다. 그런데 무조건 insert 하면 그때마다
+        # tenant_skills_pkey 중복으로 실패하고, 아래 롤백이 파일까지 지워 "발행했더니 스킬이
+        # 사라졌다" 가 된다. 이미 있는 행이면 등록 단계만 건너뛴다.
+        existing = (
+            sb.table("tenant_skills")
+            .select("skill_name")
+            .eq("tenant_id", tenant_id)
+            .eq("skill_name", skill_name)
+            .limit(1)
+            .execute()
+        )
+        if not (existing.data or []):
+            sb.table("tenant_skills").insert({
+                "tenant_id": tenant_id,
+                "skill_name": skill_name,
+                "owner_id": owner_id,
+            }).execute()
     except Exception as e:
         _logging.getLogger(__name__).warning("tenant_skills 등록 실패 skill=%s: %s", skill_name, e)
         _shutil.rmtree(str(skill_dir), ignore_errors=True)
+        if backup is not None:
+            _shutil.move(str(backup), str(skill_dir))
         return (
             f"Published '{skill_name}' → {html_url}\n"
             f"WARNING: DB 등록 실패로 파일 sync를 롤백했습니다: {e}"
         )
 
+    if backup is not None:
+        _shutil.rmtree(str(backup), ignore_errors=True)
+        return f"Published '{skill_name}' → {html_url}\n✓ 테넌트 스킬 파일을 갱신했습니다"
     return f"Published '{skill_name}' → {html_url}\n✓ 테넌트 스킬로 등록 완료"
 
 
@@ -2968,6 +3040,23 @@ def _publish_skill_impl(skill_path: str, branch: str | None = None) -> str:
 
     repo_info = provider.repo_exists(skill_name)
     repo_missing = repo_info is None
+
+    # 방 초안(.bpmn/<room>/<skill>/)을 그대로 발행하려는 경우를 체크아웃 위로 옮긴다.
+    #
+    # 같은 대화방에서 스킬을 만들고 이어서 고치면, 생성 때 쓴 초안이 방 작업 디렉터리에
+    # 그대로 남아 있어 에이전트가 checkout_to_workspace 를 부르고도 눈앞의 그 초안을 고친다.
+    # 초안에는 git 이력이 없으므로 여기서 그대로 발행하면 diff 기준이 없어 "레포 전체를
+    # 로컬본으로 교체" 가 되고, 실측에서는 기존 레포가 빈 레포로 잡혀 main 통째 커밋으로
+    # 빠졌다. 그 뒤에는 원격과 로컬이 같아져 PR 을 열 변경분이 0 이 된다 — 병합 전 회귀
+    # 검증이 통째로 우회되는 경로다(_checkout_impl 의 같은 취지 주석 참고).
+    #
+    # 새 대화방에서 고칠 때와 결과가 같아지도록, 레포가 있으면 그 레포를 클론한 뒤 초안의
+    # 파일만 얹어 발행한다. 클론이 안 되면 조용히 main 을 덮어쓰는 대신 실패로 알린다.
+    if not repo_missing and _is_room_draft_dir(cwd):
+        rebased, err = _rebase_draft_onto_checkout(cwd, skill_name, provider)
+        if err:
+            return err
+        cwd = rebased
 
     # 레포는 있는데 브랜치가 하나도 없는 "빈 레포"는 신규와 동일하게 main 초기 커밋으로 처리한다.
     # 레포 생성 직후 push 가 실패하면 이 상태로 남는데, PR 경로는 base 브랜치(main)가 없어
