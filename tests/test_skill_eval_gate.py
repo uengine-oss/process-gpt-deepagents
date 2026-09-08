@@ -233,7 +233,14 @@ def test_이전_회차가_미완이면_다음_iteration_으로_올라간다(ws):
     out = json.loads(eval_tools.plan_skill_eval.invoke({"skill_path": str(skill_dir)}))
 
     assert out["iteration"] == 2
-    assert len(out["runs"]) == 4
+    # case-1 의 대조군은 앞 회차 것을 그대로 쓴다 — 스킬을 붙이지 않고 돌린 실행이라
+    # SKILL.md 를 고쳐도 결과가 달라질 수 없는데 회차마다 다시 돌리면 그만큼 낭비다.
+    planned = {(r["eval_name"], r["variant"]) for r in out["runs"]}
+    assert planned == {
+        ("case-1", "with_skill"),
+        ("case-2", "with_skill"),
+        ("case-2", "without_skill"),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -56,8 +56,10 @@ from .eval_tools import (
     _variant_pass_rate,
     collect_gradings_at,
     find_suite,
+    grade_mechanically,
     insert_results,
     load_suite_cases,
+    reusable_baseline_results,
 )
 from . import tools as _skill_tools
 
@@ -490,11 +492,29 @@ async def execute_run(
             "head_digest": digests[HEAD_VARIANT],
         }).eq("id", run_id).execute()
 
-        # 2) 시나리오 × 두 버전 실행 → 3) 같은 기준으로 채점
-        backend = _sandbox(tenant_id)
-        missing_inputs = await _run_all(backend, root, resource_id, cases)
+        # 2) 기준선은 같은 커밋에서 이미 채점해 뒀으면 다시 돌리지 않는다.
+        #    기준선 재실행은 비용이 두 배로 드는 데다 실행마다 점수가 흔들려 비교를 망친다.
+        reused = await asyncio.to_thread(
+            reusable_baseline_results,
+            tenant_id=tenant_id,
+            resource_id=resource_id,
+            digest=digests[BASE_VARIANT],
+            variant=BASE_VARIANT,
+            cases=cases,
+        )
+        if reused:
+            logger.info(
+                "pr-verify: 기준선 %d/%d건 재사용(digest=%s) run=%s",
+                len(reused), len(cases), (digests[BASE_VARIANT] or "")[:12], run_id,
+            )
 
-        # 4) 채점 결과 수집
+        # 3) 시나리오 × 두 버전 실행 → 4) 같은 기준으로 채점
+        backend = _sandbox(tenant_id)
+        missing_inputs = await _run_all(
+            backend, root, resource_id, cases, skip_base=set(reused)
+        )
+
+        # 5) 채점 결과 수집 — 재사용한 기준선은 이번 회차에 파일이 없으므로 합쳐 넣는다.
         results, missing = collect_gradings_at(
             root / "runs",
             cases,
@@ -502,6 +522,12 @@ async def execute_run(
             baseline_variants=(BASE_VARIANT,),
             primary_variant=HEAD_VARIANT,
         )
+        if reused:
+            results = list(results) + list(reused.values())
+            missing = [
+                m for m in missing
+                if not (m.get("variant") == BASE_VARIANT and m.get("eval_name") in reused)
+            ]
         if not results:
             fail_run(run_id, "두 버전 모두 채점 결과가 만들어지지 않았습니다. 실행 로그를 확인하세요.")
             return
@@ -553,12 +579,24 @@ def _sandbox(tenant_id: str):
     )
 
 
-async def _run_all(backend, root: Path, skill_name: str, cases: list[dict]) -> dict[str, list[str]]:
+async def _run_all(
+    backend,
+    root: Path,
+    skill_name: str,
+    cases: list[dict],
+    skip_base: set[str] | None = None,
+) -> dict[str, list[str]]:
     """시나리오 × (base, head) 를 실행한 뒤 같은 조합을 채점한다.
+
+    Args:
+        skip_base: 기준선 결과를 재사용하는 시나리오 이름들. 이 시나리오의 base 는
+            실행도 채점도 건너뛴다 — 같은 커밋을 다시 돌려 같은 답을 얻으려고 모델을
+            두 번 더 부르는 셈이기 때문이다.
 
     Returns:
         {eval_name: [준비 실패한 storage 경로]} — 비어 있으면 입력이 모두 준비됐다는 뜻.
     """
+    skip_base = skip_base or set()
     from ..agents.skill_creator_subagents import (
         _DEFAULT_SKILL_CREATOR_PATH,
         _TEST_RUNNER_SYSTEM,
@@ -587,10 +625,12 @@ async def _run_all(backend, root: Path, skill_name: str, cases: list[dict]) -> d
         if failed:
             missing_inputs[case["eval_name"]] = failed
 
-    # 실행: 두 버전 모두
+    # 실행: 두 버전 모두(기준선을 재사용하는 시나리오는 head 만)
     run_jobs = []
     for case in cases:
         for variant in _VARIANTS:
+            if variant == BASE_VARIANT and case["eval_name"] in skip_base:
+                continue
             outputs = root / "runs" / case["eval_name"] / variant / "outputs"
             outputs.mkdir(parents=True, exist_ok=True)
             run_jobs.append(_invoke(
@@ -608,9 +648,24 @@ async def _run_all(backend, root: Path, skill_name: str, cases: list[dict]) -> d
 
     # 채점: 두 버전 모두 같은 기준으로
     grade_jobs = []
+    graded_in_code = 0
     for case in cases:
         for variant in _VARIANTS:
+            if variant == BASE_VARIANT and case["eval_name"] in skip_base:
+                continue
             vdir = root / "runs" / case["eval_name"] / variant
+            # assertion 이 전부 기계 검사면 코드로 채점한다 — 문자열 포함 여부를
+            # 확인하려고 채점 서브에이전트를 부를 이유가 없다.
+            mechanical = grade_mechanically(
+                vdir / "outputs", case.get("assertions") or [], case.get("checks") or []
+            )
+            if mechanical is not None:
+                vdir.mkdir(parents=True, exist_ok=True)
+                (vdir / "grading.json").write_text(
+                    json.dumps(mechanical, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                graded_in_code += 1
+                continue
             grade_jobs.append(_invoke(
                 grader,
                 _evaluator_instruction(
@@ -623,6 +678,11 @@ async def _run_all(backend, root: Path, skill_name: str, cases: list[dict]) -> d
                 label=f"grade {case['eval_name']}/{variant}",
             ))
     await _bounded(grade_jobs)
+    if graded_in_code:
+        logger.info(
+            "pr-verify: 채점 %d건을 코드로 처리(모델 호출 %d건만 사용)",
+            graded_in_code, len(grade_jobs),
+        )
     return missing_inputs
 
 

@@ -77,6 +77,10 @@ VARIANTS = ("with_skill", "without_skill")
 # 생성 시점 대조군(스킬 없이 돌린 실행).
 _BASELINE_VARIANTS = ("without_skill",)
 
+# 기준선 결과를 되찾을 때 훑어볼 최근 회차 수. 같은 digest 의 회차는 보통 한둘이라
+# 넉넉히 잡아도 조회 한 번으로 끝난다.
+_BASELINE_REUSE_RUN_LIMIT = 20
+
 
 # ---------------------------------------------------------------------------
 # 경로 헬퍼
@@ -189,18 +193,154 @@ def load_eval_cases(skill_dir: Path) -> tuple[list[dict], str]:
                 n += 1
             slug = f"{slug}-{n}"
         used.add(slug)
-        assertions = item.get("assertions") or []
-        if isinstance(assertions, str):
-            assertions = [assertions]
+        texts, checks = normalize_assertions(item.get("assertions"))
         cases.append({
             "eval_name": slug,
             "prompt": str(item.get("prompt") or "").strip(),
             "expected_output": str(item.get("expected_output") or "").strip() or None,
             "files": list(item.get("files") or []),
-            "assertions": [str(a) for a in assertions if str(a).strip()],
+            "assertions": texts,
+            "checks": checks,
             "position": idx,
         })
     return cases, ""
+
+
+# 코드로 판정할 수 있는 assertion 종류. 이런 것까지 모델에 보내 채점시키면 실행 호출만큼
+# 채점 호출이 그대로 따라붙는다 — 문자열 포함 여부를 확인하려고 LLM 을 부르는 셈이다.
+_MECHANICAL_TYPES = ("contains", "icontains", "not_contains", "regex")
+
+_MECHANICAL_LABEL = {
+    "contains": '출력에 "{v}" 가 포함된다',
+    "icontains": '출력에 "{v}" 가 (대소문자 무시) 포함된다',
+    "not_contains": '출력에 "{v}" 가 없다',
+    "regex": "출력이 정규식 /{v}/ 에 일치한다",
+}
+
+
+def _normalize_assertion(raw: Any) -> tuple[str, dict | None]:
+    """assertion 하나를 (사람이 읽을 문구, 기계 검사 명세) 로 정규화한다.
+
+    evals.json 은 `{"type":"contains","value":"판정: 승인"}` 처럼 이미 기계로 검사 가능한
+    형태를 담고 있는데, 예전에는 이걸 `str(a)` 로 뭉개 문자열 하나로 만들어 채점 서브에이전트에
+    넘겼다. 구조를 잃는 데다 판정까지 모델이 하게 되어 호출 수가 두 배가 됐다.
+    """
+    if isinstance(raw, dict):
+        # 이미 정규화해 저장해 둔 형태({"text":…, "check":…}) 를 그대로 되읽는다.
+        if "check" in raw or ("text" in raw and "type" not in raw):
+            text = str(raw.get("text") or "").strip()
+            check = raw.get("check")
+            if text:
+                return text, (check if isinstance(check, dict) else None)
+
+        kind = str(raw.get("type") or "").strip().lower()
+        value = raw.get("value")
+        if kind in _MECHANICAL_TYPES and isinstance(value, str) and value.strip():
+            label = _MECHANICAL_LABEL[kind].format(v=value)
+            text = str(raw.get("text") or raw.get("description") or label).strip() or label
+            return text, {"type": kind, "value": value}
+
+        for key in ("text", "description", "assertion", "expected", "value"):
+            v = raw.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip(), None
+        return json.dumps(raw, ensure_ascii=False), None
+
+    return str(raw).strip(), None
+
+
+def normalize_assertions(raw_list: Any) -> tuple[list[str], list[dict | None]]:
+    """assertion 목록을 (문구 목록, 검사 명세 목록) 으로 가른다. 두 목록은 같은 순서다."""
+    if isinstance(raw_list, str):
+        raw_list = [raw_list]
+    texts: list[str] = []
+    checks: list[dict | None] = []
+    for raw in (raw_list or []):
+        text, check = _normalize_assertion(raw)
+        if not text:
+            continue
+        texts.append(text)
+        checks.append(check)
+    return texts, checks
+
+
+def assertions_for_storage(texts: list[str], checks: list[dict | None]) -> list:
+    """DB(jsonb)에 넣을 형태. 기계 검사가 하나도 없으면 예전처럼 문자열 배열로 둔다."""
+    if not any(checks):
+        return list(texts)
+    return [
+        {"text": t, "check": c} if c else {"text": t}
+        for t, c in zip(texts, checks)
+    ]
+
+
+def _outputs_text(outputs_dir: Path) -> str:
+    """실행 산출물 디렉터리의 텍스트를 한 덩어리로 모은다(기계 채점 대상)."""
+    if not outputs_dir.is_dir():
+        return ""
+    chunks: list[str] = []
+    for fp in sorted(outputs_dir.rglob("*")):
+        if not fp.is_file():
+            continue
+        try:
+            chunks.append(fp.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+    return "\n".join(chunks)
+
+
+def grade_mechanically(outputs_dir: Path, texts: list[str], checks: list[dict | None]) -> dict | None:
+    """모든 assertion 이 기계 검사면 코드로 채점해 grading.json 내용을 만든다.
+
+    하나라도 의미 판단이 필요하면 None 을 돌려주고, 호출자는 종전대로 채점 서브에이전트를
+    쓴다. 섞인 경우를 코드/모델로 쪼개 합치지 않는 이유는, 반쪽짜리 채점본을 합치다
+    어긋나는 것보다 통째로 모델에 맡기는 편이 안전하기 때문이다.
+    """
+    if not texts or not all(checks):
+        return None
+
+    body = _outputs_text(outputs_dir)
+    if not body.strip():
+        # 산출물이 없으면 "전부 실패" 가 아니라 판정 불가다 — 실행 실패를 조용히
+        # 채점 결과로 바꾸면 base/head 비교가 어긋난다.
+        return None
+
+    lowered = body.lower()
+    expectations = []
+    for text, check in zip(texts, checks):
+        kind = check["type"]
+        value = str(check["value"])
+        if kind == "contains":
+            ok = value in body
+            evidence = f'"{value}" {"발견" if ok else "없음"}'
+        elif kind == "icontains":
+            ok = value.lower() in lowered
+            evidence = f'"{value}" (대소문자 무시) {"발견" if ok else "없음"}'
+        elif kind == "not_contains":
+            ok = value not in body
+            evidence = f'"{value}" {"없음(기대대로)" if ok else "발견(기대와 다름)"}'
+        else:  # regex
+            try:
+                ok = re.search(value, body, re.MULTILINE) is not None
+            except re.error as e:
+                ok = False
+                evidence = f"정규식 오류: {e}"
+            else:
+                evidence = f"/{value}/ {'일치' if ok else '불일치'}"
+        expectations.append({"text": text, "passed": bool(ok), "evidence": evidence})
+
+    passed = sum(1 for e in expectations if e["passed"])
+    total = len(expectations)
+    return {
+        "expectations": expectations,
+        "summary": {
+            "passed": passed,
+            "failed": total - passed,
+            "total": total,
+            "pass_rate": round(passed / total, 4) if total else None,
+        },
+        "graded_by": "code",
+    }
 
 
 def _grading_summary(grading: dict) -> dict:
@@ -485,18 +625,20 @@ def load_suite_cases(suite_id: str) -> list[dict]:
         .order("position")
         .execute()
     )
-    return [
-        {
+    cases = []
+    for r in (rows.data or []):
+        texts, checks = normalize_assertions(r.get("assertions"))
+        cases.append({
             "id": r["id"],
             "eval_name": r["eval_name"],
             "prompt": r["prompt"] or "",
             "expected_output": r.get("expected_output"),
             "files": r.get("files") or [],
-            "assertions": r.get("assertions") or [],
+            "assertions": texts,
+            "checks": checks,
             "position": r.get("position") or 0,
-        }
-        for r in (rows.data or [])
-    ]
+        })
+    return cases
 
 
 def sync_cases(tenant_id: str, suite_id: str, cases: list[dict]) -> dict[str, str]:
@@ -523,7 +665,9 @@ def sync_cases(tenant_id: str, suite_id: str, cases: list[dict]) -> dict[str, st
             "prompt": case["prompt"],
             "expected_output": case["expected_output"],
             "files": case["files"],
-            "assertions": case["assertions"],
+            "assertions": assertions_for_storage(
+                case["assertions"], case.get("checks") or [None] * len(case["assertions"])
+            ),
             "position": case["position"],
         }
         case_id = by_name.get(case["eval_name"])
@@ -536,6 +680,77 @@ def sync_cases(tenant_id: str, suite_id: str, cases: list[dict]) -> dict[str, st
             by_name[case["eval_name"]] = new_id
             ids[case["eval_name"]] = new_id
     return ids
+
+
+def reusable_baseline_results(
+    *,
+    tenant_id: str,
+    resource_id: str,
+    digest: str,
+    variant: str,
+    cases: list[dict],
+) -> dict[str, dict]:
+    """같은 버전(digest)에서 이미 채점된 기준선 결과를 시나리오별로 돌려준다.
+
+    기준선(base)은 기준 브랜치의 특정 커밋에 대해 고정이므로, 검증할 때마다 다시 실행하고
+    다시 채점할 이유가 없다. 매번 재실행하면 비용이 두 배로 들 뿐 아니라 같은 PR 을 두 번
+    검증했을 때 기준선 점수가 흔들려("이 변경으로 통과하게 된 단계" 가 변경과 무관하게 뜬다)
+    비교 자체를 믿을 수 없게 된다. 같은 digest 의 결과를 재사용해 둘 다 없앤다.
+
+    assertion 문구가 그 사이 바뀐 시나리오는 재사용하지 않는다 — 다른 기준으로 매긴 점수를
+    나란히 놓으면 비교가 어긋난다.
+    """
+    if not (tenant_id and resource_id and digest and cases):
+        return {}
+
+    want = {c["eval_name"]: [str(a) for a in (c.get("assertions") or [])] for c in cases}
+    try:
+        sb = _sb()
+        runs = (
+            sb.table("resource_eval_runs")
+            .select("id")
+            .eq("tenant_id", tenant_id)
+            .eq("resource_id", resource_id)
+            .eq("base_digest", digest)
+            .eq("status", "succeeded")
+            .order("started_at", desc=True)
+            .limit(_BASELINE_REUSE_RUN_LIMIT)
+            .execute()
+        )
+        run_ids = [r["id"] for r in (runs.data or []) if r.get("id")]
+        if not run_ids:
+            return {}
+        rows = (
+            sb.table("resource_eval_results")
+            .select("eval_name,variant,passed,total,pass_rate,assertions,outputs_dir,run_id")
+            .in_("run_id", run_ids)
+            .eq("variant", variant)
+            .in_("eval_name", list(want))
+            .execute()
+        )
+    except Exception as e:  # 재사용은 최적화일 뿐이다 — 실패하면 그냥 다시 실행한다.
+        logging.getLogger(__name__).warning("기준선 결과 재사용 조회 실패: %s", e)
+        return {}
+
+    order = {rid: i for i, rid in enumerate(run_ids)}
+    reusable: dict[str, dict] = {}
+    for row in sorted((rows.data or []), key=lambda r: order.get(r.get("run_id"), 1 << 30)):
+        name = row.get("eval_name")
+        if not name or name in reusable:
+            continue
+        graded = [str(a.get("text") or "") for a in (row.get("assertions") or []) if isinstance(a, dict)]
+        if sorted(graded) != sorted(want.get(name, [])):
+            continue
+        reusable[name] = {
+            "eval_name": name,
+            "variant": variant,
+            "passed": row.get("passed"),
+            "total": row.get("total"),
+            "pass_rate": row.get("pass_rate"),
+            "assertions": row.get("assertions") or [],
+            "outputs_dir": row.get("outputs_dir"),
+        }
+    return reusable
 
 
 def insert_results(
@@ -629,6 +844,43 @@ def _now_iso() -> str:
 # 도구
 # ---------------------------------------------------------------------------
 
+def _carry_over_baseline(
+    skill_name: str, from_iteration: int, to_iteration: int, cases: list[dict]
+) -> set[str]:
+    """앞 회차의 대조군(without_skill) 산출물·채점을 새 회차로 복사한다.
+
+    Returns:
+        옮겨온 시나리오 이름들. 이 시나리오는 이번 회차에 대조군을 다시 돌리지 않는다.
+    """
+    import shutil
+
+    root = eval_runs_root(skill_name)
+    src_root = root / f"iteration-{from_iteration}"
+    dst_root = root / f"iteration-{to_iteration}"
+
+    carried: set[str] = set()
+    for case in cases:
+        src = src_root / case["eval_name"] / "without_skill"
+        if not (src / "grading.json").is_file():
+            continue
+        dst = dst_root / case["eval_name"] / "without_skill"
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+        except OSError as e:
+            logger.warning("대조군 이월 실패 %s: %s", case["eval_name"], e)
+            continue
+        carried.add(case["eval_name"])
+
+    if carried:
+        logger.info(
+            "대조군 %d건을 iteration-%d 에서 이월 skill=%s", len(carried), from_iteration, skill_name
+        )
+    return carried
+
+
 @tool
 def plan_skill_eval(skill_path: str) -> str:
     """**스킬 테스트 3단계 중 1단계.** SKILL.md 초안과 `evals/evals.json` 을 쓴 뒤 호출한다.
@@ -682,10 +934,17 @@ def plan_skill_eval(skill_path: str) -> str:
     iteration = latest + 1
     root = f"{eval_runs_container_root(skill_name)}/iteration-{iteration}"
 
+    # 대조군(without_skill)은 스킬을 붙이지 않고 돌린 실행이라 SKILL.md 를 고쳐도 결과가
+    # 달라질 수 없다. 그런데도 회차마다 다시 돌려 왔고, 통과율 100% 게이트 때문에 재시도가
+    # 잦은 흐름에서 그 비용이 그대로 곱해졌다. 앞 회차 결과를 그대로 옮겨 쓴다.
+    carried = _carry_over_baseline(skill_name, latest, iteration, cases) if latest else set()
+
     runs = []
     grading_paths = []
     for case in cases:
         for variant in ("with_skill", "without_skill"):
+            if variant == "without_skill" and case["eval_name"] in carried:
+                continue
             runs.append({
                 "eval_name": case["eval_name"],
                 "variant": variant,
@@ -694,12 +953,18 @@ def plan_skill_eval(skill_path: str) -> str:
                 "skill_path": str(skill_dir) if variant == "with_skill" else "none",
                 "outputs_dir": f"{root}/{case['eval_name']}/{variant}/outputs",
             })
-        grading_paths.append({
+        entry = {
             "eval_name": case["eval_name"],
             "assertions": case["assertions"],
             "with_skill_grading_path": f"{root}/{case['eval_name']}/with_skill/grading.json",
-            "without_skill_grading_path": f"{root}/{case['eval_name']}/without_skill/grading.json",
-        })
+        }
+        if case["eval_name"] in carried:
+            entry["without_skill"] = "앞 회차 결과를 그대로 옮겼습니다. 다시 실행/채점하지 마세요."
+        else:
+            entry["without_skill_grading_path"] = (
+                f"{root}/{case['eval_name']}/without_skill/grading.json"
+            )
+        grading_paths.append(entry)
 
     return json.dumps({
         "skill_name": skill_name,
