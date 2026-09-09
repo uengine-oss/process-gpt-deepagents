@@ -24,6 +24,8 @@ from langchain_core.tools import tool
 
 from parsers import extract as _parse_document
 
+from .diff_summary import summarize_diff
+
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE", str(Path(__file__).parent.parent.parent / "workspace"))).resolve()
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -777,17 +779,52 @@ def _push_skill_sandbox(
 
     # 기존 레포: PR 생성 및 DB 기록
     if existing_repo:
+        # 제목이 곧 검토자가 병합 요청함에서 읽는 한 줄이다. `feat: update <skill>` 은
+        # 어느 스킬인지만 말할 뿐 무엇이 바뀌는지는 말해 주지 않아, 같은 스킬을 고친
+        # 요청 여러 건이 제목만으로는 갈리지 않는다.
+        title_summary, full_summary = _summarize_pushed_changes(cwd)
         return _create_pr_after_push(
             skill_name=skill_name,
             branch=branch,
             base_branch="main",
             html_url=html_url,
-            title=f"feat: update {skill_name}",
-            description=f"스킬 '{skill_name}' 업데이트",
+            title=_truncate_title(title_summary) if title_summary else f"feat: update {skill_name}",
+            description=full_summary or f"스킬 '{skill_name}' 업데이트",
         )
 
     # 신규 레포: 파일 sync + tenant_skills DB 삽입 자동 수행
     return _auto_register_tenant_skill(cwd, skill_name, html_url)
+
+
+# PR 제목 한 줄에 담을 길이. 깃 호스팅 목록에서 잘리지 않는 선을 잡았다.
+_PR_TITLE_MAX = 72
+
+
+def _truncate_title(text: str) -> str:
+    return text[: _PR_TITLE_MAX - 1].rstrip() + "…" if len(text) > _PR_TITLE_MAX else text
+
+
+def _summarize_pushed_changes(cwd: str) -> tuple[str, str]:
+    """이번에 커밋한 변경이 무엇을 바꾸는지 (제목용, 설명용) 한 줄씩으로 옮긴다.
+
+    제목은 깃 목록에서 잘리지 않게 줄이고, 설명은 접지 않은 전체를 싣는다.
+    요약을 못 만들어도 발행 자체는 막지 않는다 — 제목이 예전처럼 밋밋해질 뿐,
+    스킬을 올리지 못하는 것보다는 낫다.
+    """
+    for args in (
+        ("diff", "--unified=3", "FETCH_HEAD", "HEAD"),
+        ("show", "--unified=3", "--format=", "HEAD"),
+    ):
+        try:
+            code, out = _git_sb(cwd, *args)
+        except Exception:  # noqa: BLE001 - 요약 실패가 발행을 막아서는 안 된다
+            continue
+        if code == 0 and out.strip():
+            try:
+                return summarize_diff(out, max_chars=_PR_TITLE_MAX), summarize_diff(out)
+            except Exception:  # noqa: BLE001
+                return "", ""
+    return "", ""
 
 
 def _create_pr_after_push(

@@ -1827,6 +1827,204 @@ async def start_eval_backfill(request: Request) -> JSONResponse:
     return JSONResponse({"backfill": run}, status_code=202)
 
 
+# ---------------------------------------------------------------------------
+# 프로세스 회귀 시나리오
+# 생성 시 실엔진 검증(`/validate-and-improve`)이 통과시킨 분기 케이스를 스위트로 옮긴다.
+# 시나리오를 새로 만들지 않으므로 이 경로에는 모델 호출이 없다.
+# ---------------------------------------------------------------------------
+
+def _find_resource_pr(tenant_id: str, resource_type: str, resource_id: str, pr_id: str) -> dict | None:
+    """병합 요청 행을 id 로 찾는다.
+
+    스킬은 깃 PR 번호로 찾지만 프로세스·DMN 병합 요청에는 깃 PR 이 없다 —
+    `resource_pull_requests.id` 만 있다. 그래서 경로도 번호가 아니라 id 를 받는다.
+    """
+    from core.storage.db import get_supabase
+
+    rows = (
+        get_supabase()
+        .table("resource_pull_requests")
+        .select("id,resource_type,resource_id,branch_name,base_branch,status")
+        .eq("tenant_id", tenant_id)
+        .eq("resource_type", resource_type)
+        .eq("resource_id", resource_id)
+        .eq("id", pr_id)
+        .limit(1)
+        .execute()
+    )
+    return (rows.data or [None])[0]
+
+
+@tenant_guard
+async def get_resource_verification(request: Request) -> JSONResponse:
+    """리소스 타입을 가리지 않는 검증 결과 조회."""
+    resource_type = request.path_params["resource_type"]
+    resource_id = request.path_params["resource_id"]
+    pr_id = request.path_params["pr_id"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import eval_tools, pr_verification as prv
+
+    def _load() -> dict:
+        pr = _find_resource_pr(tenant_id, resource_type, resource_id, pr_id)
+        if not pr:
+            return {"error": "병합 요청 기록을 찾을 수 없습니다."}
+        payload = _verification_payload(tenant_id, prv.latest_run_for_pr(tenant_id, pr["id"]))
+        suite_id = eval_tools.find_suite(tenant_id, resource_id, resource_type)
+        payload["cases"] = eval_tools.load_suite_cases(suite_id) if suite_id else []
+        payload["has_suite"] = bool(payload["cases"])
+        return payload
+
+    try:
+        payload = await asyncio.to_thread(_load)
+        if payload.get("error"):
+            return JSONResponse(payload, status_code=404)
+        return JSONResponse(payload)
+    except Exception as e:
+        logger.exception("검증 조회 실패 %s/%s pr=%s", resource_type, resource_id, pr_id)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@tenant_guard
+async def start_resource_verification(request: Request) -> JSONResponse:
+    """리소스 타입을 가리지 않는 검증 시작(백그라운드)."""
+    resource_type = request.path_params["resource_type"]
+    resource_id = request.path_params["resource_id"]
+    pr_id = request.path_params["pr_id"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import pr_verification as prv
+
+    pr = await asyncio.to_thread(_find_resource_pr, tenant_id, resource_type, resource_id, pr_id)
+    if not pr:
+        return JSONResponse({"error": "병합 요청 기록을 찾을 수 없습니다."}, status_code=404)
+
+    existing = await asyncio.to_thread(prv.latest_run_for_pr, tenant_id, pr["id"])
+    if existing and existing.get("status") == "running":
+        return JSONResponse(_verification_payload(tenant_id, existing))
+
+    created = await asyncio.to_thread(
+        prv.create_run, tenant_id=tenant_id, pr=pr, created_by=request_user_id(request) or ""
+    )
+    if created.get("error"):
+        return JSONResponse(
+            {"error": created["error"], "message": created["message"]}, status_code=409
+        )
+
+    run = created["run"]
+    task = asyncio.create_task(
+        prv.execute_run(
+            tenant_id=tenant_id, run=run, cases=created["cases"], suite_id=created["suite_id"]
+        )
+    )
+    _verification_tasks[run["id"]] = task
+    task.add_done_callback(lambda _t, rid=run["id"]: _verification_tasks.pop(rid, None))
+
+    return JSONResponse(_verification_payload(tenant_id, run), status_code=202)
+
+
+@tenant_guard
+async def get_dmn_scenarios(request: Request) -> JSONResponse:
+    """이 의사결정에 병합 전 비교에 쓸 시나리오가 있는지 돌려준다."""
+    resource_id = request.path_params["resource_id"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import dmn_scenarios as ds
+
+    payload = await asyncio.to_thread(ds.summary, tenant_id, resource_id)
+    return JSONResponse(payload)
+
+
+@tenant_guard
+async def build_dmn_scenarios(request: Request) -> JSONResponse:
+    """규칙 표에서 회귀 시나리오를 만들어 붙인다.
+
+    기준은 **변경 전(base) 버전**이다 — 변경 후를 보고 만들면 바뀐 결론을 기준선으로 굳혀
+    버려서 그 검증이 아무것도 잡아내지 못한다. 표에서 파생하므로 모델 호출이 없어
+    백그라운드로 돌릴 이유도 없다(바로 끝난다).
+    """
+    resource_id = request.path_params["resource_id"]
+    tenant_id = request_tenant_id(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    from core.skills import dmn_scenarios as ds
+
+    result = await ds.promote(
+        tenant_id=tenant_id,
+        resource_id=resource_id,
+        base_ref=str((body or {}).get("base_ref") or ""),
+        replace=bool((body or {}).get("replace")),
+    )
+    if result.get("error"):
+        return JSONResponse(result, status_code=409)
+    return JSONResponse(result, status_code=201)
+
+
+@tenant_guard
+async def get_process_scenarios(request: Request) -> JSONResponse:
+    """이 프로세스에 병합 전 비교에 쓸 시나리오가 있는지 돌려준다."""
+    resource_id = request.path_params["resource_id"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import process_scenarios as ps
+
+    payload = await asyncio.to_thread(ps.summary, tenant_id, resource_id)
+    return JSONResponse(payload)
+
+
+@tenant_guard
+async def promote_process_scenarios(request: Request) -> JSONResponse:
+    """검증이 통과시킨 케이스를 회귀 스위트로 승격한다.
+
+    프론트가 draft 를 정식 프로세스로 저장하는 시점에 부른다 — 검증은 draft 에 대해 돌지만
+    스위트는 정식 정의에 붙어야, 채팅에서 버린 draft 의 케이스가 남지 않는다.
+
+    `passing_cases` 없이 부르면 **base 정의에서 직접 시나리오를 만든다**(build). 생성 시
+    검증 게이트를 거치지 않은 프로세스는 승격할 케이스가 애초에 없어서, 병합 요청 화면이
+    시나리오를 확보할 다른 길이 필요하다. 의사결정(build_dmn_scenarios)과 같은 자리다.
+    """
+    resource_id = request.path_params["resource_id"]
+    tenant_id = request_tenant_id(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    passing_cases = (body or {}).get("passing_cases")
+    if passing_cases is not None and not isinstance(passing_cases, list):
+        return JSONResponse(
+            {"error": "bad_request", "message": "passing_cases 는 배열이어야 합니다."},
+            status_code=400,
+        )
+
+    from core.skills import process_scenarios as ps
+
+    if passing_cases:
+        result = await asyncio.to_thread(
+            ps.promote,
+            tenant_id=tenant_id,
+            resource_id=resource_id,
+            passing_cases=passing_cases,
+            replace=bool((body or {}).get("replace")),
+        )
+    else:
+        # 파생은 실행기(completion)에 맡기므로 이 경로는 코루틴이다 — to_thread 로 감싸면
+        # 코루틴 객체만 만들고 아무 일도 일어나지 않는다.
+        result = await ps.build(
+            tenant_id=tenant_id,
+            resource_id=resource_id,
+            base_ref=str((body or {}).get("base_ref") or ""),
+            replace=bool((body or {}).get("replace")),
+        )
+    if result.get("error"):
+        return JSONResponse(result, status_code=409)
+    return JSONResponse(result, status_code=201)
+
+
 routes = [
     Route("/skills", list_skills, methods=["GET"]),
     Route("/skills-builtin", list_builtin_skills, methods=["GET"]),
@@ -1849,6 +2047,15 @@ routes = [
     Route("/skills/{skill_name}/pull-requests/{number:int}/verification", get_pr_verification, methods=["GET"]),
     Route("/skills/{skill_name}/pull-requests/{number:int}/verification", start_pr_verification, methods=["POST"]),
     Route("/skills/{skill_name}/pull-requests/{number:int}/verification/scenarios", start_eval_backfill, methods=["POST"]),
+    Route("/resources/bpmn/{resource_id}/verification/scenarios", get_process_scenarios, methods=["GET"]),
+    Route("/resources/bpmn/{resource_id}/verification/scenarios", promote_process_scenarios, methods=["POST"]),
+    Route("/resources/dmn/{resource_id}/verification/scenarios", get_dmn_scenarios, methods=["GET"]),
+    Route("/resources/dmn/{resource_id}/verification/scenarios", build_dmn_scenarios, methods=["POST"]),
+    # 스킬 경로는 깃 PR 번호를 받지만 프로세스·DMN 병합 요청에는 깃 PR 이 없다 — id 로 찾는다.
+    Route("/resources/{resource_type}/{resource_id}/pull-requests/{pr_id}/verification",
+          get_resource_verification, methods=["GET"]),
+    Route("/resources/{resource_type}/{resource_id}/pull-requests/{pr_id}/verification",
+          start_resource_verification, methods=["POST"]),
     Route("/skills/{skill_name}/export", export_skill, methods=["GET"]),
     Route("/skills/{skill_name}/files", list_skill_files, methods=["GET"]),
     Route("/skills/{skill_name}/files/{file_path:path}", get_skill_file, methods=["GET"]),

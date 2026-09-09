@@ -447,6 +447,98 @@ def fail_run(run_id: str, message: str) -> None:
     _finish(run_id, status="failed", error=message[:2000])
 
 
+async def _run_via_engine(
+    *, tenant_id: str, run: dict, cases: list[dict], resource_type: str, label: str
+) -> None:
+    """회차 하나를 실행 엔진(completion)에 위임해 수행한다.
+
+    이 모듈이 하는 일은 회차 관리다 — 기준선 재사용 판단, base/head 비교, 결과 기록.
+    "이 정의에서 이 시나리오가 어떤 결과인가" 는 판정 규칙의 진실 원천이 있는 곳
+    (실행 엔진)에 묻는다. 사본을 여기 두면 엔진이 규칙을 고칠 때 회귀 테스트만 옛 규칙으로
+    통과시킨다.
+    """
+    from . import regression_client
+
+    run_id = run["id"]
+    resource_id = run["resource_id"]
+
+    # 기준선은 같은 버전에서 이미 채점해 뒀으면 다시 계산하지 않는다. digest 를 알려면
+    # 엔진에 물어야 하므로, 먼저 재사용 후보를 케이스 이름으로만 좁혀 두고 회차 응답의
+    # digest 로 확정한다.
+    reused: dict[str, dict] = {}
+    try:
+        probe = await regression_client.run(
+            tenant_id=tenant_id, resource_type=resource_type, resource_id=resource_id,
+            base_ref=run["base_ref"], head_ref=run["head_ref"], cases=cases,
+        )
+    except regression_client.RegressionUnavailable as e:
+        fail_run(run_id, str(e))
+        return
+
+    if probe.get("error"):
+        fail_run(run_id, probe.get("message") or probe["error"])
+        return
+
+    digests = {
+        BASE_VARIANT: probe.get("base_digest") or "",
+        HEAD_VARIANT: probe.get("head_digest") or "",
+    }
+    _sb().table("resource_eval_runs").update({
+        "base_digest": digests[BASE_VARIANT],
+        "head_digest": digests[HEAD_VARIANT],
+    }).eq("id", run_id).execute()
+
+    reused = await asyncio.to_thread(
+        reusable_baseline_results,
+        tenant_id=tenant_id,
+        resource_id=resource_id,
+        digest=digests[BASE_VARIANT],
+        variant=BASE_VARIANT,
+        cases=cases,
+    )
+
+    # 재사용할 기준선이 있으면 그 시나리오의 base 결과는 방금 받은 것 대신 저장된 것을 쓴다.
+    # 재생은 순수 함수라 값은 같지만, 회차마다 같은 판정을 다시 계산하지 않는다는 규칙을
+    # 여기서도 지킨다(스킬 회귀에서 같은 자리가 실제 누수였다).
+    results = [
+        r for r in (probe.get("results") or [])
+        if not (r.get("variant") == BASE_VARIANT and r.get("eval_name") in reused)
+    ]
+    for row in results:
+        row.setdefault("outputs_dir", None)
+    results.extend(reused.values())
+
+    undecided = probe.get("undecided") or []
+    if not results:
+        fail_run(run_id, "채점된 시나리오가 없습니다. 저장된 시나리오와 정의를 확인하세요.")
+        return
+
+    diff = diff_results(results)
+    if undecided:
+        # 판정하지 못한 시나리오를 조용히 두면 broken_count=0 이라 "이상 없음" 으로 보인다.
+        diff["undecided"] = undecided
+    diff["mode"] = probe.get("mode") or resource_type
+    diff["llm_calls"] = probe.get("llm_calls", 0)
+    diff["engine_instances"] = probe.get("engine_instances", 0)
+
+    case_ids = {c["eval_name"]: c["id"] for c in cases if c.get("id")}
+    insert_results(run_id=run_id, tenant_id=tenant_id, results=results, case_ids=case_ids)
+
+    _finish(
+        run_id,
+        status="succeeded",
+        pass_rate=_variant_pass_rate(results, (HEAD_VARIANT,)),
+        base_pass_rate=_variant_pass_rate(results, (BASE_VARIANT,)),
+        broken_count=diff["broken_count"],
+        fixed_count=diff["fixed_count"],
+        summary=diff,
+    )
+    logger.info(
+        "pr-verify(%s): 완료 run=%s broken=%d fixed=%d 판정불가=%d 재사용=%d",
+        label, run_id, diff["broken_count"], diff["fixed_count"], len(undecided), len(reused),
+    )
+
+
 async def execute_run(
     *,
     tenant_id: str,
@@ -463,8 +555,16 @@ async def execute_run(
     root = verify_root(run_id)
 
     try:
-        if run.get("resource_type") != "skill":
-            fail_run(run_id, f"'{run.get('resource_type')}' 타입은 아직 검증 실행기가 없습니다.")
+        resource_type = run.get("resource_type") or "skill"
+        if resource_type in ("bpmn", "dmn"):
+            await _run_via_engine(
+                tenant_id=tenant_id, run=run, cases=cases,
+                resource_type=resource_type,
+                label="process" if resource_type == "bpmn" else "dmn",
+            )
+            return
+        if resource_type != "skill":
+            fail_run(run_id, f"'{resource_type}' 타입은 아직 검증 실행기가 없습니다.")
             return
 
         # 1) 두 버전을 워크스페이스에 펼친다.

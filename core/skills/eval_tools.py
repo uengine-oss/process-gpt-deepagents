@@ -319,6 +319,11 @@ def grade_mechanically(outputs_dir: Path, texts: list[str], checks: list[dict | 
         elif kind == "not_contains":
             ok = value not in body
             evidence = f'"{value}" {"없음(기대대로)" if ok else "발견(기대와 다름)"}'
+        elif kind != "regex":
+            # 산출물 텍스트로 판정할 수 없는 검사(프로세스 경로 대조 등)가 섞여 들어온 경우.
+            # 예전에는 이 자리가 else 라서 모르는 종류를 정규식으로 취급해, 리스트 값을
+            # 정규식으로 컴파일하다 조용히 전부 실패로 매겼다.
+            return None
         else:  # regex
             try:
                 ok = re.search(value, body, re.MULTILINE) is not None
