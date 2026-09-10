@@ -372,9 +372,21 @@ def diff_results(results: list[dict]) -> dict:
 
 
 def _brief(row: dict | None) -> dict | None:
+    """시나리오 한 벌의 결과 요약.
+
+    통과 수만 남기면 화면에는 `2/2 → 0/2` 만 보이고 **무엇이 나왔길래 실패인지**는
+    사라진다. 첫 단언의 근거(`결론 '(매칭 없음)' (기대 '20')`)를 함께 실어, 변경 전/후
+    실제 산출값을 그 자리에서 읽을 수 있게 한다.
+    """
     if not row:
         return None
-    return {"passed": row["passed"], "total": row["total"], "pass_rate": row["pass_rate"]}
+    assertions = row.get("assertions") or []
+    return {
+        "passed": row["passed"],
+        "total": row["total"],
+        "pass_rate": row["pass_rate"],
+        "evidence": (assertions[0].get("evidence") or "") if assertions else "",
+    }
 
 
 # ---------------------------------------------------------------------------

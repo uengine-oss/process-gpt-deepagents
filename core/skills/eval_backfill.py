@@ -163,6 +163,10 @@ Write `proposals.json` to `output_path` exactly as given:
    many drop, the whole scenario is thrown away.
 4. Each scenario needs between $AMIN and $AMAX assertions.
 5. Scenarios must be meaningfully different from each other — not the same request reworded.
+6. **`name` must say what the scenario protects** — a short noun phrase such as
+   "계약 위험조항 검토" or "회의록 액션아이템 추출". Never a number ("1", "2", "케이스 3"),
+   never the skill's own name. Reviewers read these names in a list, next to a pass/fail
+   verdict; a number tells them nothing about what broke.
 
 Write the file, then report the path you wrote. Do not write anything else to disk.
 """
@@ -217,7 +221,7 @@ def parse_proposals(raw: Any) -> list[dict]:
         if len(assertions) < MIN_ASSERTIONS:
             continue
 
-        slug = _eval_slug(str(item.get("name") or ""), idx)
+        slug = _eval_slug(str(item.get("name") or ""), idx, fallback=prompt)
         if slug in used:
             n = 2
             while f"{slug}-{n}" in used:

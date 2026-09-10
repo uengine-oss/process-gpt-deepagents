@@ -124,7 +124,8 @@ def test_시나리오별로_깨진_단계를_묶어_보고한다():
 
     assert len(diff["per_case"]["c1"]["broken"]) == 1
     assert diff["per_case"]["c2"]["broken"] == []
-    assert diff["per_case"]["c2"]["head"] == {"passed": 1, "total": 1, "pass_rate": 1.0}
+    # evidence 는 "무엇이 나왔길래 이 판정인지" 를 화면이 그 자리에서 보여주려고 함께 싣는 값이다.
+    assert diff["per_case"]["c2"]["head"] == {"passed": 1, "total": 1, "pass_rate": 1.0, "evidence": ""}
 
 
 # ---------------------------------------------------------------------------

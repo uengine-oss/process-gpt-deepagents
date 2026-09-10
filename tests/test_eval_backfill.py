@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import re
+
 from core.skills import eval_backfill as ebf
 from core.skills.eval_tools import MIN_ASSERTIONS
 
@@ -327,3 +329,41 @@ def test_케이스가_없는_스위트는_시나리오_없음으로_본다(clien
 
     assert body["has_suite"] is False
     assert body["backfill"]["status"] == "running"
+
+
+def test_numbered_names_get_a_name_from_the_prompt():
+    """`1`, `2` 같은 번호는 이름이 아니다.
+
+    목록에는 시나리오 이름과 통과/실패만 나란히 선다. 이름이 번호면 무엇이 깨졌는지
+    알려면 매번 케이스를 열어 봐야 한다 — 저자가 번호를 써 보내도 여기서 이름을 만든다.
+    """
+    cases = ebf.parse_proposals({
+        "scenarios": [
+            {
+                "name": "1",
+                "prompt": "회의실 예약 요청을 검토해줘. A회의실, 10:00~11:00, 참석 6명.",
+                "assertions": ["정원 초과 여부를 판정한다", "조정 사유를 제시한다"],
+            },
+            {
+                "name": "  2. ",
+                "prompt": "휴가 신청 반려 사유를 정리해줘.",
+                "assertions": ["반려 사유를 항목으로 나눈다", "재신청 조건을 적는다"],
+            },
+        ]
+    })
+
+    names = [c["eval_name"] for c in cases]
+    assert not any(re.fullmatch(r"[\d\s.\-_#]+", n) for n in names), names
+    assert names[0].startswith("회의실-예약")
+    assert names[1].startswith("휴가-신청")
+
+
+def test_a_real_name_is_kept_as_is():
+    cases = ebf.parse_proposals({
+        "scenarios": [{
+            "name": "계약 위험조항 검토",
+            "prompt": "이 계약서의 위험 조항을 짚어줘.",
+            "assertions": ["조항별 근거를 든다", "수정 문구를 제시한다"],
+        }]
+    })
+    assert [c["eval_name"] for c in cases] == ["계약-위험조항-검토"]

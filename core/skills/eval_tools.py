@@ -96,17 +96,49 @@ def _safe_name(name: str) -> str:
 _UNSAFE_PATH_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 
 
-def _eval_slug(name: str, position: int) -> str:
-    """시나리오 이름 → 디렉터리명.
+# `1`, `2.`, `#3` 처럼 번호만 남는 이름. 화면·로그·폴더 어디에 놓여도 그 시나리오가
+# 무엇을 지키는지 말해 주지 못한다.
+_NUMBER_ONLY = re.compile(r"^[\d\s.,\-_#()]+$")
+
+
+def _clean_slug(text: str) -> str:
+    """경로·DB 키로 쓸 수 있게 다듬는다.
 
     ASCII 로만 좁히면 한국어 이름("한국어 회의록에서 …")이 통째로 빈 문자열이 되어
     모든 케이스가 같은 폴더/같은 DB 키로 뭉개진다(실제로 그렇게 덮어써졌다).
     경로에 못 쓰는 문자만 제거하고 유니코드는 살린다.
     """
-    slug = _UNSAFE_PATH_CHARS.sub("-", str(name or ""))
+    slug = _UNSAFE_PATH_CHARS.sub("-", str(text or ""))
     slug = re.sub(r"\s+", "-", slug).strip("-. ")
-    slug = re.sub(r"-{2,}", "-", slug)
-    return slug[:80] or f"eval-{position + 1}"
+    return re.sub(r"-{2,}", "-", slug)
+
+
+def _name_from_text(text: str) -> str:
+    """본문에서 이름감을 뽑는다 — 첫 줄 앞머리 몇 낱말.
+
+    프로세스·의사결정 시나리오의 본문은 입력값 JSON 이라 중괄호와 따옴표를 걷어낸다.
+    """
+    first = next((line for line in str(text or "").splitlines() if line.strip()), "")
+    first = re.sub(r'[{}\[\]"\u201c\u201d]', " ", first)
+    first = re.sub(r"\s+", " ", first).strip()
+    return " ".join(first.split(" ")[:8])[:40]
+
+
+def _eval_slug(name: str, position: int, fallback: str = "") -> str:
+    """시나리오 이름 → 디렉터리명.
+
+    이름이 비었거나 `1`, `2` 처럼 번호뿐이면 본문에서 이름을 만든다. 번호는 목록에서
+    어느 시나리오가 무엇을 지키는지 알려 주지 못하고, 검증 결과를 읽을 때 "1번이 깨졌다"
+    는 말만 남아 매번 케이스를 열어 봐야 한다.
+    """
+    slug = _clean_slug(name)
+    if slug and not _NUMBER_ONLY.match(slug):
+        return slug[:80]
+
+    derived = _clean_slug(_name_from_text(fallback))
+    if derived and not _NUMBER_ONLY.match(derived):
+        return derived[:80]
+    return f"eval-{position + 1}"
 
 
 def eval_runs_root(skill_name: str) -> Path:
@@ -184,7 +216,7 @@ def load_eval_cases(skill_dir: Path) -> tuple[list[dict], str]:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or item.get("eval_name") or item.get("id") or "")
-        slug = _eval_slug(name, idx)
+        slug = _eval_slug(name, idx, fallback=str(item.get("prompt") or ""))
         # 같은 이름이 둘 이상이면 뒤에 번호를 붙인다 — 이름이 겹치면 두 시나리오가
         # 같은 디렉터리를 공유해 한쪽 결과가 덮어써지고 DB 키도 충돌한다.
         if slug in used:
