@@ -37,7 +37,14 @@ async def _post(path: str, payload: dict, tenant_id: str) -> dict:
             response = await client.post(
                 url,
                 json={"input": payload},
-                headers={"subdomain": tenant_id, "Content-Type": "application/json"},
+                # completion 은 테넌트를 X-Forwarded-Host 의 첫 라벨로 가린다(main.py
+                # DBConfigMiddleware). 게이트웨이를 거치지 않는 서비스 간 호출에는 이 헤더가
+                # 없어 테넌트가 'localhost' 로 떨어지고, 다른 테넌트의 정의를 못 찾는다.
+                headers={
+                    "X-Forwarded-Host": tenant_id,
+                    "subdomain": tenant_id,
+                    "Content-Type": "application/json",
+                },
             )
     except httpx.HTTPError as e:
         raise RegressionUnavailable(f"실행 엔진({url}) 에 닿지 못했습니다: {e}") from e
