@@ -208,12 +208,14 @@ def _build_runner_agent(backend, system_prompt: str, tools: list | None = None):
     from deepagents import create_deep_agent
 
     from ..llm.model import _build_model
+    from ..llm.tool_content_sanitizer import ToolContentBlockSanitizerMiddleware
 
     return create_deep_agent(
         model=_build_model(),
         tools=tools or [],
         system_prompt=system_prompt,
         backend=backend,
+        middleware=[ToolContentBlockSanitizerMiddleware()],
     )
 
 

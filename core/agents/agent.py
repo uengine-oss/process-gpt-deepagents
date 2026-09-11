@@ -430,6 +430,14 @@ async def build_agent(
     if is_chat:
         extra_middleware.append(SkillEvalGateMiddleware())
 
-    kwargs["middleware"] = [build_tool_retry_middleware(), *extra_middleware]
+    # 도구 결과의 `file` 블록 하나가 대화 이력에 남으면 이후 모든 모델 호출이 400 으로
+    # 실패해 대화방을 쓸 수 없게 된다. 모델에 넘기는 사본에서 텍스트 안내로 바꾼다.
+    from ..llm.tool_content_sanitizer import ToolContentBlockSanitizerMiddleware
+
+    kwargs["middleware"] = [
+        build_tool_retry_middleware(),
+        ToolContentBlockSanitizerMiddleware(),
+        *extra_middleware,
+    ]
 
     return create_deep_agent(**kwargs), _mcp_connectors, _mcp_tools_meta
