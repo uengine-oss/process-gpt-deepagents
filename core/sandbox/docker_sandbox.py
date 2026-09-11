@@ -25,11 +25,13 @@ import re
 import tarfile
 import threading
 import time
+import zlib
 from pathlib import Path, PurePosixPath
 
 import docker
 import docker.errors
 from deepagents.backends.protocol import (
+    EditResult,
     ExecuteResponse,
     FileDownloadResponse,
     FileUploadResponse,
@@ -37,6 +39,7 @@ from deepagents.backends.protocol import (
     GrepResult,
     LsResult,
     ReadResult,
+    WriteResult,
 )
 from deepagents.backends.sandbox import BaseSandbox
 
@@ -573,6 +576,41 @@ class DockerSandboxBackend(BaseSandbox):
         if effective_path is not None and not self._in_workspace_scope(effective_path):
             return GrepResult(error=f"Path '{effective_path}': {_SCOPE_DENY_MSG}")
         return super().grep(pattern, effective_path, glob)
+
+    # ------------------------------------------------------------------
+    # 같은 파일에 대한 쓰기 직렬화
+    #
+    # BaseSandbox.edit 은 컨테이너 안에서 "파일을 읽고 → 치환 → 'wb' 로 열어 다시 쓰기" 를
+    # 한다. 모델이 한 턴에 같은 파일로 edit_file 을 여러 개 내면 미들웨어가 각각을
+    # asyncio.to_thread 로 동시에 돌리는데, 그러면 한쪽이 'wb' 로 파일을 비운 사이 다른
+    # 쪽이 반쯤 쓰인 내용을 읽거나 두 쓰기가 섞여 멀티바이트(한글) 문자가 잘린다. 그 파일은
+    # 이후 "is not a text file" 로 편집이 막히고, read_file 이 base64(`file` 블록)로 돌려줘
+    # 모델 호출이 400 으로 실패한다. 경로 단위로 잠가 한 번에 하나씩만 쓰게 한다.
+    #
+    # 잠금은 경로 해시로 고른 고정 개수(스트라이프)만 둔다 — 경로마다 만들면 오래 도는
+    # 서비스에서 끝없이 늘어난다. 다른 파일이 같은 칸에 걸리면 잠시 기다릴 뿐 결과는 같다.
+    # ------------------------------------------------------------------
+    _FILE_LOCK_STRIPES = 64
+    _file_locks = tuple(threading.Lock() for _ in range(_FILE_LOCK_STRIPES))
+
+    def _file_lock(self, file_path: str) -> threading.Lock:
+        key = f"{getattr(self, '_tenant_id', '') or ''}:{PurePosixPath(file_path).as_posix()}"
+        index = zlib.crc32(key.encode("utf-8")) % self._FILE_LOCK_STRIPES
+        return self._file_locks[index]
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,  # noqa: FBT001, FBT002
+    ) -> EditResult:
+        with self._file_lock(file_path):
+            return super().edit(file_path, old_string, new_string, replace_all)
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        with self._file_lock(file_path):
+            return super().write(file_path, content)
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """셸 명령을 실행한다. 총 소요는 기동 상한 + 실행 상한을 넘지 않는다.
