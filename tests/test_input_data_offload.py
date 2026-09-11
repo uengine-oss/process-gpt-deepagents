@@ -206,14 +206,17 @@ def test_no_instance_id_uses_flat_path(tmp_workspace):
 def test_save_step_output_creates_file(tmp_workspace):
     import core.skills.tools as cst
     _orig = cst.WORKSPACE_ROOT
+    token = cst._current_tenant_id.set("acme")
     try:
         cst.WORKSPACE_ROOT = tmp_workspace
         import executor
         executor._save_step_output("에이전트 최종 응답 텍스트", "inst-006", "activity_abc123")
     finally:
         cst.WORKSPACE_ROOT = _orig
+        cst._current_tenant_id.reset(token)
 
-    outputs_dir = tmp_workspace / "inst-006" / "outputs"
+    # 산출물은 테넌트 작업공간(WORKSPACE_ROOT/<tenant>) 아래에 쌓인다.
+    outputs_dir = tmp_workspace / "acme" / "inst-006" / "outputs"
     files = list(outputs_dir.glob("*.md"))
     assert len(files) == 1
     assert "에이전트 최종 응답 텍스트" in files[0].read_text(encoding="utf-8")

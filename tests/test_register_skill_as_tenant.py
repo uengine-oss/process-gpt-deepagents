@@ -43,7 +43,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(skill_tools, "WORKSPACE_ROOT", workspace)
 
     token = skill_tools._current_tenant_id.set(TENANT)
-    yield workspace
+    # 도구는 테넌트 작업공간(WORKSPACE_ROOT/<tenant>) 기준으로 경로를 푼다.
+    tenant_root = workspace / TENANT
+    tenant_root.mkdir()
+    yield tenant_root
     skill_tools._current_tenant_id.reset(token)
 
 

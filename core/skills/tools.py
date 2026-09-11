@@ -25,7 +25,10 @@ from langchain_core.tools import tool
 from parsers import extract as _parse_document
 
 from .diff_summary import summarize_diff
+from ..sandbox.tenant_workspace import ensure_inside, tenant_workspace
 
+# 작업공간 볼륨 루트. 실제 작업공간은 테넌트마다 이 아래 `<tenant>/` 이고, 샌드박스의
+# `/workspace` 는 그 디렉터리다. 호스트 경로는 `tenant_workspace_root()` 로 얻는다.
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE", str(Path(__file__).parent.parent.parent / "workspace"))).resolve()
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -59,6 +62,15 @@ _current_sandbox: contextvars.ContextVar = contextvars.ContextVar(
     "tools_sandbox", default=None
 )
 
+
+def tenant_workspace_root(tenant_id: str | None = None) -> Path:
+    """현재 테넌트의 호스트 작업공간 — 샌드박스 `/workspace` 에 마운트되는 디렉터리.
+
+    WORKSPACE_ROOT 는 호출 시점에 읽는다(테스트가 모듈 속성을 갈아끼운다).
+    """
+    tid = _current_tenant_id.get() if tenant_id is None else tenant_id
+    return tenant_workspace(WORKSPACE_ROOT, tid)
+
 _CONTAINER_WORKSPACE = Path("/workspace")
 _CONTAINER_SKILLS = Path("/skills")
 
@@ -90,30 +102,40 @@ def _to_snake(s: str) -> str:
 
 
 def _substitute_ws(s: str) -> str:
-    """미치환 {ws} 플레이스홀더를 실제 workspace root로 교체한다."""
-    return s.replace("{ws}", str(WORKSPACE_ROOT))
+    """미치환 {ws} 플레이스홀더를 현재 테넌트 작업공간으로 교체한다."""
+    if "{ws}" not in s:
+        return s
+    return s.replace("{ws}", str(tenant_workspace_root()))
 
 
-# 샌드박스 작업 루트(컨테이너 /workspace/.bpmn ↔ 호스트 WORKSPACE_ROOT/.bpmn — bind mount 동일 파일).
+# 샌드박스 작업 루트(컨테이너 /workspace/.bpmn ↔ 호스트 <테넌트 작업공간>/.bpmn — bind mount 동일 파일).
 BPMN_WORK_SUBDIR = ".bpmn"
 
 
 def _resolve_ws_path(path: str) -> Path:
-    """컨테이너/플레이스홀더 경로(/workspace/..., {ws}/..., 상대경로)를 호스트 WORKSPACE_ROOT 기준 경로로 변환."""
+    """컨테이너/플레이스홀더 경로(/workspace/..., {ws}/..., 상대경로)를 현재 테넌트 작업공간 기준 호스트 경로로 변환.
+
+    작업공간을 벗어나는 경로는 ValueError. 이 경로로 호스트에서 읽고 쓰므로, 놔두면 마운트로
+    막은 다른 테넌트 파일을 `..` 로 열 수 있다.
+    """
+    root = tenant_workspace_root()
     s = _substitute_ws(str(path or "")).strip().replace("\\", "/")
-    ws = str(WORKSPACE_ROOT).replace("\\", "/")
+    ws = str(root).replace("\\", "/")
     if s.startswith(ws):
-        return Path(s)
-    for pre in ("/workspace/", "workspace/", "/workspace", "workspace"):
-        if s == pre.rstrip("/") or s.startswith(pre):
-            s = s[len(pre):]
-            break
-    return WORKSPACE_ROOT / s.lstrip("/")
+        candidate = Path(s)
+    else:
+        for pre in ("/workspace/", "workspace/", "/workspace", "workspace"):
+            if s == pre.rstrip("/") or s.startswith(pre):
+                s = s[len(pre):]
+                break
+        candidate = root / s.lstrip("/")
+    ensure_inside(root, candidate)
+    return candidate
 
 
 def _bpmn_work_dir() -> Path:
     """방별 산출물 작업 디렉터리(host). 대화방 id가 있으면 .bpmn/<room>/ 로 격리한다."""
-    base = WORKSPACE_ROOT / BPMN_WORK_SUBDIR
+    base = tenant_workspace_root() / BPMN_WORK_SUBDIR
     slug = _conv_slug(_current_conversation_id.get())
     return base / slug if slug else base
 
@@ -204,7 +226,7 @@ def write_upload_to_workspace(file_name: str, content: bytes) -> str:
     `read_file('/workspace/uploads/<name>')` 로 바로 읽을 수 있다.
     """
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(file_name or "")).strip("_") or "upload"
-    d = WORKSPACE_ROOT / "uploads"
+    d = tenant_workspace_root() / "uploads"
     d.mkdir(parents=True, exist_ok=True)
     (d / safe).write_bytes(content)
     return f"/workspace/uploads/{safe}"

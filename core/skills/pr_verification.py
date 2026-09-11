@@ -84,15 +84,24 @@ _SKIP_PREFIXES = (".git/", "evals/", "iteration-")
 # 경로
 # ---------------------------------------------------------------------------
 
+def _bind_tenant(tenant_id: str) -> None:
+    """백그라운드 회차는 요청 컨텍스트 밖에서 돈다. 작업공간 경로와 스토리지 도구가
+    이 테넌트 디렉터리로 풀리도록 컨텍스트를 채운다."""
+    from ..storage.storage import set_tenant_id as _set_storage_tenant_id
+
+    _skill_tools._current_tenant_id.set(tenant_id)
+    _set_storage_tenant_id(tenant_id)
+
+
 def verify_root(run_id: str) -> Path:
     """이 검증 회차의 호스트 루트."""
-    return _skill_tools.WORKSPACE_ROOT / PR_VERIFY_SUBDIR / str(run_id)
+    return _skill_tools.tenant_workspace_root() / PR_VERIFY_SUBDIR / str(run_id)
 
 
 def _container_path(host: Path) -> str:
     """호스트 경로를 샌드박스 컨테이너 경로(/workspace/...)로 바꾼다."""
     try:
-        rel = host.relative_to(_skill_tools.WORKSPACE_ROOT)
+        rel = host.relative_to(_skill_tools.tenant_workspace_root())
     except ValueError:
         return str(host)
     return f"/workspace/{rel.as_posix()}"
@@ -566,6 +575,7 @@ async def execute_run(
     """
     run_id = run["id"]
     resource_id = run["resource_id"]
+    _bind_tenant(tenant_id)
     root = verify_root(run_id)
 
     try:

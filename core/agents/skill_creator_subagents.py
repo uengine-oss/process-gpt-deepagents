@@ -19,9 +19,9 @@ from pathlib import Path
 from deepagents import SubAgent
 
 from ..skills.tools import (
-    WORKSPACE_ROOT,
     extract_document_structure,
     list_git_repos,
+    tenant_workspace_root,
 )
 from ..storage.storage import download_file
 
@@ -574,7 +574,7 @@ def build_skill_creator_subagents(
                              None이면 anthropics-skills/skill-creator 기본값 사용.
     """
     sc_path = Path(skill_creator_path) if skill_creator_path else _DEFAULT_SKILL_CREATOR_PATH
-    ws = str(WORKSPACE_ROOT / (task_id or "tmp"))
+    ws = str(tenant_workspace_root() / (task_id or "tmp"))
 
     repo_scout: SubAgent = {
         "name": "repo-scout",

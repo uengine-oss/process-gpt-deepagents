@@ -529,13 +529,18 @@ async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
     if streamer is None:
         return
     try:
-        from core.skills.tools import bpmn_container_base as _bcb, _conv_slug, process_work_dirs
-        from core.agents.agent import _BASE_DIR as _ABASE
+        from core.skills.tools import (
+            bpmn_container_base as _bcb,
+            _conv_slug,
+            process_work_dirs,
+            tenant_workspace_root,
+        )
     except Exception:
         return
     base_container = _bcb(chat_room_id or "")  # /workspace/.bpmn/<slug>
     slug = _conv_slug(chat_room_id or "")
-    room_host = (_ABASE / "workspace" / ".bpmn" / slug) if slug else (_ABASE / "workspace" / ".bpmn")
+    bpmn_host = tenant_workspace_root() / ".bpmn"
+    room_host = bpmn_host / slug if slug else bpmn_host
     if not room_host.exists():
         return
     # 프로세스 폴더들 + (단독 스킬용) 방 base 자체를 항상 포함해 base 바로 아래 skills/ 도 스캔한다.
@@ -751,10 +756,11 @@ def _sanitize_ws_name(name: str, max_len: int = 80) -> str:
 
 def _instance_ws_dir(instance_id: str, subdir: str):
     """인스턴스 격리 workspace 디렉토리(호스트 Path)를 반환한다."""
-    from core.skills.tools import WORKSPACE_ROOT
+    from core.skills.tools import tenant_workspace_root
+    root = tenant_workspace_root()
     if instance_id:
-        return WORKSPACE_ROOT / _sanitize_ws_name(instance_id, 64) / subdir
-    return WORKSPACE_ROOT / subdir
+        return root / _sanitize_ws_name(instance_id, 64) / subdir
+    return root / subdir
 
 
 def _offload_input_data(text: str, instance_id: str) -> str:
@@ -1998,8 +2004,8 @@ class DeepAgentExecutor(AgentExecutor):
             if not process_json_written and chat_room_id:
                 try:
                     from core.skills.tools import process_work_dirs as _process_work_dirs, _conv_slug
-                    from core.agents.agent import _BASE_DIR as _ABASE
-                    room_dir = _ABASE / "workspace" / ".bpmn" / _conv_slug(chat_room_id)
+                    from core.skills.tools import tenant_workspace_root as _tenant_ws
+                    room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id)
                     process_json_written = any(
                         (directory / "process-definition.json").is_file()
                         for directory in _process_work_dirs(room_dir, chat_room_id)
@@ -2016,10 +2022,10 @@ class DeepAgentExecutor(AgentExecutor):
                         process_work_dirs as _process_work_dirs,
                         _conv_slug,
                     )
-                    from core.agents.agent import _BASE_DIR as _ABASE
+                    from core.skills.tools import tenant_workspace_root as _tenant_ws
 
                     _ccid.set(chat_room_id or "")
-                    _room_dir = _ABASE / "workspace" / ".bpmn" / _conv_slug(chat_room_id or "")
+                    _room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id or "")
                     _validation_failures = []
                     for _work_dir in _process_work_dirs(_room_dir, chat_room_id or ""):
                         _definition_path = _work_dir / "process-definition.json"

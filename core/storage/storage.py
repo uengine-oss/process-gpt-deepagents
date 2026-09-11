@@ -17,8 +17,8 @@ Bucket layout:
     고정되므로, tenant 격리는 RLS 대신 _storage_path()의 tenant_id prefix로 코드 레벨에서
     보장한다. `files` 버킷이 public이고 anon 역할에 대한 INSERT/UPDATE RLS 정책이 없어서
     anon 키로는 업로드가 막히기 때문에 이렇게 나눴다.
-  - 업로드 source 경로는 반드시 WORKSPACE_ROOT 하위여야 한다.
-  - 다운로드 dest_dir도 반드시 WORKSPACE_ROOT 하위여야 한다.
+  - 업로드 source 경로와 다운로드 dest_dir는 반드시 현재 테넌트 작업공간
+    (WORKSPACE_ROOT/<tenant_id>) 하위여야 한다.
   - 모든 storage 경로에는 tenant_id가 prefix로 강제된다.
 
 Required environment variables:
@@ -36,6 +36,7 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
+from ..sandbox.tenant_workspace import tenant_workspace
 from .db import get_storage_supabase, get_supabase
 
 _BUCKET = "files"
@@ -70,12 +71,16 @@ def _storage_path(tenant_id: str, task_id: str, rel: str) -> str:
 
 
 def _validate_workspace_path(p: Path, label: str) -> None:
-    """경로가 WORKSPACE_ROOT 하위인지 확인 — 아니면 ValueError."""
+    """경로가 현재 테넌트 작업공간 하위인지 확인 — 아니면 ValueError.
+
+    볼륨 루트 기준으로만 보면 호스트에서 도는 이 도구로 다른 테넌트 디렉터리를 읽고 쓸 수 있다.
+    """
+    root = tenant_workspace(WORKSPACE_ROOT, _require_tenant_id()).resolve()
     try:
-        p.resolve().relative_to(WORKSPACE_ROOT)
+        p.resolve().relative_to(root)
     except ValueError:
         raise ValueError(
-            f"{label} '{p}' 는 WORKSPACE_ROOT({WORKSPACE_ROOT}) 하위여야 합니다. "
+            f"{label} '{p}' 는 현재 테넌트 작업공간({root}) 하위여야 합니다. "
             "보안상 workspace 외부 경로는 허용되지 않습니다."
         )
 

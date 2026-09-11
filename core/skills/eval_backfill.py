@@ -71,6 +71,7 @@ from .eval_tools import (
 from .pr_verification import (
     BASE_VARIANT,
     _MAX_PARALLEL,
+    _bind_tenant,
     _build_runner_agent,
     _container_path,
     _evaluator_instruction,
@@ -104,7 +105,7 @@ PROPOSE_ASSERTIONS_MAX = 6
 
 def backfill_root(run_id: str) -> Path:
     """이 회차의 호스트 루트."""
-    return _skill_tools.WORKSPACE_ROOT / BACKFILL_SUBDIR / str(run_id)
+    return _skill_tools.tenant_workspace_root() / BACKFILL_SUBDIR / str(run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +534,7 @@ async def execute_run(
     base_ref = run["base_ref"]
     # 화면이 "다시 만든 회차" 임을 알아볼 수 있도록 이후 summary 갱신에도 이어 붙인다.
     replacing = bool((run.get("summary") or {}).get("replace"))
+    _bind_tenant(tenant_id)
     root = backfill_root(run_id)
 
     try:

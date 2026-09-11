@@ -40,7 +40,8 @@ def ws(tmp_path, monkeypatch):
     t1 = skill_tools._current_tenant_id.set(TENANT)
     t2 = skill_tools._current_conversation_id.set(ROOM)
     t3 = skill_tools._current_user_id.set("00000000-0000-0000-0000-0000000000aa")
-    yield workspace
+    # 도구는 테넌트 작업공간(WORKSPACE_ROOT/<tenant>) 기준으로 경로를 푼다.
+    yield workspace / TENANT
     skill_tools._current_tenant_id.reset(t1)
     skill_tools._current_conversation_id.reset(t2)
     skill_tools._current_user_id.reset(t3)

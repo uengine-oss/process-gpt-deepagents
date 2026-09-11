@@ -4,14 +4,14 @@ BaseSandbox를 상속해 execute()/upload_files()/download_files()를 구현한�
 tenant_id 당 하나의 컨테이너를 재사용하며, atexit 훅으로 프로세스 종료 시 정리한다.
 
 컨테이너는 다음 볼륨을 마운트한다:
-  - {workspace_host}/  →  /workspace  (read-write)
+  - {workspace_host}/{tenant_id}/  →  /workspace  (read-write) — 볼륨 전체를 마운트하면
+    에이전트가 셸로 다른 테넌트의 작업 파일을 그대로 읽는다(도구 레벨 경로 검사는 셸을
+    막지 못한다). 그래서 마운트 단위로 가른다.
   - {skills_host}/{tenant_id}/ 및 알려진 글로벌 컬렉션만 각각 /skills/<name> 으로
     개별 bind-mount (read-only, optional) — skills_host 전체를 통째로 마운트하면
     다른 테넌트의 스킬 디렉토리까지 노출되므로 디렉토리 단위로 화이트리스트한다.
 
-환경변수는 호스트 전체를 상속하지 않고 **화이트리스트(_FORWARD_ENV_KEYS)만** 컨테이너로
-전달하며, 여기에 Supabase 자격증명은 포함하지 않는다(샌드박스에서 DB 직접 쓰기 차단).
-또한 요청이 들어온 tenant 로 `TENANT_ID` 를 자동 세팅한다.
+환경변수는 호스트에서 상속하지 않고 요청 tenant 의 `TENANT_ID` 만 넣는다.
 """
 
 from __future__ import annotations
@@ -43,12 +43,19 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 
+from .tenant_workspace import tenant_workspace
+
 logger = logging.getLogger(__name__)
 
 SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "python:3.13-slim")
 _CONTAINER_WORKSPACE = "/workspace"
 _MAX_OUTPUT_BYTES = 100_000
 _HOST_GATEWAY = "host.docker.internal"
+
+# 컨테이너 구성(마운트·환경변수)을 바꾸면 올린다. 이름이 같은 컨테이너가 살아 있으면 재사용하므로,
+# 라벨이 다르면 버리고 새로 띄워야 옛 구성이 배포 뒤에도 남지 않는다.
+_CONTRACT_LABEL = "processgpt.sandbox.contract"
+SANDBOX_CONTRACT = "tenant-workspace-v1"
 
 # ---------------------------------------------------------------------
 # 샌드박스 전용 브리지 네트워크 (MTU 고정)
@@ -202,21 +209,13 @@ def _is_run_scoped_path(path: str) -> bool:
 # "스킬·에이전트는 DB 에 직접 쓰지 않는다" 는 원칙이 프롬프트 금지문구로만 지켜지게 된다.
 # 프로세스/스킬/에이전트의 임시저장·최종저장은 모두 프론트가 사용자 자격증명으로 수행한다.
 # 실행엔진 검증도 프론트의 /validate-and-improve 가 담당하므로 COMPLETION_ENGINE_URL 도 넘기지 않는다.
-_FORWARD_ENV_KEYS = (
-    # LLM (core/model.py 와 동일 변수명) — 샌드박스에서 도는 스킬들의 모델 호출용
-    "LLM_MODEL", "LLM_PROXY_URL", "LLM_PROXY_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
-)
-
+#
+# 모델 API 키도 넘기지 않는다. 사용자가 채팅으로 `env` 를 시키면 그대로 출력돼 실제로 노출됐다.
+# 샌드박스 스크립트가 모델을 불러야 한다면 원본 키가 아니라 범위가 제한된 토큰을 따로 둬야 한다
+# (bpmn-process-generation-skill 의 자동교정은 자격증명이 없으면 검증만 하고 넘어간다).
 def _build_container_env(tenant_id: str) -> dict[str, str]:
-    """화이트리스트 host env + 요청 tenant 자동주입(TENANT_ID)."""
-    env: dict[str, str] = {}
-    for k in _FORWARD_ENV_KEYS:
-        v = os.environ.get(k)
-        if v:
-            env[k] = v
-    # 요청이 들어온 tenant 로 자동 세팅 (스킬 scripts 가 --tenant 없이 TENANT_ID 로 읽는다)
-    env["TENANT_ID"] = tenant_id or ""
-    return env
+    """요청 tenant 만 주입한다(스킬 scripts 가 --tenant 없이 TENANT_ID 로 읽는다)."""
+    return {"TENANT_ID": tenant_id or ""}
 
 # "bash: line 1: curl: command not found" 또는 "sh: jq: not found" 에서 커맨드명 추출
 _CMD_NOT_FOUND_RE = re.compile(
@@ -261,7 +260,8 @@ class DockerSandboxBackend(BaseSandbox):
         skills_host: Path | None = None,
     ) -> None:
         self._tenant_id = tenant_id
-        self._workspace_host = workspace_host
+        # 볼륨 루트가 아니라 이 테넌트 디렉터리만 /workspace 로 마운트한다.
+        self._workspace_host = tenant_workspace(workspace_host, tenant_id)
         self._skills_host = skills_host
         self._container: docker.models.containers.Container | None = None
         self._lock = threading.Lock()
@@ -402,16 +402,20 @@ class DockerSandboxBackend(BaseSandbox):
         try:
             old = self._client.containers.get(name)
             if old.status == "running":
-                if self._network_matches(old, network):
+                if not self._contract_matches(old):
+                    # 옛 구성(볼륨 전체 마운트·모델 키 env)으로 떠 있는 컨테이너다.
+                    logger.info("sandbox 재생성: %s 의 구성이 %s 가 아님", name, SANDBOX_CONTRACT)
+                elif self._network_matches(old, network):
                     self._container = old
                     # 이전 실행에서 살아남은 컨테이너에도 safe.directory 를 보장한다.
                     self._configure_git(old)
                     self._bootstrap_tooling(old)
                     return old
-                # 예전 배포가 기본 브리지(MTU 1500)로 띄워 둔 컨테이너다. 그대로 재사용하면
-                # git clone/push 가 계속 매달리므로, 일회용 컨테이너답게 버리고 다시 띄운다.
-                # /workspace 는 볼륨이라 재생성해도 산출물은 남는다.
-                logger.info("sandbox 재생성: %s 가 %s 네트워크에 없음", name, network)
+                else:
+                    # 예전 배포가 기본 브리지(MTU 1500)로 띄워 둔 컨테이너다. 그대로 재사용하면
+                    # git clone/push 가 계속 매달리므로, 일회용 컨테이너답게 버리고 다시 띄운다.
+                    # /workspace 는 볼륨이라 재생성해도 산출물은 남는다.
+                    logger.info("sandbox 재생성: %s 가 %s 네트워크에 없음", name, network)
             old.remove(force=True)
         except docker.errors.NotFound:
             pass
@@ -428,6 +432,7 @@ class DockerSandboxBackend(BaseSandbox):
             volumes=volumes,
             working_dir=_CONTAINER_WORKSPACE,
             environment=_build_container_env(self._tenant_id),
+            labels={_CONTRACT_LABEL: SANDBOX_CONTRACT},
             extra_hosts={_HOST_GATEWAY: "host-gateway"},
             mem_limit="512m",
             cpu_period=100_000,
@@ -443,6 +448,16 @@ class DockerSandboxBackend(BaseSandbox):
         self._configure_git(container)
         self._bootstrap_tooling(container)
         return container
+
+    @staticmethod
+    def _contract_matches(container) -> bool:
+        """컨테이너가 현재 구성 버전으로 떠 있는지. 확인하지 못하면 재사용하지 않는다."""
+        try:
+            container.reload()
+            labels = (container.attrs.get("Config") or {}).get("Labels") or {}
+        except Exception:
+            return False
+        return labels.get(_CONTRACT_LABEL) == SANDBOX_CONTRACT
 
     @staticmethod
     def _network_matches(container, network: str | None) -> bool:
@@ -795,7 +810,11 @@ def get_or_create_sandbox(
     workspace_host: Path,
     skills_host: Path | None = None,
 ) -> DockerSandboxBackend:
-    """tenant_id에 대응하는 샌드박스 백엔드를 반환한다. 없으면 새로 생성한다."""
+    """tenant_id에 대응하는 샌드박스 백엔드를 반환한다. 없으면 새로 생성한다.
+
+    tenant_id 가 비었거나 디렉터리 이름으로 쓸 수 없으면 ValueError — 공용 작업공간으로
+    떨어지면 테넌트끼리 파일이 섞인다.
+    """
     key = tenant_id or "shared"
     with _registry_lock:
         if key not in _registry:

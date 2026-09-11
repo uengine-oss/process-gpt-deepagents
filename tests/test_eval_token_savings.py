@@ -195,7 +195,7 @@ def skill_workspace(tmp_path, monkeypatch):
     ws = tmp_path / "workspace"
     room = ws / ".bpmn" / "room-1"
     room.mkdir(parents=True)
-    monkeypatch.setattr(eval_tools._skill_tools, "WORKSPACE_ROOT", ws)
+    monkeypatch.setattr(eval_tools._skill_tools, "tenant_workspace_root", lambda tenant_id=None: ws)
     monkeypatch.setattr(eval_tools, "_bpmn_work_dir", lambda: room)
     return room
 

@@ -329,7 +329,7 @@ def test_바이너리_문서는_텍스트로_풀어서_넘긴다(tmp_path, monke
     하나도 남지 않는다(실측). 그래서 바이너리를 모델 앞에 두지 않는다."""
     from core.skills import tools as skill_tools
 
-    monkeypatch.setattr(skill_tools, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(skill_tools, "tenant_workspace_root", lambda tenant_id=None: tmp_path)
     calls = []
     parser = _Parser()
     monkeypatch.setattr("core.storage.storage.download_file", _stub_downloader(tmp_path, calls))
@@ -350,7 +350,7 @@ def test_바이너리_문서는_텍스트로_풀어서_넘긴다(tmp_path, monke
 def test_이미_텍스트인_입력은_그대로_넘긴다(tmp_path, monkeypatch):
     from core.skills import tools as skill_tools
 
-    monkeypatch.setattr(skill_tools, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(skill_tools, "tenant_workspace_root", lambda tenant_id=None: tmp_path)
     parser = _Parser()
     monkeypatch.setattr("core.storage.storage.download_file", _stub_downloader(tmp_path, []))
     monkeypatch.setattr(skill_tools, "extract_document_structure", parser)
@@ -364,7 +364,7 @@ def test_이미_텍스트인_입력은_그대로_넘긴다(tmp_path, monkeypatch
 def test_문서_파싱_실패는_준비_실패로_보고한다(tmp_path, monkeypatch):
     from core.skills import tools as skill_tools
 
-    monkeypatch.setattr(skill_tools, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(skill_tools, "tenant_workspace_root", lambda tenant_id=None: tmp_path)
     monkeypatch.setattr("core.storage.storage.download_file", _stub_downloader(tmp_path, []))
     monkeypatch.setattr(skill_tools, "extract_document_structure", _Parser("ERROR: unsupported"))
 
@@ -377,7 +377,7 @@ def test_문서_파싱_실패는_준비_실패로_보고한다(tmp_path, monkeyp
 def test_입력_문서_준비_실패는_숨기지_않는다(tmp_path, monkeypatch):
     from core.skills import tools as skill_tools
 
-    monkeypatch.setattr(skill_tools, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(skill_tools, "tenant_workspace_root", lambda tenant_id=None: tmp_path)
 
     class _DL:
         def invoke(self, _args):

@@ -49,7 +49,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(skill_tools, "_get_git_provider", lambda: (_ for _ in ()).throw(ValueError("no provider")))
 
     token = skill_tools._current_tenant_id.set(TENANT)
-    yield workspace, skills
+    # 도구는 테넌트 작업공간(WORKSPACE_ROOT/<tenant>) 기준으로 경로를 푼다.
+    yield workspace / TENANT, skills
     skill_tools._current_tenant_id.reset(token)
 
 

@@ -151,7 +151,7 @@ def eval_runs_container_root(skill_name: str) -> str:
     host = eval_runs_root(skill_name)
     try:
         # 모듈 속성으로 읽는다 — 테스트가 tools.WORKSPACE_ROOT 를 갈아끼울 수 있어야 한다.
-        rel = host.relative_to(_skill_tools.WORKSPACE_ROOT)
+        rel = host.relative_to(_skill_tools.tenant_workspace_root())
     except ValueError:
         return str(host)
     return f"/workspace/{rel.as_posix()}"
