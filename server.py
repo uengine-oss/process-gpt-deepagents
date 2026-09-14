@@ -30,6 +30,7 @@ from core.api.file_download import routes as file_download_routes
 from core.api.chat_stream_attach import routes as chat_stream_attach_routes
 from core.api.chat_stop import routes as chat_stop_routes
 from core.chat.inflight_registry import start_cancel_listener
+from core.chat.sdk_registry import install as install_sdk_registries
 from core.skills.local_system_skills import seed_local_system_skills
 from executor import DeepAgentExecutor
 
@@ -46,6 +47,10 @@ PORT = int(os.environ.get("PORT", "8888"))
 AGENT_TYPE = "deepagents"
 
 async def main() -> None:
+    # SDK 가 쓰는 채팅 레지스트리를 이 저장소의 Redis 기반 구현으로 바꾼다.
+    # 마운트보다 먼저 해야 첫 요청부터 같은 레지스트리를 본다.
+    install_sdk_registries()
+
     try:
         synced = await asyncio.to_thread(seed_local_system_skills)
         logger.info("local-system-skills: 기동 시 %d개 스킬 시딩", synced)

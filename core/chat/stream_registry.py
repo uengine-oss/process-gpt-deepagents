@@ -311,23 +311,24 @@ async def unsubscribe(conversation_id: str, q: asyncio.Queue) -> None:
         await _local_unsubscribe(conversation_id, q)
 
 
-class MulticastStreamer:
-    """executor.py 가 받은 원래 streamer(SDK ChatStreamer)를 감싸는 프록시.
+class EventTapStreamer:
+    """executor.py 가 받은 원래 streamer(SDK ChatStreamer)를 감싸는 얇은 프록시.
 
-    각 send_json 호출을 (a) 원래 streamer로 그대로 전달 (b) 레지스트리(로컬 또는 Redis)에
-    이벤트 기록/브로드캐스트 (c) done/error 타입이면 run 종료 표시, 순서로 처리한다.
-    on_event 콜백은 tool/plan 이벤트를 채팅방 컨텍스트 증분 저장 등 호출자(executor.py)가
-    원하는 후속 처리로 넘기기 위한 훅이다.
+    각 send_json 호출을 (a) 원래 streamer 로 그대로 전달하고 (b) on_event 콜백에 넘긴다.
+    콜백은 tool/plan 이벤트를 채팅방 컨텍스트로 증분 저장하는 데 쓴다.
+
+    예전에는 이 자리에서 레지스트리 기록/브로드캐스트까지 했지만(MulticastStreamer),
+    SDK 0.5.x 가 채팅 출력 큐를 직접 가로채 같은 이벤트를 기록하므로 그 역할은
+    core/chat/sdk_registry.py 의 어댑터로 옮겼다. 여기서 또 기록하면 같은 토큰이
+    두 번 쌓여 재접속 스냅샷 본문이 두 배가 된다.
     """
 
     def __init__(
         self,
         inner: Any,
-        conversation_id: str,
         on_event: Callable[[dict], Awaitable[None]] | None = None,
     ) -> None:
         self._inner = inner
-        self._conversation_id = conversation_id
         self._on_event = on_event
 
     async def send_text(self, text: str) -> None:
@@ -337,25 +338,12 @@ class MulticastStreamer:
         if self._inner is not None:
             await self._inner.send_json(data)
 
-        cid = self._conversation_id
-        if not cid or not isinstance(data, dict):
+        if self._on_event is None or not isinstance(data, dict):
             return
-
         try:
-            if data.get("type") == "token":
-                content = data.get("content")
-                if isinstance(content, str) and content:
-                    await append_token(cid, content)
-
-            await broadcast(cid, data)
-
-            if data.get("type") in _DONE_TYPES:
-                await mark_done(cid)
-
-            if self._on_event is not None:
-                await self._on_event(data)
+            await self._on_event(data)
         except Exception:
-            logger.warning("stream_registry: send_json 후처리 실패 | conversation_id=%s", cid, exc_info=True)
+            logger.warning("EventTapStreamer: on_event 처리 실패", exc_info=True)
 
 
 def format_sse_message(payload: dict) -> bytes:

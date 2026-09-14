@@ -63,7 +63,7 @@ from core.chat.chat_room import (
     a_upsert_chat_room_start,
     build_initial_chat_room_context,
 )
-from core.chat.stream_registry import MulticastStreamer, mark_done, start_run
+from core.chat.stream_registry import EventTapStreamer, mark_done
 from core.chat.tool_arg_stream import ToolArgTextStreamer
 from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
@@ -1087,12 +1087,10 @@ class DeepAgentExecutor(AgentExecutor):
                     )
                 )
 
-        # 재접속(attach) 지원: 이번 턴을 conversation_id(=chat_room_id) 기준 메모리 레지스트리에
-        # 등록하고, streamer 를 프록시로 감싸 모든 토큰/이벤트를 (a) 원래 streamer (b) 누적 텍스트
-        # (c) attach 구독자에게 broadcast 한다. tool/plan 이벤트는 부가로 채팅방 컨텍스트 증분 저장.
+        # 재접속(attach) 등록과 토큰 브로드캐스트는 SDK 가 채팅 출력 큐를 가로채 처리한다
+        # (core/chat/sdk_registry.py 어댑터가 이 저장소의 레지스트리로 위임). 여기서는
+        # tool/plan 이벤트를 채팅방 컨텍스트로 증분 저장하는 훅만 얹는다.
         if streamer is not None and chat_room_id:
-            await start_run(chat_room_id)
-
             _persist_tenant_id = tenant_id
             _persist_has_file = has_file
 
@@ -1108,7 +1106,7 @@ class DeepAgentExecutor(AgentExecutor):
                         has_file=_persist_has_file,
                     )
 
-            streamer = MulticastStreamer(streamer, chat_room_id, on_event=_on_context_event)
+            streamer = EventTapStreamer(streamer, on_event=_on_context_event)
 
         tenant_mcp: dict[str, Any] = {}
         if tenant_id:

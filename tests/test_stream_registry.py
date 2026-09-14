@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from core.chat.stream_registry import (
-    MulticastStreamer,
+    EventTapStreamer,
     append_token,
     broadcast,
     mark_done,
@@ -66,43 +66,29 @@ async def test_unsubscribe_removes_queue_from_fanout():
     assert q.empty()
 
 
-async def test_multicast_streamer_forwards_to_inner_and_accumulates_tokens():
+async def test_event_tap_streamer_forwards_to_inner():
+    """토큰 누적/브로드캐스트는 SDK 어댑터(test_sdk_registry)가 맡는다.
+    여기서는 프록시가 원래 streamer 로 그대로 흘려보내는지만 본다."""
     inner = _FakeStreamer()
-    await start_run("room-5")
-    proxy = MulticastStreamer(inner, "room-5")
+    proxy = EventTapStreamer(inner)
 
     await proxy.send_json({"type": "token", "content": "ab"})
-    await proxy.send_json({"type": "token", "content": "cd"})
+    await proxy.send_text("cd")
 
     assert inner.sent == [
         {"type": "token", "content": "ab"},
         {"type": "token", "content": "cd"},
     ]
-    result = await subscribe("room-5")
-    assert result is not None
-    _, snapshot = result
-    assert snapshot == "abcd"
 
 
-async def test_multicast_streamer_marks_done_on_done_event():
+async def test_event_tap_streamer_invokes_on_event_hook_for_context_events():
     inner = _FakeStreamer()
-    await start_run("room-6")
-    proxy = MulticastStreamer(inner, "room-6")
-
-    await proxy.send_json({"type": "done", "content": "final"})
-
-    assert await subscribe("room-6") is None
-
-
-async def test_multicast_streamer_invokes_on_event_hook_for_context_events():
-    inner = _FakeStreamer()
-    await start_run("room-7")
     seen: list[dict] = []
 
     async def _on_event(evt):
         seen.append(evt)
 
-    proxy = MulticastStreamer(inner, "room-7", on_event=_on_event)
+    proxy = EventTapStreamer(inner, on_event=_on_event)
     await proxy.send_json({"type": "tool_start", "tool": "write_file"})
     await proxy.send_json({"type": "token", "content": "irrelevant-to-hook"})
 
@@ -110,3 +96,16 @@ async def test_multicast_streamer_invokes_on_event_hook_for_context_events():
         {"type": "tool_start", "tool": "write_file"},
         {"type": "token", "content": "irrelevant-to-hook"},
     ]
+
+
+async def test_event_tap_streamer_survives_failing_hook():
+    """컨텍스트 저장이 실패해도 스트림이 끊기면 안 된다."""
+    inner = _FakeStreamer()
+
+    async def _boom(evt):
+        raise RuntimeError("컨텍스트 저장 실패")
+
+    proxy = EventTapStreamer(inner, on_event=_boom)
+    await proxy.send_json({"type": "token", "content": "ab"})
+
+    assert inner.sent == [{"type": "token", "content": "ab"}]
