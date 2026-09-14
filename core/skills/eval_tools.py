@@ -607,8 +607,15 @@ def upsert_suite(
     tenant_id: str,
     resource_id: str,
     resource_type: str = RESOURCE_TYPE_SKILL,
+    baseline_ref: str = "",
 ) -> str:
-    """스위트 행을 확보하고 id 를 돌려준다."""
+    """스위트 행을 확보하고 id 를 돌려준다.
+
+    baseline_ref 는 이 시나리오들이 **어느 버전의 동작을 기준으로 굳혀진 것인지** 다.
+    통과/실패 숫자는 그 기준에 대한 상대값이라, 적어 두지 않으면 화면이 "무엇에 비해
+    깨졌는가" 를 말할 수 없다. 기준을 새로 잡아 다시 만든 경우에는 덮어쓴다 — 스위트
+    내용이 그 버전 기준으로 바뀌었으므로, 예전 기준을 남겨 두면 그게 거짓이 된다.
+    """
     sb = _sb()
     existing = (
         sb.table("resource_eval_suites")
@@ -620,7 +627,12 @@ def upsert_suite(
         .execute()
     )
     if existing.data:
-        return existing.data[0]["id"]
+        suite_id = existing.data[0]["id"]
+        if baseline_ref:
+            sb.table("resource_eval_suites").update(
+                {"baseline_ref": baseline_ref}
+            ).eq("id", suite_id).execute()
+        return suite_id
 
     payload = {
         "tenant_id": tenant_id,
@@ -628,9 +640,26 @@ def upsert_suite(
         "resource_id": resource_id,
         "source_conversation_id": _current_conversation_id.get() or None,
         "created_by": _current_user_id.get() or None,
+        # 모르는 것은 비워 둔다 — 추측해 채우면 화면이 틀린 기준을 사실처럼 말한다.
+        "baseline_ref": baseline_ref or None,
     }
     inserted = sb.table("resource_eval_suites").insert(payload).execute()
     return inserted.data[0]["id"]
+
+
+def suite_baseline_ref(suite_id: str) -> str:
+    """이 스위트가 어느 버전 기준으로 만들어졌는지. 모르면 빈 문자열(예전 스위트)."""
+    if not suite_id:
+        return ""
+    rows = (
+        _sb()
+        .table("resource_eval_suites")
+        .select("baseline_ref")
+        .eq("id", suite_id)
+        .limit(1)
+        .execute()
+    )
+    return (rows.data or [{}])[0].get("baseline_ref") or ""
 
 
 def find_suite(

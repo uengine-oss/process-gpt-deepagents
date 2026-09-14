@@ -283,16 +283,20 @@ async def build(
 
     _assign_positions(cases, existing)
 
-    suite_id = await asyncio.to_thread(upsert_suite, tenant_id, resource_id, RESOURCE_TYPE_PROCESS)
+    suite_id = await asyncio.to_thread(
+        upsert_suite, tenant_id, resource_id, RESOURCE_TYPE_PROCESS, base_ref
+    )
     ids = await asyncio.to_thread(sync_cases, tenant_id, suite_id, cases)
     logger.info(
-        "process-scenarios: 확보 완료 resource=%s suite=%s 케이스 %d건(기존 %d건, 삭제 %d건)",
-        resource_id, suite_id, len(ids), len(existing), dropped,
+        "process-scenarios: 확보 완료 resource=%s suite=%s 기준=%s 케이스 %d건(기존 %d건, 삭제 %d건)",
+        resource_id, suite_id, base_ref or "(현재 정의)", len(ids), len(existing), dropped,
     )
     return {
         "suite_id": suite_id,
         "case_count": len(ids),
         "dropped_count": dropped,
+        # 어느 버전 기준으로 굳혔는지 — 화면이 그대로 되읽어 보여 준다.
+        "baseline_ref": base_ref,
         # 만들지 못한 갈림길을 숨기지 않는다 — 화면이 그대로 보여줄 수 있게 실어 보낸다.
         "skipped_reasons": derived.get("skipped_reasons") or [],
         "skipped": False,

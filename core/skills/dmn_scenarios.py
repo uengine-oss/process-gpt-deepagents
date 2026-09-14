@@ -81,13 +81,22 @@ async def promote(
 
     _assign_positions(cases, existing)
 
-    suite_id = await asyncio.to_thread(upsert_suite, tenant_id, resource_id, RESOURCE_TYPE_DMN)
+    suite_id = await asyncio.to_thread(
+        upsert_suite, tenant_id, resource_id, RESOURCE_TYPE_DMN, base_ref
+    )
     ids = await asyncio.to_thread(sync_cases, tenant_id, suite_id, cases)
     logger.info(
-        "dmn-scenarios: 확보 완료 resource=%s suite=%s 케이스 %d건(기존 %d건, 삭제 %d건)",
-        resource_id, suite_id, len(ids), len(existing), dropped,
+        "dmn-scenarios: 확보 완료 resource=%s suite=%s 기준=%s 케이스 %d건(기존 %d건, 삭제 %d건)",
+        resource_id, suite_id, base_ref or "(현재 표)", len(ids), len(existing), dropped,
     )
-    return {"suite_id": suite_id, "case_count": len(ids), "dropped_count": dropped, "skipped": False}
+    return {
+        "suite_id": suite_id,
+        "case_count": len(ids),
+        "dropped_count": dropped,
+        # 어느 버전 기준으로 굳혔는지 — 화면이 그대로 되읽어 보여 준다.
+        "baseline_ref": base_ref,
+        "skipped": False,
+    }
 
 
 def summary(tenant_id: str, resource_id: str) -> dict[str, Any]:

@@ -209,6 +209,40 @@ def test_replace_drops_cases_missing_from_the_new_set(monkeypatch):
     assert result["dropped_count"] == 1
 
 
+# --------------------------------------------------------------------------- 기준 버전
+async def test_build_records_the_baseline_version(monkeypatch):
+    """어느 버전 기준으로 굳혔는지 스위트에 남는다.
+
+    리뷰어는 시나리오를 다시 만들 때 기준 버전을 고를 수 있다(이 요청이 갈라져 나온 버전 /
+    지금 운영 중인 버전). 통과·실패 숫자는 그 기준에 대한 상대값이라, 무엇을 기준으로 삼았는지
+    적어 두지 않으면 화면이 "무엇에 비해 깨졌는가" 를 말할 수 없다.
+    """
+    from core.skills import regression_client as rc
+
+    seen = {}
+
+    async def _derive(*, tenant_id, resource_id, base_ref):
+        seen["derive_ref"] = base_ref
+        return {"cases": [{"eval_name": "고액 승인 경로", "prompt": "{}", "assertions": [], "checks": []}]}
+
+    def _upsert(tenant_id, resource_id, resource_type, baseline_ref=""):
+        seen["baseline_ref"] = baseline_ref
+        return "suite-1"
+
+    monkeypatch.setattr(rc, "derive_process_cases", _derive)
+    monkeypatch.setattr(ps, "find_suite", lambda *a, **k: "")
+    monkeypatch.setattr(ps, "upsert_suite", _upsert)
+    monkeypatch.setattr(ps, "sync_cases", lambda t, s, cases: {c["eval_name"]: "case-0" for c in cases})
+
+    result = await ps.build(tenant_id="tn", resource_id="proc-1", base_ref="v1.0", replace=True)
+
+    # 고른 버전이 파생과 기록에 같은 값으로 가야 한다 — 한쪽만 바뀌면 화면의 기준 표기가
+    # 실제로 시나리오를 뽑은 버전과 어긋나 거짓을 말한다.
+    assert seen["derive_ref"] == "v1.0"
+    assert seen["baseline_ref"] == "v1.0"
+    assert result["baseline_ref"] == "v1.0"
+
+
 def test_without_replace_nothing_is_deleted(monkeypatch):
     """기본은 지키는 쪽이다 — 검증을 다시 돌릴 때마다 옛 기준이 사라지면 안 된다."""
     monkeypatch.setattr(ps, "find_suite", lambda *a, **k: "suite-1")

@@ -1873,6 +1873,9 @@ async def get_resource_verification(request: Request) -> JSONResponse:
         suite_id = eval_tools.find_suite(tenant_id, resource_id, resource_type)
         payload["cases"] = eval_tools.load_suite_cases(suite_id) if suite_id else []
         payload["has_suite"] = bool(payload["cases"])
+        # 이 시나리오가 어느 버전 기준인지 — 통과/실패 숫자는 그 기준에 대한 상대값이라,
+        # 기준 버전이 보이지 않으면 화면의 숫자가 무엇을 뜻하는지 읽을 수 없다.
+        payload["baseline_ref"] = eval_tools.suite_baseline_ref(suite_id) if suite_id else ""
         return payload
 
     try:
