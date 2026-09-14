@@ -75,7 +75,7 @@ def github_test_repo(github_provider):
 # ---------------------------------------------------------------------------
 # 스킬 API 테넌트 인증
 # ---------------------------------------------------------------------------
-# /skills* 는 이제 검증된 JWT 에서 테넌트를 얻는다(core/api/tenant_auth.py).
+# /skills* 는 이제 검증된 JWT 에서 테넌트를 얻는다(processgpt_agent_sdk.tenant_auth).
 # 기존 라우터 테스트는 토큰을 보내지 않으므로, 기본적으로 테스트용 신원을 주입한다.
 # 가드 자체를 검증하는 테스트는 `@pytest.mark.real_tenant_auth` 로 이 스텁을 끈다.
 
@@ -89,7 +89,7 @@ def stub_tenant_auth(request, monkeypatch):
         yield
         return
 
-    from core.api import tenant_auth
+    from processgpt_agent_sdk import tenant_auth
 
     async def _fake_resolve_identity(_request):
         return tenant_auth.RequestIdentity(

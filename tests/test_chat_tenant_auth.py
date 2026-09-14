@@ -15,8 +15,8 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from core.api import tenant_auth
-from core.api.tenant_auth import ChatTenantGuardMiddleware
+from processgpt_agent_sdk import tenant_auth
+from processgpt_agent_sdk.tenant_auth import ChatTenantGuardMiddleware
 
 pytestmark = pytest.mark.real_tenant_auth
 

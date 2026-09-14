@@ -29,8 +29,6 @@ from core.api.skills_router import routes as skills_routes
 from core.api.file_download import routes as file_download_routes
 from core.api.chat_stream_attach import routes as chat_stream_attach_routes
 from core.api.chat_stop import routes as chat_stop_routes
-from core.api.sse_heartbeat import install_sse_heartbeat
-from core.api.tenant_auth import ChatTenantGuardMiddleware
 from core.chat.inflight_registry import start_cancel_listener
 from core.skills.local_system_skills import seed_local_system_skills
 from executor import DeepAgentExecutor
@@ -57,6 +55,9 @@ async def main() -> None:
     server = ProcessGPTAgentServer(
         agent_executor=DeepAgentExecutor(),
         agent_type=AGENT_TYPE,
+        # 본문 tenant_id 가 executor → _get_skills(tenant_id) → 컨테이너 스킬 마운트까지
+        # 그대로 흘러가므로 SDK 가드로 앞단에서 검증한다.
+        tenant_auth=True,
     )
 
     async def health(_request: Request) -> JSONResponse:
@@ -69,12 +70,10 @@ async def main() -> None:
         *chat_stream_attach_routes,
         *chat_stop_routes,
     ])
-    server.mount_chat_sse(app, path="/chat/stream")
-    # 유휴 SSE 커넥션이 프록시에서 끊겨 화면이 "생각 중..." 에 멈추는 것을 막는다.
-    install_sse_heartbeat(app, "/chat/stream", float(os.environ.get("SSE_HEARTBEAT_SECONDS", "15")))
-    # /chat/stream 은 SDK 가 소유한 라우트라 데코레이터를 달 수 없다. 본문 tenant_id 가
-    # 그대로 스킬 디렉토리 로드/컨테이너 마운트까지 흘러가므로 앞단에서 검증한다.
-    app.add_middleware(ChatTenantGuardMiddleware, paths=("/chat/stream",))
+    # /chat/stream 마운트 + 유휴 SSE 하트비트 + 테넌트 가드 미들웨어를 SDK 가 함께 건다.
+    # 재접속/중지는 이 저장소가 Redis 소유권과 HITL 대기까지 다루므로 위(routes)에 둔
+    # 자체 라우트를 그대로 쓴다.
+    server.mount_chat_routes(app, attach_path=None, stop_path=None)
 
     uvicorn_server = uvicorn.Server(
         uvicorn.Config(app, host=HOST, port=PORT, log_level="info")

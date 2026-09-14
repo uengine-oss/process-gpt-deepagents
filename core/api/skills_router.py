@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from core.api.tenant_auth import (
+from processgpt_agent_sdk.tenant_auth import (
     auth_guard,
     request_tenant_id,
     request_user_id,

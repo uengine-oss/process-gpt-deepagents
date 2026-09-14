@@ -1,4 +1,4 @@
-"""/skills* 테넌트 접근 제어 테스트 (core/api/tenant_auth.py).
+"""/skills* 테넌트 접근 제어 테스트 (processgpt_agent_sdk.tenant_auth).
 
 과거에는 요청 파라미터 tenant_id 를 그대로 믿어서, 값만 바꾸면 다른 테넌트의
 스킬 디렉토리·git 자격증명에 접근할 수 있었다. 여기서는 그 경로가 막혔는지,
@@ -13,7 +13,7 @@ import pytest
 from starlette.applications import Starlette
 from starlette.testclient import TestClient
 
-from core.api import tenant_auth
+from processgpt_agent_sdk import tenant_auth
 from core.api.skills_router import routes
 
 pytestmark = pytest.mark.real_tenant_auth
@@ -129,12 +129,18 @@ class TestTokenValidation:
         assert resp.status_code == 404
 
     def test_tenant_membership_falls_back_to_users_table(self, client):
-        """토큰에 tenant_id 클레임이 없으면 users 테이블 소속으로 판단한다."""
+        """토큰에 tenant_id 클레임이 없으면 users 테이블 소속으로 판단한다.
+
+        조회는 SDK(processgpt_agent_sdk.tenant_auth)가 자기 Supabase 클라이언트로
+        수행한다. 키 선택 순서(SERVICE_ROLE_KEY → SUPABASE_KEY → SUPABASE_ANON_KEY)는
+        core.storage.db.get_supabase 와 같으므로 운영 동작은 그대로다.
+        """
         sb = MagicMock()
         sb.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(
             data=[{"tenant_id": "tenant-a"}]
         )
-        with patch("core.storage.db.get_supabase", return_value=sb):
+        with patch("processgpt_agent_sdk.database.get_db_client", return_value=sb), \
+                patch("processgpt_agent_sdk.database.initialize_db"):
             with patch("core.api.skills_router._scan_skills", return_value=[]):
                 ok = client.get("/skills?tenant_id=tenant-a", headers=_auth(USER_B, None))
             forbidden = client.get("/skills?tenant_id=tenant-b", headers=_auth(USER_B, None))
