@@ -183,11 +183,18 @@ class TestChatStreamGuard:
 
 
 class TestChatStreamAttachGuard:
+    """재접속 라우트는 이제 SDK 가 소유한다. 이 저장소가 기대하는 접근 제어가
+    SDK 핸들러에서도 그대로인지 확인한다 — 방 ID 와 테넌트 ID 만 아는 외부인이
+    남의 스트림에 붙지 못해야 한다."""
+
     @pytest.fixture
     def attach_client(self):
-        from core.api.chat_stream_attach import routes
+        from processgpt_agent_sdk.chat_sse import make_attach_handler
 
-        return TestClient(Starlette(routes=routes), raise_server_exceptions=True)
+        app = Starlette(routes=[
+            Route("/chat/stream/attach", make_attach_handler(require_auth=True), methods=["POST"]),
+        ])
+        return TestClient(app, raise_server_exceptions=True)
 
     def test_no_token_is_rejected(self, attach_client):
         resp = attach_client.post("/chat/stream/attach", json={"conversation_id": "c1", "tenant_id": "tenant-a"})

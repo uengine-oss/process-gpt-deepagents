@@ -19,18 +19,11 @@ import logging
 import uvicorn
 from dotenv import load_dotenv
 from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
 
 from processgpt_agent_sdk import ProcessGPTAgentServer
 
 from core.api.skills_router import routes as skills_routes
 from core.api.file_download import routes as file_download_routes
-from core.api.chat_stream_attach import routes as chat_stream_attach_routes
-from core.api.chat_stop import routes as chat_stop_routes
-from core.chat.inflight_registry import start_cancel_listener
-from core.chat.sdk_registry import install as install_sdk_registries
 from core.skills.local_system_skills import seed_local_system_skills
 from executor import DeepAgentExecutor
 
@@ -47,10 +40,6 @@ PORT = int(os.environ.get("PORT", "8888"))
 AGENT_TYPE = "deepagents"
 
 async def main() -> None:
-    # SDK 가 쓰는 채팅 레지스트리를 이 저장소의 Redis 기반 구현으로 바꾼다.
-    # 마운트보다 먼저 해야 첫 요청부터 같은 레지스트리를 본다.
-    install_sdk_registries()
-
     try:
         synced = await asyncio.to_thread(seed_local_system_skills)
         logger.info("local-system-skills: 기동 시 %d개 스킬 시딩", synced)
@@ -65,20 +54,21 @@ async def main() -> None:
         tenant_auth=True,
     )
 
-    async def health(_request: Request) -> JSONResponse:
-        return JSONResponse({"status": "ok"})
-
     app = Starlette(routes=[
-        Route("/health", health),
         *skills_routes,
         *file_download_routes,
-        *chat_stream_attach_routes,
-        *chat_stop_routes,
     ])
-    # /chat/stream 마운트 + 유휴 SSE 하트비트 + 테넌트 가드 미들웨어를 SDK 가 함께 건다.
-    # 재접속/중지는 이 저장소가 Redis 소유권과 HITL 대기까지 다루므로 위(routes)에 둔
-    # 자체 라우트를 그대로 쓴다.
-    server.mount_chat_routes(app, attach_path=None, stop_path=None)
+    # 채팅 인프라 한 벌(/chat/stream · 재접속 · 중지 · /health)을 SDK 가 통째로 건다.
+    # 유휴 SSE 하트비트와 테넌트 가드 미들웨어도 여기 포함된다. 이 저장소에 남은
+    # 채팅 코드는 에이전트 로직(HITL 판단, 채팅방 컨텍스트 저장)뿐이다.
+    #
+    # /health 의 busy 필드는 세션 라우터가 유휴 Pod 를 회수해도 되는지 판정하는
+    # 근거다 — 턴이 도는 중인 Pod 를 죽이면 대화가 그대로 끊긴다.
+    server.mount_chat_routes(
+        app,
+        health_path="/health",
+        health_extra=lambda: {"agent_type": AGENT_TYPE},
+    )
 
     uvicorn_server = uvicorn.Server(
         uvicorn.Config(app, host=HOST, port=PORT, log_level="info")
@@ -90,11 +80,6 @@ async def main() -> None:
         asyncio.create_task(server.run()),
         asyncio.create_task(uvicorn_server.serve()),
     ]
-    # REDIS_URL 설정 시에만 cancel listener를 띄운다. 미설정이면 start_cancel_listener()가
-    # 즉시 반환하는데, 아래 FIRST_COMPLETED가 이를 "task 종료"로 보고 나머지(서버 자체)까지
-    # 같이 내려버리므로 애초에 task 목록에 넣지 않는다.
-    if os.environ.get("REDIS_URL"):
-        all_tasks.append(asyncio.create_task(start_cancel_listener()))
 
     # server.run()이 SIGINT/SIGTERM으로 종료되면 나머지 task도 취소한다.
     done, pending = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)

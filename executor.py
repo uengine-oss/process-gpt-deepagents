@@ -36,12 +36,9 @@ from core.chat.hitl import (
     is_duplicate_hitl_request,
     normalize_hitl_payload,
 )
+from processgpt_agent_sdk.chat_registry import get_run_registry
+
 from core.chat.callbacks import ToolTrackingCallback
-from core.chat.inflight_registry import (
-    clear_inflight_and_release,
-    set_inflight_and_claim,
-    supersede_previous_turn,
-)
 from core.agents.input_builder import (
     build_graph_inputs,
     build_user_message,
@@ -63,7 +60,7 @@ from core.chat.chat_room import (
     a_upsert_chat_room_start,
     build_initial_chat_room_context,
 )
-from core.chat.stream_registry import EventTapStreamer, mark_done
+from core.chat.event_tap import EventTapStreamer
 from core.chat.tool_arg_stream import ToolArgTextStreamer
 from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
@@ -913,7 +910,52 @@ def _detect_process_result(text: Any) -> dict | None:
     return _extract_output_contract(text)
 
 
+def _resolve_run_state(extras: dict, row: dict, metadata: dict) -> dict:
+    """이번 요청이 이어받는 이전 turn 의 상태. 없으면 빈 dict.
+
+    프론트는 이 값을 metadata 로 실어 보내고, todolist 경로는 workitem 의 draft 에
+    들어 있다. 어느 쪽이든 같은 모양이라 찾는 순서만 다르다.
+    """
+    for source in (extras, metadata, row.get("draft") if isinstance(row.get("draft"), dict) else {}):
+        if isinstance(source, dict) and isinstance(source.get("run_state"), dict):
+            return dict(source["run_state"])
+    return {}
+
+
+def _is_hitl_answer(extras: dict, row: dict, metadata: dict) -> bool:
+    """이번 요청이 이전 turn 의 HITL(사람 확인) 질문에 대한 **응답**인가.
+
+    맞다면 그 turn 은 취소하면 안 되고 끝나기를 기다려야 한다. 프론트는 백엔드가
+    interrupt 를 다 처리하기 전(request_human_input 도구 호출 이벤트 시점)에 이미
+    확인 패널을 그리므로, 사용자가 바로 승인하면 이전 turn 이 아직 실행 중이다.
+    그걸 취소하면 interrupt 체크포인트가 남지 않아 재개가 불가능해지고, 화면에는
+    "새 메시지로 대체되어 이전 응답이 취소되었습니다" 오류만 남는다.
+    """
+    answer = str(
+        extras.get("human_response_answer")
+        or metadata.get("human_response_answer")
+        or ""
+    ).strip()
+    if not answer:
+        return False
+    run_state = _resolve_run_state(extras, row, metadata)
+    return str(run_state.get("tool_name") or "") == "request_human_input"
+
+
 class DeepAgentExecutor(AgentExecutor):
+
+    def should_supersede(self, context: RequestContext) -> bool:
+        """새 turn 이 이전 turn 을 대체하는가(True) 이어가는가(False).
+
+        SDK 가 turn 시작 전에 물어본다. False 면 SDK 는 이전 turn 을 취소하지 않고
+        끝나기를 기다린다 — 두 graph.astream() 실행이 같은 체크포인트를 동시에 쓰는
+        레이스는 어느 쪽이든 막힌다.
+        """
+        ctx_data = context.get_context_data() or {}
+        extras = ctx_data.get("extras") or {}
+        row = ctx_data.get("row") or {}
+        metadata = extras.get("metadata") if isinstance(extras.get("metadata"), dict) else {}
+        return not _is_hitl_answer(extras, row, metadata)
 
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> dict | None:
@@ -1064,32 +1106,15 @@ class DeepAgentExecutor(AgentExecutor):
             except Exception:
                 logger.warning("워크스페이스 하이드레이션 실패(무시하고 진행) | room_id=%s", chat_room_id, exc_info=True)
 
-        if is_chat and chat_room_id:
-            # 같은 chat_room_id 에 아직 끝나지 않은 이전 turn이 있으면 정리하고 끝날 때까지
-            # 기다린다 — 두 graph.astream() 실행이 동시에 체크포인트를 쓰는 레이스를 막는다.
-            #
-            # 단, 이번 요청이 **HITL 응답**이면 이전 turn 을 취소하면 안 된다. 프론트는
-            # 백엔드가 interrupt 를 다 처리하기 전(도구 호출 이벤트 시점)에 이미 HITL 패널을
-            # 그리므로, 사용자가 바로 승인하면 이전 turn 이 아직 실행 중이다. 그걸 취소하면
-            # interrupt 체크포인트가 남지 않아 재개가 불가능해지고, 화면에는
-            # "새 메시지로 대체되어 이전 응답이 취소되었습니다" 오류만 남는다.
-            _is_hitl_answer = bool(
-                human_answer_stripped
-                and str(run_state.get("tool_name") or "") == "request_human_input"
-            )
-            await supersede_previous_turn(chat_room_id, cancel=not _is_hitl_answer)
-            current_task = asyncio.current_task()
-            if current_task is not None:
-                await set_inflight_and_claim(chat_room_id, current_task, event_queue)
-                current_task.add_done_callback(
-                    lambda _t, _rid=chat_room_id, _task=current_task: asyncio.create_task(
-                        clear_inflight_and_release(_rid, _task)
-                    )
-                )
-
-        # 재접속(attach) 등록과 토큰 브로드캐스트는 SDK 가 채팅 출력 큐를 가로채 처리한다
-        # (core/chat/sdk_registry.py 어댑터가 이 저장소의 레지스트리로 위임). 여기서는
-        # tool/plan 이벤트를 채팅방 컨텍스트로 증분 저장하는 훅만 얹는다.
+        # 이전 turn 정리(대체할지 기다릴지), in-flight 등록, 재접속 등록, 토큰
+        # 브로드캐스트는 모두 SDK 가 한다 — 채팅 출력 큐를 가로채 레지스트리에
+        # 남기므로 재접속한 클라이언트가 받는 것과 원래 클라이언트가 받는 것이
+        # 정의상 같아진다. 대체/이어가기 판단만 `should_supersede()` 로 이 클래스가
+        # 돌려준다.
+        #
+        # 여기서는 tool/plan 이벤트를 채팅방 컨텍스트로 증분 저장하는 훅만 얹는다.
+        # 이 훅에서 레지스트리에 또 기록하면 같은 토큰이 두 번 쌓여 재접속 스냅샷
+        # 본문이 두 배가 된다(core/chat/event_tap.py).
         if streamer is not None and chat_room_id:
             _persist_tenant_id = tenant_id
             _persist_has_file = has_file
@@ -2179,7 +2204,7 @@ class DeepAgentExecutor(AgentExecutor):
             await event_queue.enqueue_event(artifact_evt)
 
             if is_chat and chat_room_id:
-                await mark_done(chat_room_id)
+                await get_run_registry().mark_done(chat_room_id)
                 logger.info(
                     "채팅 완료 | room_id=%s task_id=%s response_len=%d",
                     chat_room_id, task_id, len(final_text),
