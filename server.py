@@ -38,6 +38,15 @@ os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8888"))
 AGENT_TYPE = "deepagents"
+# todolist 폴링을 이 프로세스가 맡을지.
+#
+# 세션당 파드 배포에서는 꺼야 한다. 켜 두면 대화마다 뜨는 파드가 전부 워크아이템
+# 소비자가 되어, 유휴 TTL 로 회수될 파드가 남의 일을 집어간다 — 그 파드가 사라지면
+# 집어간 일도 같이 멎는다. 폴링은 수명이 긴 워크로드 하나가 맡는다
+# (codex 는 CODEX_PROCESS_POLLING 과 process-gpt-codex-worker 로 같은 일을 한다).
+PROCESS_POLLING = os.environ.get("DEEPAGENTS_PROCESS_POLLING", "true").strip().lower() not in (
+    "false", "0", "no",
+)
 
 async def main() -> None:
     try:
@@ -74,14 +83,16 @@ async def main() -> None:
         uvicorn.Config(app, host=HOST, port=PORT, log_level="info")
     )
 
-    logger.info("서버 시작: http://%s:%d/chat/stream", HOST, PORT)
+    logger.info(
+        "서버 시작: http://%s:%d/chat/stream (todolist 폴링 %s)",
+        HOST, PORT, "켬" if PROCESS_POLLING else "끔",
+    )
 
-    all_tasks = [
-        asyncio.create_task(server.run()),
-        asyncio.create_task(uvicorn_server.serve()),
-    ]
+    all_tasks = [asyncio.create_task(uvicorn_server.serve())]
+    if PROCESS_POLLING:
+        all_tasks.append(asyncio.create_task(server.run()))
 
-    # server.run()이 SIGINT/SIGTERM으로 종료되면 나머지 task도 취소한다.
+    # 어느 한쪽이 SIGINT/SIGTERM 으로 종료되면 나머지 task 도 취소한다.
     done, pending = await asyncio.wait(all_tasks, return_when=asyncio.FIRST_COMPLETED)
     for t in pending:
         t.cancel()
