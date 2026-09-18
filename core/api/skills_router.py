@@ -102,7 +102,20 @@ def _scan_collection(col_path: str) -> list[dict]:
         try:
             meta = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))
         except OSError:
+            logger.warning(
+                "스킬 SKILL.md 를 읽지 못했습니다 — 설명 없이 목록에 올립니다: %s", entry,
+            )
             meta = {}
+        # description 이 비면 스킬은 목록에는 오르지만 모델이 고를 근거가 없어
+        # 사실상 쓰이지 않는다. 조용히 넘어가면 "등록했는데 왜 안 쓰이지" 로만
+        # 드러나므로 여기서 남긴다 — bpmn-process-generation-skill 이 실제로
+        # 그랬다.
+        if not str(meta.get("description") or "").strip():
+            logger.warning(
+                "스킬 %s 의 SKILL.md 에 frontmatter description 이 없습니다 "
+                "(collection=%s). 목록에는 오르지만 모델이 이 스킬을 고르지 못합니다.",
+                entry.name, collection_name,
+            )
         skills.append({
             "name": entry.name,
             "display_name": meta.get("name") or entry.name,
