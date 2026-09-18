@@ -267,7 +267,10 @@ async def _materialize_hwpx_form_outputs(tenant_id: str, final_text: str) -> str
             return None
         val = {
             "path": out.get("file_url"),
-            "name": out.get("file_name") or name,
+            # 이름은 원래 것을 쓴다. 저장소가 돌려주는 이름은 아스키로 추려져
+            # '주차장_안전_안내문.hwpx' 가 'edited-_20260918_010111.hwpx' 로 남는다.
+            # 사람이 보는 이름은 무엇인지를 말해야 한다.
+            "name": name or out.get("file_name"),
             "html_url": out.get("html_url") or "",
             "ext": ".hwpx",
         }
