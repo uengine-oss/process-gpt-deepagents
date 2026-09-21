@@ -19,6 +19,8 @@ from a2a.helpers import (
 )
 from a2a.types import TaskState
 from google.protobuf.json_format import ParseDict
+
+from processgpt_agent_sdk.artifacts import download_file
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Overwrite
 from typing_extensions import override
@@ -380,59 +382,47 @@ async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> 
     return json.dumps(obj, ensure_ascii=False)
 
 
-async def _materialize_chat_file_links(tenant_id: str, text: str) -> str:
-    """
-    채팅 답변에 남은 샌드박스 문서 경로를 내려받기 링크로 바꾼다.
+async def _publish_chat_artifacts(
+    tenant_id: str, conversation_id: str, text: str,
+) -> tuple[str, list[dict]]:
+    """채팅 답변에 남은 샌드박스 산출물을 비공개 버킷에 보관하고, 본문을 받을 수 있는 주소로 바꾼다.
 
-    규칙(무엇을 잡고 어떻게 바꿀지)은 core.chat.file_links 에 있다. 여기서는
-    샌드박스에서 파일을 꺼내 내려받기 토큰을 발급하는 일만 한다.
+    무엇을 어디에 두고 어떤 주소로 내주는지는 SDK 가 모든 에이전트 공용으로 정한다
+    (`core/chat/artifacts.py`). 여기서는 샌드박스에서 파일을 꺼내 주는 일만 한다.
 
-    실패는 베스트에포트다. 링크를 못 만들어도 답변 자체는 그대로 보인다 —
+    실패는 베스트에포트다. 산출물을 못 올려도 답변 자체는 그대로 보인다 —
     경로가 남는 것이 답변이 통째로 사라지는 것보다 낫다.
     """
-    from core.chat.file_links import find_document_paths, materialize, public_download_base
+    from core.chat.artifacts import publish_chat_artifacts
+    from core.chat.file_links import find_document_paths
 
     if not find_document_paths(text):
-        return text
+        return text, []
 
     try:
         from core.agents.agent import _BASE_DIR as _AGENT_BASE_DIR, _SKILLS_DIR as _AGENT_SKILLS_DIR
         from core.sandbox.docker_sandbox import get_or_create_sandbox
-        from core.api.file_download import register_file
     except Exception:
-        logger.warning("채팅 파일 링크: 모듈 로드 실패", exc_info=True)
-        return text
+        logger.warning("채팅 산출물: 모듈 로드 실패", exc_info=True)
+        return text, []
 
-    from pathlib import PurePosixPath
-
-    # 클러스터 안쪽 주소를 실으면 휴대폰에서도 브라우저에서도 열리지 않는다.
-    # 게이트웨이를 지나는 바깥 주소로 만든다.
-    base_url = public_download_base(tenant_id)
     backend = get_or_create_sandbox(
         tenant_id,
         workspace_host=_AGENT_BASE_DIR / "workspace",
         skills_host=_AGENT_SKILLS_DIR,
     )
 
-    async def _resolve(container_path: str):
-        try:
-            results = await asyncio.to_thread(backend.download_files, [container_path])
-            res = results[0] if results else None
-            content = getattr(res, "content", None) if res else None
-            if content is None or getattr(res, "error", None):
-                # 지어낸 주소로 링크를 만들지 않는다. 눌렀는데 아무것도 안
-                # 나오는 것이 경로가 보이는 것보다 나쁘다.
-                logger.warning("채팅 파일 링크: 샌드박스에 파일 없음 | path=%s", container_path)
-                return None
-            name = PurePosixPath(container_path).name
-            token = await register_file(content, name)
-            logger.info("채팅 파일 링크 발급 | %s → 토큰 URL", container_path)
-            return f"{base_url}/api/internal/download/{token}"
-        except Exception:
-            logger.warning("채팅 파일 링크 실패 | path=%s", container_path, exc_info=True)
+    async def _fetch(container_path: str):
+        results = await asyncio.to_thread(backend.download_files, [container_path])
+        res = results[0] if results else None
+        content = getattr(res, "content", None) if res else None
+        if content is None or getattr(res, "error", None):
             return None
+        return content
 
-    return await materialize(text, _resolve)
+    return await publish_chat_artifacts(
+        tenant_id=tenant_id, conversation_id=conversation_id, text=text, fetch=_fetch,
+    )
 
 
 async def _emit_chat_hwpx_artifacts(streamer, tenant_id: str, texts: list[str], collected: set[str] | None = None) -> None:
@@ -1991,13 +1981,17 @@ class DeepAgentExecutor(AgentExecutor):
                 except Exception:
                     logger.warning("채팅 hwpx 아티팩트 emit 실패", exc_info=True)
 
-            # 채팅: 그 밖의 문서(docx·pdf·xlsx·pptx)는 답변에 컨테이너 경로만 남아
-            # 받을 길이 없었다. 내려받기 링크로 바꿔 준다.
+            # 채팅: 그 밖의 산출물은 답변에 컨테이너 경로만 남아 받을 길이 없었다.
+            # 비공개 버킷에 보관하고 서명 주소로 바꿔 준다. 레코드(`chat_artifacts`)는
+            # 아래에서 메시지에 함께 저장돼, 새로고침해도 주소가 만료돼도 다시 집을 수 있다.
+            chat_artifacts: list[dict] = []
             if is_chat:
                 try:
-                    raw_text = await _materialize_chat_file_links(tenant_id, raw_text)
+                    raw_text, chat_artifacts = await _publish_chat_artifacts(
+                        tenant_id, chat_room_id or context_id or "", raw_text,
+                    )
                 except Exception:
-                    logger.warning("채팅 파일 링크 실체화 실패 — 원본 유지", exc_info=True)
+                    logger.warning("채팅 산출물 보관 실패 — 원본 유지", exc_info=True)
 
             # 도구 출력에서 못 잡았을 때 대비: 최종 텍스트에 요약/출력계약 JSON 이 있으면 결과 카드용 이벤트 emit.
             if streamer and not process_result_sent:
@@ -2203,7 +2197,12 @@ class DeepAgentExecutor(AgentExecutor):
                 text=final_text,
                 last_chunk=True,
             )
-            ParseDict({"role": "assistant"}, artifact_evt.metadata)
+            _final_meta: dict = {"role": "assistant"}
+            if chat_artifacts:
+                # 화면이 읽는 이름은 오래된 것(`pdfFiles`)이다. 레코드에는 `file_id` 와
+                # 만료 시각이 함께 실려, 주소가 죽은 뒤에도 새 주소를 받아 갈 수 있다.
+                _final_meta["pdfFiles"] = [download_file(item) for item in chat_artifacts]
+            ParseDict(_final_meta, artifact_evt.metadata)
             await event_queue.enqueue_event(artifact_evt)
 
             if is_chat and chat_room_id:
