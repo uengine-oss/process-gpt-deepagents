@@ -302,12 +302,22 @@ async def _materialize_hwpx_form_outputs(tenant_id: str, final_text: str) -> str
     return json.dumps(obj, ensure_ascii=False)
 
 
-async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> str:
-    """worklist 폼 출력 JSON 안의 샌드박스 바이너리 파일 경로(pdf/docx/xlsx/pptx 등)를
-    내부 다운로드 토큰 URL로 치환한다. Supabase 업로드 없이 서버 자체에서 파일을 제공한다.
+async def _materialize_ws_file_form_outputs(
+    tenant_id: str, final_text: str, conversation_id: str = "",
+) -> str:
+    """worklist 폼 출력 JSON 안의 샌드박스 바이너리 파일 경로를 받을 수 있는 주소로 바꾼다.
 
-    폼값을 {path: <download_url>, name: <filename>, ext: <ext>} 로 바꿔
-    프론트 FileField 다운로드가 그대로 동작한다. 실패는 베스트에포트(원본 경로 유지)."""
+    예전에는 이 서버 메모리(또는 Redis)에 담고 한 시간짜리 토큰 주소를 폼값에 박았다.
+    그 시간이 지나거나 파드가 바뀌면 끝이었다 — 결재선을 타고 며칠 뒤에 열어 본 사람은
+    빈손이었다. 채팅 산출물에서 이미 겪은 것과 같은 일이다.
+
+    지금은 채팅과 **같은 규약**을 탄다(`core/chat/artifacts.py`). 비공개 버킷에 보관하고
+    폼값에 서명 주소와 함께 `file_id` 를 싣는다 — 주소가 죽어도 파일은 남아 있고,
+    화면이 그 열쇠로 새 주소를 받아 간다.
+
+    폼값은 {path, name, ext, file_id, url_expires_at} 가 된다. `path` 는 그대로라
+    프론트 FileField 다운로드는 손대지 않아도 동작한다.
+    실패는 베스트에포트(원본 경로 유지)."""
     if not final_text or not _WS_BINARY_FILE_RE.search(final_text):
         return final_text
     try:
@@ -320,13 +330,11 @@ async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> 
     try:
         from core.agents.agent import _BASE_DIR as _AGENT_BASE_DIR, _SKILLS_DIR as _AGENT_SKILLS_DIR
         from core.sandbox.docker_sandbox import get_or_create_sandbox
-        from core.api.file_download import register_file
+        from core.chat.artifacts import publish_one
     except Exception:
         logger.warning("ws 파일 실체화: 모듈 로드 실패", exc_info=True)
         return final_text
     from pathlib import PurePosixPath
-
-    base_url = (os.environ.get("SELF_BASE_URL") or f"http://localhost:{os.environ.get('PORT', '8888')}").rstrip("/")
 
     backend = get_or_create_sandbox(
         tenant_id,
@@ -350,14 +358,26 @@ async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> 
         p = PurePosixPath(container_path)
         name = p.name
         ext = p.suffix.lower()
-        token = await register_file(content, name)
+        record = await publish_one(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            file_name=name,
+            content=content,
+        )
+        if not record or not record.get("file_url"):
+            # 지어낸 주소로 폼값을 채우지 않는다. 경로가 남는 편이 낫다.
+            logger.warning("ws 파일 실체화: 주소를 받지 못했다 | path=%s", container_path)
+            return None
         val = {
-            "path": f"{base_url}/api/internal/download/{token}",
+            "path": record["file_url"],
             "name": name,
             "ext": ext,
+            # 주소는 만료된다. 이 열쇠로 다시 받는다.
+            "file_id": str(record.get("file_id") or ""),
+            "url_expires_at": str(record.get("url_expires_at") or ""),
         }
         cache[container_path] = val
-        logger.info("ws 파일 실체화 완료 | %s → token URL", container_path)
+        logger.info("ws 파일 실체화 완료 | %s → 서명 주소", container_path)
         return val
 
     async def _walk(node):
@@ -2174,7 +2194,9 @@ class DeepAgentExecutor(AgentExecutor):
                 except Exception:
                     logger.warning("hwpx 폼 산출물 실체화 처리 실패 — 원본 유지", exc_info=True)
                 try:
-                    final_text = await _materialize_ws_file_form_outputs(tenant_id, final_text)
+                    final_text = await _materialize_ws_file_form_outputs(
+                        tenant_id, final_text, chat_room_id or instance_id or "",
+                    )
                 except Exception:
                     logger.warning("ws 파일 폼 산출물 실체화 처리 실패 — 원본 유지", exc_info=True)
             # D2D 핸드오프: 단계 완료 시 LLM 최종 응답을 workspace에 저장해 다음 딥에이전트 단계가 직접 읽을 수 있게 한다.

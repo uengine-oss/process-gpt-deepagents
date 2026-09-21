@@ -29,7 +29,10 @@ Supabase(대화 이력)와 Supabase Storage(워크스페이스)로부터 복원�
 
 ### 채팅이 아닌 경로
 
-`/skills/*` 와 `/api/internal/download/*` 는 세션에 매이지 않는다. 다운로드 토큰은
-`REDIS_URL` 이 설정돼 있으면 Redis 에 파일 내용까지 담아 두므로 어느 파드가 받아도
-서빙된다(`core/api/file_download.py`). 게이트웨이에서 이 경로들은 라우터를 거치지
-않고 기존 Deployment 로 보낸다.
+`/skills/*` 와 `/api/internal/workspace-file` 은 세션에 매이지 않는다. 게이트웨이에서 이 경로들은
+라우터를 거치지 않고 기존 Deployment 로 보낸다.
+
+에이전트 **산출물**은 이 경로로 내주지 않는다. 채팅이든 폼(worklist)이든 SDK 의 공용
+규약을 타고 비공개 버킷에 보관되며, 주소는 한 시간짜리 서명 주소다
+(`core/chat/artifacts.py`). 예전에는 파일 내용을 이 서버(또는 Redis)에 담고 토큰 주소를
+내줬는데, 그 시간이 지나거나 파드가 바뀌면 파일을 영영 받을 수 없었다.

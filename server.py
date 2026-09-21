@@ -23,7 +23,6 @@ from starlette.applications import Starlette
 from processgpt_agent_sdk import ProcessGPTAgentServer
 
 from core.api.skills_router import routes as skills_routes
-from core.api.file_download import routes as file_download_routes
 from core.api.workspace_file import routes as workspace_file_routes
 from core.skills.local_system_skills import seed_local_system_skills
 from executor import DeepAgentExecutor
@@ -66,7 +65,6 @@ async def main() -> None:
 
     app = Starlette(routes=[
         *skills_routes,
-        *file_download_routes,
         *workspace_file_routes,
     ])
     # 채팅 인프라 한 벌(/chat/stream · 재접속 · 중지 · /health)을 SDK 가 통째로 건다.

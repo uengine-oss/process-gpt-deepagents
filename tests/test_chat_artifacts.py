@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from processgpt_agent_sdk.artifacts import StoredArtifact  # noqa: E402
 
-from core.chat.artifacts import publish_chat_artifacts  # noqa: E402
+from core.chat.artifacts import publish_chat_artifacts, publish_one  # noqa: E402
 from core.chat.file_links import find_document_paths  # noqa: E402
 
 
@@ -103,4 +103,46 @@ def test_산출물이_없으면_손대지_않는다():
 
     assert body == text
     assert records == []
+    assert store.put_calls == []
+
+
+# ── 폼(worklist) 산출물 ────────────────────────────────────────
+#
+# 채팅만 산출물을 내는 것이 아니다. 예전에는 폼 산출물을 이 서버 메모리(또는 Redis)에
+# 담고 한 시간짜리 토큰 주소를 폼값에 박았다 — 결재선을 타고 며칠 뒤에 열어 본 사람은
+# 빈손이었다. 지금은 채팅과 같은 규약을 탄다.
+
+def test_폼_산출물도_같은_규약으로_보관된다():
+    store = FakeStore()
+    record = asyncio.run(publish_one(
+        tenant_id="uengine", conversation_id="inst-1",
+        file_name="안내문.docx", content=b"docx-bytes", store=store,
+    ))
+
+    assert record["file_url"].startswith("https://signed.test/")
+    assert record["file_id"] == "artifacts/안내문.docx"
+    assert record["url_expires_at"] == "2026-01-01T00:00:00+00:00"
+    assert len(store.put_calls) == 1
+
+
+def test_폼_산출물의_형식_제한도_같다():
+    """실행 파일·소스·로그는 결과물이 아니다. 그 판단은 SDK 가 한 군데서 한다."""
+    store = FakeStore()
+    record = asyncio.run(publish_one(
+        tenant_id="uengine", conversation_id="inst-1",
+        file_name="run.sh", content=b"#!/bin/sh", store=store,
+    ))
+
+    assert record is None
+    assert store.put_calls == []
+
+
+def test_빈_파일은_내주지_않는다():
+    store = FakeStore()
+    record = asyncio.run(publish_one(
+        tenant_id="uengine", conversation_id="inst-1",
+        file_name="빈.pdf", content=b"", store=store,
+    ))
+
+    assert record is None
     assert store.put_calls == []

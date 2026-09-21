@@ -41,6 +41,34 @@ def _store() -> ArtifactStore:
     return MementoArtifactStore(os.getenv("MEMENTO_BASE_URL", "http://127.0.0.1:8005"))
 
 
+async def publish_one(
+    *,
+    tenant_id: str,
+    conversation_id: str,
+    file_name: str,
+    content: bytes,
+    store: ArtifactStore | None = None,
+    turn_id: str = "",
+) -> dict[str, Any] | None:
+    """파일 하나를 보관하고 산출물 레코드를 돌려준다. 못 내주면 None.
+
+    채팅만 산출물을 내는 것이 아니다 — 폼(worklist)도 문서를 만든다. 거두는 자리가 달라도
+    보관하고 주소를 발급하는 규칙은 같아야 하므로, 같은 `ArtifactCollector` 를 태운다.
+    형식 제한과 크기 상한, 해시와 content-type 이 그 안에 있다.
+    """
+    with tempfile.TemporaryDirectory(prefix="artifact-") as tmp:
+        outputs = Path(tmp) / "outputs"
+        outputs.mkdir()
+        await asyncio.to_thread((outputs / Path(file_name).name).write_bytes, content)
+        files = await ArtifactCollector(store or _store()).collect(
+            outputs,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+        )
+    return files[0] if files else None
+
+
 async def publish_chat_artifacts(
     *,
     tenant_id: str,
@@ -91,4 +119,4 @@ async def publish_chat_artifacts(
     return strip_local_paths(text, files), files
 
 
-__all__ = ["publish_chat_artifacts"]
+__all__ = ["publish_chat_artifacts", "publish_one"]
