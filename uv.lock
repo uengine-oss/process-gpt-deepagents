@@ -1857,10 +1857,11 @@ wheels = [
 
 [[package]]
 name = "process-gpt-agent-sdk"
-version = "0.4.27"
+version = "0.8.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "a2a-sdk" },
+    { name = "httpx" },
     { name = "litellm" },
     { name = "pydantic" },
     { name = "python-dotenv" },
@@ -1868,12 +1869,15 @@ dependencies = [
     { name = "supabase" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b2/40/2c4868edf3403171af13d7f9e1c1544d782aa36ca8090e7841683b9db060/process_gpt_agent_sdk-0.4.27.tar.gz", hash = "sha256:9800aa90b8693a3a2e8f7237ba5cc6d0366ef4b549bfceb5c1213d381f1f542c", size = 40940, upload-time = "2026-08-20T03:03:01.644Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/f6/6cc21470c67ef911f8b97289a727db106889fbd8770ce4493451ed44f54c/process_gpt_agent_sdk-0.8.1.tar.gz", hash = "sha256:72415dda56fcfe6c421a3bd389c96a2fc9fa8137ff5bb6b6e977f61b54f901d9", size = 110684, upload-time = "2026-09-21T03:17:56.783Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/20/0c/702223ccd10d75e4cda5f1f12802eec2f59edfea8c0e3ae7ecf0e68c2f6e/process_gpt_agent_sdk-0.4.27-py3-none-any.whl", hash = "sha256:77da9830c9f3731dbd984be1407c5e82d6154e2ddf8e4568219f1d577c73e566", size = 41435, upload-time = "2026-08-20T03:03:00.151Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/4c/23cbdfc766248bdd9bb28b6e84419a21233061f2486fd31e91652200ceef/process_gpt_agent_sdk-0.8.1-py3-none-any.whl", hash = "sha256:66c658e86f2ea330fab656567765f7534cb2bec328a3a5239b4959fc696bf3fa", size = 82469, upload-time = "2026-09-21T03:17:54.881Z" },
 ]
 
 [package.optional-dependencies]
+auth = [
+    { name = "pyjwt", extra = ["crypto"] },
+]
 sse = [
     { name = "starlette" },
     { name = "uvicorn" },
@@ -1897,7 +1901,7 @@ dependencies = [
     { name = "langgraph-checkpoint" },
     { name = "langgraph-checkpoint-postgres" },
     { name = "mcp" },
-    { name = "process-gpt-agent-sdk", extra = ["sse"] },
+    { name = "process-gpt-agent-sdk", extra = ["auth", "sse"] },
     { name = "protobuf" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
@@ -1933,7 +1937,7 @@ requires-dist = [
     { name = "langgraph-checkpoint", specifier = "==4.1.1" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=2.0" },
     { name = "mcp", specifier = "==1.27.2" },
-    { name = "process-gpt-agent-sdk", extras = ["sse"], specifier = "==0.4.27" },
+    { name = "process-gpt-agent-sdk", extras = ["sse", "auth"], specifier = "==0.8.1" },
     { name = "protobuf", specifier = "==6.33.6" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "psycopg-pool", specifier = ">=3.2" },
