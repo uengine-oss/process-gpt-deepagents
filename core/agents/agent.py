@@ -31,7 +31,7 @@ from ..skills.tools import (
     _current_user_id as _skill_user_id,
 )
 from ..storage.storage import set_tenant_id as _set_storage_tenant_id
-from ..bpm.tools import get_bpm_tools, set_tenant_id as _set_bpm_tenant_id
+from ..bpm.tools import get_bpm_tools, set_tenant_id as _set_bpm_tenant_id, set_user_context as _set_bpm_user
 from core.strategy.tools import get_strategy_tools
 from core.web.tools import get_web_tools
 
@@ -174,6 +174,8 @@ _PROCESS_EXECUTION_RULES = (
     "- **execute_process 는 요청 한 건당 정확히 한 번**이다. 인스턴스가 시작되면 이후 단계는 엔진이 "
     "알아서 진행하므로, 뒤 단계의 activity_id 로 execute_process 를 다시 부르지 않는다(부르면 별개의 인스턴스가 "
     "생긴다). 결과를 확인하려고 다시 부르지도 않는다. already_started 응답이면 새로 실행하지 않은 것이다.\n"
+    "- execute_process 결과에 process_instance_id 가 오기 전에는 **절대 '실행했습니다' 라고 말하지 않는다.** "
+    "도구를 부르지 않았거나 오류가 났으면 그대로 알린다.\n"
     "- 실행에 성공하면 링크나 인스턴스 ID 를 안내하지 않는다. 화면이 '프로세스가 실행되었습니다' 카드를 "
     "보여 주고, 카드를 누르면 인스턴스 대화로 간다. 무엇을 시작했는지 한두 문장으로만 알리고 끝낸다.\n"
 )
@@ -243,7 +245,9 @@ async def build_agent(
         list(extra_tools or [])
         + ([] if agent_mode == "DRAFT" or not is_chat else get_hitl_tools())
         + get_memento_tools()
-        + get_bpm_tools()
+        # 프로세스를 새로 시작하는 도구는 채팅에서만 준다 — 워크아이템을 처리하던 에이전트가
+        # 업무 도중 다른 인스턴스를 만들어 버리지 않게.
+        + [t for t in get_bpm_tools() if is_chat or getattr(t, "name", "") != "execute_process"]
         + [
             checkout_to_workspace,
             extract_document_structure,
@@ -275,6 +279,7 @@ async def build_agent(
     _skill_user_id.set((user_context or {}).get("user_id") or "")
     _set_storage_tenant_id(tenant_id)
     _set_bpm_tenant_id(tenant_id)
+    _set_bpm_user(user_context)
     _dynamic, _mcp_connectors, _mcp_tools_meta = await _build_subagents(
         subagents_raw or [], tenant_id, tenant_mcp, backend=backend
     )

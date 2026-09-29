@@ -8,10 +8,21 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
-from typing import Optional
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from langchain_core.tools import tool
 
+from core.bpm.process_start import (
+    DUPLICATE_WINDOW_MINUTES,
+    check_start_activity,
+    describe_start,
+    find_duplicate,
+    normalize_form_key,
+    normalize_role_mappings,
+)
 from core.storage.db import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -28,10 +39,20 @@ _current_workitem_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _current_proc_def_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "bpm_proc_def_id", default=""
 )
+# 대화 중인 사용자 — execute_process 가 누구 이름으로 시작하는지. build_agent 가 넣는다.
+_current_user: contextvars.ContextVar[dict] = contextvars.ContextVar("bpm_user", default={})
+
+#: 실행 엔진(completion) 주소. 배포에서는 서비스 주소(http://completion-service:8000)로 주입된다.
+_COMPLETION_URL = os.getenv("COMPLETION_SERVICE_URL", "http://localhost:8000").rstrip("/")
 
 
 def set_tenant_id(tenant_id: str) -> None:
     _current_tenant_id.set(tenant_id)
+
+
+def set_user_context(user_context: Optional[dict]) -> None:
+    """대화 중인 사용자(user_id · user_email · user_name · user_jwt)를 넣는다."""
+    _current_user.set(dict(user_context or {}))
 
 
 def set_process_context(
@@ -149,7 +170,8 @@ def get_process_detail(process_id: str) -> str:
     """특정 프로세스 정의 또는 비즈니스 규칙 상세를 조회한다.
 
     프로세스(bpmn)는 definition(JSON)을, 비즈니스 규칙(dmn)은 bpmn 컬럼의 DMN XML을 반환한다.
-    실행 전 activity_id/form_key 추출과 역할 담당자 검증에 사용한다.
+    실행 전 역할 담당자 검증에 사용한다. 결과의 start_activities 가 시작 단계이며,
+    execute_process 의 activity_id 와 get_form_fields 의 form_key 는 여기 값을 그대로 쓴다.
 
     Args:
         process_id: 프로세스 또는 규칙 정의 ID.
@@ -180,6 +202,7 @@ def get_process_detail(process_id: str) -> str:
             "name": row.get("name"),
             "type": row.get("type"),
             "definition": row.get("definition"),
+            "start_activities": describe_start(row.get("definition")),
         })
     except Exception as e:
         logger.error("[get_process_detail] %s", e)
@@ -199,6 +222,7 @@ def get_form_fields(form_key: str) -> str:
         form_key: 폼 정의 ID.
     """
     tenant_id = _require_tenant_id()
+    form_key = normalize_form_key(form_key)
     try:
         resp = (
             get_supabase()
@@ -375,6 +399,151 @@ def get_organization() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 9. execute_process
+# ---------------------------------------------------------------------------
+def _definition_of(tenant_id: str, process_definition_id: str) -> Optional[dict]:
+    """프로세스 정의(definition). 읽지 못하면 None — 호출부는 검증 없이 진행한다."""
+    try:
+        resp = (
+            get_supabase()
+            .table("proc_def")
+            .select("definition")
+            .eq("tenant_id", tenant_id)
+            .eq("id", process_definition_id)
+            .execute()
+        )
+        definition = resp.data[0].get("definition") if resp.data else None
+        if isinstance(definition, str):
+            definition = json.loads(definition)
+        return definition if isinstance(definition, dict) else None
+    except Exception as e:  # noqa: BLE001 - 정의를 못 읽어도 실행 자체는 막지 않는다
+        logger.warning("[execute_process] 정의 조회 실패(%s): %s", process_definition_id, e)
+        return None
+
+
+def _recent_start(
+    tenant_id: str, process_definition_id: str, activity_id: str, user_uid: str, form_key: str, form_values: Any
+) -> Optional[str]:
+    """같은 사용자가 같은 정의 · 시작 단계 · 첫 폼 값으로 방금 시작한 인스턴스 id."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=DUPLICATE_WINDOW_MINUTES)).isoformat()
+    try:
+        resp = (
+            get_supabase()
+            .table("todolist")
+            .select("proc_inst_id,output,updated_at")
+            .eq("tenant_id", tenant_id)
+            .eq("proc_def_id", process_definition_id.lower())
+            .eq("activity_id", activity_id)
+            .eq("user_id", user_uid)
+            .gte("updated_at", since)
+            .order("updated_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        return find_duplicate(resp.data or [], form_key, form_values)
+    except Exception as e:  # noqa: BLE001 - 확인하지 못하면 중복 방지 없이 진행한다
+        logger.warning("[execute_process] 최근 실행 조회 실패: %s", e)
+        return None
+
+
+@tool(parse_docstring=True)
+def execute_process(
+    process_definition_id: str,
+    activity_id: str,
+    form_key: str,
+    form_values: dict,
+    role_mappings: Optional[list] = None,
+    allow_duplicate: bool = False,
+) -> str:
+    """프로세스를 새로 시작한다(인스턴스 1개 생성). 요청 한 건당 정확히 한 번만 호출한다.
+
+    activity_id/form_key 는 get_process_detail 의 start_activities(시작 단계) 값이어야 한다 —
+    뒤 단계로 호출하면 거절된다(뒤 단계는 엔진이 이어서 진행한다). 같은 사용자가 같은 프로세스를
+    같은 첫 폼 값으로 방금(10분 안) 시작했다면 새로 만들지 않고 already_started=true 와 그 인스턴스를
+    돌려준다. 이 도구의 성공 결과(process_instance_id)를 받기 전에는 실행했다고 말하지 않는다.
+
+    Args:
+        process_definition_id: 프로세스 정의 ID.
+        activity_id: 시작 단계 액티비티 ID(start_activities 의 activity_id).
+        form_key: 시작 단계 폼 ID(start_activities 의 form_key).
+        form_values: 시작 폼에 넣을 값. 키는 get_form_fields 의 fields_json key.
+        role_mappings: 역할 배정. [{"name": "<정의의 역할명>", "endpoint": "<사용자 uid>"}]. 빠진 역할은 정의 기본값으로 채운다.
+        allow_duplicate: 사용자가 같은 값으로 한 번 더 실행해 달라고 분명히 말한 경우에만 true.
+    """
+    import httpx
+
+    tenant_id = _require_tenant_id()
+    user = _current_user.get() or {}
+    user_uid = str(user.get("user_id") or "")
+    user_email = str(user.get("user_email") or "")
+    if not user_uid or not user_email:
+        return _err("현재 사용자 정보를 알 수 없어 실행할 수 없습니다.")
+
+    form_key = normalize_form_key(form_key)
+    definition = _definition_of(tenant_id, process_definition_id)
+
+    rejected = check_start_activity(definition, activity_id)
+    if rejected:
+        logger.warning("[execute_process] 시작 단계가 아님: %s", activity_id)
+        return _json(rejected)
+
+    if not allow_duplicate:
+        existing = _recent_start(tenant_id, process_definition_id, activity_id, user_uid, form_key, form_values)
+        if existing:
+            return _json({
+                "process_instance_id": existing,
+                "already_started": True,
+                "message": "같은 값으로 방금 시작한 인스턴스가 있어 새로 만들지 않았습니다. "
+                "이 인스턴스를 안내하고 execute_process 를 다시 호출하지 마세요.",
+            })
+
+    start_role = next(
+        (a["role"] for a in describe_start(definition) if a["activity_id"] == activity_id), ""
+    )
+    process_instance_id = f"{process_definition_id}.{uuid.uuid4()}"
+    input_data = {
+        "process_definition_id": process_definition_id.lower(),
+        "process_instance_id": process_instance_id,
+        "activity_id": activity_id,
+        "form_values": {form_key: form_values or {}},
+        "role_mappings": normalize_role_mappings(
+            role_mappings, definition, user_uid=user_uid, start_role=start_role
+        ),
+        "answer": "",
+        "user_id": user_uid,
+        "username": str(user.get("user_name") or user_email),
+        "email": user_email,
+        "tenant_id": tenant_id,
+        "version_tag": "major",
+        "version": None,
+        "source_list": [],
+    }
+    headers = {
+        # completion 은 테넌트를 X-Forwarded-Host 의 첫 라벨로 가린다(regression_client 와 같다).
+        "X-Forwarded-Host": tenant_id,
+        "subdomain": tenant_id,
+        "Content-Type": "application/json",
+    }
+    if user.get("user_jwt"):
+        headers["Authorization"] = f"Bearer {user['user_jwt']}"
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.post(f"{_COMPLETION_URL}/complete", json={"input": input_data}, headers=headers)
+        if response.status_code >= 400:
+            return _err(f"실행 API 가 {response.status_code} 를 돌려줬습니다: {response.text[:300]}")
+        result = response.json() if response.content else {}
+    except Exception as e:  # noqa: BLE001
+        logger.error("[execute_process] %s", e)
+        return _err(f"실행 API 호출 실패: {e}")
+
+    if not isinstance(result, dict):
+        result = {"result": result}
+    result["process_instance_id"] = process_instance_id
+    result["message"] = "프로세스를 시작했습니다. 이후 단계는 엔진이 진행합니다."
+    return _json(result)
+
+
+# ---------------------------------------------------------------------------
 # 도구 목록 export
 # ---------------------------------------------------------------------------
 def get_bpm_tools() -> list:
@@ -387,4 +556,5 @@ def get_bpm_tools() -> list:
         get_todolist,
         get_related_workitem_outputs,
         get_organization,
+        execute_process,
     ]
