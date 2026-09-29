@@ -148,6 +148,36 @@ _MCP_RETRY_RULES = (
     "시도해도 계속 실패할 때만 무엇이 실패했는지 사용자에게 알린다.\n"
 )
 
+# 이미 있는 프로세스를 대화 안에서 실행하는 순서.
+#
+# 이 규칙이 없으면 에이전트는 "실행 화면에서 진행하세요" 하고 링크를 던지거나, 역할을
+# 한꺼번에 물어 무엇을 답해야 하는지 알기 어렵게 만든다. work-assistant-agent 도 같은
+# 순서를 쓴다 — 어느 에이전트와 이야기하든 같아야 사용자가 다시 배우지 않는다.
+#
+# MCP(process-gpt-mcp)의 instructions 에도 같은 내용이 있지만 이쪽은 그것을 프롬프트로
+# 들이지 않는다. 그래서 여기에 따로 적는다.
+_PROCESS_EXECUTION_RULES = (
+    "\n\n## 기존 프로세스 실행 요청 처리\n"
+    "- 이미 있는 프로세스를 실행해 달라고 하면 **정의·실행 화면으로 보내지 말고 지금 대화 안에서 끝낸다.**\n"
+    "- 순서: get_process_list → get_process_detail → (역할 배정) → get_form_fields → execute_process\n"
+    "- get_process_detail 결과의 start_activities 가 **시작 단계**다. get_form_fields 와 execute_process 는 "
+    "이 시작 단계의 form_key · activity_id 로만 부른다. 뒤 단계(시스템 작업·검토 등)의 폼은 조회하지 않는다.\n"
+    "- definition.roles 순서대로 **한 번에 하나씩** 묻는다. 질문은 반드시 "
+    '"{순번}번 {역할명} 역할은 누구로 설정하시겠습니까?" 형식을 쓴다. '
+    '사용자가 이미 정해 준 역할(예: "역할은 모두 나로")은 다시 묻지 않는다.\n'
+    "- 담당자 후보가 필요하면 get_organization 으로 조회해 선택지를 함께 보인다.\n"
+    "- 모든 역할이 정해진 뒤에 시작 단계의 get_form_fields 를 호출한다. 폼 값은 화면이 입력란으로 "
+    "그려 주므로 항목을 하나씩 되묻지 않고, 입력 폼을 채워 제출해 달라고만 말하고 턴을 마친다.\n"
+    "- 단, 사용자가 요청에 첫 폼 값을 이미 다 주었으면(예: '요청 내용은 ○○') 폼을 다시 받지 않는다. "
+    "get_form_fields 로 필드 키만 확인하고 그 값으로 바로 execute_process 를 호출한다.\n"
+    "- 사용자가 폼을 제출하면 모아 둔 역할 배정을 함께 넣어 execute_process 를 바로 호출한다.\n"
+    "- **execute_process 는 요청 한 건당 정확히 한 번**이다. 인스턴스가 시작되면 이후 단계는 엔진이 "
+    "알아서 진행하므로, 뒤 단계의 activity_id 로 execute_process 를 다시 부르지 않는다(부르면 별개의 인스턴스가 "
+    "생긴다). 결과를 확인하려고 다시 부르지도 않는다. already_started 응답이면 새로 실행하지 않은 것이다.\n"
+    "- 실행에 성공하면 링크나 인스턴스 ID 를 안내하지 않는다. 화면이 '프로세스가 실행되었습니다' 카드를 "
+    "보여 주고, 카드를 누르면 인스턴스 대화로 간다. 무엇을 시작했는지 한두 문장으로만 알리고 끝낸다.\n"
+)
+
 DEFAULT_SYSTEM_PROMPT = (
     _BASE_INTRO
     + _SKILL_SELECTION_RULES
@@ -155,6 +185,7 @@ DEFAULT_SYSTEM_PROMPT = (
     + _WEB_FETCH_RULES
     + _SKILL_CREATION_DELEGATION
     + _BPMN_DELEGATION
+    + _PROCESS_EXECUTION_RULES
     + _MCP_RETRY_RULES
 )
 
@@ -181,6 +212,8 @@ WEB_FETCH_PROMPT = (
 CUSTOM_PROFILE_SYSTEM_PROMPT = (
     _BASE_INTRO
     + _SKILL_SELECTION_RULES
+    # 프로세스 실행은 파워유저 전용이 아니다. 커스텀 프로필과 이야기하다가도 시킬 수 있다.
+    + _PROCESS_EXECUTION_RULES
     + "\n\n"
     + _MCP_RETRY_RULES
 )
