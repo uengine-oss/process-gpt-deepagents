@@ -26,6 +26,7 @@ from langgraph.types import Overwrite
 from typing_extensions import override
 
 from core.agents.agent import build_agent
+from core.agents.steering import SteeringMiddleware
 from core.bpm.tools import set_process_context
 from core.storage.checkpointer import (
     get_async_postgres_checkpointer,
@@ -39,6 +40,11 @@ from core.chat.hitl import (
     normalize_hitl_payload,
 )
 from processgpt_agent_sdk.chat_registry import get_run_registry
+from processgpt_agent_sdk.steering import (
+    REASON_AWAITING_HUMAN_INPUT,
+    SteerDirective,
+    SteerResult,
+)
 
 from core.chat.callbacks import ToolTrackingCallback
 from core.agents.input_builder import (
@@ -648,6 +654,9 @@ async def _emit_human_asked(
         "checkpoint_thread_id": checkpoint_thread_id or "",
     }
 
+    # 이 턴은 여기서 끝나고 방은 사람의 답을 기다린다 — 두 갈래 모두 마찬가지다.
+    _mark_awaiting_human(context_id)
+
     if is_duplicate:
         # 같은 질문을 다시 물은 경우다. 여기서 done 마커만 보내고 끝내면 어시스턴트 메시지가
         # 하나도 남지 않아, 사용자 화면에는 "답변했는데 아무 반응이 없는" 멈춘 상태로 보인다.
@@ -935,6 +944,58 @@ def _resolve_run_state(extras: dict, row: dict, metadata: dict) -> dict:
     return {}
 
 
+# ---------------------------------------------------------------------------
+# 수정 지시(스티어링) — SDK 표준 동작의 이쪽(에이전트) 구현
+# ---------------------------------------------------------------------------
+
+def _pending_interrupt(checkpoint_tuple: Any) -> bool:
+    """체크포인트에 재개 대기 중인 사람 확인 요청이 남아 있는가."""
+    return any(
+        len(_w) > 1 and _w[1] == "__interrupt__"
+        for _w in (getattr(checkpoint_tuple, "pending_writes", None) or [])
+    )
+
+
+# 사람의 답을 기다리며 멈춘 방. 체크포인트만 보고 판정하면 흔들린다 — 질문을 내보낸
+# 직후 몇 백 ms 동안은 interrupt 가 아직 저장소에 안 보여서, 바로 온 수정 지시가
+# "사람 확인 대기" 대신 "진행 중인 턴 없음" 으로 거절된다(실제로 그랬다). 그 사실을
+# 아는 것은 방금 질문을 내보낸 이 프로세스이므로, 여기서 직접 기억한다.
+_awaiting_human: set[str] = set()
+
+
+def _mark_awaiting_human(conversation_id: str) -> None:
+    if conversation_id:
+        _awaiting_human.add(conversation_id)
+
+
+def _clear_awaiting_human(conversation_id: str) -> None:
+    _awaiting_human.discard(conversation_id or "")
+
+
+async def _awaiting_human_input(thread_id: str) -> bool:
+    """이 방이 사람의 답을 기다리며 멈춰 있는가.
+
+    그 상태에서는 돌고 있는 실행이 없어 방향을 바꿔 넣을 곳이 없다. 사용자는 그
+    질문에 답하는 기존 경로로 방향을 바꾼다(답변 자체가 이미 방향 전환이다).
+
+    이 프로세스가 기억하는 표식을 먼저 본다. 표식이 없어도(파드가 바뀐 경우)
+    체크포인트에 재개 대기 중인 요청이 남아 있으면 대기 상태다.
+    """
+    if not thread_id:
+        return False
+    if thread_id in _awaiting_human:
+        return True
+    checkpointer = await get_async_postgres_checkpointer() or get_shared_memory_checkpointer()
+    if checkpointer is None:
+        return False
+    try:
+        tup = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
+    except Exception:
+        logger.warning("사람 확인 대기 여부 확인 실패 | thread_id=%s", thread_id, exc_info=True)
+        return False
+    return _pending_interrupt(tup)
+
+
 def _is_hitl_answer(extras: dict, row: dict, metadata: dict) -> bool:
     """이번 요청이 이전 turn 의 HITL(사람 확인) 질문에 대한 **응답**인가.
 
@@ -969,6 +1030,25 @@ class DeepAgentExecutor(AgentExecutor):
         row = ctx_data.get("row") or {}
         metadata = extras.get("metadata") if isinstance(extras.get("metadata"), dict) else {}
         return not _is_hitl_answer(extras, row, metadata)
+
+    async def steer(self, directive: SteerDirective) -> SteerResult | None:
+        """SDK 표준 동작(`steer()`)의 이쪽 구현 — 지금 방향을 바꿀 수 있는지 판정한다.
+
+        받아 두기만 하고 실제 갈아타기는 실행 루프가 한다. 지시를 도구 실행 중간에
+        집어넣으면 쓰다 만 파일이나 결과 없는 도구 호출이 남으므로, 루프는 도구가
+        끝나고 다음 판단이 시작되기 전(= 체크포인트가 온전한 지점)에만 집어 간다.
+        그 시점에 `steer_applied` 가 나간다 — 접수와 반영은 다른 이벤트다.
+
+        Returns:
+            None 이면 SDK 의 표준 판정을 그대로 쓴다. 거절할 이유가 있으면
+            `SteerResult.reject()` 로 사유를 돌려준다.
+        """
+        if await _awaiting_human_input(directive.conversation_id):
+            return SteerResult.reject(
+                REASON_AWAITING_HUMAN_INPUT,
+                detail="에이전트가 질문에 대한 답을 기다리는 중입니다. 그 질문에 답해 방향을 알려주세요.",
+            )
+        return None
 
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> dict | None:
@@ -1010,6 +1090,10 @@ class DeepAgentExecutor(AgentExecutor):
                     user_name = user_name or _u.get("name") or _u.get("username")
                     user_email = user_email or _u.get("email")
                     break
+
+        # 새 턴이 시작됐다 — 이전 턴이 남긴 "사람 확인 대기" 표식은 끝났다. 이 턴이
+        # 다시 질문하며 멈추면 그때 다시 남는다.
+        _clear_awaiting_human(context_id)
 
         _skill_tenant_id.set(tenant_id)
         _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())
@@ -1423,10 +1507,7 @@ class DeepAgentExecutor(AgentExecutor):
                 _cfg = {"configurable": {"thread_id": checkpoint_thread_id}}
                 _tup = await checkpointer.aget_tuple(_cfg)
                 has_checkpoint = _tup is not None
-                has_pending_interrupt = any(
-                    len(_w) > 1 and _w[1] == "__interrupt__"
-                    for _w in (getattr(_tup, "pending_writes", None) or [])
-                )
+                has_pending_interrupt = _pending_interrupt(_tup)
             except Exception:
                 logger.warning("체크포인트 존재 확인 실패 | thread_id=%s", checkpoint_thread_id, exc_info=True)
                 has_checkpoint = False
@@ -1605,6 +1686,20 @@ class DeepAgentExecutor(AgentExecutor):
             len(knowledge_doc_ids), knowledge_doc_ids[:5],
         )
 
+        def _discard_streamed_text() -> None:
+            """수정 지시가 얹히는 순간, 그 전까지 쓰던 본문을 버린다.
+
+            사용자가 거둬들인 지시로 만든 글이다. 남겨 두면 최종 답변이 "버려진 초안 +
+            새 답변" 이 되어, 고쳐 달라고 했더니 같은 말을 두 번 한 것처럼 보인다.
+            """
+            nonlocal full_response
+            if full_response:
+                logger.info(
+                    "steering: 수정 지시 전까지 쓴 본문 %d자를 버린다 | room=%s",
+                    len(full_response), context_id,
+                )
+            full_response = ""
+
         graph, _, _sub_mcp_tools_meta = await build_agent(
             tenant_id=tenant_id,
             conversation_id=workspace_conversation_id or "",
@@ -1612,7 +1707,17 @@ class DeepAgentExecutor(AgentExecutor):
             subagents_raw=_exclude_root_profile(agents),
             tenant_mcp=tenant_mcp,
             extra_tools=chat_root_tools,
-            middleware=[ToolResultTruncationMiddleware()],
+            # 작업 중에 들어온 수정 지시를 다음 모델 판단에 얹는다(채팅 전용 —
+            # 워크아이템 실행에는 방향을 바꿀 사용자가 붙어 있지 않다).
+            middleware=[
+                ToolResultTruncationMiddleware(),
+                *(
+                    [SteeringMiddleware(
+                        conversation_id=context_id, on_applied=_discard_streamed_text,
+                    )]
+                    if is_chat else []
+                ),
+            ],
             # skill-creator 서브에이전트(단독 스킬 생성 위임 대상)는 채팅에서 사용자가
             # "스킬 만들어줘" 라고 요청하는 흐름 전용이다. 프로세스(워크아이템) 모드는
             # BPMN 액티비티를 실행하는 것이지 스킬을 생성하는 게 아니므로 붙이지 않는다.
@@ -1963,7 +2068,6 @@ class DeepAgentExecutor(AgentExecutor):
                                                     "child todo 없음: subagent=%s activity_id=%s root_proc_inst_id=%s",
                                                     _subagent_slug, _child_activity_id, root_proc_inst_id,
                                                 )
-
                 elif stream_evt == "values" and isinstance(data, dict):
                     interrupt_payload = find_interrupt_payload(data)
                     if interrupt_payload:

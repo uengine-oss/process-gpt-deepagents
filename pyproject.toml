@@ -18,7 +18,7 @@ dependencies = [
     "langgraph-checkpoint==4.1.1",
     "langgraph-checkpoint-postgres>=2.0",
     "mcp==1.27.2",
-    "process-gpt-agent-sdk[sse,auth]==0.8.1",
+    "process-gpt-agent-sdk[sse,auth]==0.9.0",
     "protobuf==6.33.6",
     "psycopg-pool>=3.2",
     "psycopg[binary]>=3.1",
