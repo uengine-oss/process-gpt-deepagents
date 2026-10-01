@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from processgpt_agent_sdk.artifacts import StoredArtifact  # noqa: E402
 
 from core.chat.artifacts import publish_chat_artifacts, publish_one  # noqa: E402
-from core.chat.file_links import find_document_paths  # noqa: E402
+from core.chat.file_links import find_document_paths, find_room_documents  # noqa: E402
 
 
 class FakeStore:
@@ -40,7 +40,12 @@ class FakeStore:
         return StoredArtifact(file_id=file_id, url=f"https://signed.test/reissued/{file_id}")
 
 
-def publish(text: str, files: dict[str, bytes], store: FakeStore | None = None):
+def publish(
+    text: str,
+    files: dict[str, bytes],
+    store: FakeStore | None = None,
+    extra_paths: list[str] | None = None,
+):
     store = store or FakeStore()
 
     async def fetch(path: str):
@@ -48,6 +53,7 @@ def publish(text: str, files: dict[str, bytes], store: FakeStore | None = None):
 
     body, records = asyncio.run(publish_chat_artifacts(
         tenant_id="uengine", conversation_id="room-1", text=text, fetch=fetch, store=store,
+        extra_paths=extra_paths or [],
     ))
     return body, records, store
 
@@ -146,3 +152,84 @@ def test_빈_파일은_내주지_않는다():
 
     assert record is None
     assert store.put_calls == []
+
+
+# --- 본문이 말하지 않은 문서도 거둔다 -------------------------------------------------
+#
+# docx·pdf 는 바이너리라 write_file 스트림으로 화면에 뜨지 않는다. 본문에 경로가 적혔을
+# 때만 거두면, 모델이 경로를 적지 않은 턴의 문서는 만들어졌다는 말만 남고 받을 길이 없다.
+
+
+def test_본문에_없는_문서도_작업폴더_경로로_거둔다():
+    path = "/workspace/.bpmn/room/보고서.docx"
+    body, records, _ = publish("정리해 두었습니다.", {path: b"docx"}, extra_paths=[path])
+
+    assert len(records) == 1
+    assert records[0]["file_name"] == "보고서.docx"
+    # 작업 폴더가 같은 파일을 알아볼 열쇠.
+    assert records[0]["source_path"] == path
+    # 본문에 없던 경로를 링크로 끼워 넣지는 않는다.
+    assert body == "정리해 두었습니다."
+
+
+def test_본문과_스캔에_같은_파일이_있어도_한_번만_올라간다():
+    path = "/workspace/.bpmn/room/보고서.docx"
+    _, records, store = publish(
+        f"파일 경로: {path}", {path: b"docx"}, extra_paths=[path],
+    )
+
+    assert len(records) == 1
+    assert len(store.put_calls) == 1
+
+
+def test_이름이_같은_파일이_두_곳에_있으면_먼저_것만_낸다():
+    first = "/workspace/.bpmn/room/a/보고서.docx"
+    second = "/workspace/.bpmn/room/b/보고서.docx"
+    _, records, store = publish(
+        "완료", {first: b"first", second: b"second"}, extra_paths=[first, second],
+    )
+
+    assert len(records) == 1
+    assert records[0]["source_path"] == first
+    assert len(store.put_calls) == 1
+
+
+def _touch(path: Path, content: bytes = b"x", mtime_ns: int | None = None) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    if mtime_ns is not None:
+        import os
+
+        os.utime(path, ns=(mtime_ns, mtime_ns))
+    return path
+
+
+def test_작업폴더에서_이번_턴의_문서만_찾는다(tmp_path):
+    room = tmp_path / "room"
+    _touch(room / "이번턴.docx", mtime_ns=2_000_000_000_000_000_000)
+    _touch(room / "지난턴.pdf", mtime_ns=1_000_000_000_000_000_000)
+    # 문서가 아닌 것(텍스트 산출물)은 이미 write_file 스트림이 맡는다.
+    _touch(room / "process-definition.json", mtime_ns=2_000_000_000_000_000_000)
+    # 빈 파일은 받아도 열 수 없다.
+    _touch(room / "빈.docx", content=b"", mtime_ns=2_000_000_000_000_000_000)
+    # 스킬 평가 실행 산출물은 사용자 산출물이 아니다.
+    _touch(room / ".skill-evals" / "run" / "내부.docx", mtime_ns=2_000_000_000_000_000_000)
+
+    found = find_room_documents(
+        room, "/workspace/.bpmn/room", since_ns=1_500_000_000_000_000_000,
+    )
+
+    assert found == ["/workspace/.bpmn/room/이번턴.docx"]
+
+
+def test_하위_폴더의_문서도_컨테이너_경로로_찾는다(tmp_path):
+    room = tmp_path / "room"
+    _touch(room / "outputs" / "안내문.pdf", mtime_ns=2_000_000_000_000_000_000)
+
+    found = find_room_documents(room, "/workspace/.bpmn/room", since_ns=0)
+
+    assert found == ["/workspace/.bpmn/room/outputs/안내문.pdf"]
+
+
+def test_없는_작업폴더는_빈_목록(tmp_path):
+    assert find_room_documents(tmp_path / "없음", "/workspace/.bpmn/room") == []

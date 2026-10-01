@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 import asyncio
 from typing import Any, Optional
@@ -409,7 +410,7 @@ async def _materialize_ws_file_form_outputs(
 
 
 async def _publish_chat_artifacts(
-    tenant_id: str, conversation_id: str, text: str,
+    tenant_id: str, conversation_id: str, text: str, extra_paths: list[str] | None = None,
 ) -> tuple[str, list[dict]]:
     """채팅 답변에 남은 샌드박스 산출물을 비공개 버킷에 보관하고, 본문을 받을 수 있는 주소로 바꾼다.
 
@@ -422,7 +423,7 @@ async def _publish_chat_artifacts(
     from core.chat.artifacts import publish_chat_artifacts
     from core.chat.file_links import find_document_paths
 
-    if not find_document_paths(text):
+    if not find_document_paths(text) and not extra_paths:
         return text, []
 
     try:
@@ -448,6 +449,7 @@ async def _publish_chat_artifacts(
 
     return await publish_chat_artifacts(
         tenant_id=tenant_id, conversation_id=conversation_id, text=text, fetch=_fetch,
+        extra_paths=extra_paths or [],
     )
 
 
@@ -516,6 +518,80 @@ def _file_artifact_payload(path: str, content: str | None, op: str) -> dict:
         "content": text,
         "truncated": truncated,
     }
+
+
+def _room_document_paths(chat_room_id: str, since_ns: int) -> list[str]:
+    """이번 턴에 작업 폴더에 생긴 문서 산출물(docx·pdf 등)의 컨테이너 경로.
+
+    docx·pdf 는 바이너리라 `write_file` 스트림(텍스트)으로는 화면에 뜨지 않는다. 그래서
+    예전에는 **답변 본문에 경로가 적혔을 때만** 사용자에게 갔다 — 모델이 경로를 적지 않은
+    턴의 문서는 만들어졌다는 말만 남고 받을 길이 없었다. 글이 아니라 폴더를 본다.
+    """
+    try:
+        from core.chat.file_links import find_room_documents
+        from core.skills.tools import (
+            _conv_slug,
+            bpmn_container_base as _bcb,
+            tenant_workspace_root,
+        )
+    except Exception:
+        logger.warning("문서 산출물 스캔: 모듈 로드 실패", exc_info=True)
+        return []
+    slug = _conv_slug(chat_room_id or "")
+    if not slug:
+        return []
+    try:
+        room_host = tenant_workspace_root() / ".bpmn" / slug
+        return find_room_documents(room_host, _bcb(chat_room_id or ""), since_ns=since_ns)
+    except Exception:
+        logger.warning("문서 산출물 스캔 실패 | room=%s", chat_room_id, exc_info=True)
+        return []
+
+
+def _document_artifact_payload(record: dict) -> dict | None:
+    """산출물 레코드를 작업 폴더가 읽는 `file_artifact` 로 옮긴다.
+
+    텍스트 산출물과 달리 내용을 싣지 않는다 — 바이너리는 화면이 렌더할 수 없고, 받을 수만
+    있으면 된다. 대신 서명 주소와 `file_id` 를 싣는다. 주소는 한 시간이면 죽지만 파일은
+    남아 있어서, 화면이 그 열쇠로 새 주소를 받아 간다.
+    """
+    url = str(record.get("file_url") or "")
+    if not url:
+        return None
+    name = str(record.get("file_name") or "")
+    path = str(record.get("source_path") or "") or f"/workspace/{name}"
+    path_name, ext = _ws_file_meta(path)
+    return {
+        "type": "file_artifact",
+        "op": "create",
+        "path": path,
+        "name": name or path_name,
+        "ext": ext,
+        # 바이너리는 미리보기 내용이 없다. 화면은 url 로 받거나(미리보기 불가 형식)
+        # 주소를 그대로 그린다(pdf·이미지).
+        "content": "",
+        "truncated": False,
+        "url": url,
+        "file_id": str(record.get("file_id") or ""),
+        "url_expires_at": str(record.get("url_expires_at") or ""),
+        "content_type": str(record.get("content_type") or ""),
+        "size_bytes": record.get("size_bytes") or 0,
+    }
+
+
+async def _emit_document_artifacts(streamer, records: list[dict]) -> None:
+    """거둔 문서 산출물을 작업 폴더 목록에 띄운다. 실패는 베스트에포트."""
+    if streamer is None:
+        return
+    for record in records or []:
+        payload = _document_artifact_payload(record)
+        if payload is None:
+            continue
+        try:
+            await streamer.send_json(payload)
+            logger.info("문서 산출물 작업 폴더 emit | %s", payload["path"])
+        except Exception:
+            logger.warning("문서 산출물 emit 실패 | %s", payload.get("path"), exc_info=True)
 
 
 # 응답이 "병합 요청(PR)을 올렸다"고 보고하는지 판단할 표식.
@@ -1795,6 +1871,10 @@ class DeepAgentExecutor(AgentExecutor):
         # /workspace 에 파일을 썼으면 True — 컨설팅 1단계(파일 미작성)와 구분하는 데 사용한다.
         workspace_write_made = False
         pending_hitl_payload: dict[str, Any] | None = None
+        # 이번 턴이 시작한 시각. 턴이 끝나면 작업 폴더에서 이 시각 뒤에 바뀐 문서 산출물을
+        # 찾아 거둔다(`_room_document_paths`). 이 표식이 없으면 지난 턴의 문서까지 다시
+        # 올라가 화면에 같은 것이 여러 번 뜬다.
+        turn_started_ns = time.time_ns()
 
         try:
             async for _ns, stream_evt, data in graph.astream(
@@ -2111,11 +2191,21 @@ class DeepAgentExecutor(AgentExecutor):
             chat_artifacts: list[dict] = []
             if is_chat:
                 try:
+                    # 본문에 경로가 적혔든 아니든, 이번 턴에 작업 폴더에 생긴 문서는 거둔다.
+                    _doc_paths = await asyncio.to_thread(
+                        _room_document_paths, chat_room_id or "", turn_started_ns
+                    )
                     raw_text, chat_artifacts = await _publish_chat_artifacts(
-                        tenant_id, chat_room_id or context_id or "", raw_text,
+                        tenant_id, chat_room_id or context_id or "", raw_text, _doc_paths,
                     )
                 except Exception:
                     logger.warning("채팅 산출물 보관 실패 — 원본 유지", exc_info=True)
+                # 거둔 문서를 작업 폴더 목록에 띄운다. 바이너리는 write_file 스트림을
+                # 타지 않아, 이 emit 이 없으면 목록에서 통째로 빠진다.
+                try:
+                    await _emit_document_artifacts(streamer, chat_artifacts)
+                except Exception:
+                    logger.warning("문서 산출물 작업 폴더 emit 실패", exc_info=True)
 
             # 도구 출력에서 못 잡았을 때 대비: 최종 텍스트에 요약/출력계약 JSON 이 있으면 결과 카드용 이벤트 emit.
             if streamer and not process_result_sent:

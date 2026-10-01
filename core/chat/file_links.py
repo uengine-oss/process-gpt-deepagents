@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from pathlib import Path
+from typing import Iterable, Optional
 
 from processgpt_agent_sdk.artifacts import DEFAULT_EXTENSIONS
 
@@ -47,4 +48,74 @@ def find_document_paths(text: Optional[str]) -> list[str]:
     return list(dict.fromkeys(WS_DOCUMENT_RE.findall(text)))
 
 
-__all__ = ["WS_DOCUMENT_RE", "find_document_paths"]
+# 답변이 말해 주지 않아도 거둬야 하는 문서 산출물의 형식.
+#
+# 이 형식들은 바이너리라서 `write_file` 스트림(텍스트)으로 화면에 뜨지 않는다. 그래서 본문에
+# 경로가 적히지 않으면 **만들어졌다는 말만 남고 받을 길이 없다** — 모델이 경로를 적는지에
+# 산출물의 운명이 걸려 있었다. 그래서 글이 아니라 작업 폴더를 본다(SDK 의 규약과 같은 원리).
+#
+# hwp·hwpx 는 일부러 뺀다. 한글 문서는 미리보기·편집이 되는 별도 경로가 이미 맡고 있다.
+BINARY_DOCUMENT_EXTENSIONS = frozenset({"doc", "docx", "pdf", "xlsx", "pptx"})
+
+# 작업 폴더 스캔에서 뺄 경로 조각. 스킬 평가 실행은 회차마다 수십 개의 내부 작업 파일을
+# 남기는데, 그것은 사용자 산출물이 아니다.
+_SCAN_EXCLUDED_MARKERS = (".skill-evals/", "/.checkouts/")
+
+
+def find_room_documents(
+    room_dir: Path,
+    base_container: str,
+    *,
+    since_ns: int = 0,
+    extensions: Iterable[str] = BINARY_DOCUMENT_EXTENSIONS,
+) -> list[str]:
+    """방 작업 폴더에서 이번 턴에 생기거나 바뀐 문서 산출물의 컨테이너 경로.
+
+    Args:
+        room_dir:       방 작업 폴더(host). 컨테이너의 `base_container` 와 같은 곳이다.
+        base_container: 그 폴더의 컨테이너 경로(`/workspace/.bpmn/<방>`).
+        since_ns:       턴을 시작한 시각(`time.time_ns()`). 그 뒤에 바뀐 것만 본다 —
+                        0 이면 지금 있는 문서를 모두 본다.
+
+    이번 턴의 것만 보는 이유는, 그러지 않으면 이어지는 턴마다 같은 파일이 다시 올라가
+    화면에 같은 것이 여러 번 뜨기 때문이다.
+    """
+    allowed = {str(ext).lower().lstrip(".") for ext in extensions}
+    if not allowed:
+        return []
+    try:
+        if not room_dir.is_dir():
+            return []
+    except OSError:
+        return []
+
+    found: list[tuple[int, str]] = []
+    base = base_container.rstrip("/")
+    for path in sorted(room_dir.rglob("*")):
+        try:
+            if not path.is_file():
+                continue
+            if path.suffix.lower().lstrip(".") not in allowed:
+                continue
+            rel = path.relative_to(room_dir).as_posix()
+            if any(marker.strip("/") in f"/{rel}" for marker in _SCAN_EXCLUDED_MARKERS):
+                continue
+            stat = path.stat()
+            if since_ns and stat.st_mtime_ns < since_ns:
+                continue
+            if stat.st_size <= 0:
+                continue
+        except OSError:
+            continue
+        found.append((stat.st_mtime_ns, f"{base}/{rel}"))
+
+    # 만든 순서대로 — 화면에 뜨는 순서가 에이전트가 작업한 순서와 같아야 읽기 쉽다.
+    return [container_path for _, container_path in sorted(found)]
+
+
+__all__ = [
+    "BINARY_DOCUMENT_EXTENSIONS",
+    "WS_DOCUMENT_RE",
+    "find_document_paths",
+    "find_room_documents",
+]
