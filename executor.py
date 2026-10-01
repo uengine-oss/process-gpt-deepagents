@@ -41,6 +41,7 @@ from core.chat.hitl import (
     normalize_hitl_payload,
 )
 from processgpt_agent_sdk.chat_registry import get_run_registry
+from processgpt_agent_sdk.chat_mode import persist_chat_to_db
 from processgpt_agent_sdk.steering import (
     REASON_AWAITING_HUMAN_INPUT,
     SteerDirective,
@@ -577,6 +578,48 @@ def _document_artifact_payload(record: dict) -> dict | None:
         "content_type": str(record.get("content_type") or ""),
         "size_bytes": record.get("size_bytes") or 0,
     }
+
+
+CHAT_ERROR_PREFIX = "⚠️ 오류가 발생했습니다: "
+
+
+def _chat_error_display_text(error_text: str, partial_text: str = "") -> str:
+    """오류로 끝난 턴의 assistant 본문. 부분 응답이 있으면 살려서 뒤에 오류를 붙인다."""
+    partial = (partial_text or "").strip()
+    display = f"{CHAT_ERROR_PREFIX}{error_text or '에이전트 응답 오류'}"
+    return f"{partial}\n\n{display}" if partial else display
+
+
+async def _persist_chat_error_message(
+    context: RequestContext,
+    *,
+    task_id: str,
+    context_id: str,
+    error_text: str,
+    partial_text: str = "",
+) -> None:
+    """오류로 끝난 채팅 턴도 assistant 메시지를 chats 에 남긴다.
+
+    오류를 SSE 로만 보내면 화면에는 보이지만 DB 에는 아무 것도 남지 않는다. 그래서
+    새로고침하거나 방에 다시 들어오면 사용자 질문만 있고 답은 아예 오지 않은 것처럼
+    보인다 — 실제로 그랬다. 성공 턴과 같은 저장 경로(SDK persist_chat_to_db)를 쓰고,
+    프론트가 보낸 response_message_uuid 로 upsert 하므로 같은 턴이 두 row 로
+    갈라지지도 않는다.
+    """
+    req = getattr(context, "req", None)
+    if req is None:
+        # 프로세스/워크리스트 경로(ChatRequestContext 가 아님) — chats 저장 대상이 아니다.
+        return
+    display = _chat_error_display_text(error_text, partial_text)
+    evt = new_text_artifact_update_event(
+        task_id=task_id,
+        context_id=context_id,
+        name="assistant_response",
+        text=display,
+        last_chunk=True,
+    )
+    ParseDict({"role": "assistant", "isError": True, "error": error_text}, evt.metadata)
+    await persist_chat_to_db(req, evt, display)
 
 
 async def _emit_document_artifacts(streamer, records: list[dict]) -> None:
@@ -2450,6 +2493,25 @@ class DeepAgentExecutor(AgentExecutor):
                     text=json.dumps({"error": error_text}, ensure_ascii=False),
                 )
             )
+            # 오류도 chats 에 남긴다 — SSE 로만 보내면 화면에는 보이지만 레코드가
+            # 없어 새로고침/재진입 시 답변이 아예 없던 것처럼 보인다. 최종 아티팩트가
+            # 이미 저장된 뒤(예: 뒤처리 중 실패)라면 같은 uuid 를 오류로 덮어쓰지
+            # 않도록 건너뛴다.
+            # 프로세스/워크리스트 경로는 헬퍼가 알아서 건너뛴다(저장 대상 아님).
+            if not getattr(event_queue, "_finalized", False):
+                try:
+                    await _persist_chat_error_message(
+                        context,
+                        task_id=task_id,
+                        context_id=context_id,
+                        error_text=error_text,
+                        partial_text=full_response,
+                    )
+                except Exception:
+                    logger.warning(
+                        "오류 메시지 chats 저장 실패 | room_id=%s", chat_room_id, exc_info=True
+                    )
+
             # 채팅: error 타입으로 보내야 drain_sse_queue 가 스트림을 종료하고
             # 프론트 onError 가 발동해 오류를 화면에 표시한다(무한 "생각 중..." 방지).
             if streamer:
