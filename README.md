@@ -1,5 +1,92 @@
 # process-gpt-deepagents
 
+Process-GPT 의 딥 에이전트 실행체. 사용자의 요청을 받아 **샌드박스 컨테이너 안에서**
+도구를 돌려 프로세스 정의·스킬·문서 같은 산출물을 만든다. 일은 두 군데로 들어온다.
+
+| 입구 | 무엇 | 끄는 법 |
+|---|---|---|
+| `POST /chat/stream` | 화면의 채팅방에서 직접 — 토큰·도구·산출물을 SSE 로 돌려준다 | — |
+| todolist 폴링 | 프로세스 워크아이템. SDK 가 큐를 긁어 같은 실행체에 넘긴다 | `DEEPAGENTS_PROCESS_POLLING=false` |
+
+## 시작 방법
+
+### 필요한 것
+
+| | 왜 |
+|---|---|
+| Python 3.13 (`uv` 권장) | `.python-version` · `uv.lock` 기준 |
+| **Docker 데몬** | 에이전트의 파일 작업과 코드 실행은 전부 샌드박스 컨테이너에서 돈다. 없으면 도구가 통째로 멎는다 |
+| Supabase | 대화 이력(`chats`) · 워크아이템 · 스킬 등록. 로컬 인스턴스든 원격이든 상관없다 |
+| LLM | `LLM_PROXY_URL`+`LLM_PROXY_API_KEY` 를 쓰거나, `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` 를 직접 준다. 모델 이름은 `LLM_MODEL` |
+| memento (`:8005`) | **산출물 보관소.** 문서·이미지는 여기를 거쳐 비공개 버킷에 들어가고 서명 주소로 나간다. 없으면 파일을 만들어도 받을 길이 없다 |
+
+### 1. 설치
+
+```bash
+uv sync                 # 또는: uv venv && uv pip install -r requirements.txt
+cp .env.example .env    # 아래 값을 채운다
+```
+
+`.env` 에서 최소한 이 다섯 가지는 채워야 돈다 — `SUPABASE_URL` · `SUPABASE_KEY` ·
+`LLM_MODEL` · LLM 자격증명(프록시 또는 API 키) · `MEMENTO_BASE_URL`.
+나머지 항목의 뜻은 `.env.example` 에 주석으로 적혀 있다.
+
+### 2. 띄우기
+
+```bash
+uv run python server.py
+```
+
+```
+서버 시작: http://0.0.0.0:8888/chat/stream (todolist 폴링 켬)
+```
+
+포트는 `HOST`/`PORT` 로 바꾼다(기본 `0.0.0.0:8888`). 살아 있는지는 `/health` 로 본다 —
+응답의 `busy` 는 세션 라우터가 유휴 Pod 를 회수해도 되는지 판정하는 근거다.
+
+```bash
+curl -s localhost:8888/health
+```
+
+### 3. 화면에서 써 보기
+
+`process-gpt-vue3` 를 `npm run dev` 로 띄우면(`:8088`) `/process-gpt-deepagents/**` 를
+`127.0.0.1:8888` 로 프록시한다. 홈(`/definition-map`) 하단 채팅에서 에이전트를
+**딥 에이전트**로 바꾸고 보내면 이 서버로 들어온다.
+
+### 4. 샌드박스는 어디에 무엇을 두는가
+
+에이전트가 만지는 파일은 호스트의 두 디렉터리가 컨테이너로 마운트된 것이다.
+
+| 호스트 | 컨테이너 | |
+|---|---|---|
+| `workspace/` | `/workspace` (rw) | 방마다 `.bpmn/<room>/` 아래로 격리된다. 산출물이 여기 생긴다 |
+| `skills/` | `/skills/<스킬>` (ro) | 스킬별로 따로 마운트한다 |
+
+컨테이너 이름은 테넌트당 하나(`deepagent-sandbox-<tenant>`)이고 이미지는
+`SANDBOX_IMAGE`(기본 `python:3.13-slim`)다. 전용 브리지 네트워크를 쓰는 이유는
+`.env.example` 의 MTU 주석에 적어 뒀다 — 기본 브리지로는 GKE 등에서 `git clone` 이
+매달리다 죽는다.
+
+### 테스트
+
+```bash
+uv run pytest -q
+```
+
+`GITHUB_TOKEN` 이 없으면 스킬 저장소 API 테스트(`tests/test_github_skill_repo_api.py`
+등)는 실패한다 — 그 밖의 실패는 진짜 실패다.
+
+### 자주 막히는 자리
+
+| 증상 | 원인 |
+|---|---|
+| 문서를 만들었다는데 받을 수 없다 | memento 가 안 떠 있거나 `MEMENTO_BASE_URL` 이 틀렸다 |
+| `save-to-storage` 가 500, 로그에 `Bucket not found` | 산출물이 들어갈 **비공개 `artifacts` 버킷**이 없다. Supabase 에 만든다 |
+| 하루 지난 방에서 받기를 누르면 404 | 산출물 카탈로그 등록이 실패해 `/artifact-url` 재발급이 막힌 것. memento 쪽 `knowledge_files.path` 컬럼이 있는지 본다 |
+| 도구가 하나도 안 돌고 멎는다 | Docker 데몬이 없거나 권한이 없다 |
+| 채팅은 되는데 워크아이템을 안 집는다 | `DEEPAGENTS_PROCESS_POLLING` 이 꺼져 있다 |
+
 ## 채팅 인프라는 SDK 가 소유한다
 
 `/chat/stream`, `/chat/stream/attach`, `/chat/stop`, `/chat/steer`, `/health` 는 모두
