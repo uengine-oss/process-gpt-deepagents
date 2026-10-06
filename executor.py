@@ -39,6 +39,8 @@ from core.chat.hitl import (
     find_interrupt_payload,
     is_duplicate_hitl_request,
     normalize_hitl_payload,
+    records_human_answered,
+    workitem_resume_answer,
 )
 from processgpt_agent_sdk.chat_registry import get_run_registry
 from processgpt_agent_sdk.chat_mode import persist_chat_to_db
@@ -1632,22 +1634,15 @@ class DeepAgentExecutor(AgentExecutor):
                 has_checkpoint = False
                 has_pending_interrupt = False
 
-        # 워크아이템이 사람에게 묻고 멈췄다가(HUMAN_ASKED) 답을 받아 다시 집힌 경우다.
-        # 워크아이템 경로에는 프론트가 human_response_answer/run_state 를 실어 주지
-        # 않고, 답은 feedback 의 마지막 항목으로 온다. 그 원문으로 interrupt 를 재개한다 —
-        # 새 메시지로 넣으면 응답 없는 request_human_input 호출이 남은 대화에 덧붙여진다.
-        if (
-            not is_chat
-            and has_pending_interrupt
-            and not human_answer_stripped
-            and _latest_feedback_content
-        ):
-            human_answer_stripped = _latest_feedback_content
-            run_state = {
-                **run_state,
-                "pending_field": run_state.get("pending_field") or "human_response",
-                "tool_name": "request_human_input",
-            }
+        # 워크아이템이 사람에게 묻고 멈췄다가(HUMAN_ASKED) 답을 받아 다시 집힌 경우,
+        # feedback 의 마지막 항목 원문으로 interrupt 를 재개한다.
+        human_answer_stripped, run_state = workitem_resume_answer(
+            is_chat=is_chat,
+            has_pending_interrupt=has_pending_interrupt,
+            human_answer=human_answer_stripped,
+            latest_feedback=_latest_feedback_content,
+            run_state=run_state,
+        )
 
         inputs, use_graph_resume = build_graph_inputs(
             user_message,
@@ -1678,10 +1673,7 @@ class DeepAgentExecutor(AgentExecutor):
                 "checkpoint_thread_id": checkpoint_thread_id or "",
                 "resume_source": "checkpoint_graph_resume" if use_graph_resume else "human_response",
             }
-        # 워크아이템 경로에서는 내지 않는다. events.event_type enum 에 human_answered 가
-        # 없어 이 이벤트가 든 묶음 저장이 통째로 실패하고 같이 든 이벤트까지 사라진다.
-        # 답은 화면이 human_response 로 이미 남긴다.
-        if human_answer_stripped and is_chat:
+        if human_answer_stripped and records_human_answered(is_chat=is_chat):
             await _enqueue_status(
                 event_queue,
                 task_id=task_id,
