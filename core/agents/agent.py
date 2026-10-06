@@ -243,7 +243,10 @@ async def build_agent(
 
     tools = (
         list(extra_tools or [])
-        + ([] if agent_mode == "DRAFT" or not is_chat else get_hitl_tools())
+        # 사람에게 묻는 도구. 워크아이템은 COMPLETE(에이전트가 제출까지 맡음)일 때만 준다 —
+        # DRAFT 는 어차피 사람이 초안을 검토한다. 물으면 SDK 가 작업을 HUMAN_ASKED 로
+        # 두고, 답(feedback)이 오면 다시 집혀 interrupt 를 그 답으로 재개한다.
+        + (get_hitl_tools() if agent_mode != "DRAFT" and (is_chat or agent_mode == "COMPLETE") else [])
         + get_memento_tools()
         # 프로세스를 새로 시작하는 도구는 채팅에서만 준다 — 워크아이템을 처리하던 에이전트가
         # 업무 도중 다른 인스턴스를 만들어 버리지 않게.
