@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
 from langgraph.types import Command
+
+logger = logging.getLogger(__name__)
 
 # [user][이름]: 또는 [assistant][이름][agentId=...]: 형식 파싱
 _MSG_RE = re.compile(r'\[(user|assistant)\](?:\[[^\]]*\])*:\s*')
@@ -250,3 +253,83 @@ def build_graph_inputs(
         state_msgs = [*history, {"role": "user", "content": user_message}]
 
     return {"messages": state_msgs}, False
+
+
+# ---------------------------------------------------------------------------
+# 워크아이템 재개 — 크래시 재점유면 마지막 체크포인트부터 이어 간다
+# ---------------------------------------------------------------------------
+
+RESUME_FRESH = "fresh"
+RESUME_RECLAIM = "reclaim"
+
+
+def resume_kind_of(extras: Any) -> str:
+    """SDK 가 실어 준 재개 사유(``extras["resume"]["kind"]``). 없으면 ``fresh``.
+
+    SDK 의 새 심볼을 import 하지 않고 딕셔너리만 읽는다 — 재개 정보를 싣지 않는
+    구버전 SDK 와 짝지어 배포돼도 이전 동작 그대로다.
+    """
+    resume = extras.get("resume") if isinstance(extras, dict) else None
+    if isinstance(resume, dict):
+        kind = str(resume.get("kind") or "").strip()
+        if kind:
+            return kind
+    return RESUME_FRESH
+
+
+def reclaim_continues_from_checkpoint(
+    *,
+    resume_kind: str,
+    use_graph_resume: bool,
+    has_pending_interrupt: bool,
+    snapshot_next: Any,
+) -> bool:
+    """재점유된 실행을 새 입력 없이(``None``) 마지막 체크포인트부터 이어 갈 것인가.
+
+    - 사람 답을 기다리는 interrupt 가 남아 있으면 그 재개(``Command(resume=)``)가 먼저다.
+    - 그래프가 더 진행할 단계가 없으면(결과 저장 직전에 죽음) 이어 갈 것이 없다 —
+      ``None`` 으로 돌리면 아무것도 하지 않고 끝나 빈 결과가 남는다. 이전처럼 새로 돈다.
+    """
+    return bool(
+        resume_kind == RESUME_RECLAIM
+        and not use_graph_resume
+        and not has_pending_interrupt
+        and snapshot_next
+    )
+
+
+async def choose_reclaim_inputs(
+    graph: Any,
+    config: dict[str, Any],
+    inputs: Any,
+    *,
+    resume_kind: str,
+    use_graph_resume: bool,
+    has_pending_interrupt: bool,
+) -> Any:
+    """재점유면 그래프의 다음 단계를 보고 입력을 ``None`` 으로 바꾼다. 아니면 그대로.
+
+    다음 단계(``next``)는 체크포인트만으로는 모르고 그래프가 계산하므로 그래프를
+    만든 뒤에 판정한다. 같은 지시를 새 메시지로 덧붙이면 모델이 이미 받은 도구
+    결과를 다시 조회한다(2026-10-06 E2: 3/3 재호출).
+    """
+    if resume_kind != RESUME_RECLAIM or use_graph_resume or has_pending_interrupt:
+        return inputs
+    thread_id = ((config or {}).get("configurable") or {}).get("thread_id")
+    if not thread_id:
+        return inputs
+    try:
+        snap = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+    except Exception:
+        logger.warning("재점유 체크포인트 확인 실패 — 새 입력으로 실행 | thread_id=%s", thread_id, exc_info=True)
+        return inputs
+    snapshot_next = tuple(getattr(snap, "next", ()) or ())
+    if reclaim_continues_from_checkpoint(
+        resume_kind=resume_kind,
+        use_graph_resume=use_graph_resume,
+        has_pending_interrupt=has_pending_interrupt,
+        snapshot_next=snapshot_next,
+    ):
+        logger.info("재점유 — 마지막 체크포인트부터 이어서 실행 | thread_id=%s next=%s", thread_id, list(snapshot_next))
+        return None
+    return inputs

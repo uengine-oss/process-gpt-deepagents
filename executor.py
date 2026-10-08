@@ -54,6 +54,8 @@ from processgpt_agent_sdk.steering import (
 from core.chat.callbacks import ToolTrackingCallback
 from core.agents.input_builder import (
     build_graph_inputs,
+    choose_reclaim_inputs,
+    resume_kind_of,
     build_user_message,
     collect_recent_messages,
     extract_skill_command,
@@ -1898,6 +1900,16 @@ class DeepAgentExecutor(AgentExecutor):
             },
             **({"callbacks": [_tracking_cb]} if _tracking_cb else {}),
         }
+
+        # 크래시 재점유(SDK 재개 사유 reclaim)면 같은 지시를 덧붙이지 않고 마지막
+        # 체크포인트부터 이어 간다. 이미 결과가 저장된 도구는 다시 부르지 않는다.
+        if not is_chat:
+            inputs = await choose_reclaim_inputs(
+                graph, config, inputs,
+                resume_kind=resume_kind_of(extras),
+                use_graph_resume=use_graph_resume,
+                has_pending_interrupt=has_pending_interrupt,
+            )
 
         active_tool_calls: dict[str, str] = {}
         # request_human_input 의 인자(질문·초안 본문)를 쓰는 동안 화면에 흘려보내기 위한
