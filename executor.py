@@ -32,6 +32,7 @@ from core.bpm.tools import set_process_context
 from core.storage.checkpointer import (
     get_async_postgres_checkpointer,
     get_shared_memory_checkpointer,
+    get_workitem_checkpointer,
     resolve_checkpoint_thread_id,
 )
 from core.chat.hitl import (
@@ -1611,9 +1612,9 @@ class DeepAgentExecutor(AgentExecutor):
         # Postgres(DB_*) 가 있으면 그것을, 없으면 프로세스 전역 공유 InMemory 체크포인터를 쓴다.
         # 매 요청마다 새 MemorySaver 를 만들면 직전 interrupt 체크포인트가 사라져 HITL resume 이
         # 불가능하므로, 항상 동일(공유) 인스턴스를 build_agent/build_graph_inputs 에 넘긴다.
-        checkpointer = await get_async_postgres_checkpointer()
-        if checkpointer is None:
-            checkpointer = get_shared_memory_checkpointer()
+        # DB_* 가 있는데 Postgres 를 쓸 수 없으면 메모리로 대체하지 않고 실패한다
+        # (CheckpointerUnavailable → SDK 가 오류 이벤트 + FAILED 로 알린다).
+        checkpointer = await get_workitem_checkpointer()
         checkpoint_thread_id = chat_room_id if is_chat else (resolve_checkpoint_thread_id(is_chat=False, row=row) or chat_room_id)
 
         # 이 thread 에 이미 누적된 체크포인트가 있는지 확인 — 있으면 history 재주입을 생략해

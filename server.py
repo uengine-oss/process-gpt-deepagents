@@ -25,6 +25,7 @@ from processgpt_agent_sdk import ProcessGPTAgentServer
 from core.api.skills_router import routes as skills_routes
 from core.api.workspace_file import routes as workspace_file_routes
 from core.skills.local_system_skills import seed_local_system_skills
+from core.storage.checkpointer import ensure_checkpointer_ready
 from executor import DeepAgentExecutor
 
 load_dotenv()
@@ -49,6 +50,10 @@ PROCESS_POLLING = os.environ.get("DEEPAGENTS_PROCESS_POLLING", "true").strip().l
 )
 
 async def main() -> None:
+    # DB_* 가 설정됐는데 체크포인트 저장소에 붙지 못하면 기동하지 않는다. 메모리
+    # 저장으로 뜨면 재개·사람 답변이 다른 파드에서 반영되지 않는다(조용한 고장).
+    await ensure_checkpointer_ready()
+
     try:
         synced = await asyncio.to_thread(seed_local_system_skills)
         logger.info("local-system-skills: 기동 시 %d개 스킬 시딩", synced)
