@@ -216,13 +216,118 @@ def _resolve_extends_chain(
     return [by_name[n] for n in result if n in by_name]
 
 
-class FilteredSkillsMiddleware(SkillsMiddleware):
+def scan_skill_include_tools(source_dirs) -> dict[str, dict]:
+    """스킬 소스에서 `{스킬명: {"name", "path", "include_tools"}}` 를 읽는다.
+
+    SkillsMiddleware 와 같은 규칙이다 — 소스 바로 아래 디렉터리마다 SKILL.md 하나, 같은
+    이름이면 뒤 소스가 이긴다. `include_tools` 는 frontmatter `metadata.include_tools` 의
+    공백 구분 도구 이름이다(deepagents skill tools). `path` 는 호스트의 SKILL.md 경로다.
+    """
+    result: dict[str, dict] = {}
+    for source in source_dirs or []:
+        try:
+            entries = sorted(p for p in Path(source).iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for entry in entries:
+            skill_md = entry / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+            data: dict = {}
+            try:
+                m = _FRONTMATTER_RE.match(skill_md.read_text(encoding="utf-8"))
+                loaded = yaml.safe_load(m.group(1)) if m else None
+                data = loaded if isinstance(loaded, dict) else {}
+            except (OSError, yaml.YAMLError):
+                pass
+            metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+            raw = metadata.get("include_tools")
+            name = str(data.get("name") or entry.name)
+            result[name] = {
+                "name": name,
+                "path": str(skill_md),
+                "include_tools": raw.split() if isinstance(raw, str) else [],
+            }
+    return result
+
+
+class ToolBindingSkillsMiddleware(SkillsMiddleware):
+    """`tools` 로 받은 스킬 바인딩 도구가 실제 모델 요청에 실렸는지 기록하는 SkillsMiddleware.
+
+    이름을 `SkillsMiddleware` 로 두어 create_deep_agent 의 기본 SkillsMiddleware 자리를
+    대신한다(요약 뒤·프롬프트 캐싱 앞, 범용 서브에이전트에도 상속). 기록은 deepagents 가
+    도구 공개를 마친 뒤의 요청을 본다 — 스킬을 읽기 전에는 없고 읽은 뒤에 생겼는지를 실제
+    실행 로그로 확인하기 위한 것이다.
+    """
+
+    def __init__(self, *, backend, sources, tools=None, **kwargs):
+        super().__init__(backend=backend, sources=sources, tools=tools, **kwargs)
+        self._bound_names = frozenset(getattr(t, "name", "") for t in (tools or []) if getattr(t, "name", ""))
+
+    @property
+    def name(self) -> str:
+        return "SkillsMiddleware"
+
+    def wrap_model_call(self, request, handler):
+        def _logged(req):
+            self._log_request(req)
+            return handler(req)
+
+        return super().wrap_model_call(request, _logged)
+
+    async def awrap_model_call(self, request, handler):
+        async def _logged(req):
+            self._log_request(req)
+            return await handler(req)
+
+        return await super().awrap_model_call(request, _logged)
+
+    def _log_request(self, request) -> None:
+        names = [_request_tool_name(t) for t in (request.tools or [])]
+        inline = [
+            _inline_tool_name(block)
+            for message in (request.messages or [])
+            if getattr(message, "type", "") == "system" and isinstance(message.content, list)
+            for block in message.content
+            if isinstance(block, dict)
+        ]
+        visible = sorted({n for n in (*names, *inline) if n in self._bound_names})
+        logger.debug("[skill-tools] %s model request tool names=%s", self.name, sorted(n for n in (*names, *inline) if n))
+        logger.info(
+            "[skill-tools] %s model request tools=%d bound_visible=%s bound_total=%d",
+            self.name, len(names) + len([n for n in inline if n]), visible, len(self._bound_names),
+        )
+
+
+def _request_tool_name(tool) -> str:
+    if isinstance(tool, dict):
+        function = tool.get("function")
+        return tool.get("name") or (function.get("name") if isinstance(function, dict) else "") or ""
+    return getattr(tool, "name", "") or ""
+
+
+def _inline_tool_name(block: dict) -> str:
+    """대화 중간 도구 추가 블록(Anthropic `tool_addition`, OpenAI `additional_tools`)이 싣는 도구 이름."""
+    if block.get("type") == "tool_addition":
+        return ((block.get("tool") or {}).get("definition") or {}).get("name") or ""
+    if block.get("type") == "additional_tools":
+        return ((block.get("tools") or [{}])[0]).get("name") or ""
+    return ""
+
+
+class FilteredSkillsMiddleware(ToolBindingSkillsMiddleware):
     """SkillsMiddleware that restricts visible skills to a specified set.
 
     Loads skills from the full collection but filters state so only the
     allowed skill names appear in the system prompt. Skills not in
     `allowed_skills` are invisible to the sub-agent.
     """
+
+    # 기본 SkillsMiddleware 자리를 대신하지 않는다 — 대신하면 create_deep_agent 가 그 소스로
+    # 범용 서브에이전트에 필터 없는 스킬을 붙인다. 지금까지와 같은 자리·이름을 유지한다.
+    @property
+    def name(self) -> str:
+        return "FilteredSkillsMiddleware"
 
     def __init__(self, *, backend, sources, allowed_skills: list[str], **kwargs):
         super().__init__(backend=backend, sources=sources, **kwargs)

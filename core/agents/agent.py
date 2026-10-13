@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -12,7 +13,13 @@ from ..rag.tools import get_memento_tools
 import asyncio
 
 from ..skills.eval_tools import get_skill_eval_tools
-from ..skills.skills import _get_skills, FilteredSkillsMiddleware
+from ..skills.skills import (
+    _get_skills,
+    _resolve_extends_chain,
+    FilteredSkillsMiddleware,
+    ToolBindingSkillsMiddleware,
+    scan_skill_include_tools,
+)
 from ..skills.git_providers.factory import get_provider as _get_git_provider
 from ..llm.mcp import _load_mcp_tools_grouped
 from .skill_eval_gate import SkillEvalGateMiddleware
@@ -34,6 +41,8 @@ from ..storage.storage import set_tenant_id as _set_storage_tenant_id
 from ..bpm.tools import get_bpm_tools, set_tenant_id as _set_bpm_tenant_id, set_user_context as _set_bpm_user
 from core.strategy.tools import get_strategy_tools
 from core.web.tools import get_web_tools
+
+logger = logging.getLogger(__name__)
 
 _BASE_DIR = Path(__file__).parent.parent.parent
 _SKILLS_DIR = Path(os.getenv("SKILLS_HOST", str(_BASE_DIR / "skills")))
@@ -457,19 +466,69 @@ async def build_agent(
         except ValueError:
             container_skills.append(p)
 
+    # 스킬에 바인딩할 도구(deepagents Binding tools to Skills): 이 에이전트에 보이는 스킬의
+    # SKILL.md `metadata.include_tools` 에 이름이 적힌 도구는 에이전트 tools 에서 빼서
+    # SkillsMiddleware 에 넘긴다 — 그 스킬을 읽거나 고정하기 전에는 모델에 보이지 않고, 읽은
+    # 뒤에만 보이고 호출된다. tools 에 남겨 두면 처음부터 보여 include_tools 가 효과가 없다.
+    # 소스 코드 도구든 테넌트 MCP 서버 도구든 이름으로만 정한다. 이름이 적히지 않은 도구는
+    # 지금처럼 처음부터 노출된다.
+    visible_skills = scan_skill_include_tools(host_skills)
+    if activity_skills and container_skills:
+        # FilteredSkillsMiddleware 와 같은 기준(extends 부모 포함)으로 보이는 스킬만 센다 —
+        # 목록 밖 스킬이 적은 도구까지 숨기면 그 도구에 닿을 길이 없다.
+        visible_skills = {
+            s["name"]: s
+            for s in _resolve_extends_chain(list(visible_skills.values()), frozenset(activity_skills))
+        }
+    bound_names = {name for s in visible_skills.values() for name in s["include_tools"]}
+    skill_bound_tools: list = []
+    if bound_names:
+        kept: list = []
+        bound_by_name: dict = {}
+        for t in tools:
+            name = getattr(t, "name", "")
+            if name not in bound_names:
+                kept.append(t)
+            else:
+                # 같은 이름이 여러 번 붙으면(예: process-gpt-mcp 와 core/bpm 의 execute_process)
+                # create_agent 의 ToolNode 처럼 마지막 것이 실제로 쓰이는 도구다. SkillsMiddleware 는
+                # 중복 이름을 거부하므로 그 하나만 넘긴다.
+                bound_by_name[name] = t
+        skill_bound_tools = list(bound_by_name.values())
+        tools = kept
+        logger.info(
+            "[skill-tools] 스킬에 바인딩한 도구: %s",
+            {
+                s["name"]: [n for n in s["include_tools"] if any(getattr(b, "name", "") == n for b in skill_bound_tools)]
+                for s in visible_skills.values()
+                if s["include_tools"]
+            },
+        )
+
     extra_middleware = list(middleware or [])
     # 활동 지정 스킬이 있으면 전체 스킬 목록 대신 필터링된 목록만 노출한다
     # (SkillsMiddleware 중복 부착을 피하기 위해 skills= 자체는 비운다).
-    skills_kwarg = container_skills or None
+    # 스킬에 바인딩한 도구는 SkillsMiddleware 의 tools 로 줘야 하므로 기본 SkillsMiddleware 를
+    # 쓰지 않고 직접 만든다. ToolBindingSkillsMiddleware 는 이름이 같아 기본 자리를 그대로
+    # 대신하고, deepagents 가 그 소스로 skills 를 채워 범용 서브에이전트도 지금처럼 스킬을 받는다.
+    skills_kwarg = None
     if activity_skills and container_skills:
         extra_middleware.append(
             FilteredSkillsMiddleware(
                 backend=backend,
                 sources=container_skills,
                 allowed_skills=activity_skills,
+                tools=skill_bound_tools,
             )
         )
-        skills_kwarg = None
+    elif container_skills:
+        extra_middleware.append(
+            ToolBindingSkillsMiddleware(
+                backend=backend,
+                sources=container_skills,
+                tools=skill_bound_tools,
+            )
+        )
 
     kwargs = dict(
         model=_build_model(),
