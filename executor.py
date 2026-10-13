@@ -59,6 +59,7 @@ from core.agents.input_builder import (
     build_user_message,
     collect_recent_messages,
     extract_skill_command,
+    log_pinned_skill_outcome,
     resolve_chat_room_id,
 )
 from core.chat.activity import (
@@ -1403,7 +1404,9 @@ class DeepAgentExecutor(AgentExecutor):
             else:
                 _latest_feedback_content = str(_latest_feedback_item or "").strip()
         # 채팅모드에서 사용자가 메시지 선두에 '/skill-name' 을 입력하면, 그 스킬이 현재
-        # 테넌트에서 실제로 사용 가능할 때 해당 스킬을 강제 지정한다(아래 activity_skills 오버라이드).
+        # 테넌트에서 실제로 사용 가능할 때 해당 스킬을 고정한다(pinned_skills) — 첫 모델
+        # 호출부터 SKILL.md 본문이 대화에 실려 스킬을 찾아 읽는 호출이 없어진다. 스킬 목록을
+        # 그 하나로 덮어쓰지는 않는다: 목록은 thread 에 남아, 덮어쓰면 다음 턴에도 그 스킬만 보인다.
         _forced_skill_name = ""
         if _latest_feedback_content:
             _original_query = str(context.get_user_input() or "").strip()
@@ -1431,6 +1434,7 @@ class DeepAgentExecutor(AgentExecutor):
                 suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
                 agents=_exclude_root_profile(agents),
             )
+        pinned_skills = [_forced_skill_name] if _forced_skill_name else []
         recent_msgs = collect_recent_messages(extras) if is_chat else []
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).
         _user_input_text = ""
@@ -1656,6 +1660,7 @@ class DeepAgentExecutor(AgentExecutor):
             recent_messages=recent_msgs,
             has_checkpoint=has_checkpoint,
             has_pending_interrupt=has_pending_interrupt,
+            pinned_skills=pinned_skills,
         )
 
         if use_graph_resume:
@@ -1763,11 +1768,6 @@ class DeepAgentExecutor(AgentExecutor):
                         proc_def_id, activity_id,
                     )
 
-        # 사용자가 채팅 메시지에 '/skill-name' 슬래시 커맨드를 입력한 경우, 액티비티 정의로
-        # 유도된 스킬 목록과 무관하게 그 스킬 하나로 반드시 실행되도록 덮어쓴다.
-        if _forced_skill_name:
-            activity_skills = [_forced_skill_name]
-
         _root_tools_by_server: dict[str, list[str]] = {}
         for _tool_name, _srv in _root_tool_servers.items():
             _root_tools_by_server.setdefault(_srv, []).append(_tool_name)
@@ -1861,6 +1861,7 @@ class DeepAgentExecutor(AgentExecutor):
             is_chat=is_chat,
             activity_tools=activity_tools,
             activity_skills=activity_skills,
+            pinned_skills=pinned_skills,
             root_profile=agent_profile,
             user_context={
                 "user_jwt": user_jwt,
@@ -2244,6 +2245,8 @@ class DeepAgentExecutor(AgentExecutor):
                     logger.warning("chat_room context 저장 실패 | room_id=%s", chat_room_id, exc_info=True)
 
             raw_text = extract_final_text(final_state, streamed_fallback=full_response)
+            if pinned_skills:
+                log_pinned_skill_outcome(final_state, pinned_skills, room_id=chat_room_id)
 
             # 채팅: 스킬이 만든 hwpx 를 office-mcp 로 실체화해 기존 채팅 아티팩트(미리보기/편집)로 띄운다.
             if is_chat and streamer is not None:

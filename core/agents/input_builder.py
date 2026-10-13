@@ -198,6 +198,7 @@ def build_graph_inputs(
     recent_messages: list[dict[str, Any]] | None = None,
     has_checkpoint: bool = False,
     has_pending_interrupt: bool = False,
+    pinned_skills: list[str] | None = None,
 ) -> tuple[Any, bool]:
     """그래프 실행 입력과 use_graph_resume 플래그를 반환한다.
 
@@ -207,6 +208,11 @@ def build_graph_inputs(
         - use_graph_resume: True이면 LangGraph Command(resume=) 경로
 
     Args:
+        pinned_skills: 이번 턴에 고정할 스킬 이름. SkillsMiddleware 가 첫 모델 호출 전에
+            각 SKILL.md 본문을 대화에 붙이므로 모델이 스킬을 찾아 읽는 호출을 건너뛴다.
+            스킬 목록은 thread 당 한 번만 스캔돼 체크포인트에 남는데, 그 목록에 없는 이름은
+            조용히 고정되지 않는다. 그래서 고정하는 턴에는 `skills_metadata` 를 비워 다시
+            스캔하게 한다. 재개(Command) 입력에는 싣지 않는다.
         has_checkpoint: 이 thread_id 에 이미 누적된 체크포인트 상태가 있으면 True.
             지속 체크포인터(공유 메모리/Postgres) 사용 시, 이미 누적된 대화에 또 history 를
             주입하면 메시지가 중복되므로, 이 경우 새 사용자 메시지만 넘긴다.
@@ -228,6 +234,12 @@ def build_graph_inputs(
     if use_graph_resume:
         return Command(resume={"answer": human_answer_stripped}), True
 
+    def _with_pins(inputs: dict[str, Any]) -> dict[str, Any]:
+        if pinned_skills:
+            inputs["pinned_skills"] = list(pinned_skills)
+            inputs["skills_metadata"] = None
+        return inputs
+
     if human_answer_stripped:
         pending_field = run_state.get("pending_field") or "human_response"
         augmented = (
@@ -236,11 +248,11 @@ def build_graph_inputs(
             f"{human_answer_stripped}\n\n"
             "Use this to continue the task immediately; do not ask for the same information again."
         )
-        return {"messages": [{"role": "user", "content": augmented}]}, False
+        return _with_pins({"messages": [{"role": "user", "content": augmented}]}), False
 
     # 이미 체크포인트에 대화가 누적돼 있으면 history 재주입 없이 새 메시지만 추가한다(중복 방지).
     if has_checkpoint:
-        return {"messages": [{"role": "user", "content": user_message}]}, False
+        return _with_pins({"messages": [{"role": "user", "content": user_message}]}), False
 
     history = list(recent_messages or [])
     if (
@@ -252,7 +264,53 @@ def build_graph_inputs(
     else:
         state_msgs = [*history, {"role": "user", "content": user_message}]
 
-    return {"messages": state_msgs}, False
+    return _with_pins({"messages": state_msgs}), False
+
+
+def pinned_skill_outcome(state: dict[str, Any], pinned_skills: list[str]) -> dict[str, list[str]]:
+    """이번 턴에 고정이 실제로 대화에 실렸는지, 그런데도 모델이 SKILL.md 를 다시 읽었는지.
+
+    SkillsMiddleware 는 목록에 없거나 읽을 수 없는 스킬을 오류 없이 건너뛰므로, 고정을
+    요청했다는 사실만으로는 적용 여부를 알 수 없다. 이번 턴(마지막 사용자 메시지 이후)의
+    메시지만 본다.
+    """
+    messages = list((state or {}).get("messages") or [])
+    start = 0
+    for i, m in enumerate(messages):
+        if getattr(m, "type", "") == "human" and (getattr(m, "additional_kwargs", None) or {}).get("lc_source") != "pinned_skill":
+            start = i
+    turn = messages[start:]
+    pinned = [
+        str(((m.additional_kwargs or {}).get("skill") or {}).get("name") or "")
+        for m in turn
+        if getattr(m, "type", "") == "human" and (getattr(m, "additional_kwargs", None) or {}).get("lc_source") == "pinned_skill"
+    ]
+    reread = [
+        name
+        for m in turn
+        for call in (getattr(m, "tool_calls", None) or [])
+        if call.get("name") == "read_file"
+        for name in pinned_skills
+        if f"/{name}/SKILL.md" in str((call.get("args") or {}).get("file_path") or "")
+    ]
+    return {
+        "requested": list(pinned_skills),
+        "pinned": pinned,
+        "missing": [n for n in pinned_skills if n not in pinned],
+        "reread": reread,
+    }
+
+
+def log_pinned_skill_outcome(state: dict[str, Any], pinned_skills: list[str], *, room_id: str = "") -> None:
+    try:
+        outcome = pinned_skill_outcome(state, pinned_skills)
+    except Exception:
+        logger.warning("고정 스킬 결과 확인 실패 | room_id=%s", room_id, exc_info=True)
+        return
+    if outcome["missing"]:
+        logger.warning("고정 스킬이 대화에 실리지 않음 | room_id=%s %s", room_id, outcome)
+    else:
+        logger.info("고정 스킬 적용 | room_id=%s %s", room_id, outcome)
 
 
 # ---------------------------------------------------------------------------

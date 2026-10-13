@@ -236,6 +236,7 @@ async def build_agent(
     is_chat: bool = True,
     activity_tools: list[str] | None = None,
     activity_skills: list[str] | None = None,
+    pinned_skills: list[str] | None = None,
     root_profile: dict | None = None,
 ):
     if system_prompt is None:
@@ -292,6 +293,12 @@ async def build_agent(
         _rp_skill_names = _parse_csv(root_profile.get("skills"))
         if _rp_skill_names:
             activity_skills = list(dict.fromkeys(list(activity_skills or []) + _rp_skill_names))
+
+    # 고정할 스킬은 목록에 있어야 고정된다(SkillsMiddleware 는 목록에 없는 이름을 조용히
+    # 건너뛴다). 액티비티·프로필로 목록이 좁혀져 있으면 거기에 더한다. 좁히지 않았으면
+    # 전체 목록에 이미 있으므로 필터를 새로 만들지 않는다.
+    if activity_skills and pinned_skills:
+        activity_skills = list(dict.fromkeys([*activity_skills, *pinned_skills]))
 
     # 활동(activity)에 서브에이전트 프로필 없이 tools/skills 만 지정된 경우, 별도의
     # 폴백 서브에이전트를 만드는 대신 루트 딥에이전트에 도구/스킬을 직접 부착한다.
@@ -381,6 +388,18 @@ async def build_agent(
             _act_lines.append(f"- 이 액티비티에 지정된 스킬: {', '.join(activity_skills)}")
         _act_lines.append("- 위 도구/스킬을 우선 사용해 업무를 수행하세요.")
         final_prompt = final_prompt + "\n".join(_act_lines)
+
+    # 고정한 스킬은 본문이 이미 대화에 `<skill name=... path=...>` 블록으로 실린다. 위의 작업
+    # 선택 규칙("SKILL.md 를 read_file 로 읽어 절차를 따른다")만 보면 모델이 같은 파일을 다시
+    # 읽어, 고정으로 줄인 모델 호출이 그대로 되살아난다(대화 두 번째 턴부터 실제로 그랬다).
+    if pinned_skills:
+        final_prompt = final_prompt + (
+            "\n\n## 이번 요청에 고정된 스킬\n"
+            f"- 사용자가 지정한 스킬: {', '.join(pinned_skills)}\n"
+            "- 이 스킬의 SKILL.md 본문은 대화에 `<skill name=\"...\" path=\"...\">` 블록으로 **이미 전부 실려 있다**. "
+            "그 SKILL.md 를 read_file 로 다시 읽지 말고, 그 지시대로 바로 수행한다. "
+            "(SKILL.md 가 가리키는 references/ 등 다른 파일은 필요하면 읽어도 된다.)"
+        )
 
     # 방별 산출물 디렉터리 주입 + 프로세스별 하위 폴더(한 방에 여러 프로세스 가능).
     # 폴더명은 executor 가 **구체적인 값**을 생성해 주입한다(에이전트가 `<랜덤 id>`·`<new_id>` 같은
