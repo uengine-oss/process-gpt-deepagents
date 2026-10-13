@@ -16,6 +16,7 @@ tenant_id 당 하나의 컨테이너를 재사용하며, atexit 훅으로 프로
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import contextvars
 import io
@@ -626,6 +627,22 @@ class DockerSandboxBackend(BaseSandbox):
     def write(self, file_path: str, content: str) -> WriteResult:
         with self._file_lock(file_path):
             return super().write(file_path, content)
+
+    # deepagents 0.7 부터 BaseSandbox.aedit/awrite 는 동기 edit/write 를 거치지 않고
+    # aexecute/aupload_files 로 바로 간다. 그대로 두면 미들웨어(비동기 경로)의 편집이 위
+    # 잠금을 우회해 같은 파일 동시 편집으로 파일이 깨지던 문제가 되살아나므로, 잠금이 걸린
+    # 동기 경로로 되돌린다.
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,  # noqa: FBT001, FBT002
+    ) -> EditResult:
+        return await asyncio.to_thread(self.edit, file_path, old_string, new_string, replace_all)
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.write, file_path, content)
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """셸 명령을 실행한다. 총 소요는 기동 상한 + 실행 상한을 넘지 않는다.

@@ -98,6 +98,18 @@ async def test_async_edits_from_middleware_are_serialized(backend, monkeypatch):
     assert probe.max_active == 1
 
 
+async def test_async_writes_from_middleware_are_serialized(backend, monkeypatch):
+    """deepagents 0.7 의 awrite 는 write 를 거치지 않고 aupload_files 로 간다. 그 우회가 막혀야 한다."""
+    probe = _ConcurrencyProbe()
+    monkeypatch.setattr(ds.BaseSandbox, "write", probe)
+    path = "/workspace/.checkouts/room-1/skill/evals/evals.json"
+
+    results = await asyncio.gather(*(backend.awrite(path, f"{{\"i\": {i}}}") for i in range(4)))
+
+    assert results == ["ok"] * 4
+    assert probe.max_active == 1
+
+
 def test_same_path_always_maps_to_same_lock(backend):
     path = "/workspace/.checkouts/room-1/skill/SKILL.md"
     assert backend._file_lock(path) is backend._file_lock(path)
