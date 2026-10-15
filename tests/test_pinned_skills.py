@@ -22,7 +22,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from core.agents.input_builder import build_graph_inputs, pinned_skill_outcome
-from core.skills.skills import FilteredSkillsMiddleware
+from core.skills.skills import FilteredSkillsMiddleware, ToolBindingSkillsMiddleware, skill_reload_inputs
 
 MARKER = "MEETING-PREP-STEP-7f3a"
 SKILL_PATH = "/skills/meeting-prep/SKILL.md"
@@ -68,10 +68,11 @@ def _agent(root: Path, saver, *, allowed: list[str] | None = None):
     backend = FilesystemBackend(root_dir=root, virtual_mode=True)
     model = _SkillFollowingModel(requests=[])
     kwargs: dict = dict(model=model, backend=backend, checkpointer=saver, system_prompt="너는 업무 비서다.")
+    # core/agents/agent.py 와 같은 조립 — 기본 SkillsMiddleware 자리를 서비스 미들웨어가 대신한다.
     if allowed is None:
-        kwargs["skills"] = ["/skills/"]
+        kwargs["middleware"] = [ToolBindingSkillsMiddleware(backend=backend, sources=["/skills/"])]
     else:
-        # 액티비티·프로필로 목록을 좁힌 경우 — core/agents/agent.py 와 같은 조립.
+        # 액티비티·프로필로 목록을 좁힌 경우.
         kwargs["middleware"] = [FilteredSkillsMiddleware(backend=backend, sources=["/skills/"], allowed_skills=allowed)]
     return create_deep_agent(**kwargs), model
 
@@ -82,6 +83,13 @@ def _inputs(text: str, *, pinned: list[str] | None, has_checkpoint: bool = False
         recent_messages=[], has_checkpoint=has_checkpoint, has_pending_interrupt=False, pinned_skills=pinned,
     )
     return inputs
+
+
+async def _with_reload(inputs: dict, saver, config, root: Path) -> dict:
+    """executor 처럼 이 thread 의 체크포인트를 보고 스킬 재로드 입력을 더한다."""
+    tup = await saver.aget_tuple(config)
+    values = dict(tup.checkpoint.get("channel_values") or {}) if tup else {}
+    return {**inputs, **skill_reload_inputs(values, [str(root / "skills")], ["/skills"])}
 
 
 def _read_file_calls(state) -> list:
@@ -117,16 +125,17 @@ async def test_without_pin_the_model_spends_a_call_reading_the_skill(tmp_path):
 
 
 async def test_skill_added_mid_conversation_is_still_pinned(tmp_path):
-    """스킬 목록은 첫 턴에 스캔돼 남는다. 그 뒤 생긴 스킬을 고정하려면 목록을 다시 스캔해야 한다."""
+    """스킬 목록은 첫 턴에 스캔돼 남는다. 그 뒤 생긴 스킬은 스킬 재로드로 목록에 들어와 고정된다."""
     _write_skill(tmp_path, "other", "OTHER-0000")
     saver = InMemorySaver()
     config = {"configurable": {"thread_id": "t3"}}
     graph, _ = _agent(tmp_path, saver)
-    await graph.ainvoke(_inputs("안녕", pinned=None), config=config)
+    await graph.ainvoke(await _with_reload(_inputs("안녕", pinned=None), saver, config, tmp_path), config=config)
 
     _write_skill(tmp_path, "meeting-prep", MARKER)
     graph, model = _agent(tmp_path, saver)
-    state = await graph.ainvoke(_inputs("내일 회의 준비해줘", pinned=["meeting-prep"], has_checkpoint=True), config=config)
+    inputs = _inputs("내일 회의 준비해줘", pinned=["meeting-prep"], has_checkpoint=True)
+    state = await graph.ainvoke(await _with_reload(inputs, saver, config, tmp_path), config=config)
 
     assert len(model.requests) == 1
     assert state["messages"][-1].content.startswith(MARKER)
@@ -146,10 +155,12 @@ async def test_pin_works_when_skill_list_is_filtered(tmp_path):
 
 
 @pytest.mark.parametrize("has_checkpoint", [False, True])
-def test_graph_inputs_carry_pins_and_request_a_rescan(has_checkpoint):
+def test_graph_inputs_carry_pins_without_forcing_a_rescan(has_checkpoint):
+    """고정만으로 다시 스캔하지 않는다 — 대화 도중 추가한 스킬은 스킬 재로드가 목록에 넣는다
+    (tests/test_skill_reload.py::test_skill_added_mid_conversation_can_be_pinned)."""
     inputs = _inputs("x", pinned=["meeting-prep"], has_checkpoint=has_checkpoint)
     assert inputs["pinned_skills"] == ["meeting-prep"]
-    assert "skills_metadata" in inputs and inputs["skills_metadata"] is None
+    assert "skills_metadata" not in inputs, "스킬이 바뀌지 않았는데 고정하는 턴마다 다시 스캔하면 안 된다"
 
 
 def test_graph_inputs_without_pins_leave_skill_state_alone():

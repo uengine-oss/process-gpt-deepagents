@@ -210,9 +210,9 @@ def build_graph_inputs(
     Args:
         pinned_skills: 이번 턴에 고정할 스킬 이름. SkillsMiddleware 가 첫 모델 호출 전에
             각 SKILL.md 본문을 대화에 붙이므로 모델이 스킬을 찾아 읽는 호출을 건너뛴다.
-            스킬 목록은 thread 당 한 번만 스캔돼 체크포인트에 남는데, 그 목록에 없는 이름은
-            조용히 고정되지 않는다. 그래서 고정하는 턴에는 `skills_metadata` 를 비워 다시
-            스캔하게 한다. 재개(Command) 입력에는 싣지 않는다.
+            목록에 없는 이름은 조용히 고정되지 않는데, 대화 도중 추가한 스킬도 스킬이 바뀐
+            턴에 SkillsMiddleware 가 목록을 다시 읽으므로(ToolBindingSkillsMiddleware) 여기서
+            `skills_metadata` 를 따로 비우지 않는다. 재개(Command) 입력에는 싣지 않는다.
         has_checkpoint: 이 thread_id 에 이미 누적된 체크포인트 상태가 있으면 True.
             지속 체크포인터(공유 메모리/Postgres) 사용 시, 이미 누적된 대화에 또 history 를
             주입하면 메시지가 중복되므로, 이 경우 새 사용자 메시지만 넘긴다.
@@ -237,7 +237,6 @@ def build_graph_inputs(
     def _with_pins(inputs: dict[str, Any]) -> dict[str, Any]:
         if pinned_skills:
             inputs["pinned_skills"] = list(pinned_skills)
-            inputs["skills_metadata"] = None
         return inputs
 
     if human_answer_stripped:

@@ -26,7 +26,7 @@ from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Overwrite
 from typing_extensions import override
 
-from core.agents.agent import build_agent
+from core.agents.agent import build_agent, resolve_skill_sources
 from core.agents.steering import SteeringMiddleware
 from core.bpm.tools import set_process_context
 from core.storage.checkpointer import (
@@ -78,10 +78,10 @@ from core.chat.chat_room import (
 )
 from core.chat.event_tap import EventTapStreamer
 from core.chat.tool_arg_stream import ToolArgTextStreamer
-from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
+from core.llm.mcp import fetch_tenant_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
-from core.skills.skills import resolve_slash_skill
+from core.skills.skills import resolve_slash_skill, skill_reload_inputs
 from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
@@ -1355,24 +1355,7 @@ class DeepAgentExecutor(AgentExecutor):
 
             streamer = EventTapStreamer(streamer, on_event=_on_context_event)
 
-        tenant_mcp: dict[str, Any] = {}
-        if tenant_id:
-            try:
-                from core.storage.db import get_supabase
-                sb = get_supabase()
-                result = (
-                    sb.table("tenants")
-                    .select("mcp")
-                    .eq("id", tenant_id)
-                    .single()
-                    .execute()
-                )
-                fetched = (result.data or {}).get("mcp")
-                if isinstance(fetched, dict):
-                    tenant_mcp = fetched
-            except Exception:
-                logger.warning("tenant_mcp DB 조회 실패 | tenant_id=%s", tenant_id, exc_info=True)
-            tenant_mcp = ensure_process_gpt_mcp(tenant_mcp, tenant_id)
+        tenant_mcp: dict[str, Any] = await asyncio.to_thread(fetch_tenant_mcp, tenant_id) if tenant_id else {}
         chat_root_tools, _root_tool_servers = (
             await load_chat_root_tools(tenant_mcp) if is_chat else ([], {})
         )
@@ -1630,12 +1613,14 @@ class DeepAgentExecutor(AgentExecutor):
         # 를 만들고, 그걸 executor 가 중복 HITL 로 억제해 사용자에겐 빈 응답만 남는다.
         has_checkpoint = False
         has_pending_interrupt = False
+        checkpoint_values: dict = {}
         if checkpointer is not None and checkpoint_thread_id:
             try:
                 _cfg = {"configurable": {"thread_id": checkpoint_thread_id}}
                 _tup = await checkpointer.aget_tuple(_cfg)
                 has_checkpoint = _tup is not None
                 has_pending_interrupt = _pending_interrupt(_tup)
+                checkpoint_values = dict((_tup.checkpoint or {}).get("channel_values") or {}) if _tup else {}
             except Exception:
                 logger.warning("체크포인트 존재 확인 실패 | thread_id=%s", checkpoint_thread_id, exc_info=True)
                 has_checkpoint = False
@@ -1835,8 +1820,10 @@ class DeepAgentExecutor(AgentExecutor):
                 )
             full_response = ""
 
+        skill_sources = await resolve_skill_sources(tenant_id)
         graph, _, _sub_mcp_tools_meta = await build_agent(
             tenant_id=tenant_id,
+            skill_sources=skill_sources,
             conversation_id=workspace_conversation_id or "",
             checkpointer=checkpointer,
             subagents_raw=_exclude_root_profile(agents),
@@ -1911,6 +1898,12 @@ class DeepAgentExecutor(AgentExecutor):
                 use_graph_resume=use_graph_resume,
                 has_pending_interrupt=has_pending_interrupt,
             )
+
+        # 스킬 재로드(deepagents Reload skills): 이 대화가 스킬 목록을 읽은 뒤 SKILL.md 가
+        # 바뀌었으면 이번 실행 입력에 `skills_metadata: None` 을 넣어 다시 읽게 한다. 재개
+        # (Command)·체크포인트 이어 가기 입력에는 싣지 않는다 — 그 실행은 목록을 다시 읽지 않는다.
+        if isinstance(inputs, dict):
+            inputs.update(skill_reload_inputs(checkpoint_values, *skill_sources))
 
         active_tool_calls: dict[str, str] = {}
         # request_human_input 의 인자(질문·초안 본문)를 쓰는 동안 화면에 흘려보내기 위한

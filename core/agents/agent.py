@@ -22,6 +22,7 @@ from ..skills.skills import (
 )
 from ..skills.git_providers.factory import get_provider as _get_git_provider
 from ..llm.mcp import _load_mcp_tools_grouped
+from ..skills import tool_catalog
 from .skill_eval_gate import SkillEvalGateMiddleware
 from .subagents import _build_subagents, _format_profile_traits, _normalize_tool_filters, _parse_csv
 from ..skills.tools import (
@@ -230,30 +231,15 @@ CUSTOM_PROFILE_SYSTEM_PROMPT = (
 )
 
 
-async def build_agent(
-    tenant_id: str = "",
-    system_prompt: str | None = None,
-    extra_tools: list = None,
-    checkpointer=None,
-    subagents_raw: list = None,
-    tenant_mcp: dict | None = None,
-    middleware: list = None,
-    static_subagents: list = None,
-    conversation_id: str = "",
-    user_context: dict | None = None,
-    agent_mode: str = "",
-    is_chat: bool = True,
-    activity_tools: list[str] | None = None,
-    activity_skills: list[str] | None = None,
-    pinned_skills: list[str] | None = None,
-    root_profile: dict | None = None,
-):
-    if system_prompt is None:
-        system_prompt = CUSTOM_PROFILE_SYSTEM_PROMPT if root_profile else DEFAULT_SYSTEM_PROMPT
 
+def root_service_tools(*, is_chat: bool, agent_mode: str = "") -> list:
+    """루트 에이전트에 붙는 서비스 코드 도구(테넌트 MCP·액티비티·프로필 도구 제외).
+
+    build_agent 와 스킬 도구 카탈로그(GET /skill-tools/catalog)가 같은 목록을 쓰도록 한곳에 둔다 —
+    카탈로그의 도구 이름이 실제 에이전트의 도구 이름과 어긋나면 스킬에 적어도 묶이지 않는다.
+    """
     tools = (
-        list(extra_tools or [])
-        + (get_hitl_tools() if hitl_tools_enabled(agent_mode=agent_mode, is_chat=is_chat) else [])
+        (get_hitl_tools() if hitl_tools_enabled(agent_mode=agent_mode, is_chat=is_chat) else [])
         + get_memento_tools()
         # 프로세스를 새로 시작하는 도구는 채팅에서만 준다 — 워크아이템을 처리하던 에이전트가
         # 업무 도중 다른 인스턴스를 만들어 버리지 않게.
@@ -281,6 +267,55 @@ async def build_agent(
     # 워크아이템 실행(is_chat=False)에는 여전히 붙이지 않는다.
     if is_chat:
         tools += get_skill_eval_tools()
+    return tools
+
+
+async def resolve_skill_sources(tenant_id: str) -> tuple[list[str], list[str]]:
+    """이 테넌트 에이전트의 스킬 소스를 `(호스트 경로, 에이전트가 보는 경로)` 로 같은 순서로 돌려준다."""
+    provider_config_id = ""
+    if tenant_id:
+        try:
+            _git_provider = await asyncio.to_thread(_get_git_provider, tenant_id)
+            provider_config_id = _git_provider.config_id
+        except Exception:
+            pass
+
+    host_skills = _get_skills(tenant_id, provider_config_id) or []
+    container_skills = []
+    for p in host_skills:
+        try:
+            rel = Path(p).relative_to(_SKILLS_DIR)
+            container_skills.append(f"{_SKILLS_CONTAINER_MOUNT}/{rel}")
+        except ValueError:
+            container_skills.append(p)
+    return host_skills, container_skills
+
+
+async def build_agent(
+    tenant_id: str = "",
+    system_prompt: str | None = None,
+    extra_tools: list = None,
+    checkpointer=None,
+    subagents_raw: list = None,
+    tenant_mcp: dict | None = None,
+    middleware: list = None,
+    static_subagents: list = None,
+    conversation_id: str = "",
+    user_context: dict | None = None,
+    agent_mode: str = "",
+    is_chat: bool = True,
+    activity_tools: list[str] | None = None,
+    activity_skills: list[str] | None = None,
+    pinned_skills: list[str] | None = None,
+    root_profile: dict | None = None,
+    skill_sources: tuple[list[str], list[str]] | None = None,
+):
+    """`skill_sources` 는 `resolve_skill_sources` 결과다. executor 가 같은 경로로 스킬 재로드
+    여부를 정하므로 한 번 구한 것을 넘긴다(없으면 여기서 구한다)."""
+    if system_prompt is None:
+        system_prompt = CUSTOM_PROFILE_SYSTEM_PROMPT if root_profile else DEFAULT_SYSTEM_PROMPT
+
+    tools = list(extra_tools or []) + root_service_tools(is_chat=is_chat, agent_mode=agent_mode)
 
     backend = get_or_create_sandbox(tenant_id, workspace_host=_BASE_DIR / "workspace", skills_host=_SKILLS_DIR)
     _skill_sandbox.set(backend)
@@ -449,45 +484,22 @@ async def build_agent(
             f"실제 저장은 사용자가 화면에서 '저장' 버튼을 눌러 한다."
         )
 
-    provider_config_id = ""
-    if tenant_id:
-        try:
-            _git_provider = await asyncio.to_thread(_get_git_provider, tenant_id)
-            provider_config_id = _git_provider.config_id
-        except Exception:
-            pass
+    host_skills, container_skills = skill_sources if skill_sources is not None else await resolve_skill_sources(tenant_id)
 
-    host_skills = _get_skills(tenant_id, provider_config_id) or []
-    container_skills = []
-    for p in host_skills:
-        try:
-            rel = Path(p).relative_to(_SKILLS_DIR)
-            container_skills.append(f"{_SKILLS_CONTAINER_MOUNT}/{rel}")
-        except ValueError:
-            container_skills.append(p)
-
-    # 스킬에 바인딩할 도구(deepagents Binding tools to Skills): 이 에이전트에 보이는 스킬의
-    # SKILL.md `metadata.include_tools` 에 이름이 적힌 도구는 에이전트 tools 에서 빼서
-    # SkillsMiddleware 에 넘긴다 — 그 스킬을 읽거나 고정하기 전에는 모델에 보이지 않고, 읽은
-    # 뒤에만 보이고 호출된다. tools 에 남겨 두면 처음부터 보여 include_tools 가 효과가 없다.
-    # 소스 코드 도구든 테넌트 MCP 서버 도구든 이름으로만 정한다. 이름이 적히지 않은 도구는
-    # 지금처럼 처음부터 노출된다.
-    visible_skills = scan_skill_include_tools(host_skills)
-    if activity_skills and container_skills:
-        # FilteredSkillsMiddleware 와 같은 기준(extends 부모 포함)으로 보이는 스킬만 센다 —
-        # 목록 밖 스킬이 적은 도구까지 숨기면 그 도구에 닿을 길이 없다.
-        visible_skills = {
-            s["name"]: s
-            for s in _resolve_extends_chain(list(visible_skills.values()), frozenset(activity_skills))
-        }
-    bound_names = {name for s in visible_skills.values() for name in s["include_tools"]}
+    # 스킬 전용 도구(deepagents Add tools to skills): 테넌트 관리자가 스킬 전용으로 지정한 도구만
+    # 에이전트 tools 에서 빼서 SkillsMiddleware 에 넘긴다 — 그 도구를 `metadata.include_tools` 에
+    # 적은 스킬을 읽거나 고정하기 전에는 모델에 보이지 않고, 읽은 뒤에만 보이고 호출된다.
+    # 지정되지 않은 도구는 스킬에 적혀 있어도 tools 에 남아 처음부터 보인다(공식 동작 — 에이전트
+    # 자신의 도구는 include_tools 의 영향을 받지 않는다). include_tools 는 숨길지가 아니라 어느
+    # 스킬이 그 도구를 여는지만 정한다. 소스 코드 도구든 테넌트 MCP 서버 도구든 이름으로만 정한다.
+    skill_only_names = await asyncio.to_thread(tool_catalog.load_skill_only_tools, tenant_id)
     skill_bound_tools: list = []
-    if bound_names:
+    if skill_only_names:
         kept: list = []
         bound_by_name: dict = {}
         for t in tools:
             name = getattr(t, "name", "")
-            if name not in bound_names:
+            if name not in skill_only_names:
                 kept.append(t)
             else:
                 # 같은 이름이 여러 번 붙으면(예: process-gpt-mcp 와 core/bpm 의 execute_process)
@@ -496,14 +508,22 @@ async def build_agent(
                 bound_by_name[name] = t
         skill_bound_tools = list(bound_by_name.values())
         tools = kept
-        logger.info(
-            "[skill-tools] 스킬에 바인딩한 도구: %s",
-            {
-                s["name"]: [n for n in s["include_tools"] if any(getattr(b, "name", "") == n for b in skill_bound_tools)]
-                for s in visible_skills.values()
-                if s["include_tools"]
-            },
-        )
+        if skill_bound_tools:
+            visible_skills = scan_skill_include_tools(host_skills)
+            if activity_skills and container_skills:
+                # FilteredSkillsMiddleware 와 같은 기준(extends 부모 포함)으로 이 에이전트에 보이는 스킬.
+                visible_skills = {
+                    s["name"]: s
+                    for s in _resolve_extends_chain(list(visible_skills.values()), frozenset(activity_skills))
+                }
+            openers = {
+                b.name: sorted(s["name"] for s in visible_skills.values() if b.name in s["include_tools"])
+                for b in skill_bound_tools
+            }
+            logger.info("[skill-tools] 스킬 전용 도구와 여는 스킬: %s", openers)
+            closed = sorted(n for n, skills in openers.items() if not skills)
+            if closed:
+                logger.warning("[skill-tools] 이 에이전트에서 여는 스킬이 없어 쓸 수 없는 스킬 전용 도구: %s", closed)
 
     extra_middleware = list(middleware or [])
     # 활동 지정 스킬이 있으면 전체 스킬 목록 대신 필터링된 목록만 노출한다

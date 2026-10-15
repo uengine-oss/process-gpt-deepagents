@@ -3,8 +3,11 @@ import os
 import re
 from pathlib import Path
 
+from typing import Annotated, NotRequired
+
 import yaml
-from deepagents.middleware.skills import SkillsMiddleware, SkillsStateUpdate
+from deepagents.middleware.skills import SkillsMiddleware, SkillsState, SkillsStateUpdate
+from langchain.agents.middleware.types import OmitFromOutput
 
 _BASE_DIR = Path(__file__).parent.parent.parent
 
@@ -251,6 +254,63 @@ def scan_skill_include_tools(source_dirs) -> dict[str, dict]:
     return result
 
 
+def skill_sources_fingerprint(host_sources, sources) -> dict[str, str]:
+    """스킬 소스의 `{SKILL.md 경로: "수정시각:크기"}` — 파일을 읽지 않고 stat 만 한다.
+
+    SkillsMiddleware 와 같은 규칙(소스 바로 아래 디렉터리마다 SKILL.md)으로 본다. 키는
+    `sources`(에이전트가 보는 경로) 기준이라 `skills_metadata` 의 `path` 와 같다.
+    `host_sources` 는 같은 순서의 호스트 경로다(샌드박스 마운트 전 실제 위치).
+    """
+    result: dict[str, str] = {}
+    for host, source in zip(host_sources, sources):
+        try:
+            entries = sorted(e.name for e in os.scandir(host) if e.is_dir())
+        except OSError:
+            continue
+        for name in entries:
+            try:
+                st = os.stat(os.path.join(host, name, "SKILL.md"))
+            except OSError:
+                continue
+            result[f"{source.rstrip('/')}/{name}/SKILL.md"] = f"{st.st_mtime_ns}:{st.st_size}"
+    return result
+
+
+class SkillReloadState(SkillsState):
+    skills_fingerprint: NotRequired[Annotated[dict[str, str] | None, OmitFromOutput]]
+    """`skills_metadata` 를 읽던 때의 `skill_sources_fingerprint`. 다르면 스킬이 바뀐 것이다.
+
+    실행 입력으로 받아야 하므로 `skills_metadata` 와 같이 입력에서는 보이고 출력에서만 뺀다.
+    """
+
+
+def skill_reload_inputs(checkpoint_values, host_sources, sources) -> dict:
+    """이번 실행 입력에 더할 스킬 재로드 값(deepagents Reload skills).
+
+    SkillsMiddleware 는 thread 마다 한 번 읽은 목록을 `skills_metadata` 에 두고 체크포인트로
+    이어 쓴다. 공식 방법은 다시 읽힐 실행의 입력에 `skills_metadata: None` 을 넣는 것이다.
+    언제 넣을지는 앱이 정하므로, SKILL.md 의 stat 이 그 목록을 읽던 때(체크포인트의
+    `skills_fingerprint`)와 다를 때만 넣는다 — 바뀌지 않은 턴에는 다시 스캔하지 않는다.
+    `checkpoint_values` 는 이 thread 의 마지막 체크포인트 값(없으면 빈 dict)이다.
+    """
+    fingerprint = skill_sources_fingerprint(host_sources, sources)
+    values = checkpoint_values or {}
+    if values.get("skills_metadata") is None:
+        # 아직 읽지 않은 thread — SkillsMiddleware 가 이번 실행에서 읽는다. 기준만 남긴다.
+        return {"skills_fingerprint": fingerprint}
+    before = values.get("skills_fingerprint")
+    if before == fingerprint:
+        return {}
+    before = before or {}
+    logger.info(
+        "[skill-reload] 스킬 파일이 바뀌어 이번 실행에서 다시 읽음 added=%s removed=%s modified=%s",
+        sorted(fingerprint.keys() - before.keys()),
+        sorted(before.keys() - fingerprint.keys()),
+        sorted(k for k in fingerprint.keys() & before.keys() if fingerprint[k] != before[k]),
+    )
+    return {"skills_metadata": None, "skills_fingerprint": fingerprint}
+
+
 class ToolBindingSkillsMiddleware(SkillsMiddleware):
     """`tools` 로 받은 스킬 바인딩 도구가 실제 모델 요청에 실렸는지 기록하는 SkillsMiddleware.
 
@@ -258,7 +318,12 @@ class ToolBindingSkillsMiddleware(SkillsMiddleware):
     대신한다(요약 뒤·프롬프트 캐싱 앞, 범용 서브에이전트에도 상속). 기록은 deepagents 가
     도구 공개를 마친 뒤의 요청을 본다 — 스킬을 읽기 전에는 없고 읽은 뒤에 생겼는지를 실제
     실행 로그로 확인하기 위한 것이다.
+
+    상태에 `skills_fingerprint` 를 더한다 — 스킬 재로드 여부는 executor 가 실행 입력으로
+    정한다(`skill_reload_inputs`). 목록을 읽는 일은 공식 SkillsMiddleware 그대로다.
     """
+
+    state_schema = SkillReloadState
 
     def __init__(self, *, backend, sources, tools=None, **kwargs):
         super().__init__(backend=backend, sources=sources, tools=tools, **kwargs)
