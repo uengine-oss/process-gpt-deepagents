@@ -27,7 +27,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 import core.agents.agent as agent_mod
 from core.agents.input_builder import build_graph_inputs
 from core.skills import tool_catalog
-from core.skills.skills import skill_reload_inputs
+from core.skills.skills import add_skill_reload_inputs
 
 THREAD = {"configurable": {"thread_id": "room-1"}}
 
@@ -44,6 +44,7 @@ class _ScriptedModel(BaseChatModel):
     script: list = []
     tool_names: list = []
     prompts: list = []
+    seen: list = []
     bound: list = []
 
     @property
@@ -56,6 +57,7 @@ class _ScriptedModel(BaseChatModel):
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         self.tool_names.append(list(self.bound))
+        self.seen.append(list(messages))
         self.prompts.append(
             "\n".join(str(m.content) for m in messages if isinstance(m, SystemMessage))
         )
@@ -130,7 +132,7 @@ async def _turn(env, text, script, *, pinned=None, activity_skills=None):
     """서비스의 한 턴: 에이전트를 새로 조립하고 같은 체크포인터·thread 로 실행한다."""
     _, model, _, checkpointer = env
     model.script = script
-    model.tool_names, model.prompts = [], []
+    model.tool_names, model.prompts, model.seen = [], [], []
     tup = await checkpointer.aget_tuple(THREAD)
     checkpoint_values = dict(tup.checkpoint.get("channel_values") or {}) if tup else {}
     inputs, _ = build_graph_inputs(
@@ -147,7 +149,7 @@ async def _turn(env, text, script, *, pinned=None, activity_skills=None):
         activity_skills=activity_skills,
         skill_sources=skill_sources,
     )
-    inputs.update(skill_reload_inputs(checkpoint_values, *skill_sources))
+    await add_skill_reload_inputs(inputs, graph, THREAD, checkpoint_values, *skill_sources)
     return await graph.ainvoke(inputs, config=THREAD)
 
 
@@ -302,7 +304,136 @@ async def test_activity_filtered_list_reloads_too(env):
     assert "베타 보고서 작성 절차" not in prompt, "액티비티 밖 스킬이 재로드로 들어왔다"
 
 
-def test_executor_is_wired_to_skill_reload_inputs():
+def _pins(state) -> list[HumanMessage]:
+    return [
+        m for m in state["messages"]
+        if isinstance(m, HumanMessage) and m.additional_kwargs.get("lc_source") == "pinned_skill"
+    ]
+
+
+def _latest_instruction(messages, name: str) -> str:
+    """모델이 받은 메시지 가운데 스킬 `name` 본문의 가장 나중 것(read_file 결과 또는 고정 메시지)."""
+    path = f"/skills/coll/{name}/SKILL.md"
+    read_ids = {
+        c["id"] for m in messages if isinstance(m, AIMessage) for c in m.tool_calls
+        if c["name"] == "read_file" and c["args"].get("file_path") == path
+    }
+    bodies = [
+        str(m.content) for m in messages
+        if (isinstance(m, ToolMessage) and m.tool_call_id in read_ids)
+        or (isinstance(m, HumanMessage) and (m.additional_kwargs.get("skill") or {}).get("path") == path)
+    ]
+    return bodies[-1] if bodies else ""
+
+
+async def test_skill_read_then_edited_mid_conversation_gives_the_model_the_new_body(env):
+    root = env[0]
+    _write_skill(root, "reply-style", "답변 형식", body="답 끝에 OLD-SIGN 을 붙인다.")
+    await _turn(env, "안녕", [[("read_file", {"file_path": "/skills/coll/reply-style/SKILL.md"})], []])
+    assert "OLD-SIGN" in _latest_instruction(env[1].seen[1], "reply-style")
+
+    _write_skill(root, "reply-style", "답변 형식", body="답 끝에 NEW-SIGN 을 붙인다.")
+    state = await _turn(env, "다시 답해줘", [[]])
+
+    latest = _latest_instruction(env[1].seen[0], "reply-style")
+    assert "NEW-SIGN" in latest, "이미 읽은 스킬을 고쳤는데 다음 턴 첫 모델 호출에 바뀐 본문이 없다"
+    assert "OLD-SIGN" not in latest
+    old_read = [m for m in env[1].seen[0] if isinstance(m, ToolMessage) and "OLD-SIGN" in str(m.content)]
+    assert old_read, "이전 메시지(옛 읽기 결과)를 고치거나 지웠다"
+    assert [p.additional_kwargs["skill"]["name"] for p in _pins(state)] == ["reply-style"]
+    # 옛 읽기 결과와 새 고정 본문이 함께 있으면 gpt-5 는 옛 지시를 따르곤 했다(실측 4/4) — 나중 본문이
+    # 현재 버전이라는 규칙이 시스템 프롬프트에 있어야 한다.
+    assert "가장 나중에 실린 것이 현재 버전" in env[1].prompts[0]
+
+
+async def test_pinned_skill_edited_mid_conversation_is_pinned_again(env):
+    root = env[0]
+    _write_skill(root, "reply-style", "답변 형식", body="답 끝에 OLD-SIGN 을 붙인다.")
+    await _turn(env, "/reply-style 안녕", [[]], pinned=["reply-style"])
+
+    _write_skill(root, "reply-style", "답변 형식", body="답 끝에 NEW-SIGN 을 붙인다.")
+    state = await _turn(env, "다시 답해줘", [[]])
+
+    assert "NEW-SIGN" in _latest_instruction(env[1].seen[0], "reply-style"), "고정했던 스킬을 고쳤는데 다시 고정되지 않았다"
+    assert len(_pins(state)) == 2
+
+
+async def test_unchanged_turns_do_not_pin_again(env):
+    root = env[0]
+    _write_skill(root, "reply-style", "답변 형식", body="답 끝에 OLD-SIGN 을 붙인다.")
+    await _turn(env, "안녕", [[("read_file", {"file_path": "/skills/coll/reply-style/SKILL.md"})], []])
+    _write_skill(root, "reply-style", "답변 형식", body="답 끝에 NEW-SIGN 을 붙인다.")
+    await _turn(env, "두 번째", [[]])
+
+    state = await _turn(env, "세 번째", [[]])
+    state = await _turn(env, "네 번째", [[]])
+    assert len(_pins(state)) == 1, "스킬이 바뀌지 않은 턴에 다시 고정했다"
+
+
+async def test_edited_skill_not_read_in_this_conversation_is_not_pinned(env):
+    root = env[0]
+    _write_skill(root, "reply-style", "답변 형식", body="답 끝에 OLD-SIGN 을 붙인다.")
+    _write_skill(root, "other", "다른 절차", body="OTHER-V1")
+    await _turn(env, "안녕", [[("read_file", {"file_path": "/skills/coll/reply-style/SKILL.md"})], []])
+
+    _write_skill(root, "other", "다른 절차", body="OTHER-V2")
+    state = await _turn(env, "다시", [[]])
+    assert _pins(state) == [], "이 대화가 읽지 않은 스킬까지 고정했다"
+    assert "다른 절차" in env[1].prompts[0], "목록 재로드는 그대로 돼야 한다"
+
+
+async def test_slash_pin_and_repin_of_the_same_skill_pin_once(env):
+    root = env[0]
+    _write_skill(root, "reply-style", "답변 형식", body="답 끝에 OLD-SIGN 을 붙인다.")
+    await _turn(env, "안녕", [[("read_file", {"file_path": "/skills/coll/reply-style/SKILL.md"})], []])
+
+    _write_skill(root, "reply-style", "답변 형식", body="답 끝에 NEW-SIGN 을 붙인다.")
+    state = await _turn(env, "/reply-style 다시", [[]], pinned=["reply-style"])
+    assert len(_pins(state)) == 1, "/스킬명 고정과 다시 고정이 겹쳐 같은 본문이 두 번 붙었다"
+    assert "NEW-SIGN" in _pins(state)[0].content
+
+
+async def test_repin_keeps_the_slash_pin_of_another_skill(env):
+    root = env[0]
+    _write_skill(root, "reply-style", "답변 형식", body="OLD-SIGN")
+    _write_skill(root, "alpha", "알파 업무 절차", body="ALPHA-BODY")
+    await _turn(env, "안녕", [[("read_file", {"file_path": "/skills/coll/reply-style/SKILL.md"})], []])
+
+    _write_skill(root, "reply-style", "답변 형식", body="NEW-SIGN")
+    state = await _turn(env, "/alpha 해줘", [[]], pinned=["alpha"])
+    assert [p.additional_kwargs["skill"]["name"] for p in _pins(state)] == ["alpha", "reply-style"], (
+        "다시 고정이 /스킬명 고정을 덮어썼다"
+    )
+
+
+async def test_failed_read_does_not_count_as_read(env):
+    root = env[0]
+    _write_skill(root, "reply-style", "답변 형식", body="OLD-SIGN")
+    await _turn(env, "안녕", [[("read_file", {"file_path": "/skills/coll/reply-style/MISSING.md"})], []])
+    _write_skill(root, "reply-style", "답변 형식", body="NEW-SIGN")
+    state = await _turn(env, "다시", [[]])
+    assert _pins(state) == []
+
+
+async def test_deleted_read_skill_is_not_pinned_and_turn_still_runs(env):
+    root = env[0]
+    _write_skill(root, "reply-style", "답변 형식", body="OLD-SIGN")
+    _write_skill(root, "alpha", "알파 업무 절차")
+    await _turn(env, "안녕", [[("read_file", {"file_path": "/skills/coll/reply-style/SKILL.md"})], []])
+
+    _delete_skill(root, "reply-style")
+    state = await _turn(env, "다시", [[]])
+    assert _pins(state) == []
+    assert "답변 형식" not in env[1].prompts[0]
+
+
+@pytest.mark.parametrize("prompt_name", ["DEFAULT_SYSTEM_PROMPT", "CUSTOM_PROFILE_SYSTEM_PROMPT"])
+def test_both_system_prompts_say_the_latest_skill_body_wins(prompt_name):
+    """채팅 화면은 커스텀 프로필 프롬프트를 쓴다. 한쪽에만 있으면 화면 대화에서 옛 지시로 돌아간다."""
+    assert "가장 나중에 실린 것이 현재 버전" in getattr(agent_mod, prompt_name)
+
+
+def test_executor_is_wired_to_add_skill_reload_inputs():
     """executor 전체를 띄우려면 DB·MCP 가 필요하다. 재로드 판단은 위에서 실제 그래프로 검증했고,
     여기서는 실행이 그 판단을 실제로 거치는지만 지킨다 — 에이전트와 같은 스킬 소스로, 체크포인트
     값을 보고, 그래프 실행 전에 입력에 더한다."""
@@ -313,5 +444,5 @@ def test_executor_is_wired_to_skill_reload_inputs():
     src = inspect.getsource(executor.DeepAgentExecutor.execute)
     assert "skill_sources = await resolve_skill_sources(tenant_id)" in src
     assert "skill_sources=skill_sources" in src
-    assert "inputs.update(skill_reload_inputs(checkpoint_values, *skill_sources))" in src
-    assert src.index("skill_reload_inputs(") < src.index("graph.astream(")
+    assert "await add_skill_reload_inputs(inputs, graph, config, checkpoint_values, *skill_sources)" in src
+    assert src.index("add_skill_reload_inputs(") < src.index("graph.astream(")

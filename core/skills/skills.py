@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Annotated, NotRequired
 
 import yaml
+from deepagents.backends.utils import validate_path
 from deepagents.middleware.skills import SkillsMiddleware, SkillsState, SkillsStateUpdate
 from langchain.agents.middleware.types import OmitFromOutput
 
@@ -306,9 +307,87 @@ def skill_reload_inputs(checkpoint_values, host_sources, sources) -> dict:
         "[skill-reload] 스킬 파일이 바뀌어 이번 실행에서 다시 읽음 added=%s removed=%s modified=%s",
         sorted(fingerprint.keys() - before.keys()),
         sorted(before.keys() - fingerprint.keys()),
-        sorted(k for k in fingerprint.keys() & before.keys() if fingerprint[k] != before[k]),
+        _modified_skill_paths(before, fingerprint),
     )
     return {"skills_metadata": None, "skills_fingerprint": fingerprint}
+
+
+def _modified_skill_paths(before, after) -> list[str]:
+    before, after = before or {}, after or {}
+    return sorted(k for k in after.keys() & before.keys() if after[k] != before[k])
+
+
+def skills_read_in_conversation(messages, skills_metadata, paths) -> list[str]:
+    """`paths`(SKILL.md 경로) 가운데 이 대화가 읽었거나 고정한 스킬의 이름.
+
+    deepagents 가 스킬 읽기로 보는 것과 같다 — 오류 없는 `read_file` 결과(그 호출의
+    `file_path`)이거나 `lc_source == "pinned_skill"` 메시지다. 공식 판정과 달리
+    `include_tools` 가 없는 스킬도 센다. 이름은 그 본문을 읽던 때의 목록에서 찾는다.
+    """
+    wanted = {p for p in (_normalized_skill_path(p) for p in paths or []) if p}
+    if not wanted or not messages:
+        return []
+    names = {
+        p: s.get("name")
+        for s in skills_metadata or []
+        if (p := _normalized_skill_path(s.get("path"))) in wanted
+    }
+    read_paths = {
+        call.get("id"): (call.get("args") or {}).get("file_path")
+        for m in messages
+        if getattr(m, "type", "") == "ai"
+        for call in (getattr(m, "tool_calls", None) or [])
+        if call.get("name") == "read_file" and call.get("id")
+    }
+    found: list[str] = []
+    for m in messages:
+        kind = getattr(m, "type", "")
+        if kind == "tool" and getattr(m, "status", "success") != "error":
+            path = read_paths.get(getattr(m, "tool_call_id", None))
+        elif kind == "human" and (getattr(m, "additional_kwargs", None) or {}).get("lc_source") == "pinned_skill":
+            marker = m.additional_kwargs.get("skill")
+            path = marker.get("path") if isinstance(marker, dict) else None
+        else:
+            continue
+        name = names.get(_normalized_skill_path(path) or "")
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def _normalized_skill_path(path) -> str | None:
+    """`read_file` 이 경로를 맞추는 방식(deepagents validate_path)으로 정규화한다."""
+    if not isinstance(path, str):
+        return None
+    try:
+        return validate_path(path)
+    except ValueError:
+        return None
+
+
+async def add_skill_reload_inputs(inputs: dict, graph, config, checkpoint_values, host_sources, sources) -> None:
+    """`skill_reload_inputs` 를 실행 입력에 더하고, 바뀐 스킬을 이 대화가 이미 읽었으면 다시 고정한다.
+
+    재로드는 목록만 다시 읽는다. 대화 기록에 남은 옛 본문은 고치지 않으므로(deepagents: 이전
+    메시지는 바뀌지 않음), 공식 고정(`pinned_skills`)으로 현재 본문을 새 메시지로 붙인다 — 바뀐
+    스킬이 있는 턴에만 대화를 읽는다. 메시지는 마지막 체크포인트 값에 다 있지 않을 수 있어
+    `graph.aget_state` 로 읽는다. `/스킬명` 고정에 더한다(같은 이름은 deepagents 가 한 번만 고정).
+    """
+    update = skill_reload_inputs(checkpoint_values, host_sources, sources)
+    inputs.update(update)
+    values = checkpoint_values or {}
+    modified = _modified_skill_paths(values.get("skills_fingerprint"), update.get("skills_fingerprint")) if "skills_metadata" in update else []
+    if not modified:
+        return
+    try:
+        messages = (await graph.aget_state(config)).values.get("messages")
+    except Exception:
+        logger.warning("[skill-reload] 다시 고정할 스킬을 찾으려 대화를 읽다 실패", exc_info=True)
+        return
+    repin = skills_read_in_conversation(messages, values.get("skills_metadata"), modified)
+    if repin:
+        logger.info("[skill-reload] 이 대화가 읽은 스킬이 바뀌어 다시 고정 repin=%s", repin)
+        inputs["pinned_skills"] = [*(inputs.get("pinned_skills") or []), *repin]
 
 
 class ToolBindingSkillsMiddleware(SkillsMiddleware):

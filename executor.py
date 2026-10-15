@@ -81,7 +81,7 @@ from core.chat.tool_arg_stream import ToolArgTextStreamer
 from core.llm.mcp import fetch_tenant_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
-from core.skills.skills import resolve_slash_skill, skill_reload_inputs
+from core.skills.skills import add_skill_reload_inputs, resolve_slash_skill
 from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
@@ -1902,8 +1902,9 @@ class DeepAgentExecutor(AgentExecutor):
         # 스킬 재로드(deepagents Reload skills): 이 대화가 스킬 목록을 읽은 뒤 SKILL.md 가
         # 바뀌었으면 이번 실행 입력에 `skills_metadata: None` 을 넣어 다시 읽게 한다. 재개
         # (Command)·체크포인트 이어 가기 입력에는 싣지 않는다 — 그 실행은 목록을 다시 읽지 않는다.
+        # 바뀐 스킬을 이 대화가 이미 읽었거나 고정했으면 그 스킬을 다시 고정해 현재 본문을 붙인다.
         if isinstance(inputs, dict):
-            inputs.update(skill_reload_inputs(checkpoint_values, *skill_sources))
+            await add_skill_reload_inputs(inputs, graph, config, checkpoint_values, *skill_sources)
 
         active_tool_calls: dict[str, str] = {}
         # request_human_input 의 인자(질문·초안 본문)를 쓰는 동안 화면에 흘려보내기 위한

@@ -22,7 +22,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from core.agents.input_builder import build_graph_inputs, pinned_skill_outcome
-from core.skills.skills import FilteredSkillsMiddleware, ToolBindingSkillsMiddleware, skill_reload_inputs
+from core.skills.skills import FilteredSkillsMiddleware, ToolBindingSkillsMiddleware, add_skill_reload_inputs
 
 MARKER = "MEETING-PREP-STEP-7f3a"
 SKILL_PATH = "/skills/meeting-prep/SKILL.md"
@@ -85,11 +85,13 @@ def _inputs(text: str, *, pinned: list[str] | None, has_checkpoint: bool = False
     return inputs
 
 
-async def _with_reload(inputs: dict, saver, config, root: Path) -> dict:
+async def _with_reload(inputs: dict, graph, saver, config, root: Path) -> dict:
     """executor 처럼 이 thread 의 체크포인트를 보고 스킬 재로드 입력을 더한다."""
     tup = await saver.aget_tuple(config)
     values = dict(tup.checkpoint.get("channel_values") or {}) if tup else {}
-    return {**inputs, **skill_reload_inputs(values, [str(root / "skills")], ["/skills"])}
+    inputs = dict(inputs)
+    await add_skill_reload_inputs(inputs, graph, config, values, [str(root / "skills")], ["/skills"])
+    return inputs
 
 
 def _read_file_calls(state) -> list:
@@ -130,12 +132,12 @@ async def test_skill_added_mid_conversation_is_still_pinned(tmp_path):
     saver = InMemorySaver()
     config = {"configurable": {"thread_id": "t3"}}
     graph, _ = _agent(tmp_path, saver)
-    await graph.ainvoke(await _with_reload(_inputs("안녕", pinned=None), saver, config, tmp_path), config=config)
+    await graph.ainvoke(await _with_reload(_inputs("안녕", pinned=None), graph, saver, config, tmp_path), config=config)
 
     _write_skill(tmp_path, "meeting-prep", MARKER)
     graph, model = _agent(tmp_path, saver)
     inputs = _inputs("내일 회의 준비해줘", pinned=["meeting-prep"], has_checkpoint=True)
-    state = await graph.ainvoke(await _with_reload(inputs, saver, config, tmp_path), config=config)
+    state = await graph.ainvoke(await _with_reload(inputs, graph, saver, config, tmp_path), config=config)
 
     assert len(model.requests) == 1
     assert state["messages"][-1].content.startswith(MARKER)
