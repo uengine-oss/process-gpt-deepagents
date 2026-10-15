@@ -13,6 +13,8 @@ description: >
   request_human_input)로 한 번에 하나씩 질문하며 재무·고객·내부프로세스·학습과
   성장 4대 관점의 인과 사슬을 검증한 뒤, 어느 방식으로 시작했든 최종적으로
   Mermaid.js BSC 전략맵과 BMC 캔버스를 함께, 서로 정합성을 맞춰 산출한다.
+metadata:
+  include_tools: save_strategy_objective save_strategy_kpi save_canvas_block link_kpi_to_process
 ---
 
 # BSC 전략 인터뷰어 (bsc-strategy-interview)

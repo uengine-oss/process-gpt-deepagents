@@ -43,6 +43,14 @@ _NUDGE_MARKER = "[skill-eval-gate]"
 # 전제하지 않는다. 쓰기(write/edit)로 만들어진 SKILL.md 는 어디에 있든 스킬 저작이다.
 _SKILL_MD_RE = re.compile(r"^(?P<dir>.+)/SKILL\.md$", re.IGNORECASE)
 
+# 스킬 생성 도구(plan_skill_eval·complete_skill_creation)는 전역 skill-creator 스킬이 연결한다. 관리자가 스킬
+# 전용으로 지정하면 그 스킬을 읽은 뒤에만 보이므로, 읽지 않고 SKILL.md 를 쓴 경우에도 남은 단계를 할 수 있게 연다.
+SKILL_CREATOR_PATH = "/skills/anthropics-skills/skill-creator/SKILL.md"
+_OPEN_TOOLS_HINT = (
+    f"`plan_skill_eval`·`complete_skill_creation` 이 도구 목록에 없으면 먼저 `{SKILL_CREATOR_PATH}` 를 read_file 로 읽으세요. "
+    "그 스킬을 읽으면 두 도구가 생기고, 남은 단계도 그 절차대로 하면 됩니다."
+)
+
 # 게이트를 통과했다고 인정하는 도구.
 _GATE_TOOLS = ("complete_skill_creation", "complete_skill_regression")
 
@@ -212,7 +220,8 @@ class SkillEvalGateMiddleware(AgentMiddleware):
                 f"{_NUDGE_MARKER} 아직 이 스킬의 테스트가 끝나지 않아 완료로 볼 수 없습니다. "
                 f"사용자에게 완료를 알리지 말고, 아래 남은 단계를 지금 수행하세요.\n"
                 f"대상 스킬: {skill_dir}\n{detail}\n"
-                f"마지막에 `complete_skill_creation(\"{skill_dir}\")` 가 성공해야 이 턴을 끝낼 수 있습니다."
+                f"마지막에 `complete_skill_creation(\"{skill_dir}\")` 가 성공해야 이 턴을 끝낼 수 있습니다.\n"
+                f"{_OPEN_TOOLS_HINT}"
             ))],
             "jump_to": "model",
         }

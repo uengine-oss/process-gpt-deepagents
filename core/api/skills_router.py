@@ -182,6 +182,14 @@ def _scan_skills(tenant_id: str = "") -> list[dict]:
     return skills
 
 
+def _is_system_skill_dir(skill_dir: Path) -> bool:
+    """서비스 기본 스킬(`process-gpt-system`)인지. 서버를 다시 띄울 때마다 이미지의 원본으로 덮어써지고
+    모든 테넌트가 함께 쓰므로, 화면에서 고친 내용은 다른 테넌트에도 퍼졌다가 재시작하면 사라진다."""
+    from core.skills.local_system_skills import SYSTEM_COLLECTION_NAME
+
+    return skill_dir.parent.name == SYSTEM_COLLECTION_NAME
+
+
 def _scan_builtin_skills() -> list[dict]:
     from core.skills.skills import _get_skills
 
@@ -883,7 +891,7 @@ async def list_skill_files(request: Request) -> JSONResponse:
             "modified": stat.st_mtime,
         })
 
-    return JSONResponse({"skill_name": skill_name, "files": files, "count": len(files)})
+    return JSONResponse({"skill_name": skill_name, "files": files, "count": len(files), "system": _is_system_skill_dir(skill_dir)})
 
 
 @tenant_guard
@@ -1587,6 +1595,8 @@ async def put_skill_file_local(request: Request) -> JSONResponse:
     skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
     if skill_dir is None:
         return JSONResponse({"error": f"skill '{skill_name}' not found"}, status_code=404)
+    if _is_system_skill_dir(skill_dir):
+        return JSONResponse({"error": "서비스 기본 스킬은 바꿀 수 없습니다", "code": "system_skill_read_only"}, status_code=403)
 
     # path traversal 방지: resolve 후 skill_dir 하위인지 확인
     resolved_skill = skill_dir.resolve()

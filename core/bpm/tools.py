@@ -461,6 +461,7 @@ def execute_process(
     뒤 단계로 호출하면 거절된다(뒤 단계는 엔진이 이어서 진행한다). 같은 사용자가 같은 프로세스를
     같은 첫 폼 값으로 방금(10분 안) 시작했다면 새로 만들지 않고 already_started=true 와 그 인스턴스를
     돌려준다. 이 도구의 성공 결과(process_instance_id)를 받기 전에는 실행했다고 말하지 않는다.
+    처음 실행하기 전에 process-execution 스킬을 읽고 그 순서(역할 배정·시작 폼)를 따른다.
 
     Args:
         process_definition_id: 프로세스 정의 ID.

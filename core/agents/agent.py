@@ -40,7 +40,7 @@ from ..skills.tools import (
 )
 from ..storage.storage import set_tenant_id as _set_storage_tenant_id
 from ..bpm.tools import get_bpm_tools, set_tenant_id as _set_bpm_tenant_id, set_user_context as _set_bpm_user
-from core.strategy.tools import get_strategy_tools
+from core.strategy.tools import get_strategy_save_tools
 from core.web.tools import get_web_tools
 
 logger = logging.getLogger(__name__)
@@ -79,16 +79,11 @@ _SKILL_SELECTION_BPMN_CAVEAT = (
     "판단하지 마라 — 스킬 목록에 있는 다른 스킬(예: bsc-strategy-interview)이 더 맞으면 그것부터 읽는다.\n\n"
 )
 
-_WEB_FETCH_RULES = (
-    "## 웹페이지 조회 도구 사용 원칙\n"
-    "`fetch_webpage` 도구가 있다. 사용자가 회사 도메인·URL·회사명을 언급했고(예: 'uengine.org 라는 회사의 전략을 "
-    "수립하고 싶어') 그 회사 정보가 필요한 작업(전략 수립, 프로세스 추천 등)이면, **사용자에게 회사 사업모델·제품을 "
-    "설명해 달라고 되묻는 대신 `fetch_webpage` 를 그 도메인으로 직접 호출**해 실제 내용을 확인한다. "
-    "단, 로딩된 스킬(SKILL.md)이 이보다 먼저 해야 할 단계를 명시했다면(예: 기존 데이터 존재 여부 확인 등) "
-    "그 스킬의 순서를 따른다 — 이 원칙은 '사용자에게 설명을 요구하지 말라'는 것이지 '다른 모든 단계보다 "
-    "무조건 먼저 하라'는 뜻이 아니다. "
-    "본문이 비어있거나(notice 필드) 조회 실패면 그때만 사용자에게 보충 정보나 다른 URL을 요청한다.\n\n"
-    "그 스킬이 이미 정의한 작업에 대해서는, 같은 목적의 조직도/사용자/프로세스 조회 도구를 호출하거나 "
+# 웹페이지 조회 원칙(`fetch_webpage`)은 그 도구가 실제로 붙을 때만 WEB_FETCH_PROMPT 로 싣는다(build_agent).
+# 예전에는 같은 안내가 도구 없이도 기본 프롬프트에 늘 실려 있었다. 남은 것은 도구와 무관한 스킬 범위 규칙이다.
+_SKILL_SCOPE_RULES = (
+    "## 스킬이 정한 작업의 범위\n"
+    "스킬이 이미 정의한 작업에 대해서는, 같은 목적의 조직도/사용자/프로세스 조회 도구를 호출하거나 "
     "사용자 토큰·테넌트 ID 등 자격정보를 사용자에게 요청하지 않는다(필요한 값은 환경변수로 주입되며, 역할 등은 스킬 절차가 정한다). "
     "반대로 단순 조회·일반 대화 등 스킬과 무관한 요청은 적절한 도구로 바로 처리한다.\n\n"
 )
@@ -108,6 +103,10 @@ _SKILL_CREATION_DELEGATION = (
     "아래 \'BPMN/프로세스 생성\' 절차는 사용자가 명시적으로 프로세스/워크플로/BPMN 을 만들라고 한 경우에만 적용된다.\n\n"
 
     "### 스킬 생성은 아래 6단계를 순서대로 **직접** 수행한다 (건너뛰기 금지)\n"
+    # 스킬 생성 도구는 전역 skill-creator 스킬이 연결(include_tools)한다. 관리자가 스킬 전용으로 지정하면
+    # 그 스킬을 읽어야 보이므로 먼저 읽게 한다(work-report 2026-10-13 6절 ①).
+    "**먼저 skill-creator 스킬의 SKILL.md 를 read_file 로 읽는다** — `plan_skill_eval`·`complete_skill_creation` 같은 "
+    "스킬 생성 도구는 그 스킬을 읽어야 생길 수 있다.\n"
     "이 파이프라인 전체를 `general-purpose` 같은 범용 서브에이전트에 통째로 위임하지 마라. "
     "**서브에이전트에는 `task()` 도구가 없어서, 위임하는 순간 아래 3·4단계(테스트 실행·채점)를 영원히 수행할 수 없게 된다.** "
     "`test-runner`·`evaluator` 는 이 루트 에이전트만 호출할 수 있다.\n"
@@ -161,46 +160,18 @@ _MCP_RETRY_RULES = (
     "시도해도 계속 실패할 때만 무엇이 실패했는지 사용자에게 알린다.\n"
 )
 
-# 이미 있는 프로세스를 대화 안에서 실행하는 순서.
-#
-# 이 규칙이 없으면 에이전트는 "실행 화면에서 진행하세요" 하고 링크를 던지거나, 역할을
-# 한꺼번에 물어 무엇을 답해야 하는지 알기 어렵게 만든다. work-assistant-agent 도 같은
-# 순서를 쓴다 — 어느 에이전트와 이야기하든 같아야 사용자가 다시 배우지 않는다.
-#
-# MCP(process-gpt-mcp)의 instructions 에도 같은 내용이 있지만 이쪽은 그것을 프롬프트로
-# 들이지 않는다. 그래서 여기에 따로 적는다.
-_PROCESS_EXECUTION_RULES = (
-    "\n\n## 기존 프로세스 실행 요청 처리\n"
-    "- 이미 있는 프로세스를 실행해 달라고 하면 **정의·실행 화면으로 보내지 말고 지금 대화 안에서 끝낸다.**\n"
-    "- 순서: get_process_list → get_process_detail → (역할 배정) → get_form_fields → execute_process\n"
-    "- get_process_detail 결과의 start_activities 가 **시작 단계**다. get_form_fields 와 execute_process 는 "
-    "이 시작 단계의 form_key · activity_id 로만 부른다. 뒤 단계(시스템 작업·검토 등)의 폼은 조회하지 않는다.\n"
-    "- definition.roles 순서대로 **한 번에 하나씩** 묻는다. 질문은 반드시 "
-    '"{순번}번 {역할명} 역할은 누구로 설정하시겠습니까?" 형식을 쓴다. '
-    '사용자가 이미 정해 준 역할(예: "역할은 모두 나로")은 다시 묻지 않는다.\n'
-    "- 담당자 후보가 필요하면 get_organization 으로 조회해 선택지를 함께 보인다.\n"
-    "- 모든 역할이 정해진 뒤에 시작 단계의 get_form_fields 를 호출한다. 폼 값은 화면이 입력란으로 "
-    "그려 주므로 항목을 하나씩 되묻지 않고, 입력 폼을 채워 제출해 달라고만 말하고 턴을 마친다.\n"
-    "- 단, 사용자가 요청에 첫 폼 값을 이미 다 주었으면(예: '요청 내용은 ○○') 폼을 다시 받지 않는다. "
-    "get_form_fields 로 필드 키만 확인하고 그 값으로 바로 execute_process 를 호출한다.\n"
-    "- 사용자가 폼을 제출하면 모아 둔 역할 배정을 함께 넣어 execute_process 를 바로 호출한다.\n"
-    "- **execute_process 는 요청 한 건당 정확히 한 번**이다. 인스턴스가 시작되면 이후 단계는 엔진이 "
-    "알아서 진행하므로, 뒤 단계의 activity_id 로 execute_process 를 다시 부르지 않는다(부르면 별개의 인스턴스가 "
-    "생긴다). 결과를 확인하려고 다시 부르지도 않는다. already_started 응답이면 새로 실행하지 않은 것이다.\n"
-    "- execute_process 결과에 process_instance_id 가 오기 전에는 **절대 '실행했습니다' 라고 말하지 않는다.** "
-    "도구를 부르지 않았거나 오류가 났으면 그대로 알린다.\n"
-    "- 실행에 성공하면 링크나 인스턴스 ID 를 안내하지 않는다. 화면이 '프로세스가 실행되었습니다' 카드를 "
-    "보여 주고, 카드를 누르면 인스턴스 대화로 간다. 무엇을 시작했는지 한두 문장으로만 알리고 끝낸다.\n"
-)
+# 이미 있는 프로세스를 대화 안에서 실행하는 순서는 번들 시스템 스킬 `process-execution`
+# (system-skills/process-gpt-system/process-execution/SKILL.md)에 있다. 그 스킬이 `execute_process` 를
+# 연결(include_tools)하므로, 관리자가 그 도구를 스킬 전용으로 지정하면 실행 지침을 읽은 뒤에만 실행한다.
+# 실행과 무관한 대화에는 지침도 도구 스키마도 실리지 않는다(work-report 2026-10-13 6절 ②).
 
 DEFAULT_SYSTEM_PROMPT = (
     _BASE_INTRO
     + _SKILL_SELECTION_RULES
     + _SKILL_SELECTION_BPMN_CAVEAT
-    + _WEB_FETCH_RULES
+    + _SKILL_SCOPE_RULES
     + _SKILL_CREATION_DELEGATION
     + _BPMN_DELEGATION
-    + _PROCESS_EXECUTION_RULES
     + _MCP_RETRY_RULES
 )
 
@@ -227,9 +198,7 @@ WEB_FETCH_PROMPT = (
 CUSTOM_PROFILE_SYSTEM_PROMPT = (
     _BASE_INTRO
     + _SKILL_SELECTION_RULES
-    # 프로세스 실행은 파워유저 전용이 아니다. 커스텀 프로필과 이야기하다가도 시킬 수 있다.
-    + _PROCESS_EXECUTION_RULES
-    + "\n\n"
+    + "\n"
     + _MCP_RETRY_RULES
 )
 
@@ -258,10 +227,13 @@ def root_service_tools(*, is_chat: bool, agent_mode: str = "") -> list:
             # 턴 종료 시 executor 가 결정적으로 수행한다(core/skills/tools.py 의 동일 함수 재사용).
         ]
     )
-    # BSC 전략 도구(save_strategy_objective/save_strategy_kpi/save_canvas_block/link_kpi_to_process)와
-    # 웹페이지 조회 도구(fetch_webpage — Claude Code의 WebFetch에 대응)는
-    # HITL 도구와 달리 DRAFT 모드에서도 제외하지 않고 항상 제공한다.
-    # tools += get_strategy_tools()
+    # BSC 전략 저장 도구는 전략 서비스가 있는 배포(STRATEGY_SERVICE_URL)에서만 붙인다. 이 도구를 쓰는 곳은
+    # bsc-strategy-interview 스킬의 저장 단계뿐이고 그 스킬이 include_tools 로 연결하므로, 관리자가 스킬 전용으로
+    # 지정하면 그 스킬을 읽은 대화에만 실린다(work-report 2026-10-13 6절 ③). 조회·수정 도구(get_strategy_map 등)는
+    # 스킬 밖에서도 쓸 만한 것이라 묶지 않았고, 지금처럼 붙이지 않는다.
+    if os.getenv("STRATEGY_SERVICE_URL"):
+        tools += get_strategy_save_tools()
+    # 웹페이지 조회 도구(fetch_webpage — Claude Code의 WebFetch에 대응)는 아직 붙이지 않는다.
     # tools += get_web_tools()
     # 스킬 평가/회귀 도구는 채팅 대화 전반에 붙인다. 처음에는 "커스텀 프로필 대화는 스킬을
     # 만들지 않는다" 고 보고 root_profile 일 때 제외했는데, 실측에서 정반대였다 — 정의체계도
