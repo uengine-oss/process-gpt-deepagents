@@ -59,7 +59,12 @@ def extract_json_text(text: str) -> str:
     stripped = (text or "").strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", stripped)
     if match:
-        stripped = match.group(1).strip()
+        fenced = match.group(1).strip()
+        try:
+            return json.dumps(json.loads(fenced), ensure_ascii=False)
+        except Exception:
+            # 코드펜스가 JSON 이 아니면(예: 폼 필드 값 안에 들어간 ``` 블록) 원문 전체에서 JSON 을 찾는다
+            pass
     try:
         return json.dumps(json.loads(stripped), ensure_ascii=False)
     except Exception:
