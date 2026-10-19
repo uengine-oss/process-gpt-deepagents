@@ -24,6 +24,7 @@ from ..skills.skills import (
 from ..skills.git_providers.factory import get_provider as _get_git_provider
 from ..llm.mcp import _load_mcp_tools_grouped
 from ..skills import tool_catalog
+from .skill_creator_first_read import SkillCreatorFirstReadMiddleware
 from .skill_eval_gate import SkillEvalGateMiddleware
 from .subagents import _build_subagents, _format_profile_traits, _normalize_tool_filters, _parse_csv
 from ..skills.tools import (
@@ -541,6 +542,9 @@ async def build_agent(
     # 잡힌 메인 채팅에서 만들어진다). 스킬을 만들지 않은 턴에는 아무 일도 하지 않는다.
     if is_chat:
         extra_middleware.append(SkillEvalGateMiddleware())
+        # 스킬 생성 요청이면 첫 도구 호출을 skill-creator 읽기로 고정한다. 프롬프트의 "먼저 읽는다"
+        # 만으로는 gpt-5 가 서브에이전트 위임부터 했다(bind-skill-tools verification 2026-10-16).
+        extra_middleware.append(SkillCreatorFirstReadMiddleware())
 
     # 도구 결과의 `file` 블록 하나가 대화 이력에 남으면 이후 모든 모델 호출이 400 으로
     # 실패해 대화방을 쓸 수 없게 된다. 모델에 넘기는 사본에서 텍스트 안내로 바꾼다.
