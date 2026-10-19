@@ -1032,6 +1032,15 @@ def plan_skill_eval(skill_path: str) -> str:
             )
         grading_paths.append(entry)
 
+    # test-runner 가 실행마다 `mkdir` 로 폴더부터 만드느라 모델 호출을 한 번씩 더 썼다.
+    # 경로는 여기서 정하므로 여기서 만들어 둔다(대조군 이월 폴더와 같은 호스트 경로).
+    host_root = eval_runs_root(skill_name) / f"iteration-{iteration}"
+    for run in runs:
+        try:
+            (host_root / run["eval_name"] / run["variant"] / "outputs").mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning("평가 실행 폴더 생성 실패 %s/%s: %s", run["eval_name"], run["variant"], e)
+
     return json.dumps({
         "skill_name": skill_name,
         "iteration": iteration,

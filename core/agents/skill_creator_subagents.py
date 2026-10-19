@@ -428,8 +428,8 @@ skill, and eval outputs must not end up inside it.
 ## How to run
 
 1. Read `outputs_dir`, `prompt`, `skill_path`, `files`, and `variant` from your task description.
-2. Create `outputs_dir` if it doesn't exist.
-2b. **If `files` is a non-empty list, materialise and read the inputs before anything else.**
+   `outputs_dir` already exists — do not create or list it, just write into it.
+2. **If `files` is a non-empty list, materialise and read the inputs before anything else.**
    - Entries that look like Supabase storage paths (e.g. `files/<uuid>.docx`) must be fetched
      with `download_file(storage_path, dest_dir=<outputs_dir>/../inputs)`; entries that are
      already absolute `/workspace/...` paths are on disk.
@@ -453,11 +453,8 @@ skill, and eval outputs must not end up inside it.
 5. Save every created or transformed output file to `outputs_dir`.
 6. If you encounter uncertainties or errors, write a brief `user_notes.md`
    in `outputs_dir` — but do not stop working.
-7. After saving outputs, write `outputs_dir/../timing.json`:
-   ```json
-   {"executor_duration_seconds": <float>, "total_duration_seconds": <float>}
-   ```
-   Use the actual wall-clock time you spent.
+7. Do not measure or record timing — no `date`, no `timing.json`. The main agent gets the
+   run's duration and tokens from the task result.
 
 ## Rules
 - Do the work — do not just explain what you would do.
@@ -552,6 +549,37 @@ persisted by the completion gate, so this is not required):
    If either command fails, say so and move on — do not retry in a loop.
 """
     return _EVALUATOR_PREAMBLE + grader_instructions + task_suffix
+
+
+# ---------------------------------------------------------------------------
+# 평가 서브에이전트의 파일 도구
+# ---------------------------------------------------------------------------
+
+# deepagents 는 서브에이전트마다 기본 FilesystemMiddleware 로 파일 도구 8개를 모두 준다.
+# 평가 서브에이전트는 요청 한 번의 3분의 2가 도구 설명이었는데, 스킬 생성 4회(test-runner
+# 96 요청, evaluator 94 요청) 동안 아래에 없는 도구는 한 번도 쓰지 않았다(2026-10-16).
+# 서브에이전트 정의의 middleware 에 같은 이름의 FilesystemMiddleware 를 두면 기본 자리를
+# 대신한다(deepagents 공식 교체 규칙). 백엔드가 build_agent 에서 정해지므로 거기서 붙인다.
+SUBAGENT_FILESYSTEM_TOOLS: dict[str, list[str]] = {
+    "test-runner": ["ls", "read_file", "write_file", "edit_file", "execute"],
+    "evaluator": ["ls", "read_file", "write_file", "glob", "grep", "execute"],
+}
+
+
+def attach_subagent_filesystem_tools(subagents: list, backend) -> list:
+    """SUBAGENT_FILESYSTEM_TOOLS 에 있는 서브에이전트에 파일 도구를 고른 FilesystemMiddleware 를 붙인다."""
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    result = []
+    for spec in subagents:
+        names = SUBAGENT_FILESYSTEM_TOOLS.get(spec.get("name", "")) if isinstance(spec, dict) else None
+        if names:
+            spec = {
+                **spec,
+                "middleware": [*spec.get("middleware", []), FilesystemMiddleware(backend=backend, tools=names)],
+            }
+        result.append(spec)
+    return result
 
 
 # ---------------------------------------------------------------------------

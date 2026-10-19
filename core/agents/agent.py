@@ -9,6 +9,7 @@ from .tool_retry import build_tool_retry_middleware
 from ..sandbox.docker_sandbox import get_or_create_sandbox
 from ..chat.hitl import get_hitl_tools, hitl_tools_enabled
 from ..llm.model import _build_model
+from .skill_creator_subagents import attach_subagent_filesystem_tools
 from ..rag.tools import get_memento_tools
 import asyncio
 
@@ -302,7 +303,7 @@ async def build_agent(
     _dynamic, _mcp_connectors, _mcp_tools_meta = await _build_subagents(
         subagents_raw or [], tenant_id, tenant_mcp, backend=backend
     )
-    built_subagents = list(static_subagents or []) + _dynamic
+    built_subagents = attach_subagent_filesystem_tools(list(static_subagents or []), backend) + _dynamic
 
     # 이 대화의 담당 에이전트 프로필(root_profile)에 지정된 스킬은, 서브에이전트 프로필 없이
     # tools/skills 만 지정된 액티비티와 동일하게 activity_skills 목록에 합류시켜 아래
