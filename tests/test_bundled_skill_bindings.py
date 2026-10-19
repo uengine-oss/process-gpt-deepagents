@@ -2,8 +2,8 @@
 
 - ② 프로세스 실행 절차 → `process-execution` 스킬, `execute_process` 를 연결
 - ① 스킬 생성 도구 4개 → 전역 `skill-creator` 스킬이 연결(6단계 지침은 기본 프롬프트에 그대로, 먼저 그 스킬을 읽게 함)
-- ③ BSC 전략 저장 도구 4개 → 전략 서비스가 있을 때만 붙이고 `bsc-strategy-interview` 가 연결
-- ④ 웹 조회 원칙 → 도구(`fetch_webpage`)가 붙을 때만 싣는다
+- ③ BSC 전략 도구 9개 → 항상 붙이고 `bsc-strategy-interview` 가 연결
+- ④ 웹 조회 도구 `fetch_webpage` → 항상 붙이고 `bsc-strategy-interview` 가 연결. 원칙은 그 도구가 처음부터 보일 때만 싣는다
 
 관리자가 그 도구를 스킬 전용으로 지정하면 실행과 무관한 대화에는 지침도 도구 스키마도 실리지 않고,
 스킬을 읽은 뒤에만 도구가 보인다. 실제 `build_agent` 와 저장소의 번들 스킬 원본을 쓴다.
@@ -31,7 +31,19 @@ BUNDLED = REPO / "system-skills" / "process-gpt-system"
 SKILL_CREATOR = REPO / "skills" / "anthropics-skills" / "skill-creator"
 EXECUTION_TOOLS = {"execute_process"}
 BUILDER_TOOLS = {"plan_skill_eval", "complete_skill_creation", "publish_skill", "register_skill_as_tenant"}
-STRATEGY_TOOLS = {"save_strategy_objective", "save_strategy_kpi", "save_canvas_block", "link_kpi_to_process"}
+STRATEGY_TOOLS = {
+    "get_strategy_map",
+    "get_strategy_canvas",
+    "save_strategy_objective",
+    "update_strategy_objective",
+    "save_strategy_kpi",
+    "update_strategy_kpi",
+    "save_canvas_block",
+    "link_kpi_to_process",
+    "check_strategy_alignment",
+}
+WEB_TOOLS = {"fetch_webpage"}
+WEB_FETCH_HEADING = "## 웹페이지 조회 도구 사용 원칙"
 
 
 def _frontmatter(name: str, root: Path = BUNDLED) -> dict:
@@ -124,26 +136,31 @@ async def test_without_designation_the_tools_stay_visible(env):
 
 
 @pytest.mark.parametrize("root_profile", [None, {"name": "process-gpt-agent"}])
-async def test_execution_and_web_fetch_rules_left_the_system_prompt(env, root_profile):
+async def test_execution_rules_left_the_system_prompt(env, root_profile):
     model, _ = env
     await _run(model, [[]], root_profile=root_profile)
     prompt = model.prompts[0]
     assert "누구로 설정하시겠습니까" not in prompt, "프로세스 실행 절차가 다시 시스템 프롬프트에 실렸다"
-    assert "fetch_webpage" not in prompt, "도구가 없는데 웹 조회 원칙이 실렸다"
     assert "process-execution" in prompt, "스킬 목록에 실행 스킬이 없다"
     assert "누구로 설정하시겠습니까" in (BUNDLED / "process-execution" / "SKILL.md").read_text(encoding="utf-8")
 
 
-async def test_web_fetch_rules_come_with_the_tool(env):
+async def test_web_fetch_rules_come_with_the_visible_tool(env):
     model, _ = env
+    await _run(model, [[]])
+    assert "fetch_webpage" in model.tool_names[0]
+    assert WEB_FETCH_HEADING in model.prompts[0]
 
-    @tool
-    def fetch_webpage(url: str) -> str:
-        """웹페이지 본문을 가져온다."""
-        return url
 
-    await _run(model, [[]], extra_tools=[fetch_webpage])
-    assert "fetch_webpage" in model.prompts[0]
+async def test_designated_web_fetch_opens_with_the_bsc_skill_without_its_rules(env):
+    """스킬 전용으로 지정하면 읽기 전에는 도구도 원칙도 없고, BSC 스킬을 읽은 뒤 도구가 열린다(원칙은 SKILL.md 에 있다)."""
+    model, designated = env
+    designated |= WEB_TOOLS
+    await _run(model, [[("read_file", {"file_path": "/skills/process-gpt-system/bsc-strategy-interview/SKILL.md"})], []])
+    before, after = model.tool_names
+    assert not WEB_TOOLS & before
+    assert WEB_FETCH_HEADING not in model.prompts[0], "도구가 숨었는데 웹 조회 원칙이 실렸다"
+    assert WEB_TOOLS <= after
 
 
 def test_skill_creation_gate_tells_how_to_open_its_tools():
@@ -160,16 +177,13 @@ def test_skill_creation_gate_tells_how_to_open_its_tools():
     assert out and SKILL_CREATOR_PATH in out["messages"][0].content
 
 
-def test_strategy_save_tools_come_only_with_the_service_and_open_with_the_bsc_skill(monkeypatch):
-    monkeypatch.delenv("STRATEGY_SERVICE_URL", raising=False)
-    assert not STRATEGY_TOOLS & {t.name for t in agent_mod.root_service_tools(is_chat=True)}, "전략 서비스가 없는데 저장 도구가 붙었다"
-    monkeypatch.setenv("STRATEGY_SERVICE_URL", "http://strategy:8000")
+def test_strategy_and_web_tools_are_attached_and_bound_to_the_bsc_skill():
     assert STRATEGY_TOOLS <= {t.name for t in agent_mod.root_service_tools(is_chat=True)}
-    assert set(_frontmatter("bsc-strategy-interview")["metadata"]["include_tools"].split()) == STRATEGY_TOOLS
+    assert WEB_TOOLS <= {t.name for t in agent_mod.root_service_tools(is_chat=True)}
+    assert set(_frontmatter("bsc-strategy-interview")["metadata"]["include_tools"].split()) == STRATEGY_TOOLS | WEB_TOOLS
 
 
-async def test_designated_strategy_tools_open_after_reading_the_bsc_skill(env, monkeypatch):
-    monkeypatch.setenv("STRATEGY_SERVICE_URL", "http://strategy:8000")
+async def test_designated_strategy_tools_open_after_reading_the_bsc_skill(env):
     model, designated = env
     designated |= STRATEGY_TOOLS
     await _run(model, [[("read_file", {"file_path": "/skills/process-gpt-system/bsc-strategy-interview/SKILL.md"})], []])

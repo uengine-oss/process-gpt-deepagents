@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,11 @@ _DISABLED_MCP_TOOLS: set[str] = {
     "create_consulting_process_workitem",
     "create_pdf2bpmn_workitem",
 }
+
+
+def is_mcp_server_enabled(server_config: Any) -> bool:
+    """설정 화면의 켜기/끄기. 값이 없으면 켜진 것으로 본다(화면과 같은 기본값)."""
+    return isinstance(server_config, dict) and server_config.get("enabled", True) is not False
 
 
 def _mcp_connection_config(server_config: dict) -> dict:
@@ -59,11 +65,16 @@ async def _load_mcp_tools_grouped(
     (해당 서버 키가 없거나 빈 리스트면 그 서버는 전체 허용).
 
     errors 를 넘기면 설정이 없거나 불러오기에 실패한 서버의 이유를 서버 이름으로 담는다.
+
+    설정 화면에서 끈 서버(`enabled: false`)는 불러오지 않는다 — 채팅 루트·업무 지정·서브에이전트·
+    스킬 도구 카탈로그가 모두 여기를 거친다. 끈 것은 실패가 아니므로 errors 에 담지 않는다.
     """
     mcp_servers = tenant_mcp.get("mcpServers", {})
     connections = {}
     for name in server_names:
-        if name in mcp_servers:
+        if name in mcp_servers and not is_mcp_server_enabled(mcp_servers[name]):
+            logger.info("MCP 서버 꺼짐, 건너뜀: %s", name)
+        elif name in mcp_servers:
             connections[name] = _mcp_connection_config(mcp_servers[name])
         else:
             logger.warning("MCP 서버 설정 없음: %s (사용 가능: %s)", name, list(mcp_servers))

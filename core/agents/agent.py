@@ -40,7 +40,7 @@ from ..skills.tools import (
 )
 from ..storage.storage import set_tenant_id as _set_storage_tenant_id
 from ..bpm.tools import get_bpm_tools, set_tenant_id as _set_bpm_tenant_id, set_user_context as _set_bpm_user
-from core.strategy.tools import get_strategy_save_tools
+from core.strategy.tools import get_strategy_tools
 from core.web.tools import get_web_tools
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ _SKILL_SELECTION_BPMN_CAVEAT = (
     "판단하지 마라 — 스킬 목록에 있는 다른 스킬(예: bsc-strategy-interview)이 더 맞으면 그것부터 읽는다.\n\n"
 )
 
-# 웹페이지 조회 원칙(`fetch_webpage`)은 그 도구가 실제로 붙을 때만 WEB_FETCH_PROMPT 로 싣는다(build_agent).
+# 웹페이지 조회 원칙(`fetch_webpage`)은 그 도구가 처음부터 보일 때만 WEB_FETCH_PROMPT 로 싣는다(build_agent).
 # 예전에는 같은 안내가 도구 없이도 기본 프롬프트에 늘 실려 있었다. 남은 것은 도구와 무관한 스킬 범위 규칙이다.
 _SKILL_SCOPE_RULES = (
     "## 스킬이 정한 작업의 범위\n"
@@ -227,14 +227,13 @@ def root_service_tools(*, is_chat: bool, agent_mode: str = "") -> list:
             # 턴 종료 시 executor 가 결정적으로 수행한다(core/skills/tools.py 의 동일 함수 재사용).
         ]
     )
-    # BSC 전략 저장 도구는 전략 서비스가 있는 배포(STRATEGY_SERVICE_URL)에서만 붙인다. 이 도구를 쓰는 곳은
-    # bsc-strategy-interview 스킬의 저장 단계뿐이고 그 스킬이 include_tools 로 연결하므로, 관리자가 스킬 전용으로
-    # 지정하면 그 스킬을 읽은 대화에만 실린다(work-report 2026-10-13 6절 ③). 조회·수정 도구(get_strategy_map 등)는
-    # 스킬 밖에서도 쓸 만한 것이라 묶지 않았고, 지금처럼 붙이지 않는다.
-    if os.getenv("STRATEGY_SERVICE_URL"):
-        tools += get_strategy_save_tools()
-    # 웹페이지 조회 도구(fetch_webpage — Claude Code의 WebFetch에 대응)는 아직 붙이지 않는다.
-    # tools += get_web_tools()
+    # BSC 전략 도구(조회·저장·수정·정합성 점검 9개). bsc-strategy-interview 스킬이 include_tools 로 9개를 모두
+    # 연결하므로, 관리자가 스킬 전용으로 지정하면 그 스킬을 읽은 대화에만 실려 첫 요청의 도구 수는 늘지 않는다.
+    # 전략 서비스가 없으면 각 도구가 {"error": ...} 를 돌려줄 뿐 실행을 죽이지 않는다.
+    tools += get_strategy_tools()
+    # 웹페이지 조회 도구(fetch_webpage — Claude Code의 WebFetch에 대응). 지금 쓰는 곳은 bsc-strategy-interview 의
+    # 0단계(회사 정보 확보)뿐이라 그 스킬이 include_tools 로 연결한다. 스킬 전용으로 지정하면 그 스킬을 읽은 대화에만 실린다.
+    tools += get_web_tools()
     # 스킬 평가/회귀 도구는 채팅 대화 전반에 붙인다. 처음에는 "커스텀 프로필 대화는 스킬을
     # 만들지 않는다" 고 보고 root_profile 일 때 제외했는데, 실측에서 정반대였다 — 정의체계도
     # 메인 채팅은 담당 에이전트가 루트로 승격돼 **항상 root_profile 이 잡히고**, 스킬은 바로
@@ -337,11 +336,6 @@ async def build_agent(
                     "servers": [_srv],
                     "tools": _tool_names,
                 })
-
-    # `fetch_webpage` 안내는 그 도구가 실제로 바인딩됐을 때만 붙인다.
-    # (도구 없이 안내만 남으면 모델이 없는 도구를 호출하려다 턴을 낭비한다.)
-    if any(getattr(t, "name", "") == "fetch_webpage" for t in tools):
-        system_prompt = system_prompt + WEB_FETCH_PROMPT
 
     # root_profile 에 지정된 MCP 도구 서버도 동일하게 루트에 직접 부착한다(tool_filters 반영).
     if root_profile and tenant_mcp:
@@ -499,6 +493,12 @@ async def build_agent(
             closed = sorted(n for n, skills in openers.items() if not skills)
             if closed:
                 logger.warning("[skill-tools] 이 에이전트에서 여는 스킬이 없어 쓸 수 없는 스킬 전용 도구: %s", closed)
+
+    # `fetch_webpage` 안내는 그 도구가 처음부터 보일 때만 붙인다. 스킬 전용으로 지정돼 위에서 빠졌으면
+    # 싣지 않는다 — 그 도구를 여는 bsc-strategy-interview 의 SKILL.md 가 같은 안내를 담고 있다.
+    # (도구 없이 안내만 남으면 모델이 없는 도구를 호출하려다 턴을 낭비한다.)
+    if any(getattr(t, "name", "") == "fetch_webpage" for t in tools):
+        final_prompt = final_prompt + WEB_FETCH_PROMPT
 
     extra_middleware = list(middleware or [])
     # 활동 지정 스킬이 있으면 전체 스킬 목록 대신 필터링된 목록만 노출한다

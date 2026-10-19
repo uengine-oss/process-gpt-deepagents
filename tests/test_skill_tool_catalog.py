@@ -172,6 +172,31 @@ def test_unreachable_server_is_reported_and_others_still_listed(env, client):
     assert body["unavailable_servers"][0]["reason"]
 
 
+def test_disabled_server_tools_are_not_listed_and_come_back_when_enabled(env, client):
+    """설정 화면에서 끈 서버(enabled: false)의 도구는 목록에 없고, 실패로도 보고하지 않는다."""
+    env["mcp"] = {"mcpServers": {**TENANT_MCP["mcpServers"], "orders": {**_server("orders"), "enabled": False}}}
+
+    body = client.get("/skill-tools/catalog?tenant_id=t1").json()
+
+    assert not [t for t in body["tools"] if t["server"] == "orders"]
+    assert body["unavailable_servers"] == []
+
+    env["mcp"] = {"mcpServers": {**TENANT_MCP["mcpServers"], "orders": {**_server("orders"), "enabled": True}}}
+    assert _by_name(client.get("/skill-tools/catalog?tenant_id=t1").json())["lookup_order"]["server"] == "orders"
+
+
+async def test_disabled_server_is_not_loaded_for_direct_assignments_either():
+    """업무·에이전트가 서버를 직접 지정해도 꺼진 서버는 불러오지 않는다(채팅 루트와 같은 규칙)."""
+    tenant_mcp = {"mcpServers": {**TENANT_MCP["mcpServers"], "orders": {**_server("orders"), "enabled": False}}}
+    errors: dict[str, str] = {}
+
+    grouped = await mcp_mod._load_mcp_tools_grouped(["orders", "dup"], tenant_mcp, errors=errors)
+
+    assert "orders" not in grouped
+    assert "dup" in grouped
+    assert errors == {}
+
+
 def test_other_tenant_is_rejected_without_connecting_its_mcp(env, client):
     response = client.get("/skill-tools/catalog?tenant_id=someone-else")
 
