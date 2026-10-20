@@ -137,6 +137,23 @@ def resolve_chat_room_id(extras: dict[str, Any], row: dict[str, Any]) -> str:
     return ""
 
 
+# 대화창 인계로 만든 할 일은 query 에 받은 방을 '[ChatRoom] <방 id>' 한 줄로 싣는다
+# (process-gpt-vue3 createChatHandover).
+_HANDOVER_ROOM_RE = re.compile(r"^\[ChatRoom\]\s*([0-9A-Za-z_-]{8,64})\s*$", re.M)
+
+
+def resolve_handover_room_id(row: dict[str, Any]) -> str:
+    """대화창 인계로 받은 할 일이면 그 일을 받은 방 id. 아니면 ''.
+
+    할 일 폴러로 실행되면 채팅 컨텍스트가 없어 방 작업 폴더를 쓰지 못했다. 그러면 넘겨받은
+    파일을 찾지 못하고, 만든 결과도 넘긴 사람이 보는 방에 남지 않는다.
+    """
+    if not row.get("adhoc"):
+        return ""
+    m = _HANDOVER_ROOM_RE.search(str(row.get("query") or ""))
+    return m.group(1) if m else ""
+
+
 def _parse_history_string(s: str) -> list[dict[str, Any]]:
     """'[user][이름]: 내용' 형식의 문자열(또는 줄바꿈으로 연결된 여러 메시지)을 파싱한다."""
     result: list[dict[str, Any]] = []

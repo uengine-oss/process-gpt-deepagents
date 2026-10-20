@@ -9,6 +9,7 @@ import re
 import time
 import uuid
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -61,6 +62,7 @@ from core.agents.input_builder import (
     extract_skill_command,
     log_pinned_skill_outcome,
     resolve_chat_room_id,
+    resolve_handover_room_id,
 )
 from core.chat.activity import (
     fetch_child_activity_todo,
@@ -72,6 +74,7 @@ from core.chat.activity import (
 from core.chat.chat_room import (
     CtxAccumulator,
     a_set_chat_room_context,
+    a_set_chat_room_preview,
     a_update_chat_room_context,
     a_upsert_chat_room_start,
     build_initial_chat_room_context,
@@ -525,6 +528,104 @@ def _file_artifact_payload(path: str, content: str | None, op: str) -> dict:
         "content": text,
         "truncated": truncated,
     }
+
+
+def _handover_agent(row: dict, agents: list) -> dict:
+    """이 할 일을 받은 에이전트(이름·id). 방 메시지의 발신자로 쓴다.
+
+    이름이 비면 화면이 'agent:<id>' 를 발신자로 보여 준다. 실행 목록에 없으면 users 에서 찾는다.
+    """
+    agent_id = str(row.get("user_id") or "").split(",")[0].strip()
+    for a in agents or []:
+        if isinstance(a, dict) and str(a.get("id") or "") == agent_id:
+            name = a.get("name") or a.get("username") or ""
+            if name:
+                return {"id": agent_id, "name": name}
+    name = str(row.get("username") or "")
+    if not name and agent_id:
+        try:
+            from core.storage.db import get_supabase
+
+            res = get_supabase().table("users").select("username").eq("id", agent_id).limit(1).execute()
+            name = str(((res.data or [{}])[0] or {}).get("username") or "")
+        except Exception:
+            logger.warning("인계 에이전트 이름 조회 실패 | agent=%s", agent_id, exc_info=True)
+    return {"id": agent_id, "name": name}
+
+
+def _readable_result(text: str) -> str:
+    """폼 결과 JSON({"defaultform": {"free_input": "..."}})에서 사람이 읽을 글을 꺼낸다.
+
+    할 일 폴러의 최종 답은 폼값 JSON 이다. 그대로 방에 올리면 넘긴 사람이 JSON 원문을 읽게 된다.
+    """
+    raw = (text or "").strip()
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+    parts: list[str] = []
+
+    def walk(v):
+        if isinstance(v, str):
+            if v.strip():
+                parts.append(v.strip())
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    walk(obj)
+    return "\n\n".join(parts) if parts else raw
+
+
+async def _post_handover_result(
+    *, tenant_id: str, room_id: str, todo_id: str, text: str, agent: dict, since_ns: int,
+) -> None:
+    """인계받은 할 일을 마친 결과를 그 방의 에이전트 답으로 남긴다.
+
+    할 일 폴러는 결과를 할 일 output 에만 남겨, 일을 넘긴 사람이 방에서 결과를 보고 다음
+    사람에게 이어 줄 수 없었다. 문서 산출물은 채팅과 같은 규약으로 보관해 `pdfFiles` 로
+    싣는다 — 방을 열면 작업 폴더와 인계 후보에 뜬다. 작업 폴더는 저장소에 올려, 다음에
+    이 방에서 일하는 에이전트가 이어서 읽는다.
+    메시지 키를 할 일 id 로 고정해 다시 실행돼도 한 건만 남는다. 실패는 베스트에포트.
+    """
+    try:
+        doc_paths = await asyncio.to_thread(_room_document_paths, room_id, since_ns)
+        content, records = await _publish_chat_artifacts(tenant_id, room_id, _readable_result(text), doc_paths)
+    except Exception:
+        logger.warning("인계 결과 산출물 보관 실패 | room=%s", room_id, exc_info=True)
+        content, records = _readable_result(text), []
+    try:
+        room_dir = _bpmn_work_dir()
+        if room_dir.exists():
+            _set_storage_tenant_id(tenant_id)
+            await asyncio.to_thread(upload_workspace_directory, room_id, room_dir)
+    except Exception:
+        logger.warning("인계 방 작업 폴더 동기화 실패 | room=%s", room_id, exc_info=True)
+    message = {
+        "role": "assistant",
+        "name": agent.get("name") or "",
+        "agentId": agent.get("id") or "",
+        "email": f"agent:{agent.get('id') or ''}",
+        "content": content,
+        "contentType": "text",
+        "timeStamp": datetime.now(timezone.utc).isoformat(),
+        "uuid": f"handover-result-{todo_id}",
+    }
+    if records:
+        message["pdfFiles"] = [download_file(r) for r in records]
+    try:
+        from processgpt_agent_sdk.database import insert_chat_message
+
+        await insert_chat_message(
+            uuid=f"handover-result-{todo_id}", chat_id=room_id, messages=message, tenant_id=tenant_id,
+        )
+        await a_set_chat_room_preview(room_id=room_id, text=content)
+        logger.info("인계 결과를 방에 남김 | room=%s todo=%s 문서=%d", room_id, todo_id, len(records))
+    except Exception:
+        logger.warning("인계 결과 방 저장 실패 | room=%s", room_id, exc_info=True)
 
 
 def _room_document_paths(chat_room_id: str, since_ns: int) -> list[str]:
@@ -1292,6 +1393,11 @@ class DeepAgentExecutor(AgentExecutor):
 
         is_chat = streamer is not None
         chat_room_id = resolve_chat_room_id(extras, row if isinstance(row, dict) else {})
+        # 대화창 인계로 받은 할 일은 폴러로 실행돼도 그 방의 작업 폴더에서 일한다 —
+        # 넘겨받은 파일이 거기 있고, 만든 결과도 넘긴 사람이 그 방에서 본다.
+        handover_room_id = "" if is_chat else resolve_handover_room_id(row if isinstance(row, dict) else {})
+        if handover_room_id and not chat_room_id:
+            chat_room_id = handover_room_id
         # 산출물을 방별 디렉터리(.bpmn/<room>/)로 격리 — 경로 충돌/덮어쓰기 방지.
         # chat_room_id 가 없는 워크리스트/액티비티 실행(is_chat=False)은 canonical_process_dir_name()이
         # tenant_id 로 폴백해 매 실행이 같은 산출물 폴더를 공유하게 된다 — 그러면 이전 실행(예: 일주일 전
@@ -1313,7 +1419,7 @@ class DeepAgentExecutor(AgentExecutor):
             _scope_prefixes.append(f"/workspace/{_sanitize_ws_name(instance_id, 64)}")
         set_workspace_scope(*_scope_prefixes)
 
-        if is_chat and chat_room_id and tenant_id:
+        if (is_chat or handover_room_id) and chat_room_id and tenant_id:
             # 이 파드가 이 방을 처음 다루는 경우(로컬에 파일이 없음) 다른 파드가 이전 턴에
             # 만들었을 수 있는 워크스페이스 파일을 Supabase Storage에서 미리 내려받는다.
             # 로컬 디스크는 파드 로컬이라(RWX 공유 스토리지 없음) 이게 없으면 다른 파드가
@@ -2461,6 +2567,15 @@ class DeepAgentExecutor(AgentExecutor):
                     logger.warning("ws 파일 폼 산출물 실체화 처리 실패 — 원본 유지", exc_info=True)
             # D2D 핸드오프: 단계 완료 시 LLM 최종 응답을 workspace에 저장해 다음 딥에이전트 단계가 직접 읽을 수 있게 한다.
             _save_step_output(raw_text, instance_id, activity_id)
+            if handover_room_id and tenant_id:
+                await _post_handover_result(
+                    tenant_id=tenant_id,
+                    room_id=handover_room_id,
+                    todo_id=current_workitem_id,
+                    text=raw_text,
+                    agent=_handover_agent(row, agents),
+                    since_ns=turn_started_ns,
+                )
             await _enqueue_status(
                 event_queue,
                 task_id=task_id,
@@ -2489,6 +2604,10 @@ class DeepAgentExecutor(AgentExecutor):
 
             if is_chat and chat_room_id:
                 await get_run_registry().mark_done(chat_room_id)
+                try:
+                    await a_set_chat_room_preview(room_id=chat_room_id, text=raw_text)
+                except Exception:
+                    logger.warning("방 미리보기 저장 실패 | room_id=%s", chat_room_id, exc_info=True)
                 logger.info(
                     "채팅 완료 | room_id=%s task_id=%s response_len=%d",
                     chat_room_id, task_id, len(final_text),

@@ -406,6 +406,36 @@ def set_chat_room_context(
     get_supabase().table("chat_rooms").update({"context": context}).eq("id", rid).execute()
 
 
+# 방 목록 미리보기 길이(프론트와 같다)
+PREVIEW_LEN = 50
+
+
+def set_chat_room_preview(*, room_id: str, text: str) -> None:
+    """방 목록 미리보기를 이 방의 마지막 에이전트 답으로 맞춘다.
+
+    미리보기는 그동안 화면이 최종 답을 받았을 때만 고쳤다. 사용자가 답을 기다리지 않고
+    방을 떠나거나, 할 일 폴러가 답을 남기면 미리보기에 사용자 질문이나 중간 안내가 남아
+    실제 답과 달랐다. 답을 저장하는 서버가 함께 쓴다.
+    """
+    rid = (room_id or "").strip()
+    body = (text or "").strip()
+    if not rid or not body:
+        return
+    get_supabase().table("chat_rooms").update(
+        {
+            "message": {
+                "msg": body[:PREVIEW_LEN],
+                "type": "text",
+                "createdAt": now_iso(),
+            }
+        }
+    ).eq("id", rid).execute()
+
+
+async def a_set_chat_room_preview(**kwargs: Any) -> None:
+    await asyncio.to_thread(set_chat_room_preview, **kwargs)
+
+
 async def a_upsert_chat_room_start(**kwargs: Any) -> None:
     await asyncio.to_thread(upsert_chat_room_start, **kwargs)
 

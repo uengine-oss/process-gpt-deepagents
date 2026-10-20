@@ -29,9 +29,11 @@ Required environment variables:
 
 from __future__ import annotations
 
+import base64
 import contextvars
 import mimetypes
 import os
+import re
 from pathlib import Path
 
 from langchain_core.tools import tool
@@ -65,9 +67,46 @@ def _require_tenant_id() -> str:
     return tid
 
 
+# Supabase Storage 가 키로 받는 글자. 한글 등 나머지가 섞이면 InvalidKey 로 거부한다
+# (storage-api 의 키 검사와 같은 집합).
+_SAFE_KEY_SEGMENT = re.compile(r"^[A-Za-z0-9_/!\-.*'() &$@=;:+,?]*$")
+# 인코딩한 경로 조각의 표식. 뒤는 UTF-8 이름의 base64url(패딩 없음)이다.
+_ENCODED_MARK = "__u8__"
+
+
+def encode_key_segment(segment: str) -> str:
+    """키로 쓸 수 없는 글자가 있는 경로 조각을 되돌릴 수 있게 바꾼다.
+
+    그대로 두면 '견적서_한빛상사.docx' 같은 산출물이 업로드에서 빠져, 다른 파드나
+    인계받은 방에서 그 파일을 찾지 못한다.
+    """
+    if _SAFE_KEY_SEGMENT.match(segment) and not segment.startswith(_ENCODED_MARK):
+        return segment
+    raw = base64.urlsafe_b64encode(segment.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{_ENCODED_MARK}{raw}"
+
+
+def decode_key_segment(segment: str) -> str:
+    if not segment.startswith(_ENCODED_MARK):
+        return segment
+    raw = segment[len(_ENCODED_MARK):]
+    try:
+        return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return segment
+
+
+def encode_key_path(rel: str) -> str:
+    return "/".join(encode_key_segment(p) for p in str(rel).replace("\\", "/").split("/"))
+
+
+def decode_key_path(rel: str) -> str:
+    return "/".join(decode_key_segment(p) for p in str(rel).split("/"))
+
+
 def _storage_path(tenant_id: str, task_id: str, rel: str) -> str:
-    """bucket 내 오브젝트 키: skills/{tenant_id}/{task_id}/{rel}"""
-    return f"{_PREFIX}/{tenant_id}/{task_id}/{rel}"
+    """bucket 내 오브젝트 키: skills/{tenant_id}/{task_id}/{rel}. rel 의 한글 등은 인코딩한다."""
+    return f"{_PREFIX}/{tenant_id}/{task_id}/{encode_key_path(rel)}"
 
 
 def _validate_workspace_path(p: Path, label: str) -> None:
@@ -277,7 +316,7 @@ def download_workspace_directory(task_id: str, dest_dir: str | Path) -> str:
         downloaded: list[str] = []
         errors: list[str] = []
         for key in keys:
-            rel = key[len(prefix):].lstrip("/")
+            rel = decode_key_path(key[len(prefix):].lstrip("/"))
             if not rel:
                 continue
             local_path = dest / rel
