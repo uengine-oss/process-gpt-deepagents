@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 import asyncio
 from typing import Any, Optional
@@ -19,34 +20,53 @@ from a2a.helpers import (
 )
 from a2a.types import TaskState
 from google.protobuf.json_format import ParseDict
+
+from processgpt_agent_sdk.artifacts import download_file
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Overwrite
 from typing_extensions import override
 
-from core.agents.agent import build_agent
+from core.agents.agent import build_agent, resolve_skill_sources
+from core.agents.steering import SteeringMiddleware
 from core.bpm.tools import set_process_context
 from core.storage.checkpointer import (
     get_async_postgres_checkpointer,
     get_shared_memory_checkpointer,
+    get_workitem_checkpointer,
     resolve_checkpoint_thread_id,
 )
-from core.chat.hitl import extract_interrupt_payload, is_duplicate_hitl_request
-from core.chat.callbacks import ToolTrackingCallback
-from core.chat.inflight_registry import (
-    clear_inflight_if_current,
-    set_inflight,
-    supersede_previous_turn,
+from core.chat.hitl import (
+    extract_interrupt_payload,
+    find_interrupt_payload,
+    is_duplicate_hitl_request,
+    normalize_hitl_payload,
+    records_human_answered,
+    workitem_resume_answer,
 )
+from processgpt_agent_sdk.chat_registry import get_run_registry
+from processgpt_agent_sdk.chat_mode import persist_chat_to_db
+from processgpt_agent_sdk.steering import (
+    REASON_AWAITING_HUMAN_INPUT,
+    SteerDirective,
+    SteerResult,
+)
+
+from core.chat.callbacks import ToolTrackingCallback
 from core.agents.input_builder import (
     build_graph_inputs,
+    choose_reclaim_inputs,
+    resume_kind_of,
     build_user_message,
     collect_recent_messages,
+    extract_skill_command,
+    log_pinned_skill_outcome,
     resolve_chat_room_id,
 )
 from core.chat.activity import (
-    build_fallback_subagent,
     fetch_child_activity_todo,
     load_activity_capabilities,
+    load_activity_root_agent,
+    resolve_root_agent,
     load_subprocess_subagents,
 )
 from core.chat.chat_room import (
@@ -56,25 +76,43 @@ from core.chat.chat_room import (
     a_upsert_chat_room_start,
     build_initial_chat_room_context,
 )
-from core.chat.stream_registry import MulticastStreamer, mark_done, start_run
-from core.llm.mcp import ensure_process_gpt_mcp, load_chat_root_tools
+from core.chat.event_tap import EventTapStreamer
+from core.chat.tool_arg_stream import ToolArgTextStreamer
+from core.llm.mcp import fetch_tenant_mcp, load_chat_root_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
+from core.skills.skills import add_skill_reload_inputs, resolve_slash_skill
 from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
-from core.deterministic import try_deterministic_execution
+from core.deterministic import MODE_UNDO_PENDING, try_deterministic_execution
 # 우리 기능(프로세스 생성 HITL 캡처/이름도출)에서 사용하는 contextvar — incoming 에는 없으나 유지.
 from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
+from core.skills.tools import _bpmn_work_dir
+from core.skills.tools import bpmn_container_base as _bpmn_container_base
+from core.skills.tools import checkout_container_base as _checkout_container_base
+from core.sandbox.docker_sandbox import set_workspace_scope
+from core.storage.storage import (
+    download_workspace_directory,
+    set_tenant_id as _set_storage_tenant_id,
+    upload_workspace_directory,
+)
 
 logger = logging.getLogger(__name__)
 
 # deepagent 가 샌드박스 workspace 에 생성/수정하는 산출물 파일을 프론트(Claude Desktop식 파일 UI)로
 # 실시간 전달하기 위한 설정. write_file/edit_file 도구가 건드린 /workspace 하위 파일을 file_artifact 로 보낸다.
-_FILE_TOOL_NAMES = ("write_file", "edit_file", "write_process_definition", "update_process_definition")
+# 에이전트에게 바인딩된 파일 도구는 deepagents 기본 도구뿐이다(프로세스 정의 전용
+# write/update 도구는 더 이상 부착하지 않는다 — core/agents/agent.py 참고).
+_FILE_TOOL_NAMES = ("write_file", "edit_file")
 _FILE_ARTIFACT_MAX_BYTES = 400_000  # 미리보기에 과한 대용량 파일은 잘라 보냄
+
+# 스킬 평가(test-runner/evaluator) 실행 산출물 디렉터리. 회차마다 outputs/·grading.json 이
+# 수십 개씩 쌓이는 내부 작업 파일이라 사용자 산출물 패널에 띄우지 않는다 — 결과 요약은
+# complete_skill_creation 이 DB(skill_eval_runs/_results)에 남긴다.
+_EVAL_RUN_PATH_MARKER = "/.skill-evals/"
 
 # 채팅 산출물에서 스킬이 만든 hwpx 컨테이너 경로를 잡아내기 위한 패턴.
 _HWPX_PATH_RE = re.compile(r"/workspace/[^\s\"']+\.hwpx")
@@ -84,6 +122,21 @@ _WS_BINARY_FILE_RE = re.compile(
     r"/workspace/[^\s\"']+\.(?:pdf|docx?|xlsx?|pptx?)",
     re.IGNORECASE,
 )
+
+
+def _validation_failure_summary(failures: list[dict], max_items: int = 3) -> str:
+    """검증 실패 목록을 사용자에게 보여줄 짧은 불릿으로 요약한다."""
+    lines: list[str] = []
+    for failure in failures:
+        for defect in (failure.get("defects") or [])[:max_items]:
+            if not isinstance(defect, dict):
+                continue
+            detail = str(defect.get("detail") or defect.get("type") or "").strip()
+            if detail:
+                lines.append(f"- {detail}")
+    if not lines:
+        return "- 정의 구조 검사에서 결함이 남아 있습니다."
+    return "\n".join(lines[:max_items])
 
 
 def _ws_file_meta(path: str) -> tuple[str, str]:
@@ -230,7 +283,10 @@ async def _materialize_hwpx_form_outputs(tenant_id: str, final_text: str) -> str
             return None
         val = {
             "path": out.get("file_url"),
-            "name": out.get("file_name") or name,
+            # 이름은 원래 것을 쓴다. 저장소가 돌려주는 이름은 아스키로 추려져
+            # '주차장_안전_안내문.hwpx' 가 'edited-_20260918_010111.hwpx' 로 남는다.
+            # 사람이 보는 이름은 무엇인지를 말해야 한다.
+            "name": name or out.get("file_name"),
             "html_url": out.get("html_url") or "",
             "ext": ".hwpx",
         }
@@ -260,12 +316,22 @@ async def _materialize_hwpx_form_outputs(tenant_id: str, final_text: str) -> str
     return json.dumps(obj, ensure_ascii=False)
 
 
-async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> str:
-    """worklist 폼 출력 JSON 안의 샌드박스 바이너리 파일 경로(pdf/docx/xlsx/pptx 등)를
-    내부 다운로드 토큰 URL로 치환한다. Supabase 업로드 없이 서버 자체에서 파일을 제공한다.
+async def _materialize_ws_file_form_outputs(
+    tenant_id: str, final_text: str, conversation_id: str = "",
+) -> str:
+    """worklist 폼 출력 JSON 안의 샌드박스 바이너리 파일 경로를 받을 수 있는 주소로 바꾼다.
 
-    폼값을 {path: <download_url>, name: <filename>, ext: <ext>} 로 바꿔
-    프론트 FileField 다운로드가 그대로 동작한다. 실패는 베스트에포트(원본 경로 유지)."""
+    예전에는 이 서버 메모리(또는 Redis)에 담고 한 시간짜리 토큰 주소를 폼값에 박았다.
+    그 시간이 지나거나 파드가 바뀌면 끝이었다 — 결재선을 타고 며칠 뒤에 열어 본 사람은
+    빈손이었다. 채팅 산출물에서 이미 겪은 것과 같은 일이다.
+
+    지금은 채팅과 **같은 규약**을 탄다(`core/chat/artifacts.py`). 비공개 버킷에 보관하고
+    폼값에 서명 주소와 함께 `file_id` 를 싣는다 — 주소가 죽어도 파일은 남아 있고,
+    화면이 그 열쇠로 새 주소를 받아 간다.
+
+    폼값은 {path, name, ext, file_id, url_expires_at} 가 된다. `path` 는 그대로라
+    프론트 FileField 다운로드는 손대지 않아도 동작한다.
+    실패는 베스트에포트(원본 경로 유지)."""
     if not final_text or not _WS_BINARY_FILE_RE.search(final_text):
         return final_text
     try:
@@ -278,13 +344,11 @@ async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> 
     try:
         from core.agents.agent import _BASE_DIR as _AGENT_BASE_DIR, _SKILLS_DIR as _AGENT_SKILLS_DIR
         from core.sandbox.docker_sandbox import get_or_create_sandbox
-        from core.api.file_download import register_file
+        from core.chat.artifacts import publish_one
     except Exception:
         logger.warning("ws 파일 실체화: 모듈 로드 실패", exc_info=True)
         return final_text
     from pathlib import PurePosixPath
-
-    base_url = (os.environ.get("SELF_BASE_URL") or f"http://localhost:{os.environ.get('PORT', '8888')}").rstrip("/")
 
     backend = get_or_create_sandbox(
         tenant_id,
@@ -308,14 +372,26 @@ async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> 
         p = PurePosixPath(container_path)
         name = p.name
         ext = p.suffix.lower()
-        token = register_file(content, name)
+        record = await publish_one(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            file_name=name,
+            content=content,
+        )
+        if not record or not record.get("file_url"):
+            # 지어낸 주소로 폼값을 채우지 않는다. 경로가 남는 편이 낫다.
+            logger.warning("ws 파일 실체화: 주소를 받지 못했다 | path=%s", container_path)
+            return None
         val = {
-            "path": f"{base_url}/api/internal/download/{token}",
+            "path": record["file_url"],
             "name": name,
             "ext": ext,
+            # 주소는 만료된다. 이 열쇠로 다시 받는다.
+            "file_id": str(record.get("file_id") or ""),
+            "url_expires_at": str(record.get("url_expires_at") or ""),
         }
         cache[container_path] = val
-        logger.info("ws 파일 실체화 완료 | %s → token URL", container_path)
+        logger.info("ws 파일 실체화 완료 | %s → 서명 주소", container_path)
         return val
 
     async def _walk(node):
@@ -338,6 +414,50 @@ async def _materialize_ws_file_form_outputs(tenant_id: str, final_text: str) -> 
         logger.warning("ws 파일 실체화: JSON 순회 실패", exc_info=True)
         return final_text
     return json.dumps(obj, ensure_ascii=False)
+
+
+async def _publish_chat_artifacts(
+    tenant_id: str, conversation_id: str, text: str, extra_paths: list[str] | None = None,
+) -> tuple[str, list[dict]]:
+    """채팅 답변에 남은 샌드박스 산출물을 비공개 버킷에 보관하고, 본문을 받을 수 있는 주소로 바꾼다.
+
+    무엇을 어디에 두고 어떤 주소로 내주는지는 SDK 가 모든 에이전트 공용으로 정한다
+    (`core/chat/artifacts.py`). 여기서는 샌드박스에서 파일을 꺼내 주는 일만 한다.
+
+    실패는 베스트에포트다. 산출물을 못 올려도 답변 자체는 그대로 보인다 —
+    경로가 남는 것이 답변이 통째로 사라지는 것보다 낫다.
+    """
+    from core.chat.artifacts import publish_chat_artifacts
+    from core.chat.file_links import find_document_paths
+
+    if not find_document_paths(text) and not extra_paths:
+        return text, []
+
+    try:
+        from core.agents.agent import _BASE_DIR as _AGENT_BASE_DIR, _SKILLS_DIR as _AGENT_SKILLS_DIR
+        from core.sandbox.docker_sandbox import get_or_create_sandbox
+    except Exception:
+        logger.warning("채팅 산출물: 모듈 로드 실패", exc_info=True)
+        return text, []
+
+    backend = get_or_create_sandbox(
+        tenant_id,
+        workspace_host=_AGENT_BASE_DIR / "workspace",
+        skills_host=_AGENT_SKILLS_DIR,
+    )
+
+    async def _fetch(container_path: str):
+        results = await asyncio.to_thread(backend.download_files, [container_path])
+        res = results[0] if results else None
+        content = getattr(res, "content", None) if res else None
+        if content is None or getattr(res, "error", None):
+            return None
+        return content
+
+    return await publish_chat_artifacts(
+        tenant_id=tenant_id, conversation_id=conversation_id, text=text, fetch=_fetch,
+        extra_paths=extra_paths or [],
+    )
 
 
 async def _emit_chat_hwpx_artifacts(streamer, tenant_id: str, texts: list[str], collected: set[str] | None = None) -> None:
@@ -407,6 +527,140 @@ def _file_artifact_payload(path: str, content: str | None, op: str) -> dict:
     }
 
 
+def _room_document_paths(chat_room_id: str, since_ns: int) -> list[str]:
+    """이번 턴에 작업 폴더에 생긴 문서 산출물(docx·pdf 등)의 컨테이너 경로.
+
+    docx·pdf 는 바이너리라 `write_file` 스트림(텍스트)으로는 화면에 뜨지 않는다. 그래서
+    예전에는 **답변 본문에 경로가 적혔을 때만** 사용자에게 갔다 — 모델이 경로를 적지 않은
+    턴의 문서는 만들어졌다는 말만 남고 받을 길이 없었다. 글이 아니라 폴더를 본다.
+    """
+    try:
+        from core.chat.file_links import find_room_documents
+        from core.skills.tools import (
+            _conv_slug,
+            bpmn_container_base as _bcb,
+            tenant_workspace_root,
+        )
+    except Exception:
+        logger.warning("문서 산출물 스캔: 모듈 로드 실패", exc_info=True)
+        return []
+    slug = _conv_slug(chat_room_id or "")
+    if not slug:
+        return []
+    try:
+        room_host = tenant_workspace_root() / ".bpmn" / slug
+        return find_room_documents(room_host, _bcb(chat_room_id or ""), since_ns=since_ns)
+    except Exception:
+        logger.warning("문서 산출물 스캔 실패 | room=%s", chat_room_id, exc_info=True)
+        return []
+
+
+def _document_artifact_payload(record: dict) -> dict | None:
+    """산출물 레코드를 작업 폴더가 읽는 `file_artifact` 로 옮긴다.
+
+    텍스트 산출물과 달리 내용을 싣지 않는다 — 바이너리는 화면이 렌더할 수 없고, 받을 수만
+    있으면 된다. 대신 서명 주소와 `file_id` 를 싣는다. 주소는 한 시간이면 죽지만 파일은
+    남아 있어서, 화면이 그 열쇠로 새 주소를 받아 간다.
+    """
+    url = str(record.get("file_url") or "")
+    if not url:
+        return None
+    name = str(record.get("file_name") or "")
+    path = str(record.get("source_path") or "") or f"/workspace/{name}"
+    path_name, ext = _ws_file_meta(path)
+    return {
+        "type": "file_artifact",
+        "op": "create",
+        "path": path,
+        "name": name or path_name,
+        "ext": ext,
+        # 바이너리는 미리보기 내용이 없다. 화면은 url 로 받거나(미리보기 불가 형식)
+        # 주소를 그대로 그린다(pdf·이미지).
+        "content": "",
+        "truncated": False,
+        "url": url,
+        "file_id": str(record.get("file_id") or ""),
+        "url_expires_at": str(record.get("url_expires_at") or ""),
+        "content_type": str(record.get("content_type") or ""),
+        "size_bytes": record.get("size_bytes") or 0,
+    }
+
+
+CHAT_ERROR_PREFIX = "⚠️ 오류가 발생했습니다: "
+
+
+def _chat_error_display_text(error_text: str, partial_text: str = "") -> str:
+    """오류로 끝난 턴의 assistant 본문. 부분 응답이 있으면 살려서 뒤에 오류를 붙인다."""
+    partial = (partial_text or "").strip()
+    display = f"{CHAT_ERROR_PREFIX}{error_text or '에이전트 응답 오류'}"
+    return f"{partial}\n\n{display}" if partial else display
+
+
+async def _persist_chat_error_message(
+    context: RequestContext,
+    *,
+    task_id: str,
+    context_id: str,
+    error_text: str,
+    partial_text: str = "",
+) -> None:
+    """오류로 끝난 채팅 턴도 assistant 메시지를 chats 에 남긴다.
+
+    오류를 SSE 로만 보내면 화면에는 보이지만 DB 에는 아무 것도 남지 않는다. 그래서
+    새로고침하거나 방에 다시 들어오면 사용자 질문만 있고 답은 아예 오지 않은 것처럼
+    보인다 — 실제로 그랬다. 성공 턴과 같은 저장 경로(SDK persist_chat_to_db)를 쓰고,
+    프론트가 보낸 response_message_uuid 로 upsert 하므로 같은 턴이 두 row 로
+    갈라지지도 않는다.
+    """
+    req = getattr(context, "req", None)
+    if req is None:
+        # 프로세스/워크리스트 경로(ChatRequestContext 가 아님) — chats 저장 대상이 아니다.
+        return
+    display = _chat_error_display_text(error_text, partial_text)
+    evt = new_text_artifact_update_event(
+        task_id=task_id,
+        context_id=context_id,
+        name="assistant_response",
+        text=display,
+        last_chunk=True,
+    )
+    ParseDict({"role": "assistant", "isError": True, "error": error_text}, evt.metadata)
+    await persist_chat_to_db(req, evt, display)
+
+
+async def _emit_document_artifacts(streamer, records: list[dict]) -> None:
+    """거둔 문서 산출물을 작업 폴더 목록에 띄운다. 실패는 베스트에포트."""
+    if streamer is None:
+        return
+    for record in records or []:
+        payload = _document_artifact_payload(record)
+        if payload is None:
+            continue
+        try:
+            await streamer.send_json(payload)
+            logger.info("문서 산출물 작업 폴더 emit | %s", payload["path"])
+        except Exception:
+            logger.warning("문서 산출물 emit 실패 | %s", payload.get("path"), exc_info=True)
+
+
+# 응답이 "병합 요청(PR)을 올렸다"고 보고하는지 판단할 표식.
+# PR 을 올린 턴은 저장 버튼을 누를 일이 없으므로 기본 안내 문구로 덮어쓰면 안 된다.
+_PULL_REQUEST_MARKERS = (
+    "PR created",
+    "pull/",
+    "merge_requests/",
+    "PR #",
+    "병합 요청",
+    "병합해 주세요",
+)
+
+
+def _reports_pull_request(text: str | None) -> bool:
+    """응답 본문이 PR 생성 결과를 알리고 있으면 True."""
+    body = text or ""
+    return any(marker in body for marker in _PULL_REQUEST_MARKERS)
+
+
 async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
     """검증/완료 후 방의 모든 산출물 파일을 file_artifact(edit)로 재전송한다.
 
@@ -416,13 +670,18 @@ async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
     if streamer is None:
         return
     try:
-        from core.skills.tools import bpmn_container_base as _bcb, _conv_slug, process_work_dirs
-        from core.agents.agent import _BASE_DIR as _ABASE
+        from core.skills.tools import (
+            bpmn_container_base as _bcb,
+            _conv_slug,
+            process_work_dirs,
+            tenant_workspace_root,
+        )
     except Exception:
         return
     base_container = _bcb(chat_room_id or "")  # /workspace/.bpmn/<slug>
     slug = _conv_slug(chat_room_id or "")
-    room_host = (_ABASE / "workspace" / ".bpmn" / slug) if slug else (_ABASE / "workspace" / ".bpmn")
+    bpmn_host = tenant_workspace_root() / ".bpmn"
+    room_host = bpmn_host / slug if slug else bpmn_host
     if not room_host.exists():
         return
     # 프로세스 폴더들 + (단독 스킬용) 방 base 자체를 항상 포함해 base 바로 아래 skills/ 도 스캔한다.
@@ -461,6 +720,14 @@ async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
                 continue
 
 
+
+# 결정론적 실행 카드의 crew_type. `result` 를 쓰면 안 된다 — 프론트는 그 값을 "제출할
+# 수 있는 산출물"로 읽어 채택 버튼을 붙이고(`EventTimeline.isSubmittableTask`), 생성기는
+# 표본의 폼 산출물을 그 값으로 찾는다. 이 카드가 싣는 것은 폼 값이 아니라 실행 방식과
+# 도구 호출 결과라서, `result` 로 두면 채택 버튼이 둘이 되고 그중 하나는 누르는 순간
+# 폼에 실행 로그 JSON 을 밀어 넣는다. 폼 값은 뒤따르는 `최종 결과 반환` 이 싣는다.
+_DETERMINISTIC_CARD_CREW_TYPE = "deterministic"
+
 async def _enqueue_status(
     event_queue: EventQueue,
     *,
@@ -475,6 +742,123 @@ async def _enqueue_status(
     evt = new_text_status_update_event(task_id=task_id, context_id=context_id, state=state, text=text)
     ParseDict({"event_type": event_type, "job_id": job_id, "crew_type": crew_type}, evt.metadata)
     await event_queue.enqueue_event(evt)
+
+
+async def _emit_human_asked(
+    event_queue: EventQueue,
+    *,
+    task_id: str,
+    context_id: str,
+    interrupt_payload: dict[str, Any],
+    run_state: dict[str, Any],
+    checkpoint_thread_id: str,
+    job_id: str,
+    streamer: Any = None,
+) -> dict[str, Any]:
+    question = (
+        interrupt_payload.get("question") if isinstance(interrupt_payload, dict) else None
+    ) or "이 작업을 계속 진행하려면 추가 입력이 필요합니다."
+    context_text = (
+        interrupt_payload.get("context", "") if isinstance(interrupt_payload, dict) else ""
+    )
+    options_payload = (
+        interrupt_payload.get("options") if isinstance(interrupt_payload, dict) else None
+    )
+    multi_select_payload = bool(
+        interrupt_payload.get("multi_select") if isinstance(interrupt_payload, dict) else False
+    )
+    pending_field = "human_response"
+
+    is_duplicate = is_duplicate_hitl_request(
+        run_state, question=question, pending_field=pending_field
+    )
+    new_run_state = {
+        "pending_field": pending_field,
+        "tool_name": "request_human_input",
+        "last_question": question,
+        "checkpoint_thread_id": checkpoint_thread_id or "",
+    }
+
+    # 이 턴은 여기서 끝나고 방은 사람의 답을 기다린다 — 두 갈래 모두 마찬가지다.
+    _mark_awaiting_human(context_id)
+
+    if is_duplicate:
+        # 같은 질문을 다시 물은 경우다. 여기서 done 마커만 보내고 끝내면 어시스턴트 메시지가
+        # 하나도 남지 않아, 사용자 화면에는 "답변했는데 아무 반응이 없는" 멈춘 상태로 보인다.
+        # 억제(= 새 run_state 로 갱신하지 않음)는 유지하되, 질문 본문은 반드시 남겨 사용자가
+        # 다시 답할 수 있게 한다.
+        logger.info("중복 HITL 요청 억제 | task_id=%s question=%.80s", task_id, question)
+        if streamer:
+            hitl_content = json.dumps(
+                {
+                    "type": "human_input_required",
+                    "question": question,
+                    "context": context_text,
+                    "options": options_payload or [],
+                    "multi_select": multi_select_payload,
+                    "run_state": new_run_state,
+                },
+                ensure_ascii=False,
+            )
+            await streamer.send_json({"type": "done", "content": hitl_content})
+        dup_evt = new_text_artifact_update_event(
+            task_id=task_id,
+            context_id=context_id,
+            name="assistant_response",
+            text=f"{question}\n\n{context_text}",
+            last_chunk=True,
+        )
+        ParseDict({"role": "assistant"}, dup_evt.metadata)
+        await event_queue.enqueue_event(dup_evt)
+        return {"status": "waiting_for_human", "run_state": dict(run_state)}
+
+    await _enqueue_status(
+        event_queue,
+        task_id=task_id,
+        context_id=context_id,
+        state=TaskState.TASK_STATE_INPUT_REQUIRED,
+        text=json.dumps(
+            {
+                "question": question,
+                "context": context_text,
+                "options": options_payload or [],
+                "multi_select": multi_select_payload,
+                "type": "text",
+                "run_state": new_run_state,
+            },
+            ensure_ascii=False,
+        ),
+        event_type="human_asked",
+        job_id=job_id,
+    )
+    # 채팅 경로: ChatEventQueue 는 TaskStatusUpdateEvent(human_asked)를 무시하고,
+    # interrupt 후 done/error 가 없으면 SSE 가 끝나지 않아 프론트가 무한 대기한다.
+    # 그래서 human_asked enqueue 직후 질문/컨텍스트/run_state 를 담은 done 메시지도 보낸다.
+    if streamer:
+        hitl_content = json.dumps(
+            {
+                "type": "human_input_required",
+                "question": question,
+                "context": context_text,
+                "options": options_payload or [],
+                "multi_select": multi_select_payload,
+                "run_state": new_run_state,
+            },
+            ensure_ascii=False,
+        )
+        await streamer.send_json({"type": "done", "content": hitl_content})
+
+    ae_text = f"{question}\n\n{context_text}"
+    artifact_evt = new_text_artifact_update_event(
+        task_id=task_id,
+        context_id=context_id,
+        name="assistant_response",
+        text=ae_text,
+        last_chunk=True,
+    )
+    ParseDict({"role": "assistant"}, artifact_evt.metadata)
+    await event_queue.enqueue_event(artifact_evt)
+    return {"status": "waiting_for_human", "run_state": new_run_state}
 
 
 def _iter_json_objects(text: str):
@@ -516,10 +900,11 @@ def _sanitize_ws_name(name: str, max_len: int = 80) -> str:
 
 def _instance_ws_dir(instance_id: str, subdir: str):
     """인스턴스 격리 workspace 디렉토리(호스트 Path)를 반환한다."""
-    from core.skills.tools import WORKSPACE_ROOT
+    from core.skills.tools import tenant_workspace_root
+    root = tenant_workspace_root()
     if instance_id:
-        return WORKSPACE_ROOT / _sanitize_ws_name(instance_id, 64) / subdir
-    return WORKSPACE_ROOT / subdir
+        return root / _sanitize_ws_name(instance_id, 64) / subdir
+    return root / subdir
 
 
 def _offload_input_data(text: str, instance_id: str) -> str:
@@ -672,7 +1057,123 @@ def _detect_process_result(text: Any) -> dict | None:
     return _extract_output_contract(text)
 
 
+def _resolve_run_state(extras: dict, row: dict, metadata: dict) -> dict:
+    """이번 요청이 이어받는 이전 turn 의 상태. 없으면 빈 dict.
+
+    프론트는 이 값을 metadata 로 실어 보내고, todolist 경로는 workitem 의 draft 에
+    들어 있다. 어느 쪽이든 같은 모양이라 찾는 순서만 다르다.
+    """
+    for source in (extras, metadata, row.get("draft") if isinstance(row.get("draft"), dict) else {}):
+        if isinstance(source, dict) and isinstance(source.get("run_state"), dict):
+            return dict(source["run_state"])
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# 수정 지시(스티어링) — SDK 표준 동작의 이쪽(에이전트) 구현
+# ---------------------------------------------------------------------------
+
+def _pending_interrupt(checkpoint_tuple: Any) -> bool:
+    """체크포인트에 재개 대기 중인 사람 확인 요청이 남아 있는가."""
+    return any(
+        len(_w) > 1 and _w[1] == "__interrupt__"
+        for _w in (getattr(checkpoint_tuple, "pending_writes", None) or [])
+    )
+
+
+# 사람의 답을 기다리며 멈춘 방. 체크포인트만 보고 판정하면 흔들린다 — 질문을 내보낸
+# 직후 몇 백 ms 동안은 interrupt 가 아직 저장소에 안 보여서, 바로 온 수정 지시가
+# "사람 확인 대기" 대신 "진행 중인 턴 없음" 으로 거절된다(실제로 그랬다). 그 사실을
+# 아는 것은 방금 질문을 내보낸 이 프로세스이므로, 여기서 직접 기억한다.
+_awaiting_human: set[str] = set()
+
+
+def _mark_awaiting_human(conversation_id: str) -> None:
+    if conversation_id:
+        _awaiting_human.add(conversation_id)
+
+
+def _clear_awaiting_human(conversation_id: str) -> None:
+    _awaiting_human.discard(conversation_id or "")
+
+
+async def _awaiting_human_input(thread_id: str) -> bool:
+    """이 방이 사람의 답을 기다리며 멈춰 있는가.
+
+    그 상태에서는 돌고 있는 실행이 없어 방향을 바꿔 넣을 곳이 없다. 사용자는 그
+    질문에 답하는 기존 경로로 방향을 바꾼다(답변 자체가 이미 방향 전환이다).
+
+    이 프로세스가 기억하는 표식을 먼저 본다. 표식이 없어도(파드가 바뀐 경우)
+    체크포인트에 재개 대기 중인 요청이 남아 있으면 대기 상태다.
+    """
+    if not thread_id:
+        return False
+    if thread_id in _awaiting_human:
+        return True
+    checkpointer = await get_async_postgres_checkpointer() or get_shared_memory_checkpointer()
+    if checkpointer is None:
+        return False
+    try:
+        tup = await checkpointer.aget_tuple({"configurable": {"thread_id": thread_id}})
+    except Exception:
+        logger.warning("사람 확인 대기 여부 확인 실패 | thread_id=%s", thread_id, exc_info=True)
+        return False
+    return _pending_interrupt(tup)
+
+
+def _is_hitl_answer(extras: dict, row: dict, metadata: dict) -> bool:
+    """이번 요청이 이전 turn 의 HITL(사람 확인) 질문에 대한 **응답**인가.
+
+    맞다면 그 turn 은 취소하면 안 되고 끝나기를 기다려야 한다. 프론트는 백엔드가
+    interrupt 를 다 처리하기 전(request_human_input 도구 호출 이벤트 시점)에 이미
+    확인 패널을 그리므로, 사용자가 바로 승인하면 이전 turn 이 아직 실행 중이다.
+    그걸 취소하면 interrupt 체크포인트가 남지 않아 재개가 불가능해지고, 화면에는
+    "새 메시지로 대체되어 이전 응답이 취소되었습니다" 오류만 남는다.
+    """
+    answer = str(
+        extras.get("human_response_answer")
+        or metadata.get("human_response_answer")
+        or ""
+    ).strip()
+    if not answer:
+        return False
+    run_state = _resolve_run_state(extras, row, metadata)
+    return str(run_state.get("tool_name") or "") == "request_human_input"
+
+
 class DeepAgentExecutor(AgentExecutor):
+
+    def should_supersede(self, context: RequestContext) -> bool:
+        """새 turn 이 이전 turn 을 대체하는가(True) 이어가는가(False).
+
+        SDK 가 turn 시작 전에 물어본다. False 면 SDK 는 이전 turn 을 취소하지 않고
+        끝나기를 기다린다 — 두 graph.astream() 실행이 같은 체크포인트를 동시에 쓰는
+        레이스는 어느 쪽이든 막힌다.
+        """
+        ctx_data = context.get_context_data() or {}
+        extras = ctx_data.get("extras") or {}
+        row = ctx_data.get("row") or {}
+        metadata = extras.get("metadata") if isinstance(extras.get("metadata"), dict) else {}
+        return not _is_hitl_answer(extras, row, metadata)
+
+    async def steer(self, directive: SteerDirective) -> SteerResult | None:
+        """SDK 표준 동작(`steer()`)의 이쪽 구현 — 지금 방향을 바꿀 수 있는지 판정한다.
+
+        받아 두기만 하고 실제 갈아타기는 실행 루프가 한다. 지시를 도구 실행 중간에
+        집어넣으면 쓰다 만 파일이나 결과 없는 도구 호출이 남으므로, 루프는 도구가
+        끝나고 다음 판단이 시작되기 전(= 체크포인트가 온전한 지점)에만 집어 간다.
+        그 시점에 `steer_applied` 가 나간다 — 접수와 반영은 다른 이벤트다.
+
+        Returns:
+            None 이면 SDK 의 표준 판정을 그대로 쓴다. 거절할 이유가 있으면
+            `SteerResult.reject()` 로 사유를 돌려준다.
+        """
+        if await _awaiting_human_input(directive.conversation_id):
+            return SteerResult.reject(
+                REASON_AWAITING_HUMAN_INPUT,
+                detail="에이전트가 질문에 대한 답을 기다리는 중입니다. 그 질문에 답해 방향을 알려주세요.",
+            )
+        return None
 
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> dict | None:
@@ -703,19 +1204,76 @@ class DeepAgentExecutor(AgentExecutor):
         user_jwt = extras.get("user_jwt")
         user_email = extras.get("user_email")
         user_name = extras.get("user_name")
+        if not (user_email or user_name):
+            # process/worklist 모드는 SDK 컨텍스트가 user_email/user_name 을 채우지 않는다.
+            # 대신 workitem 담당자 목록(extras["users"])에서 조회해 채운다.
+            _uid = str(extras.get("user_id") or row.get("user_id") or "").split(",")[0].strip()
+            for _u in (extras.get("users") or []):
+                if not isinstance(_u, dict):
+                    continue
+                if not _uid or str(_u.get("id") or "") == _uid:
+                    user_name = user_name or _u.get("name") or _u.get("username")
+                    user_email = user_email or _u.get("email")
+                    break
+
+        # 새 턴이 시작됐다 — 이전 턴이 남긴 "사람 확인 대기" 표식은 끝났다. 이 턴이
+        # 다시 질문하며 멈추면 그때 다시 남는다.
+        _clear_awaiting_human(context_id)
 
         _skill_tenant_id.set(tenant_id)
         _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())
         set_process_context(root_proc_inst_id, current_workitem_id, current_proc_def_id)
-        agents = extras.get("agents", [])
-        streamer = extras.get("streamer")
-        form_id = extras.get("form_id")
-        has_file = bool(extras.get("sources"))
-
         # 채팅 경로(ChatRequestContext)에서는 프론트가 보낸 run_state/human_response_answer 가
         # extras["metadata"] 안에 들어온다. worklist 경로는 extras 최상위/draft 에 둔다.
         # 두 위치를 모두 확인해 채팅에서도 HITL resume 이 트리거되게 한다.
         metadata = extras.get("metadata", {}) if isinstance(extras.get("metadata"), dict) else {}
+
+        agents = extras.get("agents", [])
+        # 서브프로세스/액티비티 능력치 폴백(아래 `if not _has_directly_assigned_agents:`)은
+        # row.user_id로 직접 배정된 에이전트가 애초에 하나도 없을 때만 타야 한다. 아래에서
+        # agents 를 승격 처리로 비워도(agents = []) 이 폴백이 잘못 트리거되지 않도록,
+        # 원래 배정 여부를 별도로 기억해둔다.
+        _has_directly_assigned_agents = bool(agents)
+        streamer = extras.get("streamer")
+        form_id = extras.get("form_id")
+        has_file = bool(extras.get("sources"))
+
+        # 프론트가 이번 대화 상대로 지정한 에이전트 프로필(role/goal/persona/tools/skills).
+        # 딥 에이전트의 루트 프롬프트·도구·스킬을 이 프로필로 커스터마이즈하는 데 쓰인다.
+        agent_profile = metadata.get("agent_profile") if isinstance(metadata.get("agent_profile"), dict) else None
+
+        # 설계자/사용자가 "누구를 루트로 쓸지" 명시적으로 지정했는지 확인한다.
+        # - 프로세스 모드: 액티비티 정의의 rootAgent (프로세스 설계 화면의 '메인 에이전트')
+        # - 채팅 모드: 프론트가 보내는 metadata.root_agent_id
+        # 미지정(None)이면 아래의 기존 자동 휴리스틱이 그대로 적용된다.
+        explicit_root_agent_id = str(metadata.get("root_agent_id") or "").strip() or None
+        if explicit_root_agent_id is None and streamer is None and _has_directly_assigned_agents:
+            try:
+                explicit_root_agent_id = load_activity_root_agent(
+                    tenant_id=tenant_id,
+                    proc_def_id=current_proc_def_id,
+                    activity_id=activity_id,
+                )
+            except Exception:
+                logger.exception(
+                    "루트 에이전트 설정 조회 실패, 자동 규칙으로 진행 | proc_def_id=%s activity_id=%s",
+                    current_proc_def_id, activity_id,
+                )
+                explicit_root_agent_id = None
+
+        agent_profile, agents = resolve_root_agent(
+            agents=agents,
+            agent_profile=agent_profile,
+            explicit_root_agent_id=explicit_root_agent_id,
+            activity_id=activity_id,
+        )
+
+        def _exclude_root_profile(agent_list: list) -> list:
+            # 대화 상대 프로필이 루트 에이전트 자체가 된 경우, "서브에이전트 위임" 문구·
+            # task() 위임 후보에서 자기 자신은 제외한다.
+            if not (agent_profile and agent_profile.get("id")):
+                return agent_list
+            return [a for a in agent_list if str(a.get("id") or "") != str(agent_profile["id"])]
 
         draft = row.get("draft") if isinstance(row.get("draft"), dict) else {}
         run_state: dict[str, Any] = {}
@@ -735,25 +1293,51 @@ class DeepAgentExecutor(AgentExecutor):
         is_chat = streamer is not None
         chat_room_id = resolve_chat_room_id(extras, row if isinstance(row, dict) else {})
         # 산출물을 방별 디렉터리(.bpmn/<room>/)로 격리 — 경로 충돌/덮어쓰기 방지.
-        _skill_conversation_id.set(chat_room_id or "")
+        # chat_room_id 가 없는 워크리스트/액티비티 실행(is_chat=False)은 canonical_process_dir_name()이
+        # tenant_id 로 폴백해 매 실행이 같은 산출물 폴더를 공유하게 된다 — 그러면 이전 실행(예: 일주일 전
+        # 같은 액티비티 실행)이 남긴 파일을 이번 실행 결과로 재사용하는 사고가 난다. instance_id(process
+        # instance 또는 workitem 단위로 유일)로 폴백해 실행마다 격리한다.
+        workspace_conversation_id = chat_room_id or instance_id
+        _skill_conversation_id.set(workspace_conversation_id or "")
+        # 도구 레벨 봉쇄: ls/read_file/glob/grep 이 다른 실행의 .bpmn/<다른 방> 이나
+        # <다른 instance_id>/inputs·outputs 를 절대경로로 직접 찍어 읽는 것도 막는다
+        # (위 방 단위 폴더 격리만으론 에이전트가 의도적/우발적으로 형제 디렉토리를 열람하는 걸 못 막음).
+        _scope_prefixes = [_bpmn_container_base(workspace_conversation_id)]
+        # 스킬 체크아웃도 방 단위로 갈리므로(.checkouts/<room>) 이번 방 것만 열어 준다.
+        # 방 id 가 없으면 checkout base 가 /workspace 자체라, 그걸 prefix 로 넣으면 위에서
+        # 좁혀 둔 스코프가 통째로 풀린다 — 그 경우는 넣지 않는다(어차피 격리할 방이 없다).
+        _checkout_base = _checkout_container_base(workspace_conversation_id)
+        if _checkout_base != "/workspace":
+            _scope_prefixes.append(_checkout_base)
+        if instance_id:
+            _scope_prefixes.append(f"/workspace/{_sanitize_ws_name(instance_id, 64)}")
+        set_workspace_scope(*_scope_prefixes)
 
-        if is_chat and chat_room_id:
-            # 같은 chat_room_id 에 아직 끝나지 않은 이전 turn이 있으면 취소하고 끝날 때까지
-            # 기다린다 — 두 graph.astream() 실행이 동시에 체크포인트를 쓰는 레이스를 막는다.
-            await supersede_previous_turn(chat_room_id)
-            current_task = asyncio.current_task()
-            if current_task is not None:
-                set_inflight(chat_room_id, current_task, event_queue)
-                current_task.add_done_callback(
-                    lambda _t, _rid=chat_room_id, _task=current_task: clear_inflight_if_current(_rid, _task)
-                )
+        if is_chat and chat_room_id and tenant_id:
+            # 이 파드가 이 방을 처음 다루는 경우(로컬에 파일이 없음) 다른 파드가 이전 턴에
+            # 만들었을 수 있는 워크스페이스 파일을 Supabase Storage에서 미리 내려받는다.
+            # 로컬 디스크는 파드 로컬이라(RWX 공유 스토리지 없음) 이게 없으면 다른 파드가
+            # 만든 process-definition.json 등을 이어서 못 읽는다.
+            try:
+                _set_storage_tenant_id(tenant_id)
+                room_dir = _bpmn_work_dir()
+                has_local_files = room_dir.exists() and any(room_dir.glob("**/*"))
+                if not has_local_files:
+                    result = await asyncio.to_thread(download_workspace_directory, chat_room_id, room_dir)
+                    logger.info("워크스페이스 하이드레이션 | room_id=%s | %s", chat_room_id, result.splitlines()[0] if result else "")
+            except Exception:
+                logger.warning("워크스페이스 하이드레이션 실패(무시하고 진행) | room_id=%s", chat_room_id, exc_info=True)
 
-        # 재접속(attach) 지원: 이번 턴을 conversation_id(=chat_room_id) 기준 메모리 레지스트리에
-        # 등록하고, streamer 를 프록시로 감싸 모든 토큰/이벤트를 (a) 원래 streamer (b) 누적 텍스트
-        # (c) attach 구독자에게 broadcast 한다. tool/plan 이벤트는 부가로 채팅방 컨텍스트 증분 저장.
+        # 이전 turn 정리(대체할지 기다릴지), in-flight 등록, 재접속 등록, 토큰
+        # 브로드캐스트는 모두 SDK 가 한다 — 채팅 출력 큐를 가로채 레지스트리에
+        # 남기므로 재접속한 클라이언트가 받는 것과 원래 클라이언트가 받는 것이
+        # 정의상 같아진다. 대체/이어가기 판단만 `should_supersede()` 로 이 클래스가
+        # 돌려준다.
+        #
+        # 여기서는 tool/plan 이벤트를 채팅방 컨텍스트로 증분 저장하는 훅만 얹는다.
+        # 이 훅에서 레지스트리에 또 기록하면 같은 토큰이 두 번 쌓여 재접속 스냅샷
+        # 본문이 두 배가 된다(core/chat/event_tap.py).
         if streamer is not None and chat_room_id:
-            await start_run(chat_room_id)
-
             _persist_tenant_id = tenant_id
             _persist_has_file = has_file
 
@@ -769,26 +1353,9 @@ class DeepAgentExecutor(AgentExecutor):
                         has_file=_persist_has_file,
                     )
 
-            streamer = MulticastStreamer(streamer, chat_room_id, on_event=_on_context_event)
+            streamer = EventTapStreamer(streamer, on_event=_on_context_event)
 
-        tenant_mcp: dict[str, Any] = {}
-        if tenant_id:
-            try:
-                from core.storage.db import get_supabase
-                sb = get_supabase()
-                result = (
-                    sb.table("tenants")
-                    .select("mcp")
-                    .eq("id", tenant_id)
-                    .single()
-                    .execute()
-                )
-                fetched = (result.data or {}).get("mcp")
-                if isinstance(fetched, dict):
-                    tenant_mcp = fetched
-            except Exception:
-                logger.warning("tenant_mcp DB 조회 실패 | tenant_id=%s", tenant_id, exc_info=True)
-            tenant_mcp = ensure_process_gpt_mcp(tenant_mcp, tenant_id)
+        tenant_mcp: dict[str, Any] = await asyncio.to_thread(fetch_tenant_mcp, tenant_id) if tenant_id else {}
         chat_root_tools, _root_tool_servers = (
             await load_chat_root_tools(tenant_mcp) if is_chat else ([], {})
         )
@@ -809,24 +1376,48 @@ class DeepAgentExecutor(AgentExecutor):
                 )
 
         # [InputData] 섹션의 큰 필드를 workspace 파일로 오프로드해 초기 LLM 컨텍스트 크기를 줄인다.
-        # 피드백 재작업(FB_REQUESTED)이면 summarized_feedback 기반으로 메시지를 구성한다.
-        _summarized_feedback = str(extras.get("summarized_feedback") or "").strip()
-        if _summarized_feedback:
+        # 피드백 재작업(FB_REQUESTED)이면 feedback 배열의 가장 최근 항목의 content만 추출해
+        # 메시지를 구성한다(build_user_message 미사용 — 소스/폼 형식 안내가 재작업 지시와 섞이지 않게).
+        _feedback_list = row.get("feedback")
+        _latest_feedback_content = ""
+        if isinstance(_feedback_list, list) and _feedback_list:
+            _latest_feedback_item = _feedback_list[-1]
+            if isinstance(_latest_feedback_item, dict):
+                _latest_feedback_content = str(_latest_feedback_item.get("content") or "").strip()
+            else:
+                _latest_feedback_content = str(_latest_feedback_item or "").strip()
+        # 채팅모드에서 사용자가 메시지 선두에 '/skill-name' 을 입력하면, 그 스킬이 현재
+        # 테넌트에서 실제로 사용 가능할 때 해당 스킬을 고정한다(pinned_skills) — 첫 모델
+        # 호출부터 SKILL.md 본문이 대화에 실려 스킬을 찾아 읽는 호출이 없어진다. 스킬 목록을
+        # 그 하나로 덮어쓰지는 않는다: 목록은 thread 에 남아, 덮어쓰면 다음 턴에도 그 스킬만 보인다.
+        _forced_skill_name = ""
+        if _latest_feedback_content:
             _original_query = str(context.get_user_input() or "").strip()
-            _feedback_raw = (
-                f"[재작업 요청 — 피드백]\n{_summarized_feedback}"
+            user_message = (
+                f"[재작업 요청 — 피드백]\n{_latest_feedback_content}"
                 + (f"\n\n[원본 작업 지시]\n{_original_query}" if _original_query else "")
             )
-            _base_message = _offload_input_data(_feedback_raw, instance_id)
         else:
             _base_message = _offload_input_data(str(context.get_user_input() or ""), instance_id)
-        user_message = build_user_message(
-            _base_message,
-            sources=extras.get("sources") or [],
-            form_id=form_id,
-            form_fields=extras.get("form_fields"),
-            suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
-        )
+            if is_chat:
+                _slash_skill, _stripped_message = extract_skill_command(_base_message)
+                if _slash_skill:
+                    _forced_skill_name = resolve_slash_skill(tenant_id, _slash_skill)
+                    if _forced_skill_name:
+                        _base_message = _stripped_message
+                        logger.info(
+                            "채팅 슬래시 커맨드로 스킬 지정 | tenant_id=%s skill=%s",
+                            tenant_id, _forced_skill_name,
+                        )
+            user_message = build_user_message(
+                _base_message,
+                sources=extras.get("sources") or [],
+                form_id=form_id,
+                form_fields=extras.get("form_fields"),
+                suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
+                agents=_exclude_root_profile(agents),
+            )
+        pinned_skills = [_forced_skill_name] if _forced_skill_name else []
         recent_msgs = collect_recent_messages(extras) if is_chat else []
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).
         _user_input_text = ""
@@ -877,11 +1468,25 @@ class DeepAgentExecutor(AgentExecutor):
             if deterministic is not None:
                 deterministic_job_id = str(uuid.uuid4())
                 is_undo = deterministic.mode == "deterministic-undo"
-                card_name = (
-                    "Undo(실행 취소) 후 재실행 결과"
-                    if is_undo
-                    else "결정론적 코드 실행 결과"
-                )
+                is_undo_only = deterministic.mode == "deterministic-undo-only"
+                # 되돌릴 근거가 없어 재작업 전체를 에이전트가 맡는 경우. 카드를 띄우지
+                # 않으면 "되돌릴 것이 없었다"와 "되돌릴 수 없었다"가 기록에서 구분되지
+                # 않는다 — 사람이 보는 자리에 사유가 남아야 한다.
+                is_skipped = deterministic.mode == "deterministic-skipped"
+                # 되돌릴 것이 남아 있는 채로 넘어온 경우. 사람이 보는 자리에 "보류"가 아니라
+                # "에이전트가 되돌린다"로 남아야, 재작업 결과를 검수할 때 무엇을 확인해야
+                # 하는지가 보인다.
+                is_undo_pending = deterministic.mode == MODE_UNDO_PENDING
+                if is_undo_pending:
+                    card_name = "이전 실행 되돌리기 — 에이전트가 수행"
+                elif is_skipped:
+                    card_name = "재작업 되돌리기 보류"
+                elif is_undo_only:
+                    card_name = "Undo(실행 취소) 결과"
+                elif is_undo:
+                    card_name = "Undo(실행 취소) 후 재실행 결과"
+                else:
+                    card_name = "결정론적 코드 실행 결과"
                 await _enqueue_status(
                     event_queue,
                     task_id=task_id,
@@ -892,7 +1497,13 @@ class DeepAgentExecutor(AgentExecutor):
                             "role": card_name,
                             "name": card_name,
                             "goal": (
-                                "고착화된 undo 코드로 이전 실행을 되돌린 뒤 새 입력으로 재실행합니다."
+                                str(deterministic.output.get("note") or "")
+                                + " 사유: "
+                                + str(deterministic.output.get("reason") or "")
+                                if is_skipped or is_undo_pending
+                                else "고착화된 undo 코드로 이전 실행을 되돌립니다. 재실행은 에이전트가 수행합니다."
+                                if is_undo_only
+                                else "고착화된 undo 코드로 이전 실행을 되돌린 뒤 새 입력으로 재실행합니다."
                                 if is_undo
                                 else "고착화된 코드로 LLM 추론 없이 재실행합니다."
                             ),
@@ -903,7 +1514,7 @@ class DeepAgentExecutor(AgentExecutor):
                     ),
                     event_type="task_started",
                     job_id=deterministic_job_id,
-                    crew_type="result",
+                    crew_type=_DETERMINISTIC_CARD_CREW_TYPE,
                 )
                 await _enqueue_status(
                     event_queue,
@@ -913,18 +1524,67 @@ class DeepAgentExecutor(AgentExecutor):
                     text=deterministic.result_text,
                     event_type="task_completed",
                     job_id=deterministic_job_id,
-                    crew_type="result",
+                    crew_type=_DETERMINISTIC_CARD_CREW_TYPE,
                 )
-                artifact_evt = new_text_artifact_update_event(
-                    task_id=task_id,
-                    context_id=context_id,
-                    name="assistant_response",
-                    text=deterministic.result_text,
-                    last_chunk=True,
-                )
-                ParseDict({"role": "assistant"}, artifact_evt.metadata)
-                await event_queue.enqueue_event(artifact_evt)
-                return None
+                if not deterministic.continue_to_llm:
+                    # 에이전트 경로와 같은 자리에 `최종 결과 반환` 을 하나 더 띄운다.
+                    # 워크아이템의 폼 산출물은 이 이벤트와 최종 artifact 로만 전달되고,
+                    # 위의 결과 카드는 실행 방식만 보여 준다. 이걸 빼면 코드가 제대로
+                    # 돌았는데도 폼이 빈 채로 워크아이템이 완료되어 다음 활동이 굶는다.
+                    final_text = deterministic.form_output_text or deterministic.result_text
+                    if deterministic.form_output_text:
+                        result_job_id = str(uuid.uuid4())
+                        await _enqueue_status(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            state=TaskState.TASK_STATE_WORKING,
+                            text=json.dumps(
+                                {
+                                    "goal": "최종 결과를 반환합니다.",
+                                    "name": "최종 결과 반환",
+                                    "role": "최종 결과 반환",
+                                    "agent_profile": "/images/chat-icon.png",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            event_type="task_started",
+                            job_id=result_job_id,
+                            crew_type="result",
+                        )
+                        _save_step_output(final_text, instance_id, activity_id)
+                        await _enqueue_status(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            state=TaskState.TASK_STATE_COMPLETED,
+                            text=final_text,
+                            event_type="task_completed",
+                            job_id=result_job_id,
+                            crew_type="result",
+                        )
+                    artifact_evt = new_text_artifact_update_event(
+                        task_id=task_id,
+                        context_id=context_id,
+                        name="assistant_response",
+                        text=final_text,
+                        last_chunk=True,
+                    )
+                    ParseDict({"role": "assistant"}, artifact_evt.metadata)
+                    await event_queue.enqueue_event(artifact_evt)
+                    return None
+                # 되돌리기만 수행한 경우: 결과 카드만 남기고 DeepAgents 실행을 계속한다.
+                # 최종 산출물은 에이전트가 만든다.
+                if deterministic.undo_directive:
+                    # 보상이 아직 끝나지 않았다. 되돌리기(또는 사람 확인) 지시를 작업 지시
+                    # **앞에** 붙여, 그것을 먼저 마치고 나서 재작업하게 한다. 이 줄이 없으면
+                    # 되돌려지지 않은 세상 위에 재작업이 얹혀 같은 값이 두 번 반영된다.
+                    user_message = f"{deterministic.undo_directive}\n\n{user_message}"
+                    logger.info(
+                        "되돌리기 지시를 에이전트 입력에 주입 | todo=%s mode=%s steps=%d",
+                        row.get("id"), deterministic.mode,
+                        len(deterministic.output.get("undo_steps") or []),
+                    )
 
         job_id = str(uuid.uuid4())
 
@@ -941,22 +1601,40 @@ class DeepAgentExecutor(AgentExecutor):
         # Postgres(DB_*) 가 있으면 그것을, 없으면 프로세스 전역 공유 InMemory 체크포인터를 쓴다.
         # 매 요청마다 새 MemorySaver 를 만들면 직전 interrupt 체크포인트가 사라져 HITL resume 이
         # 불가능하므로, 항상 동일(공유) 인스턴스를 build_agent/build_graph_inputs 에 넘긴다.
-        checkpointer = await get_async_postgres_checkpointer()
-        if checkpointer is None:
-            checkpointer = get_shared_memory_checkpointer()
+        # DB_* 가 있는데 Postgres 를 쓸 수 없으면 메모리로 대체하지 않고 실패한다
+        # (CheckpointerUnavailable → SDK 가 오류 이벤트 + FAILED 로 알린다).
+        checkpointer = await get_workitem_checkpointer()
         checkpoint_thread_id = chat_room_id if is_chat else (resolve_checkpoint_thread_id(is_chat=False, row=row) or chat_room_id)
 
         # 이 thread 에 이미 누적된 체크포인트가 있는지 확인 — 있으면 history 재주입을 생략해
         # 메시지 중복을 막는다(지속 체크포인터가 history 를 이미 들고 있으므로).
+        # 재개 대기 중인 interrupt 가 실제로 남아 있는지까지 확인한다. 없는데 Command(resume=)
+        # 를 보내면 LangGraph 는 오류 없이 그래프를 처음부터 재실행해 같은 질문으로 새 interrupt
+        # 를 만들고, 그걸 executor 가 중복 HITL 로 억제해 사용자에겐 빈 응답만 남는다.
         has_checkpoint = False
+        has_pending_interrupt = False
+        checkpoint_values: dict = {}
         if checkpointer is not None and checkpoint_thread_id:
             try:
                 _cfg = {"configurable": {"thread_id": checkpoint_thread_id}}
                 _tup = await checkpointer.aget_tuple(_cfg)
                 has_checkpoint = _tup is not None
+                has_pending_interrupt = _pending_interrupt(_tup)
+                checkpoint_values = dict((_tup.checkpoint or {}).get("channel_values") or {}) if _tup else {}
             except Exception:
                 logger.warning("체크포인트 존재 확인 실패 | thread_id=%s", checkpoint_thread_id, exc_info=True)
                 has_checkpoint = False
+                has_pending_interrupt = False
+
+        # 워크아이템이 사람에게 묻고 멈췄다가(HUMAN_ASKED) 답을 받아 다시 집힌 경우,
+        # feedback 의 마지막 항목 원문으로 interrupt 를 재개한다.
+        human_answer_stripped, run_state = workitem_resume_answer(
+            is_chat=is_chat,
+            has_pending_interrupt=has_pending_interrupt,
+            human_answer=human_answer_stripped,
+            latest_feedback=_latest_feedback_content,
+            run_state=run_state,
+        )
 
         inputs, use_graph_resume = build_graph_inputs(
             user_message,
@@ -966,15 +1644,18 @@ class DeepAgentExecutor(AgentExecutor):
             checkpoint_thread_id=checkpoint_thread_id,
             recent_messages=recent_msgs,
             has_checkpoint=has_checkpoint,
+            has_pending_interrupt=has_pending_interrupt,
+            pinned_skills=pinned_skills,
         )
 
         if use_graph_resume:
             logger.info("HITL 그래프 재개 | thread_id=%s task_id=%s", checkpoint_thread_id, task_id)
         elif human_answer_stripped:
             logger.info(
-                "HITL 비-그래프 재개 | task_id=%s pending_field=%s",
+                "HITL 비-그래프 재개 | task_id=%s pending_field=%s pending_interrupt=%s",
                 task_id,
                 run_state.get("pending_field") or "human_response",
+                has_pending_interrupt,
             )
 
         if human_answer_stripped:
@@ -985,6 +1666,7 @@ class DeepAgentExecutor(AgentExecutor):
                 "checkpoint_thread_id": checkpoint_thread_id or "",
                 "resume_source": "checkpoint_graph_resume" if use_graph_resume else "human_response",
             }
+        if human_answer_stripped and records_human_answered(is_chat=is_chat):
             await _enqueue_status(
                 event_queue,
                 task_id=task_id,
@@ -1000,7 +1682,9 @@ class DeepAgentExecutor(AgentExecutor):
 
         subprocess_alias_map: dict[str, str] = {}
         root_proc_inst_id: str = ""
-        if not agents:
+        activity_tools: list[str] = []
+        activity_skills: list[str] = []
+        if not _has_directly_assigned_agents:
             proc_def_id = str(row.get("proc_def_id") or "").strip()
             activity_id = str(row.get("activity_id") or "").strip()
             subprocess_agents = load_subprocess_subagents(
@@ -1057,20 +1741,15 @@ class DeepAgentExecutor(AgentExecutor):
                     activity_id=activity_id,
                 )
                 if act_tools or act_skills:
-                    fallback = build_fallback_subagent(
-                        tenant_id=tenant_id,
-                        activity_tools=act_tools,
-                        activity_skills=act_skills,
+                    activity_tools = act_tools
+                    activity_skills = act_skills
+                    logger.info(
+                        "액티비티 지정 도구/스킬을 루트 딥에이전트에 부착 | proc_def_id=%s activity_id=%s tools=%s skills=%s",
+                        proc_def_id, activity_id, act_tools, act_skills,
                     )
-                    if fallback:
-                        agents = [fallback]
-                        logger.info(
-                            "서브에이전트 폴백 활성화 | proc_def_id=%s activity_id=%s tools=%s skills=%s",
-                            proc_def_id, activity_id, act_tools, act_skills,
-                        )
                 elif not is_chat:
                     logger.warning(
-                        "서브에이전트 미설정 (activity fallback 없음) | proc_def_id=%s activity_id=%s",
+                        "서브에이전트 미설정 (activity tools/skills 없음) | proc_def_id=%s activity_id=%s",
                         proc_def_id, activity_id,
                     )
 
@@ -1127,16 +1806,50 @@ class DeepAgentExecutor(AgentExecutor):
             len(knowledge_doc_ids), knowledge_doc_ids[:5],
         )
 
+        def _discard_streamed_text() -> None:
+            """수정 지시가 얹히는 순간, 그 전까지 쓰던 본문을 버린다.
+
+            사용자가 거둬들인 지시로 만든 글이다. 남겨 두면 최종 답변이 "버려진 초안 +
+            새 답변" 이 되어, 고쳐 달라고 했더니 같은 말을 두 번 한 것처럼 보인다.
+            """
+            nonlocal full_response
+            if full_response:
+                logger.info(
+                    "steering: 수정 지시 전까지 쓴 본문 %d자를 버린다 | room=%s",
+                    len(full_response), context_id,
+                )
+            full_response = ""
+
+        skill_sources = await resolve_skill_sources(tenant_id)
         graph, _, _sub_mcp_tools_meta = await build_agent(
             tenant_id=tenant_id,
-            conversation_id=chat_room_id or "",
+            skill_sources=skill_sources,
+            conversation_id=workspace_conversation_id or "",
             checkpointer=checkpointer,
-            subagents_raw=agents,
+            subagents_raw=_exclude_root_profile(agents),
             tenant_mcp=tenant_mcp,
             extra_tools=chat_root_tools,
-            middleware=[ToolResultTruncationMiddleware()],
-            static_subagents=build_skill_creator_subagents(task_id=task_id),
+            # 작업 중에 들어온 수정 지시를 다음 모델 판단에 얹는다(채팅 전용 —
+            # 워크아이템 실행에는 방향을 바꿀 사용자가 붙어 있지 않다).
+            middleware=[
+                ToolResultTruncationMiddleware(),
+                *(
+                    [SteeringMiddleware(
+                        conversation_id=context_id, on_applied=_discard_streamed_text,
+                    )]
+                    if is_chat else []
+                ),
+            ],
+            # skill-creator 서브에이전트(단독 스킬 생성 위임 대상)는 채팅에서 사용자가
+            # "스킬 만들어줘" 라고 요청하는 흐름 전용이다. 프로세스(워크아이템) 모드는
+            # BPMN 액티비티를 실행하는 것이지 스킬을 생성하는 게 아니므로 붙이지 않는다.
+            static_subagents=build_skill_creator_subagents(task_id=task_id) if is_chat else [],
             agent_mode=agent_mode,
+            is_chat=is_chat,
+            activity_tools=activity_tools,
+            activity_skills=activity_skills,
+            pinned_skills=pinned_skills,
+            root_profile=agent_profile,
             user_context={
                 "user_jwt": user_jwt,
                 "user_email": user_email,
@@ -1176,7 +1889,34 @@ class DeepAgentExecutor(AgentExecutor):
             **({"callbacks": [_tracking_cb]} if _tracking_cb else {}),
         }
 
+        # 크래시 재점유(SDK 재개 사유 reclaim)면 같은 지시를 덧붙이지 않고 마지막
+        # 체크포인트부터 이어 간다. 이미 결과가 저장된 도구는 다시 부르지 않는다.
+        if not is_chat:
+            inputs = await choose_reclaim_inputs(
+                graph, config, inputs,
+                resume_kind=resume_kind_of(extras),
+                use_graph_resume=use_graph_resume,
+                has_pending_interrupt=has_pending_interrupt,
+            )
+
+        # 스킬 재로드(deepagents Reload skills): 이 대화가 스킬 목록을 읽은 뒤 SKILL.md 가
+        # 바뀌었으면 이번 실행 입력에 `skills_metadata: None` 을 넣어 다시 읽게 한다. 재개
+        # (Command)·체크포인트 이어 가기 입력에는 싣지 않는다 — 그 실행은 목록을 다시 읽지 않는다.
+        # 바뀐 스킬을 이 대화가 이미 읽었거나 고정했으면 그 스킬을 다시 고정해 현재 본문을 붙인다.
+        if isinstance(inputs, dict):
+            await add_skill_reload_inputs(inputs, graph, config, checkpoint_values, *skill_sources)
+
         active_tool_calls: dict[str, str] = {}
+        # request_human_input 의 인자(질문·초안 본문)를 쓰는 동안 화면에 흘려보내기 위한
+        # 스트리머. 이 도구는 사용자에게 보여줄 본문이 통째로 **인자 안에** 들어가고
+        # 어시스턴트 content 는 비어 있어서, 중계하지 않으면 몇 분간 "생각 중..." 만 뜬다.
+        # key = tool_call index(스트리밍 청크는 id 없이 index 로만 온다).
+        hitl_arg_streamers: dict[int, ToolArgTextStreamer] = {}
+        hitl_arg_indexes: set[int] = set()
+        # 도구 호출 인자 tool_call_id → args. tool_usage_finished 이벤트에 인자를 함께
+        # 실어야 고착화 코드 생성과 보상(undo) 생성이 성립한다. 인자 없이 결과만
+        # 남으면 되돌릴 대상을 복원할 수 없다.
+        pending_tool_args: dict[str, dict] = {}
         # write_file/edit_file tool_call_id → {path, op}. tool_end 시 파일을 읽어 file_artifact emit.
         pending_file_ops: dict[str, dict] = {}
         # subprocess 딥에이전트: task() tool_call_id → subagent_type slug
@@ -1194,6 +1934,11 @@ class DeepAgentExecutor(AgentExecutor):
         chat_hwpx_paths: set[str] = set()
         # /workspace 에 파일을 썼으면 True — 컨설팅 1단계(파일 미작성)와 구분하는 데 사용한다.
         workspace_write_made = False
+        pending_hitl_payload: dict[str, Any] | None = None
+        # 이번 턴이 시작한 시각. 턴이 끝나면 작업 폴더에서 이 시각 뒤에 바뀐 문서 산출물을
+        # 찾아 거둔다(`_room_document_paths`). 이 표식이 없으면 지난 턴의 문서까지 다시
+        # 올라가 화면에 같은 것이 여러 번 뜬다.
+        turn_started_ns = time.time_ns()
 
         try:
             async for _ns, stream_evt, data in graph.astream(
@@ -1216,8 +1961,38 @@ class DeepAgentExecutor(AgentExecutor):
                             full_response += text
                             if streamer:
                                 await streamer.send_json({"type": "token", "content": text})
+                        # HITL 질문/초안은 도구 인자로만 오므로 별도로 흘려보낸다.
+                        # 화면 표시 전용이라 full_response 에는 넣지 않는다 — 최종 메시지
+                        # 본문은 HITL 패널이 대신하고, 여기에 섞으면 저장 내용이 중복된다.
+                        if streamer:
+                            for _tcc in (getattr(msg, "tool_call_chunks", None) or []):
+                                if not isinstance(_tcc, dict):
+                                    continue
+                                _idx = _tcc.get("index")
+                                if _idx is None:
+                                    continue
+                                if (_tcc.get("name") or "") == "request_human_input":
+                                    hitl_arg_indexes.add(_idx)
+                                    hitl_arg_streamers.setdefault(_idx, ToolArgTextStreamer())
+                                if _idx not in hitl_arg_indexes:
+                                    continue
+                                _delta = hitl_arg_streamers[_idx].feed(_tcc.get("args") or "")
+                                if _delta:
+                                    await streamer.send_json({"type": "token", "content": _delta})
 
                 elif stream_evt == "updates":
+                    interrupt_payload = find_interrupt_payload(data)
+                    if interrupt_payload:
+                        return await _emit_human_asked(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            interrupt_payload=interrupt_payload,
+                            run_state=run_state,
+                            checkpoint_thread_id=checkpoint_thread_id or "",
+                            job_id=job_id,
+                            streamer=streamer,
+                        )
                     for _node, update in data.items():
                         if not isinstance(update, dict):
                             continue
@@ -1229,25 +2004,33 @@ class DeepAgentExecutor(AgentExecutor):
                                 for tc in msg.tool_calls:
                                     tool_name = tc["name"]
                                     tool_args = tc.get("args", {})
+                                    _tc_id = tc.get("id")
+                                    if _tc_id:
+                                        active_tool_calls[_tc_id] = tool_name
+                                        if isinstance(tool_args, dict):
+                                            pending_tool_args[_tc_id] = tool_args
+                                    if tool_name == "request_human_input":
+                                        pending_hitl_payload = normalize_hitl_payload(tool_args)
                                     # 파일 산출물 추적: write_file/edit_file 의 대상 경로를 기록해두고
                                     # tool_end 에서 실제 내용을 읽어 file_artifact 로 프론트에 전달한다.
                                     if subprocess_alias_map and tool_name == "task":
-                                        _tc_id = tc.get("id")
                                         _subagent_slug = (tool_args.get("subagent_type") or "") if isinstance(tool_args, dict) else ""
                                         if _tc_id and _subagent_slug:
                                             pending_task_calls[_tc_id] = _subagent_slug
                                     if streamer and tool_name in _FILE_TOOL_NAMES:
                                         _fp = (tool_args.get("file_path") or tool_args.get("path") or "") if isinstance(tool_args, dict) else ""
-                                        _tc_id = tc.get("id")
-                                        if _fp and _tc_id and str(_fp).startswith("/workspace"):
+                                        if (
+                                            _fp
+                                            and _tc_id
+                                            and str(_fp).startswith("/workspace")
+                                            and _EVAL_RUN_PATH_MARKER not in str(_fp)
+                                        ):
                                             pending_file_ops[_tc_id] = {
                                                 "path": str(_fp),
-                                                "op": "create" if tool_name in ("write_file", "write_process_definition") else "edit",
+                                                "op": "create" if tool_name == "write_file" else "edit",
                                                 "inline": (
                                                     tool_args.get("content")
                                                     if tool_name == "write_file"
-                                                    else json.dumps(tool_args.get("definition"), ensure_ascii=False, indent=2)
-                                                    if tool_name == "write_process_definition"
                                                     else None
                                                 ),
                                             }
@@ -1307,6 +2090,7 @@ class DeepAgentExecutor(AgentExecutor):
                                 tool_name = active_tool_calls.pop(
                                     msg.tool_call_id, getattr(msg, "name", "unknown")
                                 )
+                                tool_args_used = pending_tool_args.pop(msg.tool_call_id, {})
                                 result_content = msg.content
                                 # 채팅: 도구 결과(예: build_hwpx 실행 출력)에서 hwpx 경로를 모아 종료 시 실체화.
                                 if is_chat:
@@ -1321,8 +2105,14 @@ class DeepAgentExecutor(AgentExecutor):
                                     context_id=context_id,
                                     state=TaskState.TASK_STATE_WORKING,
                                     text=json.dumps(
-                                        {"tool": tool_name, "tool_name": tool_name, "result": result_content},
+                                        {
+                                            "tool": tool_name,
+                                            "tool_name": tool_name,
+                                            "args": tool_args_used,
+                                            "result": result_content,
+                                        },
                                         ensure_ascii=False,
+                                        default=str,
                                     ),
                                     event_type="tool_usage_finished",
                                     job_id=job_id,
@@ -1422,8 +2212,19 @@ class DeepAgentExecutor(AgentExecutor):
                                                     "child todo 없음: subagent=%s activity_id=%s root_proc_inst_id=%s",
                                                     _subagent_slug, _child_activity_id, root_proc_inst_id,
                                                 )
-
                 elif stream_evt == "values" and isinstance(data, dict):
+                    interrupt_payload = find_interrupt_payload(data)
+                    if interrupt_payload:
+                        return await _emit_human_asked(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            interrupt_payload=interrupt_payload,
+                            run_state=run_state,
+                            checkpoint_thread_id=checkpoint_thread_id or "",
+                            job_id=job_id,
+                            streamer=streamer,
+                        )
                     if not _ns:  # root graph only — ignore subagent intermediate states
                         final_state = data
 
@@ -1438,6 +2239,8 @@ class DeepAgentExecutor(AgentExecutor):
                     logger.warning("chat_room context 저장 실패 | room_id=%s", chat_room_id, exc_info=True)
 
             raw_text = extract_final_text(final_state, streamed_fallback=full_response)
+            if pinned_skills:
+                log_pinned_skill_outcome(final_state, pinned_skills, room_id=chat_room_id)
 
             # 채팅: 스킬이 만든 hwpx 를 office-mcp 로 실체화해 기존 채팅 아티팩트(미리보기/편집)로 띄운다.
             if is_chat and streamer is not None:
@@ -1448,6 +2251,28 @@ class DeepAgentExecutor(AgentExecutor):
                 except Exception:
                     logger.warning("채팅 hwpx 아티팩트 emit 실패", exc_info=True)
 
+            # 채팅: 그 밖의 산출물은 답변에 컨테이너 경로만 남아 받을 길이 없었다.
+            # 비공개 버킷에 보관하고 서명 주소로 바꿔 준다. 레코드(`chat_artifacts`)는
+            # 아래에서 메시지에 함께 저장돼, 새로고침해도 주소가 만료돼도 다시 집을 수 있다.
+            chat_artifacts: list[dict] = []
+            if is_chat:
+                try:
+                    # 본문에 경로가 적혔든 아니든, 이번 턴에 작업 폴더에 생긴 문서는 거둔다.
+                    _doc_paths = await asyncio.to_thread(
+                        _room_document_paths, chat_room_id or "", turn_started_ns
+                    )
+                    raw_text, chat_artifacts = await _publish_chat_artifacts(
+                        tenant_id, chat_room_id or context_id or "", raw_text, _doc_paths,
+                    )
+                except Exception:
+                    logger.warning("채팅 산출물 보관 실패 — 원본 유지", exc_info=True)
+                # 거둔 문서를 작업 폴더 목록에 띄운다. 바이너리는 write_file 스트림을
+                # 타지 않아, 이 emit 이 없으면 목록에서 통째로 빠진다.
+                try:
+                    await _emit_document_artifacts(streamer, chat_artifacts)
+                except Exception:
+                    logger.warning("문서 산출물 작업 폴더 emit 실패", exc_info=True)
+
             # 도구 출력에서 못 잡았을 때 대비: 최종 텍스트에 요약/출력계약 JSON 이 있으면 결과 카드용 이벤트 emit.
             if streamer and not process_result_sent:
                 _pr_final = _detect_process_result(raw_text)
@@ -1455,84 +2280,19 @@ class DeepAgentExecutor(AgentExecutor):
                     process_result_sent = True
                     await streamer.send_json({"type": "process_result", "data": _pr_final})
 
-            interrupt_payload = extract_interrupt_payload(final_state)
+            interrupt_payload = extract_interrupt_payload(final_state) or pending_hitl_payload
 
             if interrupt_payload:
-                question = (
-                    interrupt_payload.get("question") if isinstance(interrupt_payload, dict) else None
-                ) or "이 작업을 계속 진행하려면 추가 입력이 필요합니다."
-                context_text = (
-                    interrupt_payload.get("context", "") if isinstance(interrupt_payload, dict) else ""
-                )
-                options_payload = (
-                    interrupt_payload.get("options") if isinstance(interrupt_payload, dict) else None
-                )
-                multi_select_payload = bool(
-                    interrupt_payload.get("multi_select") if isinstance(interrupt_payload, dict) else False
-                )
-                pending_field = "human_response"
-
-                is_duplicate = is_duplicate_hitl_request(
-                    run_state, question=question, pending_field=pending_field
-                )
-                new_run_state = {
-                    "pending_field": pending_field,
-                    "tool_name": "request_human_input",
-                    "last_question": question,
-                    "checkpoint_thread_id": checkpoint_thread_id or "",
-                }
-                # 채팅 경로: ChatEventQueue 는 TaskStatusUpdateEvent(human_asked)를 무시하고,
-                # interrupt 후 done/error 가 없으면 SSE 가 끝나지 않아 프론트가 무한 대기한다.
-                # 그래서 질문/컨텍스트/run_state 를 담은 done 메시지를 streamer 로 보내 스트림을
-                # 정상 종료시키고, 프론트가 이 마커로 HITL 패널을 띄우고 같은 세션으로 resume 한다.
-                if streamer:
-                    hitl_content = json.dumps(
-                        {
-                            "type": "human_input_required",
-                            "question": question,
-                            "context": context_text,
-                            "options": options_payload or [],
-                            "multi_select": multi_select_payload,
-                            "run_state": new_run_state,
-                        },
-                        ensure_ascii=False,
-                    )
-                    await streamer.send_json({"type": "done", "content": hitl_content})
-
-                if is_duplicate:
-                    logger.info("중복 HITL 요청 억제 | task_id=%s", task_id)
-                    return {"status": "waiting_for_human", "run_state": dict(run_state)}
-
-                await _enqueue_status(
+                return await _emit_human_asked(
                     event_queue,
                     task_id=task_id,
                     context_id=context_id,
-                    state=TaskState.TASK_STATE_INPUT_REQUIRED,
-                    text=json.dumps(
-                        {
-                            "question": question,
-                            "context": context_text,
-                            "options": options_payload or [],
-                            "multi_select": multi_select_payload,
-                            "type": "text",
-                            "run_state": new_run_state,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    event_type="human_asked",
+                    interrupt_payload=interrupt_payload,
+                    run_state=run_state,
+                    checkpoint_thread_id=checkpoint_thread_id or "",
                     job_id=job_id,
+                    streamer=streamer,
                 )
-                ae_text = f"{question}\n\n{context_text}"
-                artifact_evt = new_text_artifact_update_event(
-                    task_id=task_id,
-                    context_id=context_id,
-                    name="assistant_response",
-                    text=ae_text,
-                    last_chunk=True,
-                )
-                ParseDict({"role": "assistant"}, artifact_evt.metadata)
-                await event_queue.enqueue_event(artifact_evt)
-                return {"status": "waiting_for_human", "run_state": new_run_state}
 
             # 폴백: 에이전트가 process-definition.json 은 만들었으나(이번 턴) complete 를 호출하지 않고
             # 인터럽트 없이 턴을 끝낸 경우 — 스킬 생성 등으로 step 이 소진되면 발생한다.
@@ -1544,8 +2304,8 @@ class DeepAgentExecutor(AgentExecutor):
             if not process_json_written and chat_room_id:
                 try:
                     from core.skills.tools import process_work_dirs as _process_work_dirs, _conv_slug
-                    from core.agents.agent import _BASE_DIR as _ABASE
-                    room_dir = _ABASE / "workspace" / ".bpmn" / _conv_slug(chat_room_id)
+                    from core.skills.tools import tenant_workspace_root as _tenant_ws
+                    room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id)
                     process_json_written = any(
                         (directory / "process-definition.json").is_file()
                         for directory in _process_work_dirs(room_dir, chat_room_id)
@@ -1562,10 +2322,10 @@ class DeepAgentExecutor(AgentExecutor):
                         process_work_dirs as _process_work_dirs,
                         _conv_slug,
                     )
-                    from core.agents.agent import _BASE_DIR as _ABASE
+                    from core.skills.tools import tenant_workspace_root as _tenant_ws
 
                     _ccid.set(chat_room_id or "")
-                    _room_dir = _ABASE / "workspace" / ".bpmn" / _conv_slug(chat_room_id or "")
+                    _room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id or "")
                     _validation_failures = []
                     for _work_dir in _process_work_dirs(_room_dir, chat_room_id or ""):
                         _definition_path = _work_dir / "process-definition.json"
@@ -1584,30 +2344,46 @@ class DeepAgentExecutor(AgentExecutor):
                                 "defects": _vobj.get("remaining_defects") or [],
                             })
                     if _validation_failures:
+                        # 정상적인 실패 경로다(예외 아님). 예외로 올려 스택트레이스를 남기는
+                        # 대신 사용자에게 무엇이 걸렸는지 한 줄로 알려주고 이 턴을 마친다.
                         complete_called = True  # 이번 턴의 무검증 재시도 방지
                         logger.error(
                             "auto-complete 검증 실패 | room=%s failures=%s",
                             chat_room_id,
                             _validation_failures,
                         )
-                        raw_text = "프로세스 실행 검증을 통과하지 못해 결과 전달을 중단했습니다. 자동 보정 후 다시 검증합니다."
-                        raise RuntimeError("process validation failed before auto-complete")
-                    _cres = await asyncio.to_thread(_cpg.invoke, {})
-                    logger.info("auto-complete(폴백) | room=%s result=%.140s", chat_room_id, str(_cres))
-                    complete_called = True
-                    if not str(_cres or "").startswith("ERROR"):
-                        await _reemit_room_artifacts(streamer, chat_room_id or "")
-                        await streamer.send_json({"type": "plan_todos", "todos": [
-                            {"content": "1. 프로세스 초안 설계 & JSON 생성", "status": "completed"},
-                            {"content": "2. 스킬·에이전트·DMN 선택 & 생성", "status": "completed"},
-                            {"content": "3. 입력 폼 & 참조정보 생성", "status": "completed"},
-                            {"content": "4. 프로세스 검증 & 자동 보정", "status": "completed"},
-                            {"content": "5. 결과 통합 & 완료", "status": "completed"},
-                        ]})
-                        if "확인 후 저장" not in (raw_text or ""):
-                            raw_text = "프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요."
+                        raw_text = (
+                            "프로세스 정의가 검증을 통과하지 못해 결과 전달을 보류했어요.\n"
+                            + _validation_failure_summary(_validation_failures)
+                            + "\n어떻게 고칠지 알려주시면 이어서 수정할게요."
+                        )
+                    else:
+                        _cres = await asyncio.to_thread(_cpg.invoke, {})
+                        logger.info("auto-complete | room=%s result=%.140s", chat_room_id, str(_cres))
+                        complete_called = True
+                        if str(_cres or "").startswith("ERROR"):
+                            raw_text = (
+                                "프로세스 산출물을 통합하는 중 문제가 생겨 결과 전달을 보류했어요. "
+                                "다시 시도하거나 수정할 부분을 알려주세요."
+                            )
+                        else:
+                            await _reemit_room_artifacts(streamer, chat_room_id or "")
+                            await streamer.send_json({"type": "plan_todos", "todos": [
+                                {"content": "1. 프로세스 초안 설계 & JSON 생성", "status": "completed"},
+                                {"content": "2. 스킬·에이전트·DMN 선택 & 생성", "status": "completed"},
+                                {"content": "3. 입력 폼 & 참조정보 생성", "status": "completed"},
+                                {"content": "4. 프로세스 검증 & 자동 보정", "status": "completed"},
+                                {"content": "5. 결과 통합 & 완료", "status": "completed"},
+                            ]})
+                            if "확인 후 저장" not in (raw_text or ""):
+                                raw_text = "프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요."
                 except Exception:
-                    logger.exception("auto-complete(폴백) 실패")
+                    logger.exception("auto-complete 실패")
+                    complete_called = True
+                    raw_text = (
+                        "프로세스 마무리 처리 중 오류가 발생했어요. "
+                        "잠시 후 다시 시도하거나 수정할 부분을 알려주세요."
+                    )
 
             # 단독 스킬 생성: process-definition.json 이 없어 위 complete 폴백을 타지 않으므로,
             # 방 산출물(base/skills/*/SKILL.md)을 file_artifact 로 재전송해 프론트 패널 표시 + 저장을 보장한다.
@@ -1617,10 +2393,27 @@ class DeepAgentExecutor(AgentExecutor):
                 try:
                     await _reemit_room_artifacts(streamer, chat_room_id or "")
                     logger.info("단독 스킬 산출물 재전송 | room=%s", chat_room_id)
-                    if "확인 후 저장" not in (raw_text or ""):
+                    # PR(병합 요청)을 올린 턴은 사용자가 저장 버튼을 누를 일이 없다. 그런데도
+                    # 이 문구로 덮어쓰면 PR 링크와 병합 위치 안내가 사라지고 "저장하라"는
+                    # 잘못된 안내만 남는다. 그런 응답은 에이전트의 원문을 그대로 둔다.
+                    if "확인 후 저장" not in (raw_text or "") and not _reports_pull_request(raw_text):
                         raw_text = "스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요."
                 except Exception:
                     logger.exception("단독 스킬 산출물 재전송 실패")
+
+            # 빈 턴 방지: 모델이 아무 텍스트도 내지 않고(도구 호출도 없이) 끝난 경우
+            # 빈 어시스턴트 메시지가 저장돼 사용자 화면에는 "답변했는데 반응이 없는" 상태로 보인다.
+            # HITL 응답 직후 재개가 헛돌 때 특히 잘 생긴다 — 무슨 일이 있었는지 짧게라도 남긴다.
+            if not str(raw_text or "").strip():
+                logger.warning(
+                    "빈 응답으로 턴 종료 | room=%s resume=%s pending_interrupt=%s",
+                    chat_room_id, use_graph_resume, has_pending_interrupt,
+                )
+                raw_text = (
+                    "이어서 진행하지 못했어요. 한 번만 더 알려주시면 그 지점부터 계속할게요."
+                    if human_answer_stripped
+                    else "요청을 처리하지 못했어요. 다시 말씀해 주세요."
+                )
 
             await _enqueue_status(
                 event_queue,
@@ -1661,7 +2454,9 @@ class DeepAgentExecutor(AgentExecutor):
                 except Exception:
                     logger.warning("hwpx 폼 산출물 실체화 처리 실패 — 원본 유지", exc_info=True)
                 try:
-                    final_text = await _materialize_ws_file_form_outputs(tenant_id, final_text)
+                    final_text = await _materialize_ws_file_form_outputs(
+                        tenant_id, final_text, chat_room_id or instance_id or "",
+                    )
                 except Exception:
                     logger.warning("ws 파일 폼 산출물 실체화 처리 실패 — 원본 유지", exc_info=True)
             # D2D 핸드오프: 단계 완료 시 LLM 최종 응답을 workspace에 저장해 다음 딥에이전트 단계가 직접 읽을 수 있게 한다.
@@ -1684,15 +2479,31 @@ class DeepAgentExecutor(AgentExecutor):
                 text=final_text,
                 last_chunk=True,
             )
-            ParseDict({"role": "assistant"}, artifact_evt.metadata)
+            _final_meta: dict = {"role": "assistant"}
+            if chat_artifacts:
+                # 화면이 읽는 이름은 오래된 것(`pdfFiles`)이다. 레코드에는 `file_id` 와
+                # 만료 시각이 함께 실려, 주소가 죽은 뒤에도 새 주소를 받아 갈 수 있다.
+                _final_meta["pdfFiles"] = [download_file(item) for item in chat_artifacts]
+            ParseDict(_final_meta, artifact_evt.metadata)
             await event_queue.enqueue_event(artifact_evt)
 
             if is_chat and chat_room_id:
-                await mark_done(chat_room_id)
+                await get_run_registry().mark_done(chat_room_id)
                 logger.info(
                     "채팅 완료 | room_id=%s task_id=%s response_len=%d",
                     chat_room_id, task_id, len(final_text),
                 )
+                if tenant_id:
+                    # 이번 턴이 만든/수정한 워크스페이스 파일을 Supabase Storage에 올려서,
+                    # 다음 턴이 다른 파드로 라우팅돼도 이어서 읽을 수 있게 한다.
+                    try:
+                        room_dir = _bpmn_work_dir()
+                        if room_dir.exists():
+                            _set_storage_tenant_id(tenant_id)
+                            result = await asyncio.to_thread(upload_workspace_directory, chat_room_id, room_dir)
+                            logger.info("워크스페이스 동기화 | room_id=%s | %s", chat_room_id, result.splitlines()[0] if result else "")
+                    except Exception:
+                        logger.warning("워크스페이스 동기화 실패(무시) | room_id=%s", chat_room_id, exc_info=True)
 
         except Exception as e:
             logger.exception("execute 실패: %s", e)
@@ -1705,6 +2516,25 @@ class DeepAgentExecutor(AgentExecutor):
                     text=json.dumps({"error": error_text}, ensure_ascii=False),
                 )
             )
+            # 오류도 chats 에 남긴다 — SSE 로만 보내면 화면에는 보이지만 레코드가
+            # 없어 새로고침/재진입 시 답변이 아예 없던 것처럼 보인다. 최종 아티팩트가
+            # 이미 저장된 뒤(예: 뒤처리 중 실패)라면 같은 uuid 를 오류로 덮어쓰지
+            # 않도록 건너뛴다.
+            # 프로세스/워크리스트 경로는 헬퍼가 알아서 건너뛴다(저장 대상 아님).
+            if not getattr(event_queue, "_finalized", False):
+                try:
+                    await _persist_chat_error_message(
+                        context,
+                        task_id=task_id,
+                        context_id=context_id,
+                        error_text=error_text,
+                        partial_text=full_response,
+                    )
+                except Exception:
+                    logger.warning(
+                        "오류 메시지 chats 저장 실패 | room_id=%s", chat_room_id, exc_info=True
+                    )
+
             # 채팅: error 타입으로 보내야 drain_sse_queue 가 스트림을 종료하고
             # 프론트 onError 가 발동해 오류를 화면에 표시한다(무한 "생각 중..." 방지).
             if streamer:

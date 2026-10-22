@@ -267,6 +267,11 @@ class GiteaProvider(GitProvider):
                 "state": p["state"],
                 "head": p["head"]["ref"],
                 "base": p["base"]["ref"],
+                "merged_at": p.get("merged_at"),
+                "merged": bool(p.get("merged_at")),
+                "author": (p.get("user") or {}).get("login", ""),
+                "created_at": p.get("created_at"),
+                "updated_at": p.get("updated_at"),
             }
             for p in resp.json()
         ]
@@ -277,7 +282,9 @@ class GiteaProvider(GitProvider):
             headers=self._headers(),
             timeout=15,
         )
-        if resp.status_code != 204:
+        # 이미 없는 레포(404)는 '삭제 완료'와 같게 다룬다. DELETE 는 멱등해야 하고,
+        # 여기서 예외를 던지면 호출부가 로컬 정리까지 건너뛰어 스킬이 영영 안 지워진다.
+        if resp.status_code not in (204, 404):
             raise RuntimeError(f"Gitea 레포 삭제 실패: {resp.status_code} {resp.text[:200]}")
 
     def get_pull_request_files(self, owner: str, repo: str, number: int) -> list[dict]:

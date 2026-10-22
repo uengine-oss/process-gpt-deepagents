@@ -14,10 +14,15 @@ _API = "https://api.github.com"
 class GitHubProvider(GitProvider):
 
     def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
+        # 토큰이 비어 있으면 Authorization 헤더 자체를 넣지 않는다. `Bearer ` 처럼 값이 빈
+        # 헤더는 httpx/urllib 이 "Illegal header value" 로 거절해, 공개 레포(anthropics/skills)
+        # 인덱싱조차 매번 실패한다(→ skill-creator 등 번들 스킬이 안 받아짐).
+        # 익명 호출은 rate limit 만 낮을 뿐 공개 레포 읽기에는 문제가 없다.
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        token = str(self.token or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
 
     # ------------------------------------------------------------------
 
@@ -79,10 +84,11 @@ class GitHubProvider(GitProvider):
 
     def fetch_file(self, owner: str, repo: str, branch: str, path: str) -> bytes:
         url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-        req = Request(
-            url,
-            headers={"Authorization": f"Bearer {self.token}", "User-Agent": "process-gpt-deepagents/1.0"},
-        )
+        raw_headers = {"User-Agent": "process-gpt-deepagents/1.0"}
+        token = str(self.token or "").strip()
+        if token:
+            raw_headers["Authorization"] = f"Bearer {token}"
+        req = Request(url, headers=raw_headers)
         with urlopen(req, timeout=60) as r:
             return r.read()
 
@@ -260,6 +266,16 @@ class GitHubProvider(GitProvider):
                 "state": p["state"],
                 "head": p["head"]["ref"],
                 "base": p["base"]["ref"],
+                # 병합된 PR 과 그냥 닫힌 PR 을 구분할 수 있어야 한다. 이 정보가 없으면
+                # 호출자가 closed 를 모두 "병합됨" 으로 표시해 변경 이력을 오해하게 된다.
+                # (목록 API 는 merged 플래그를 주지 않고 merged_at 만 준다.)
+                "merged_at": p.get("merged_at"),
+                "merged": bool(p.get("merged_at")),
+                # 기록이 누락된 PR 을 목록에 채워 넣으려면 작성자와 시각이 필요하다.
+                # 이게 없으면 복구된 항목이 "알 수 없는 사용자 · 방금" 으로만 보인다.
+                "author": (p.get("user") or {}).get("login", ""),
+                "created_at": p.get("created_at"),
+                "updated_at": p.get("updated_at"),
             }
             for p in resp.json()
         ]
@@ -270,7 +286,9 @@ class GitHubProvider(GitProvider):
             headers=self._headers(),
             timeout=15,
         )
-        if resp.status_code != 204:
+        # 이미 없는 레포(404)는 '삭제 완료'와 같게 다룬다. DELETE 는 멱등해야 하고,
+        # 여기서 예외를 던지면 호출부가 로컬 정리까지 건너뛰어 스킬이 영영 안 지워진다.
+        if resp.status_code not in (204, 404):
             raise RuntimeError(f"GitHub repo 삭제 실패: {resp.status_code} {resp.text[:200]}")
 
     def get_pull_request_files(self, owner: str, repo: str, number: int) -> list[dict]:

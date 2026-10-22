@@ -10,15 +10,37 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# executor 모듈에서 필요한 함수만 직접 임포트하기 위해
-# 무거운 의존성을 모킹한다.
+# executor 모듈에서 필요한 함수만 직접 임포트하기 위해 무거운 의존성을 모킹한다.
+# 단, **실제로 설치되지 않은 것만** 스텁한다. 설치된 패키지를 빈 모듈로 덮으면
+# sys.modules 가 세션 내내 오염돼 "No module named 'langchain.agents';
+# 'langchain' is not a package" 처럼 이 파일과 이후 테스트가 함께 깨진다.
 _HEAVY = [
     "langgraph", "langchain_core", "langchain", "anthropic",
     "a2a", "processgpt_agent_sdk", "litellm", "supabase",
 ]
-for _mod in _HEAVY:
-    if _mod not in sys.modules:
-        sys.modules[_mod] = types.ModuleType(_mod)
+
+
+def _stub_missing_heavy_deps() -> list[str]:
+    """설치되지 않은 의존성만 빈 모듈로 채우고, 채운 이름 목록을 돌려준다."""
+    import importlib.util as _ilu
+
+    stubbed: list[str] = []
+    for mod in _HEAVY:
+        if mod in sys.modules:
+            continue
+        try:
+            if _ilu.find_spec(mod) is not None:
+                continue  # 실제 패키지가 있으면 건드리지 않는다
+        except (ImportError, ValueError):
+            pass
+        sys.modules[mod] = types.ModuleType(mod)
+        stubbed.append(mod)
+    return stubbed
+
+
+def _remove_stubs(names: list[str]) -> None:
+    for name in names:
+        sys.modules.pop(name, None)
 
 # executor를 직접 import하지 않고 함수만 추출
 import importlib.util, os
@@ -28,6 +50,14 @@ _EXEC_PATH = Path(__file__).parent.parent / "executor.py"
 
 def _load_helpers():
     """executor.py에서 _offload_input_data / _save_step_output만 추출."""
+    _stubbed = _stub_missing_heavy_deps()
+    try:
+        return _load_helpers_inner()
+    finally:
+        _remove_stubs(_stubbed)
+
+
+def _load_helpers_inner():
     src = _EXEC_PATH.read_text(encoding="utf-8")
     # 필요한 함수 정의만 포함하는 최소 모듈 생성
     ns: dict = {"re": re, "json": json, "Path": Path}
@@ -176,14 +206,17 @@ def test_no_instance_id_uses_flat_path(tmp_workspace):
 def test_save_step_output_creates_file(tmp_workspace):
     import core.skills.tools as cst
     _orig = cst.WORKSPACE_ROOT
+    token = cst._current_tenant_id.set("acme")
     try:
         cst.WORKSPACE_ROOT = tmp_workspace
         import executor
         executor._save_step_output("에이전트 최종 응답 텍스트", "inst-006", "activity_abc123")
     finally:
         cst.WORKSPACE_ROOT = _orig
+        cst._current_tenant_id.reset(token)
 
-    outputs_dir = tmp_workspace / "inst-006" / "outputs"
+    # 산출물은 테넌트 작업공간(WORKSPACE_ROOT/<tenant>) 아래에 쌓인다.
+    outputs_dir = tmp_workspace / "acme" / "inst-006" / "outputs"
     files = list(outputs_dir.glob("*.md"))
     assert len(files) == 1
     assert "에이전트 최종 응답 텍스트" in files[0].read_text(encoding="utf-8")

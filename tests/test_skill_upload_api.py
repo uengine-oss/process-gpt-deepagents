@@ -338,3 +338,65 @@ class TestUploadSkillFromGit:
 
         assert resp.status_code == 422
         assert "SKILL.md" in resp.json()["error"]
+
+
+# ── /skills/upload 의 overwrite (기존 스킬 내용 교체) ─────────────────────────
+
+class TestUploadSkillOverwrite:
+    """깃 연동 없이 스킬을 수정하려면 업로드가 기존 스킬을 교체할 수 있어야 한다.
+    기본값은 종전대로 409(실수로 덮어쓰지 않게), overwrite=true 일 때만 교체한다."""
+
+    def _post(self, client, zip_bytes, *, overwrite=None, tenant_id="tenant1", skill_name="my-skill"):
+        data = {"tenant_id": tenant_id, "skill_name": skill_name}
+        if overwrite is not None:
+            data["overwrite"] = overwrite
+        return client.post(
+            "/skills/upload",
+            data=data,
+            files={"file": ("my-skill.zip", zip_bytes, "application/zip")},
+        )
+
+    def _dest(self, tmp_path, skill_name="my-skill", tenant_id="tenant1"):
+        # get_tenant_skill_dest 규칙: <root>/<tenant>/<config_id>/<skill>
+        return tmp_path / tenant_id / "local" / skill_name
+
+    def test_conflict_without_overwrite(self, client, tmp_path, monkeypatch):
+        monkeypatch.setenv("SKILLS_DIRS", str(tmp_path))
+        with patch("core.api.skills_router._save_tenant_skill"):
+            self._post(client, _make_zip({"SKILL.md": "name: my-skill\n", "a.md": "v1"}))
+            resp = self._post(client, _make_zip({"SKILL.md": "name: my-skill\n", "a.md": "v2"}))
+        assert resp.status_code == 409
+        assert "already exists" in resp.json()["error"]
+        assert (self._dest(tmp_path) / "a.md").read_text() == "v1"
+
+    def test_overwrite_replaces_files(self, client, tmp_path, monkeypatch):
+        monkeypatch.setenv("SKILLS_DIRS", str(tmp_path))
+        with patch("core.api.skills_router._save_tenant_skill") as save:
+            self._post(client, _make_zip({"SKILL.md": "name: my-skill\n", "a.md": "v1"}))
+            assert save.call_count == 1
+            resp = self._post(
+                client,
+                _make_zip({"SKILL.md": "name: my-skill\n", "a.md": "v2"}),
+                overwrite="true",
+            )
+            # 이미 등록된 스킬이므로 tenant_skills 중복 insert 는 하지 않는다.
+            assert save.call_count == 1
+
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["overwritten"] is True
+        assert (self._dest(tmp_path) / "a.md").read_text() == "v2"
+        # 백업 디렉터리는 남기지 않는다.
+        assert not list(self._dest(tmp_path).parent.glob("my-skill.bak-*"))
+
+    def test_overwrite_removes_files_absent_from_new_package(self, client, tmp_path, monkeypatch):
+        monkeypatch.setenv("SKILLS_DIRS", str(tmp_path))
+        with patch("core.api.skills_router._save_tenant_skill"):
+            self._post(client, _make_zip({"SKILL.md": "name: my-skill\n", "old.md": "gone"}))
+            resp = self._post(
+                client,
+                _make_zip({"SKILL.md": "name: my-skill\n", "new.md": "here"}),
+                overwrite="true",
+            )
+        assert resp.status_code == 201, resp.text
+        assert (self._dest(tmp_path) / "new.md").exists()
+        assert not (self._dest(tmp_path) / "old.md").exists()

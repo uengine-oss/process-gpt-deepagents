@@ -1,10 +1,11 @@
 import asyncio
+import json
 import logging
 import re
 
 from deepagents import SubAgent
-from langchain.agents.middleware import ToolRetryMiddleware
 
+from .tool_retry import build_tool_retry_middleware
 from ..llm.mcp import _load_mcp_tools_grouped
 from ..skills.skills import FilteredSkillsMiddleware, _get_skills
 from ..skills.git_providers.factory import get_provider as _get_git_provider
@@ -23,14 +24,32 @@ def _parse_csv(value) -> list[str]:
     return []
 
 
-def _build_subagent_system_prompt(agent: dict) -> str:
-    username = agent.get("username") or agent.get("name", "에이전트")
-    parts = [f"You are {username}."]
+def _format_profile_traits(agent: dict) -> list[str]:
+    """프로필 dict(description/role/goal/persona)를 프롬프트용 텍스트 라인으로 변환한다."""
+    parts = []
     if desc := (agent.get("description") or "").strip():
         parts.append(desc)
     for key in ("role", "goal", "persona"):
         if val := (agent.get(key) or "").strip():
             parts.append(f"{key.capitalize()}: {val}")
+    return parts
+
+
+def _normalize_tool_filters(value) -> dict:
+    """JSON 문자열 또는 dict로 들어오는 tool_filters를 dict로 정규화한다."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _build_subagent_system_prompt(agent: dict, tenant_id: str = "") -> str:
+    username = agent.get("username") or agent.get("name", "에이전트")
+    parts = [f"You are {username}."] + _format_profile_traits(agent)
+    if tenant_id:
+        parts.append(f"- 테넌트 ID: {tenant_id}")
     parts.append("Reply in Korean unless the user writes in another language.")
     return "\n".join(parts)
 
@@ -71,9 +90,10 @@ async def _build_subagents(
         seen_names.add(name)
 
         mcp_server_names = _parse_csv(agent.get("tools"))
+        tool_filters = _normalize_tool_filters(agent.get("tool_filters"))
         tools = []
         if mcp_server_names and tenant_mcp:
-            grouped = await _load_mcp_tools_grouped(mcp_server_names, tenant_mcp)
+            grouped = await _load_mcp_tools_grouped(mcp_server_names, tenant_mcp, tool_filters=tool_filters)
             for srv, srv_tools in grouped.items():
                 tools.extend(srv_tools)
                 if srv not in mcp_connectors:
@@ -116,12 +136,12 @@ async def _build_subagents(
             # MCP 도구(예: odoo-mcp aggregate_records/search_records) 호출이 ToolException
             # 등으로 실패해도 실행을 중단시키지 않고, 에러를 ToolMessage 로 모델에 돌려줘
             # 인자를 스스로 보정해 재시도하게 한다.
-            extra_middleware.append(ToolRetryMiddleware(max_retries=1, on_failure="continue"))
+            extra_middleware.append(build_tool_retry_middleware())
 
         subagent: SubAgent = SubAgent(
             name=name,
             description=description,
-            system_prompt=_build_subagent_system_prompt(agent),
+            system_prompt=_build_subagent_system_prompt(agent, tenant_id),
         )
         if tools:
             subagent["tools"] = tools

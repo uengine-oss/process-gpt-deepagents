@@ -225,7 +225,7 @@ def test_completion_requires_exact_validated_definition_and_ignores_stale_dirs(t
     conversation_id = "conversation-validated"
     tools._current_conversation_id.set(conversation_id)
     tools._current_tenant_id.set("localhost")
-    room = tmp_path / ".bpmn" / conversation_id
+    room = tmp_path / "localhost" / ".bpmn" / conversation_id
     active = room / tools.canonical_process_dir_name(conversation_id)
     stale = room / "process-stale01"
     active.mkdir(parents=True)

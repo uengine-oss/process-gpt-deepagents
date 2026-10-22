@@ -33,28 +33,30 @@ def _get_proc_def_definition(tenant_id: str, proc_def_id: str) -> dict[str, Any]
     return row0.get("definition") if isinstance(row0, dict) else None
 
 
-def _extract_activity_tools_skills(
-    definition: Any,
-    *,
-    activity_id: str,
-) -> tuple[list[str], list[str]]:
+def _find_activity(definition: Any, activity_id: str) -> dict[str, Any] | None:
+    """definition.activities[] 에서 activity_id 와 일치하는 항목을 반환한다."""
     aid = (activity_id or "").strip()
     if not aid or not isinstance(definition, dict):
-        return ([], [])
+        return None
     activities = definition.get("activities")
     if not isinstance(activities, list):
-        return ([], [])
+        return None
 
-    target: dict[str, Any] | None = None
     for act in activities:
         if not isinstance(act, dict):
             continue
         for key in ("id", "activity_id", "activityId", "key"):
             if str(act.get(key) or "").strip() == aid:
-                target = act
-                break
-        if target is not None:
-            break
+                return act
+    return None
+
+
+def _extract_activity_tools_skills(
+    definition: Any,
+    *,
+    activity_id: str,
+) -> tuple[list[str], list[str]]:
+    target = _find_activity(definition, activity_id)
     if target is None:
         return ([], [])
 
@@ -95,6 +97,118 @@ def load_activity_capabilities(
     return _extract_activity_tools_skills(definition, activity_id=aid)
 
 
+# 액티비티에 배정된 에이전트가 2명 이상일 때, 그중 하나를 딥 에이전트의 "루트"로
+# 승격할지 설계자가 고르는 값(프로세스 설계 화면의 '메인 에이전트').
+#   - None  : 미설정(자동) — 배정 에이전트가 1명이면 승격하는 기존 휴리스틱을 그대로 둔다.
+#   - GENERIC: 승격 금지 — 제네릭 딥 에이전트가 배정 에이전트 전원을 서브에이전트로 위임한다.
+#   - 그 외  : 해당 에이전트 id 를 루트로 승격하고 나머지는 서브에이전트로 남긴다.
+ROOT_AGENT_GENERIC = "__none__"
+
+
+def _extract_activity_root_agent(definition: Any, *, activity_id: str) -> str | None:
+    target = _find_activity(definition, activity_id)
+    if target is None:
+        return None
+    for key in ("rootAgent", "root_agent", "rootAgentId", "root_agent_id"):
+        if key not in target:
+            continue
+        value = target.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        return text
+    return None
+
+
+def load_activity_root_agent(
+    *,
+    tenant_id: str,
+    proc_def_id: str,
+    activity_id: str,
+) -> str | None:
+    """액티비티에 설정된 루트 에이전트 지정값을 반환한다. 미설정/조회 실패 시 None."""
+    tid = (tenant_id or "").strip()
+    pdid = (proc_def_id or "").strip()
+    aid = (activity_id or "").strip()
+    if not (tid and pdid and aid):
+        return None
+    try:
+        definition = _get_proc_def_definition(tid, pdid)
+    except Exception:
+        logger.exception(
+            "activity root agent lookup failed | tenant_id=%s proc_def_id=%s activity_id=%s",
+            tid, pdid, aid,
+        )
+        return None
+    return _extract_activity_root_agent(definition, activity_id=aid)
+
+
+def resolve_root_agent(
+    *,
+    agents: list,
+    agent_profile: dict | None,
+    explicit_root_agent_id: str | None,
+    activity_id: str = "",
+) -> tuple[dict | None, list]:
+    """딥 에이전트의 루트 프로필과 서브에이전트로 남을 에이전트 목록을 확정한다.
+
+    반환: (agent_profile, agents)
+      - agent_profile 이 None 이면 제네릭 딥 에이전트가 루트다.
+      - agents 는 서브에이전트 후보 원본이며, 루트로 승격된 항목의 제외는
+        호출부의 _exclude_root_profile() 이 담당한다.
+    """
+    agent_list = list(agents or [])
+    pinned = (explicit_root_agent_id or "").strip() or None
+
+    if pinned == ROOT_AGENT_GENERIC:
+        # '기본 딥 에이전트' 명시 선택 — 배정 에이전트가 1명이어도 승격하지 않고
+        # 제네릭 루트가 전원을 서브에이전트로 위임한다.
+        logger.info(
+            "루트 에이전트: 기본 딥 에이전트로 고정(승격 없음) | activity_id=%s agents=%d",
+            activity_id, len(agent_list),
+        )
+        return (None, agent_list)
+
+    if pinned:
+        picked = next(
+            (a for a in agent_list if isinstance(a, dict) and str(a.get("id") or "") == pinned),
+            None,
+        )
+        if picked is not None:
+            # 지정된 에이전트를 루트로 승격한다. 나머지 배정 에이전트는 그대로 남아
+            # 서브에이전트로 위임된다.
+            logger.info(
+                "루트 에이전트 승격 | activity_id=%s root=%s subagents=%d",
+                activity_id, pinned, len(agent_list) - 1,
+            )
+            return (picked, agent_list)
+        if agent_profile and str(agent_profile.get("id") or "") == pinned:
+            # 채팅 경로: 지정 대상이 이미 이번 턴의 agent_profile 이다.
+            return (agent_profile, agent_list)
+        # 배정에서 빠진 에이전트를 가리키는 낡은 설정 — 아래 자동 규칙으로 폴백한다.
+        logger.warning(
+            "지정된 루트 에이전트를 배정 목록에서 찾지 못해 자동 규칙으로 폴백 | activity_id=%s root=%s",
+            activity_id, pinned,
+        )
+
+    # 자동(미설정) 규칙.
+    # 방에 참여한 에이전트가 둘 이상이면(그룹 채팅) 특정 프로필 하나를 루트로 승격하지
+    # 않는다 — 참여 에이전트 전원이 제네릭 딥 에이전트의 서브에이전트로 위임되는,
+    # 여러 에이전트 협업 시나리오이기 때문이다.
+    if agent_profile and len(agent_list) > 1:
+        agent_profile = None
+
+    # 채팅처럼 명시적인 agent_profile 신호가 없는 경우(주로 프로세스/워크리스트 모드):
+    # row.user_id로 직접 배정된 에이전트가 정확히 1명이면 그 에이전트를 서브에이전트가
+    # 아니라 루트로 승격한다. 2명 이상이면(레인 협업) 기존처럼 전원 서브에이전트로 위임한다.
+    if not agent_profile and len(agent_list) == 1:
+        return (agent_list[0], [])
+
+    return (agent_profile, agent_list)
+
+
 def fetch_child_activity_todo(root_proc_inst_id: str, activity_id: str) -> dict | None:
     """root_proc_inst_id + activity_id로 child activity todo를 조회한다.
 
@@ -128,53 +242,6 @@ def fetch_child_activity_todo(root_proc_inst_id: str, activity_id: str) -> dict 
             rpid, aid,
         )
         return None
-
-
-def build_fallback_subagent(
-    *,
-    tenant_id: str,
-    activity_tools: list[str],
-    activity_skills: list[str],
-) -> dict[str, Any] | None:
-    """Build a SubAgent-compatible dict from activity-declared tools/skills.
-
-    The returned dict shape is understood by core.agents.subagents._build_subagents:
-    - tools: CSV/list of MCP server names
-    - skills: CSV of skill names
-    """
-    if not activity_tools and not activity_skills:
-        return None
-
-    name = "업무 실행자"
-    sys_lines = [
-        "=== 역할 ===",
-        "- 당신은 프로세스 액티비티에 정의된 도구/스킬을 사용해 업무를 수행하는 실행 에이전트입니다.",
-        "- 결과는 간결하고 검증 가능한 형태(파일/JSON/근거)로 반환하세요.",
-    ]
-    if activity_tools:
-        sys_lines.append(f"- 액티비티 지정 도구: {', '.join(activity_tools)}")
-    if activity_skills:
-        sys_lines.append(f"- 액티비티 지정 스킬: {', '.join(activity_skills)}")
-    sys_lines.extend([
-        "",
-        "=== 우선순위 ===",
-        "- 1) task() 위임(description)의 지시/출력 형식을 최우선으로 따른다.",
-        "- 2) 스킬은 추정하지 말고, 필요한 경우 도구로 문서를 조회/로드한 뒤 사용한다.",
-        "- 3) 실행이 가능하면 실행(샌드박스)하고, 불가하면 근거와 다음 시도안을 보고한다.",
-    ])
-
-    return {
-        "name": name,
-        "username": name,
-        "alias": name,
-        "description": (
-            f"프로세스 액티비티 정의 기반 폴백 실행자 (tenant={tenant_id or '(unknown)'})"
-        ),
-        "system_prompt": "\n".join(sys_lines),
-        "tools": ",".join(activity_tools),
-        "skills": ",".join(activity_skills),
-        "agent_type": "activity_fallback",
-    }
 
 
 def _find_subprocess(definition: Any, activity_id: str) -> dict[str, Any] | None:

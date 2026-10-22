@@ -3,8 +3,12 @@ import os
 import re
 from pathlib import Path
 
+from typing import Annotated, NotRequired
+
 import yaml
-from deepagents.middleware.skills import SkillsMiddleware, SkillsStateUpdate
+from deepagents.backends.utils import validate_path
+from deepagents.middleware.skills import SkillsMiddleware, SkillsState, SkillsStateUpdate
+from langchain.agents.middleware.types import OmitFromOutput
 
 _BASE_DIR = Path(__file__).parent.parent.parent
 
@@ -109,6 +113,21 @@ def _get_skills(tenant_id: str = "", provider_config_id: str = "") -> list[str] 
     return paths if paths else None
 
 
+def resolve_slash_skill(tenant_id: str, requested_name: str) -> str:
+    """슬래시 커맨드(`/skill-name`)로 지정된 스킬이 이 테넌트에서 실제로 사용 가능하면
+    이름을 그대로, 아니면 빈 문자열을 반환한다.
+
+    `/skills` API가 프론트에 노출하는 목록과 동일한 기준(`_scan_skills`)을 사용해,
+    사용자가 채팅에서 고를 수 있는 스킬만 허용한다.
+    """
+    if not requested_name:
+        return ""
+    from core.api.skills_router import _scan_skills
+
+    names = {s["name"] for s in _scan_skills(tenant_id)}
+    return requested_name if requested_name in names else ""
+
+
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
@@ -201,13 +220,258 @@ def _resolve_extends_chain(
     return [by_name[n] for n in result if n in by_name]
 
 
-class FilteredSkillsMiddleware(SkillsMiddleware):
+def scan_skill_include_tools(source_dirs) -> dict[str, dict]:
+    """스킬 소스에서 `{스킬명: {"name", "path", "include_tools"}}` 를 읽는다.
+
+    SkillsMiddleware 와 같은 규칙이다 — 소스 바로 아래 디렉터리마다 SKILL.md 하나, 같은
+    이름이면 뒤 소스가 이긴다. `include_tools` 는 frontmatter `metadata.include_tools` 의
+    공백 구분 도구 이름이다(deepagents skill tools). `path` 는 호스트의 SKILL.md 경로다.
+    """
+    result: dict[str, dict] = {}
+    for source in source_dirs or []:
+        try:
+            entries = sorted(p for p in Path(source).iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for entry in entries:
+            skill_md = entry / "SKILL.md"
+            if not skill_md.is_file():
+                continue
+            data: dict = {}
+            try:
+                m = _FRONTMATTER_RE.match(skill_md.read_text(encoding="utf-8"))
+                loaded = yaml.safe_load(m.group(1)) if m else None
+                data = loaded if isinstance(loaded, dict) else {}
+            except (OSError, yaml.YAMLError):
+                pass
+            metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+            raw = metadata.get("include_tools")
+            name = str(data.get("name") or entry.name)
+            result[name] = {
+                "name": name,
+                "path": str(skill_md),
+                "include_tools": raw.split() if isinstance(raw, str) else [],
+            }
+    return result
+
+
+def skill_sources_fingerprint(host_sources, sources) -> dict[str, str]:
+    """스킬 소스의 `{SKILL.md 경로: "수정시각:크기"}` — 파일을 읽지 않고 stat 만 한다.
+
+    SkillsMiddleware 와 같은 규칙(소스 바로 아래 디렉터리마다 SKILL.md)으로 본다. 키는
+    `sources`(에이전트가 보는 경로) 기준이라 `skills_metadata` 의 `path` 와 같다.
+    `host_sources` 는 같은 순서의 호스트 경로다(샌드박스 마운트 전 실제 위치).
+    """
+    result: dict[str, str] = {}
+    for host, source in zip(host_sources, sources):
+        try:
+            entries = sorted(e.name for e in os.scandir(host) if e.is_dir())
+        except OSError:
+            continue
+        for name in entries:
+            try:
+                st = os.stat(os.path.join(host, name, "SKILL.md"))
+            except OSError:
+                continue
+            result[f"{source.rstrip('/')}/{name}/SKILL.md"] = f"{st.st_mtime_ns}:{st.st_size}"
+    return result
+
+
+class SkillReloadState(SkillsState):
+    skills_fingerprint: NotRequired[Annotated[dict[str, str] | None, OmitFromOutput]]
+    """`skills_metadata` 를 읽던 때의 `skill_sources_fingerprint`. 다르면 스킬이 바뀐 것이다.
+
+    실행 입력으로 받아야 하므로 `skills_metadata` 와 같이 입력에서는 보이고 출력에서만 뺀다.
+    """
+
+
+def skill_reload_inputs(checkpoint_values, host_sources, sources) -> dict:
+    """이번 실행 입력에 더할 스킬 재로드 값(deepagents Reload skills).
+
+    SkillsMiddleware 는 thread 마다 한 번 읽은 목록을 `skills_metadata` 에 두고 체크포인트로
+    이어 쓴다. 공식 방법은 다시 읽힐 실행의 입력에 `skills_metadata: None` 을 넣는 것이다.
+    언제 넣을지는 앱이 정하므로, SKILL.md 의 stat 이 그 목록을 읽던 때(체크포인트의
+    `skills_fingerprint`)와 다를 때만 넣는다 — 바뀌지 않은 턴에는 다시 스캔하지 않는다.
+    `checkpoint_values` 는 이 thread 의 마지막 체크포인트 값(없으면 빈 dict)이다.
+    """
+    fingerprint = skill_sources_fingerprint(host_sources, sources)
+    values = checkpoint_values or {}
+    if values.get("skills_metadata") is None:
+        # 아직 읽지 않은 thread — SkillsMiddleware 가 이번 실행에서 읽는다. 기준만 남긴다.
+        return {"skills_fingerprint": fingerprint}
+    before = values.get("skills_fingerprint")
+    if before == fingerprint:
+        return {}
+    before = before or {}
+    logger.info(
+        "[skill-reload] 스킬 파일이 바뀌어 이번 실행에서 다시 읽음 added=%s removed=%s modified=%s",
+        sorted(fingerprint.keys() - before.keys()),
+        sorted(before.keys() - fingerprint.keys()),
+        _modified_skill_paths(before, fingerprint),
+    )
+    return {"skills_metadata": None, "skills_fingerprint": fingerprint}
+
+
+def _modified_skill_paths(before, after) -> list[str]:
+    before, after = before or {}, after or {}
+    return sorted(k for k in after.keys() & before.keys() if after[k] != before[k])
+
+
+def skills_read_in_conversation(messages, skills_metadata, paths) -> list[str]:
+    """`paths`(SKILL.md 경로) 가운데 이 대화가 읽었거나 고정한 스킬의 이름.
+
+    deepagents 가 스킬 읽기로 보는 것과 같다 — 오류 없는 `read_file` 결과(그 호출의
+    `file_path`)이거나 `lc_source == "pinned_skill"` 메시지다. 공식 판정과 달리
+    `include_tools` 가 없는 스킬도 센다. 이름은 그 본문을 읽던 때의 목록에서 찾는다.
+    """
+    wanted = {p for p in (_normalized_skill_path(p) for p in paths or []) if p}
+    if not wanted or not messages:
+        return []
+    names = {
+        p: s.get("name")
+        for s in skills_metadata or []
+        if (p := _normalized_skill_path(s.get("path"))) in wanted
+    }
+    read_paths = {
+        call.get("id"): (call.get("args") or {}).get("file_path")
+        for m in messages
+        if getattr(m, "type", "") == "ai"
+        for call in (getattr(m, "tool_calls", None) or [])
+        if call.get("name") == "read_file" and call.get("id")
+    }
+    found: list[str] = []
+    for m in messages:
+        kind = getattr(m, "type", "")
+        if kind == "tool" and getattr(m, "status", "success") != "error":
+            path = read_paths.get(getattr(m, "tool_call_id", None))
+        elif kind == "human" and (getattr(m, "additional_kwargs", None) or {}).get("lc_source") == "pinned_skill":
+            marker = m.additional_kwargs.get("skill")
+            path = marker.get("path") if isinstance(marker, dict) else None
+        else:
+            continue
+        name = names.get(_normalized_skill_path(path) or "")
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def _normalized_skill_path(path) -> str | None:
+    """`read_file` 이 경로를 맞추는 방식(deepagents validate_path)으로 정규화한다."""
+    if not isinstance(path, str):
+        return None
+    try:
+        return validate_path(path)
+    except ValueError:
+        return None
+
+
+async def add_skill_reload_inputs(inputs: dict, graph, config, checkpoint_values, host_sources, sources) -> None:
+    """`skill_reload_inputs` 를 실행 입력에 더하고, 바뀐 스킬을 이 대화가 이미 읽었으면 다시 고정한다.
+
+    재로드는 목록만 다시 읽는다. 대화 기록에 남은 옛 본문은 고치지 않으므로(deepagents: 이전
+    메시지는 바뀌지 않음), 공식 고정(`pinned_skills`)으로 현재 본문을 새 메시지로 붙인다 — 바뀐
+    스킬이 있는 턴에만 대화를 읽는다. 메시지는 마지막 체크포인트 값에 다 있지 않을 수 있어
+    `graph.aget_state` 로 읽는다. `/스킬명` 고정에 더한다(같은 이름은 deepagents 가 한 번만 고정).
+    """
+    update = skill_reload_inputs(checkpoint_values, host_sources, sources)
+    inputs.update(update)
+    values = checkpoint_values or {}
+    modified = _modified_skill_paths(values.get("skills_fingerprint"), update.get("skills_fingerprint")) if "skills_metadata" in update else []
+    if not modified:
+        return
+    try:
+        messages = (await graph.aget_state(config)).values.get("messages")
+    except Exception:
+        logger.warning("[skill-reload] 다시 고정할 스킬을 찾으려 대화를 읽다 실패", exc_info=True)
+        return
+    repin = skills_read_in_conversation(messages, values.get("skills_metadata"), modified)
+    if repin:
+        logger.info("[skill-reload] 이 대화가 읽은 스킬이 바뀌어 다시 고정 repin=%s", repin)
+        inputs["pinned_skills"] = [*(inputs.get("pinned_skills") or []), *repin]
+
+
+class ToolBindingSkillsMiddleware(SkillsMiddleware):
+    """`tools` 로 받은 스킬 바인딩 도구가 실제 모델 요청에 실렸는지 기록하는 SkillsMiddleware.
+
+    이름을 `SkillsMiddleware` 로 두어 create_deep_agent 의 기본 SkillsMiddleware 자리를
+    대신한다(요약 뒤·프롬프트 캐싱 앞, 범용 서브에이전트에도 상속). 기록은 deepagents 가
+    도구 공개를 마친 뒤의 요청을 본다 — 스킬을 읽기 전에는 없고 읽은 뒤에 생겼는지를 실제
+    실행 로그로 확인하기 위한 것이다.
+
+    상태에 `skills_fingerprint` 를 더한다 — 스킬 재로드 여부는 executor 가 실행 입력으로
+    정한다(`skill_reload_inputs`). 목록을 읽는 일은 공식 SkillsMiddleware 그대로다.
+    """
+
+    state_schema = SkillReloadState
+
+    def __init__(self, *, backend, sources, tools=None, **kwargs):
+        super().__init__(backend=backend, sources=sources, tools=tools, **kwargs)
+        self._bound_names = frozenset(getattr(t, "name", "") for t in (tools or []) if getattr(t, "name", ""))
+
+    @property
+    def name(self) -> str:
+        return "SkillsMiddleware"
+
+    def wrap_model_call(self, request, handler):
+        def _logged(req):
+            self._log_request(req)
+            return handler(req)
+
+        return super().wrap_model_call(request, _logged)
+
+    async def awrap_model_call(self, request, handler):
+        async def _logged(req):
+            self._log_request(req)
+            return await handler(req)
+
+        return await super().awrap_model_call(request, _logged)
+
+    def _log_request(self, request) -> None:
+        names = [_request_tool_name(t) for t in (request.tools or [])]
+        inline = [
+            _inline_tool_name(block)
+            for message in (request.messages or [])
+            if getattr(message, "type", "") == "system" and isinstance(message.content, list)
+            for block in message.content
+            if isinstance(block, dict)
+        ]
+        visible = sorted({n for n in (*names, *inline) if n in self._bound_names})
+        logger.debug("[skill-tools] %s model request tool names=%s", self.name, sorted(n for n in (*names, *inline) if n))
+        logger.info(
+            "[skill-tools] %s model request tools=%d bound_visible=%s bound_total=%d",
+            self.name, len(names) + len([n for n in inline if n]), visible, len(self._bound_names),
+        )
+
+
+def _request_tool_name(tool) -> str:
+    if isinstance(tool, dict):
+        function = tool.get("function")
+        return tool.get("name") or (function.get("name") if isinstance(function, dict) else "") or ""
+    return getattr(tool, "name", "") or ""
+
+
+def _inline_tool_name(block: dict) -> str:
+    """대화 중간 도구 추가 블록(Anthropic `tool_addition`, OpenAI `additional_tools`)이 싣는 도구 이름."""
+    if block.get("type") == "tool_addition":
+        return ((block.get("tool") or {}).get("definition") or {}).get("name") or ""
+    if block.get("type") == "additional_tools":
+        return ((block.get("tools") or [{}])[0]).get("name") or ""
+    return ""
+
+
+class FilteredSkillsMiddleware(ToolBindingSkillsMiddleware):
     """SkillsMiddleware that restricts visible skills to a specified set.
 
     Loads skills from the full collection but filters state so only the
     allowed skill names appear in the system prompt. Skills not in
     `allowed_skills` are invisible to the sub-agent.
     """
+
+    # 기본 SkillsMiddleware 자리를 대신하지 않는다 — 대신하면 create_deep_agent 가 그 소스로
+    # 범용 서브에이전트에 필터 없는 스킬을 붙인다. 지금까지와 같은 자리·이름을 유지한다.
+    @property
+    def name(self) -> str:
+        return "FilteredSkillsMiddleware"
 
     def __init__(self, *, backend, sources, allowed_skills: list[str], **kwargs):
         super().__init__(backend=backend, sources=sources, **kwargs)

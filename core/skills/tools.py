@@ -11,16 +11,24 @@ extract_document_structure, list_git_repos, publish_skill을 제공한다.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import os
 import re
 import shlex
+import threading
+import time
 from pathlib import Path
 
 from langchain_core.tools import tool
 
 from parsers import extract as _parse_document
 
+from .diff_summary import summarize_diff
+from ..sandbox.tenant_workspace import ensure_inside, tenant_workspace
+
+# 작업공간 볼륨 루트. 실제 작업공간은 테넌트마다 이 아래 `<tenant>/` 이고, 샌드박스의
+# `/workspace` 는 그 디렉터리다. 호스트 경로는 `tenant_workspace_root()` 로 얻는다.
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE", str(Path(__file__).parent.parent.parent / "workspace"))).resolve()
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -54,6 +62,15 @@ _current_sandbox: contextvars.ContextVar = contextvars.ContextVar(
     "tools_sandbox", default=None
 )
 
+
+def tenant_workspace_root(tenant_id: str | None = None) -> Path:
+    """현재 테넌트의 호스트 작업공간 — 샌드박스 `/workspace` 에 마운트되는 디렉터리.
+
+    WORKSPACE_ROOT 는 호출 시점에 읽는다(테스트가 모듈 속성을 갈아끼운다).
+    """
+    tid = _current_tenant_id.get() if tenant_id is None else tenant_id
+    return tenant_workspace(WORKSPACE_ROOT, tid)
+
 _CONTAINER_WORKSPACE = Path("/workspace")
 _CONTAINER_SKILLS = Path("/skills")
 
@@ -85,30 +102,40 @@ def _to_snake(s: str) -> str:
 
 
 def _substitute_ws(s: str) -> str:
-    """미치환 {ws} 플레이스홀더를 실제 workspace root로 교체한다."""
-    return s.replace("{ws}", str(WORKSPACE_ROOT))
+    """미치환 {ws} 플레이스홀더를 현재 테넌트 작업공간으로 교체한다."""
+    if "{ws}" not in s:
+        return s
+    return s.replace("{ws}", str(tenant_workspace_root()))
 
 
-# 샌드박스 작업 루트(컨테이너 /workspace/.bpmn ↔ 호스트 WORKSPACE_ROOT/.bpmn — bind mount 동일 파일).
+# 샌드박스 작업 루트(컨테이너 /workspace/.bpmn ↔ 호스트 <테넌트 작업공간>/.bpmn — bind mount 동일 파일).
 BPMN_WORK_SUBDIR = ".bpmn"
 
 
 def _resolve_ws_path(path: str) -> Path:
-    """컨테이너/플레이스홀더 경로(/workspace/..., {ws}/..., 상대경로)를 호스트 WORKSPACE_ROOT 기준 경로로 변환."""
+    """컨테이너/플레이스홀더 경로(/workspace/..., {ws}/..., 상대경로)를 현재 테넌트 작업공간 기준 호스트 경로로 변환.
+
+    작업공간을 벗어나는 경로는 ValueError. 이 경로로 호스트에서 읽고 쓰므로, 놔두면 마운트로
+    막은 다른 테넌트 파일을 `..` 로 열 수 있다.
+    """
+    root = tenant_workspace_root()
     s = _substitute_ws(str(path or "")).strip().replace("\\", "/")
-    ws = str(WORKSPACE_ROOT).replace("\\", "/")
+    ws = str(root).replace("\\", "/")
     if s.startswith(ws):
-        return Path(s)
-    for pre in ("/workspace/", "workspace/", "/workspace", "workspace"):
-        if s == pre.rstrip("/") or s.startswith(pre):
-            s = s[len(pre):]
-            break
-    return WORKSPACE_ROOT / s.lstrip("/")
+        candidate = Path(s)
+    else:
+        for pre in ("/workspace/", "workspace/", "/workspace", "workspace"):
+            if s == pre.rstrip("/") or s.startswith(pre):
+                s = s[len(pre):]
+                break
+        candidate = root / s.lstrip("/")
+    ensure_inside(root, candidate)
+    return candidate
 
 
 def _bpmn_work_dir() -> Path:
     """방별 산출물 작업 디렉터리(host). 대화방 id가 있으면 .bpmn/<room>/ 로 격리한다."""
-    base = WORKSPACE_ROOT / BPMN_WORK_SUBDIR
+    base = tenant_workspace_root() / BPMN_WORK_SUBDIR
     slug = _conv_slug(_current_conversation_id.get())
     return base / slug if slug else base
 
@@ -117,6 +144,45 @@ def bpmn_container_base(conversation_id: str = "") -> str:
     """에이전트에게 알려줄 컨테이너 기준 경로(/workspace/.bpmn 또는 .bpmn/<room>)."""
     slug = _conv_slug(conversation_id or _current_conversation_id.get())
     return f"/workspace/{BPMN_WORK_SUBDIR}/{slug}" if slug else f"/workspace/{BPMN_WORK_SUBDIR}"
+
+
+# 체크아웃(기존 스킬/저장소를 편집하려고 가져온 사본) 루트.
+#
+# 샌드박스 컨테이너와 /workspace 볼륨은 **테넌트 단위로 공유**된다. 체크아웃을
+# /workspace/<skill-name> 에 두면 같은 테넌트의 두 사용자가 같은 스킬을 동시에 편집할 때
+# 서로의 작업 디렉터리를 `rm -rf` 하고 덮어쓴다 — 한쪽이 방금 쓴 파일이 소리 없이 사라지거나,
+# 남의 수정본이 내 PR diff 에 섞여 들어간다. 신규 스킬 산출물이 이미 .bpmn/<room>/ 으로
+# 방 단위 격리되는 것과 같은 방식으로, 체크아웃도 .checkouts/<room>/ 아래로 가른다.
+CHECKOUT_SUBDIR = ".checkouts"
+
+# 방별로 갈라 두면 방 수만큼 사본이 쌓이므로 오래된 것은 걷어낸다. 체크아웃은 원본(레포 또는
+# /skills)에서 언제든 다시 만들 수 있어 지워도 잃는 것이 없다.
+try:
+    _CHECKOUT_RETENTION_DAYS = int(os.getenv("CHECKOUT_RETENTION_DAYS", "7"))
+except ValueError:
+    _CHECKOUT_RETENTION_DAYS = 7
+
+
+def checkout_container_base(conversation_id: str = "") -> str:
+    """이번 대화방(또는 실행)의 체크아웃 루트(컨테이너 경로).
+
+    대화방 id 가 없는 호출부는 종전처럼 /workspace 를 그대로 쓴다.
+    """
+    slug = _conv_slug(conversation_id or _current_conversation_id.get())
+    return f"/workspace/{CHECKOUT_SUBDIR}/{slug}" if slug else "/workspace"
+
+
+def _checkout_dest(name: str) -> str:
+    """체크아웃 대상 경로를 만들고(부모 디렉터리 생성 + 오래된 방 정리) 돌려준다."""
+    base = checkout_container_base()
+    if base != "/workspace":
+        root = f"/workspace/{CHECKOUT_SUBDIR}"
+        _sandbox_exec(
+            f"find {root} -mindepth 1 -maxdepth 1 -type d "
+            f"-mtime +{_CHECKOUT_RETENTION_DAYS} -exec rm -rf {{}} + 2>/dev/null; "
+            f"mkdir -p {shlex.quote(base)}"
+        )
+    return f"{base}/{name}"
 
 
 def canonical_process_dir_name(conversation_id: str = "") -> str:
@@ -160,26 +226,41 @@ def write_upload_to_workspace(file_name: str, content: bytes) -> str:
     `read_file('/workspace/uploads/<name>')` 로 바로 읽을 수 있다.
     """
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(file_name or "")).strip("_") or "upload"
-    d = WORKSPACE_ROOT / "uploads"
+    d = tenant_workspace_root() / "uploads"
     d.mkdir(parents=True, exist_ok=True)
     (d / safe).write_bytes(content)
     return f"/workspace/uploads/{safe}"
 
 
+_SKILL_NAME = "bpmn-process-generation-skill"
+
+
 def _skill_scripts_dir() -> Path | None:
-    """bpmn-process-generation-skill 의 scripts 디렉토리(호스트)를 찾는다 (검증/flatten 재사용)."""
-    repo_skills = Path(__file__).parent.parent.parent / "skills"
-    for c in sorted(repo_skills.glob("**/bpmn-process-generation-skill/scripts")):
-        if c.is_dir():
-            return c
+    """bpmn-process-generation-skill 의 scripts 디렉토리(호스트)를 찾는다 (검증/flatten 재사용).
+
+    번들 원본(`system-skills/process-gpt-system/`)을 **항상 먼저** 본다. 예전에는
+    `skills/**` 를 glob 해 사전순 첫 히트를 썼는데, 개발 환경에 남은 테넌트 사본
+    (`skills/<tenant>/bpmn-process-generation-skill/`)이 'p'(process-gpt-system)보다
+    앞서 잡혀 **오래된 검증 스크립트가 로드**되는 일이 있었다. 원본을 고정 우선으로
+    두면 어떤 환경에서도 같은 검증기를 쓴다.
+    """
+    from .local_system_skills import SYSTEM_COLLECTION_NAME, _resolve_skills_root
+
+    base = Path(__file__).parent.parent.parent
+    candidates = [
+        base / "system-skills" / SYSTEM_COLLECTION_NAME / _SKILL_NAME / "scripts",
+    ]
     try:
-        from .skills import _get_skills
-        for p in (_get_skills(_current_tenant_id.get()) or []):
-            sc = Path(p) / "scripts"
-            if sc.is_dir():
-                return sc
+        candidates.append(_resolve_skills_root() / SYSTEM_COLLECTION_NAME / _SKILL_NAME / "scripts")
     except Exception:
         pass
+    for c in candidates:
+        if c.is_dir():
+            return c
+    # 최후 폴백: 어디든 남아있는 사본(사전순 고정).
+    for c in sorted((base / "skills").glob(f"**/{_SKILL_NAME}/scripts")):
+        if c.is_dir():
+            return c
     return None
 
 
@@ -204,12 +285,95 @@ def _require_sandbox():
     return sandbox
 
 
-def _sandbox_exec(cmd: str) -> tuple[int, str]:
+# 스킬 도구가 거는 셸 실행 상한(초). 샌드박스 기본값(SANDBOX_EXEC_TIMEOUT)과 별개로
+# 도구 호출 한 번이 사용자를 기다리게 하는 시간을 여기서 못 박는다.
+def _env_seconds(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+_SKILL_EXEC_TIMEOUT = _env_seconds("SKILL_TOOL_EXEC_TIMEOUT_SECONDS", 120)
+
+# docker_sandbox.execute() 가 상한 초과/샌드박스 불가에 쓰는 종료 코드.
+_TIMEOUT_EXIT_CODES = (124, 125)
+
+
+def _sandbox_exec(cmd: str, *, timeout: int | None = None) -> tuple[int, str]:
     sandbox = _current_sandbox.get()
     if sandbox is None:
         return 1, "ERROR: sandbox not available"
-    resp = sandbox.execute(cmd)
+    resp = sandbox.execute(cmd, timeout=timeout or _SKILL_EXEC_TIMEOUT)
     return resp.exit_code or 0, resp.output.strip()
+
+
+# ---------------------------------------------------------------------------
+# 폴백 알림
+#
+# 상한을 넘겨 대체 경로(로컬 사본, 원격 건너뛰기 등)로 흘러갔다는 사실은 도구가 조용히
+# 삼키면 사용자에게 영원히 닿지 않는다 — 화면에는 "성공"만 보이고, 왜 결과가 다른지
+# 알 길이 없다. 호출 깊은 곳에서 남긴 메모를 도구 응답 끝에 NOTE 줄로 실어 보낸다.
+# (스트리밍 채널이 따로 없어 도구 반환 문자열이 유일한 전달 경로다.)
+# ---------------------------------------------------------------------------
+_fallback_notes: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "tools_fallback_notes", default=None
+)
+
+
+@contextlib.contextmanager
+def _fallback_notices():
+    notes: list[str] = []
+    token = _fallback_notes.set(notes)
+    try:
+        yield notes
+    finally:
+        _fallback_notes.reset(token)
+
+
+def _note_fallback(message: str) -> None:
+    notes = _fallback_notes.get()
+    if notes is None or message in notes:
+        return
+    notes.append(message)
+
+
+def _with_notes(result: str) -> str:
+    notes = _fallback_notes.get() or []
+    if not notes:
+        return result
+    return result + "\n" + "\n".join(f"NOTE: {n}" for n in notes)
+
+
+def _timed_out(rc: int, out: str) -> bool:
+    """샌드박스가 상한 초과/사용 불가로 끊은 결과인가."""
+    return rc in _TIMEOUT_EXIT_CODES or "timed out after" in (out or "")
+
+
+def _call_with_timeout(fn, timeout: float, *args, **kwargs):
+    """fn 을 데몬 스레드에서 돌리고 상한 안에 끝나지 않으면 TimeoutError 를 던진다.
+
+    DB/HTTP 클라이언트가 자체 상한을 갖고 있어도(그리고 대개 갖고 있어도) 커넥션 풀
+    고갈이나 재시도 때문에 호출이 그 상한의 몇 배로 늘어나는 경우가 있다. 호출부에서
+    한 번 더 못 박아 두면 어떤 라이브러리를 쓰든 상한이 지켜진다.
+    """
+    box: dict = {}
+
+    def _run() -> None:
+        try:
+            box["value"] = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - 호출 스레드로 그대로 옮긴다
+            box["error"] = exc
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(f"{getattr(fn, '__name__', fn)} 이(가) {timeout:.0f}초 안에 끝나지 않았습니다")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 def _git_sb(cwd: str, *args: str) -> tuple[int, str]:
@@ -218,11 +382,207 @@ def _git_sb(cwd: str, *args: str) -> tuple[int, str]:
 
 
 # ---------------------------------------------------------------------------
+# git 네트워크 작업 상한 — 샌드박스 egress 가 막힌 환경에서 매달리지 않게 한다
+#
+# 샌드박스 컨테이너에서 원격 저장소로 가는 길이 막히면(경로 MTU 불일치, 방화벽 등)
+# git 은 TCP 가 리셋될 때까지 150초 넘게 조용히 매달린다. checkout_to_workspace 는
+# 그 뒤에야 로컬 사본으로 폴백하므로 스킬을 열기만 해도 매번 2~3분이 날아가고,
+# publish_skill 은 fetch + push 로 두 번 물어 5분이 넘어간다.
+#
+# 그래서 (1) git 자체에 저속 중단 옵션을 걸고, (2) execute() 상한을 짧게 주고,
+# (3) 한 번 네트워크 장애로 판정되면 같은 컨테이너에서는 일정 시간 동안 원격 작업을
+#     아예 건너뛴다. 폴백 경로(로컬 사본)는 그대로 살아 있으므로 기능은 유지된다.
+# ---------------------------------------------------------------------------
+try:
+    _GIT_NET_TIMEOUT = int(os.getenv("GIT_NET_TIMEOUT_SECONDS", "45"))
+except ValueError:
+    _GIT_NET_TIMEOUT = 45
+
+# 15초 동안 1KB/s 미만이면 git 이 스스로 중단한다.
+_GIT_NET_OPTS = "-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15"
+
+# 원격에 닿지 못했다고 판단할 출력 패턴.
+# 전송 계층 실패만 넣는다 — git 이 붙여 주는 "unable to access" 는 403/404 같은 인증·권한
+# 오류에도 똑같이 붙어서, 그걸 넣으면 토큰이 틀린 것뿐인데 10분간 원격 작업을 막게 된다.
+_GIT_NET_FAIL_RE = re.compile(
+    r"Recv failure|Connection reset|Could not resolve host|Failed to connect"
+    r"|Operation too slow|Connection timed out|timed out after",
+    re.IGNORECASE,
+)
+
+# 네트워크 장애 판정 유지 시간(초). 일시적 장애면 이 시간 뒤 다시 시도한다.
+_GIT_EGRESS_BLOCK_TTL = 600.0
+
+_GIT_EGRESS_BLOCKED_MSG = (
+    "샌드박스에서 원격 Git 저장소에 접속할 수 없습니다(네트워크 차단). "
+    "원격 작업을 건너뜁니다."
+)
+
+
+def _git_net_blocked() -> bool:
+    """이 샌드박스에서 원격 Git 접속이 막혀 있다고 이미 판정됐는지."""
+    import time as _time
+
+    sandbox = _current_sandbox.get()
+    if sandbox is None:
+        return False
+    return getattr(sandbox, "_git_egress_blocked_until", 0.0) > _time.monotonic()
+
+
+def _mark_git_net_blocked(detail: str) -> None:
+    import logging as _logging
+    import time as _time
+
+    sandbox = _current_sandbox.get()
+    if sandbox is None:
+        return
+    sandbox._git_egress_blocked_until = _time.monotonic() + _GIT_EGRESS_BLOCK_TTL
+    _logging.getLogger(__name__).warning(
+        "샌드박스 → 원격 Git 접속 차단으로 판정, %.0f초간 원격 작업을 건너뜁니다: %s",
+        _GIT_EGRESS_BLOCK_TTL,
+        (detail or "")[:300],
+    )
+
+
+def _git_net_exec(cmd: str) -> tuple[int, str]:
+    """원격을 타는 git 명령을 시간 상한과 저속 중단 옵션을 걸고 실행한다."""
+    rc, out = _sandbox_exec(cmd, timeout=_GIT_NET_TIMEOUT)
+    if rc != 0 and _GIT_NET_FAIL_RE.search(out or ""):
+        if _timed_out(rc, out):
+            _note_fallback(
+                f"원격 Git 작업이 {_GIT_NET_TIMEOUT}초 상한을 넘겨 중단했습니다."
+            )
+        _mark_git_net_blocked(out)
+    return rc, out
+
+
+def _git_net_sb(cwd: str, *args: str) -> tuple[int, str]:
+    """cwd 에서 원격을 타는 git 명령(fetch/push 등)을 실행한다."""
+    if _git_net_blocked():
+        _note_fallback(_GIT_EGRESS_BLOCKED_MSG)
+        return 1, _GIT_EGRESS_BLOCKED_MSG
+    parts = " ".join(shlex.quote(a) for a in args)
+    return _git_net_exec(f"cd {shlex.quote(cwd)} && git {_GIT_NET_OPTS} {parts}")
+
+
+def _clone_sb(auth_url: str, dest: str) -> tuple[int, str]:
+    """원격 저장소를 dest 로 클론한다. 네트워크가 막혀 있으면 즉시 실패로 돌려준다."""
+    if _git_net_blocked():
+        _note_fallback(_GIT_EGRESS_BLOCKED_MSG)
+        return 1, _GIT_EGRESS_BLOCKED_MSG
+    return _git_net_exec(
+        f"rm -rf {shlex.quote(dest)} && "
+        f"git {_GIT_NET_OPTS} clone --depth=50 {shlex.quote(auth_url)} {shlex.quote(dest)}"
+    )
+
+
+def _try_clone_skill_repo(skill_name: str, dest: str) -> str | None:
+    """스킬 이름과 같은 Git 레포가 있으면 dest 로 클론하고 그 경로를 돌려준다.
+
+    레포가 없거나(=git 미연동 포함) 클론이 실패하면 None 을 돌려주고, 호출자는 로컬 사본
+    경로로 폴백한다. 레포가 있을 때 로컬 사본으로 작업하면 이후 publish_skill 의 PR diff 가
+    "레포 전체를 로컬본으로 교체" 가 되어 병합 관리 흐름이 의미를 잃는다.
+    """
+    if _git_net_blocked():
+        _note_fallback(_GIT_EGRESS_BLOCKED_MSG + " 로컬 사본으로 진행합니다.")
+        return None
+    try:
+        provider = _get_git_provider()
+    except ValueError as e:
+        # 설정 조회가 상한을 넘긴 경우는 "git 미연동"과 달리 사용자가 알아야 한다 —
+        # 같은 요청을 다시 하면 결과가 달라질 수 있기 때문이다.
+        if "상한" in str(e):
+            _note_fallback(f"{e} 로컬 사본으로 진행합니다.")
+        return None
+    try:
+        if not provider.repo_exists(skill_name):
+            return None
+    except Exception as e:
+        _note_fallback(f"원격 저장소 조회에 실패해 로컬 사본으로 진행합니다({e}).")
+        return None
+
+    auth_url = provider.get_authenticated_clone_url(provider.username, skill_name)
+    rc, out = _clone_sb(auth_url, dest)
+    if rc != 0:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "스킬 레포 클론 실패, 로컬 사본으로 폴백 skill=%s: %s", skill_name, out
+        )
+        _note_fallback(
+            "원격 저장소 클론에 실패해 로컬 사본으로 진행합니다 — "
+            "이번 변경은 병합 요청이 아니라 로컬 사본 기준으로 만들어집니다."
+        )
+        return None
+    return dest
+
+
+def _is_room_draft_dir(path: str) -> bool:
+    """이 경로가 방 산출물 작업 디렉터리(.bpmn/<room>/...) 안인가.
+
+    체크아웃(.checkouts/<room>/...)과 달리 git 이력이 없는 초안 자리다.
+    """
+    s = str(path or "").replace("\\", "/")
+    return f"/{BPMN_WORK_SUBDIR}/" in s or s.endswith(f"/{BPMN_WORK_SUBDIR}")
+
+
+def _rebase_draft_onto_checkout(
+    draft_dir: str, skill_name: str, provider
+) -> tuple[str, str]:
+    """방 초안의 파일을 원격 레포 클론 위에 얹고 그 체크아웃 경로를 돌려준다.
+
+    돌려주는 값은 (경로, 에러문자열) 이며 둘 중 하나만 채워진다. 클론하지 못하면 경로 대신
+    에러를 돌려준다 — 초안 그대로 발행하면 기존 이력과 무관한 커밋이 되어 병합 요청을
+    만들 수 없기 때문에, 조용히 진행하는 것보다 실패로 알리는 편이 낫다.
+    """
+    dest = _checkout_dest(skill_name)
+    if str(dest).rstrip("/") == str(draft_dir).rstrip("/"):
+        return draft_dir, ""
+
+    auth_url = provider.get_authenticated_clone_url(provider.username, skill_name)
+    rc, out = _clone_sb(auth_url, dest)
+    if rc != 0:
+        return "", (
+            f"ERROR: '{skill_name}' 레포를 체크아웃하지 못해 발행을 중단했습니다: {out}\n"
+            "이 경로는 대화방 산출물 초안이라 git 이력이 없어, 그대로 발행하면 기존 내용을 "
+            "덮어써 병합 요청을 만들 수 없습니다. 네트워크를 확인한 뒤 다시 시도하거나 "
+            "checkout_to_workspace 가 돌려준 경로에서 수정해 주세요."
+        )
+
+    # 초안 파일만 얹는다(.git 은 클론한 것을 그대로 둔다). 초안에 없는 원격 파일은 지우지
+    # 않는다 — 사용자가 요청하지 않은 삭제가 PR 에 섞이지 않게 하려는 것으로,
+    # _push_skill_sandbox 의 `add --ignore-removal` 과 같은 판단이다.
+    rc, out = _sandbox_exec(
+        f"cd {shlex.quote(draft_dir)} && "
+        f"find . -mindepth 1 -maxdepth 1 ! -name .git "
+        f"-exec cp -R {{}} {shlex.quote(dest)}/ ';'"
+    )
+    if rc != 0:
+        return "", f"ERROR: 초안 파일을 체크아웃으로 옮기지 못했습니다: {out}"
+    return dest, ""
+
+
+# ---------------------------------------------------------------------------
 # Git provider 헬퍼
 # ---------------------------------------------------------------------------
 
+# 설정 조회(tenant_git_config DB) 상한과 캐시.
+# 한 번의 도구 호출에서 provider 를 여러 번 만드는 경로가 있어(레포 존재 확인 → 클론 URL →
+# PR 생성) 매번 DB 를 두 번씩 왕복한다. DB 가 느려지면 그 왕복이 그대로 사용자 대기시간이
+# 되므로, 상한을 걸고 짧게 캐시한다(설정 변경은 TTL 안에 반영된다).
+_GIT_CONFIG_TIMEOUT = _env_seconds("GIT_CONFIG_LOOKUP_TIMEOUT_SECONDS", 15)
+_GIT_CONFIG_CACHE_TTL = 60.0
+_git_provider_cache: dict[str, tuple[float, object]] = {}
+_git_provider_cache_lock = threading.Lock()
+
+
 def _get_git_provider():
-    """현재 테넌트의 Git provider 인스턴스를 반환한다."""
+    """현재 테넌트의 Git provider 인스턴스를 반환한다.
+
+    설정 조회가 상한을 넘기면 ValueError 로 바꿔 던진다 — 호출부는 "git 미연동"과 같은
+    폴백(로컬 사본으로 계속 진행)을 이미 갖고 있으므로, 조회 지연이 대화를 멈추는 대신
+    폴백 경로로 흘러간다.
+    """
     from .git_providers.factory import get_provider
 
     tenant_id = _current_tenant_id.get()
@@ -230,7 +590,27 @@ def _get_git_provider():
         raise ValueError(
             "tenant_id가 설정되지 않았습니다. ask_user를 호출하지 말고 작업을 중단하세요."
         )
-    return get_provider(tenant_id)
+
+    now = time.monotonic()
+    with _git_provider_cache_lock:
+        cached = _git_provider_cache.get(tenant_id)
+        if cached and cached[0] > now:
+            return cached[1]
+
+    try:
+        provider = _call_with_timeout(get_provider, _GIT_CONFIG_TIMEOUT, tenant_id)
+    except TimeoutError as e:
+        _note_fallback(
+            f"Git 설정 조회가 {_GIT_CONFIG_TIMEOUT}초 상한을 넘겨 git 없이 진행합니다."
+        )
+        raise ValueError(
+            f"Git 설정 조회가 {_GIT_CONFIG_TIMEOUT}초 상한을 넘겼습니다({e}). "
+            "ask_user를 호출하지 말고 git 없이 작업을 계속하세요."
+        ) from e
+
+    with _git_provider_cache_lock:
+        _git_provider_cache[tenant_id] = (time.monotonic() + _GIT_CONFIG_CACHE_TTL, provider)
+    return provider
 
 
 # ---------------------------------------------------------------------------
@@ -291,12 +671,20 @@ def _auto_register_tenant_skill(cwd: str, skill_name: str, html_url: str) -> str
     skills_root = Path(first) if os.path.isabs(first) else (_BASE_DIR / first).resolve()
     skill_dir = skills_root / tenant_id / config_id / skill_name
 
+    # 이미 같은 스킬이 깔려 있으면 지우지 말고 백업해 두고 교체한다. 예전에는 곧바로
+    # rmtree 후 copytree 했는데, 뒤이은 DB 단계가 실패하면 그 삭제가 되돌려지지 않아
+    # 멀쩡히 등록돼 있던 스킬 디렉터리만 사라졌다.
+    already_registered = skill_dir.exists()
+    backup = skill_dir.with_name(f"{skill_dir.name}.bak-{os.getpid()}") if already_registered else None
     try:
         skill_dir.parent.mkdir(parents=True, exist_ok=True)
-        if skill_dir.exists():
-            _shutil.rmtree(skill_dir)
+        if backup is not None:
+            _shutil.rmtree(str(backup), ignore_errors=True)
+            _shutil.move(str(skill_dir), str(backup))
         _shutil.copytree(str(host_src), str(skill_dir))
     except Exception as e:
+        if backup is not None and backup.exists() and not skill_dir.exists():
+            _shutil.move(str(backup), str(skill_dir))
         return (
             f"Published '{skill_name}' → {html_url}\n"
             f"WARNING: 파일 sync 실패로 자동 등록을 건너뜁니다: {e}"
@@ -305,19 +693,38 @@ def _auto_register_tenant_skill(cwd: str, skill_name: str, html_url: str) -> str
     owner_id = _current_user_id.get() or ""
     try:
         from ..storage.db import get_supabase
-        get_supabase().table("tenant_skills").insert({
-            "tenant_id": tenant_id,
-            "skill_name": skill_name,
-            "owner_id": owner_id,
-        }).execute()
+        sb = get_supabase()
+        # 저장 버튼(register_skill_as_tenant)으로 먼저 등록해 둔 스킬을 뒤늦게 Git 으로
+        # 발행하는 것은 막다른 길이 아니라 정상 경로다. 그런데 무조건 insert 하면 그때마다
+        # tenant_skills_pkey 중복으로 실패하고, 아래 롤백이 파일까지 지워 "발행했더니 스킬이
+        # 사라졌다" 가 된다. 이미 있는 행이면 등록 단계만 건너뛴다.
+        existing = (
+            sb.table("tenant_skills")
+            .select("skill_name")
+            .eq("tenant_id", tenant_id)
+            .eq("skill_name", skill_name)
+            .limit(1)
+            .execute()
+        )
+        if not (existing.data or []):
+            sb.table("tenant_skills").insert({
+                "tenant_id": tenant_id,
+                "skill_name": skill_name,
+                "owner_id": owner_id,
+            }).execute()
     except Exception as e:
         _logging.getLogger(__name__).warning("tenant_skills 등록 실패 skill=%s: %s", skill_name, e)
         _shutil.rmtree(str(skill_dir), ignore_errors=True)
+        if backup is not None:
+            _shutil.move(str(backup), str(skill_dir))
         return (
             f"Published '{skill_name}' → {html_url}\n"
             f"WARNING: DB 등록 실패로 파일 sync를 롤백했습니다: {e}"
         )
 
+    if backup is not None:
+        _shutil.rmtree(str(backup), ignore_errors=True)
+        return f"Published '{skill_name}' → {html_url}\n✓ 테넌트 스킬 파일을 갱신했습니다"
     return f"Published '{skill_name}' → {html_url}\n✓ 테넌트 스킬로 등록 완료"
 
 
@@ -349,11 +756,29 @@ def _push_skill_sandbox(
     _git_sb(cwd, "config", "user.name", author_name)
 
     if existing_repo:
-        fetch_code, _ = _git_sb(cwd, "fetch", "origin", "main", "--depth=1")
+        fetch_code, fetch_out = _git_net_sb(cwd, "fetch", "origin", "main", "--depth=1")
+        if fetch_code != 0 and _git_net_blocked():
+            # 원격에 닿지 못하는 상태에서 계속 진행하면 아래 push 에서 같은 시간을 또 물고
+            # "레포는 있는데 PR 은 없는" 어중간한 상태만 남는다. 여기서 끊고 알린다.
+            return (
+                f"ERROR git fetch: {fetch_out}\n"
+                "샌드박스에서 원격 Git 저장소에 접속할 수 없습니다. "
+                "네트워크 설정을 확인한 뒤 다시 시도하세요."
+            )
         if fetch_code == 0:
-            _git_sb(cwd, "reset", "--soft", "FETCH_HEAD")
+            # --mixed(기본): HEAD 와 **인덱스**를 원격 커밋으로 맞추고 워킹트리는 건드리지 않는다.
+            # --soft 는 인덱스를 그대로(= git init 직후엔 빈 상태) 두기 때문에 원격 HEAD 의 모든
+            # 파일이 "삭제"로 보이고, 바뀌지 않은 파일까지 전체 교체 diff 로 커밋된다.
+            _git_sb(cwd, "reset", "--mixed", "FETCH_HEAD")
 
-    _git_sb(cwd, "add", ".")
+    if existing_repo:
+        # 기존 레포 수정: 워킹트리에 없는 원격 파일을 "삭제"로 스테이징하지 않는다.
+        # 워킹트리는 로컬 스킬 사본일 수 있고(레포에만 있는 evals/ 같은 디렉터리가 없다),
+        # 그 상태에서 `git add .` 를 하면 사용자가 요청하지 않은 파일 삭제가 PR 에 섞여
+        # 병합 시 레포 파일이 사라진다. 의도적인 삭제는 delete_skill_file 경로를 쓴다.
+        _git_sb(cwd, "add", "--ignore-removal", ".")
+    else:
+        _git_sb(cwd, "add", ".")
     verb = "update" if branch == "main" else f"add branch {branch}"
     code, out = _git_sb(cwd, "commit", "-m", f"feat: {verb} {skill_name}")
     if code != 0 and "nothing to commit" not in out:
@@ -370,23 +795,58 @@ def _push_skill_sandbox(
     push_args = ["push", "-u", "origin", branch]
     if not existing_repo:
         push_args.append("--force")
-    code, out = _git_sb(cwd, *push_args)
+    code, out = _git_net_sb(cwd, *push_args)
     if code != 0:
         return f"ERROR git push: {out}"
 
     # 기존 레포: PR 생성 및 DB 기록
     if existing_repo:
+        # 제목이 곧 검토자가 병합 요청함에서 읽는 한 줄이다. `feat: update <skill>` 은
+        # 어느 스킬인지만 말할 뿐 무엇이 바뀌는지는 말해 주지 않아, 같은 스킬을 고친
+        # 요청 여러 건이 제목만으로는 갈리지 않는다.
+        title_summary, full_summary = _summarize_pushed_changes(cwd)
         return _create_pr_after_push(
             skill_name=skill_name,
             branch=branch,
             base_branch="main",
             html_url=html_url,
-            title=f"feat: update {skill_name}",
-            description=f"스킬 '{skill_name}' 업데이트",
+            title=_truncate_title(title_summary) if title_summary else f"feat: update {skill_name}",
+            description=full_summary or f"스킬 '{skill_name}' 업데이트",
         )
 
     # 신규 레포: 파일 sync + tenant_skills DB 삽입 자동 수행
     return _auto_register_tenant_skill(cwd, skill_name, html_url)
+
+
+# PR 제목 한 줄에 담을 길이. 깃 호스팅 목록에서 잘리지 않는 선을 잡았다.
+_PR_TITLE_MAX = 72
+
+
+def _truncate_title(text: str) -> str:
+    return text[: _PR_TITLE_MAX - 1].rstrip() + "…" if len(text) > _PR_TITLE_MAX else text
+
+
+def _summarize_pushed_changes(cwd: str) -> tuple[str, str]:
+    """이번에 커밋한 변경이 무엇을 바꾸는지 (제목용, 설명용) 한 줄씩으로 옮긴다.
+
+    제목은 깃 목록에서 잘리지 않게 줄이고, 설명은 접지 않은 전체를 싣는다.
+    요약을 못 만들어도 발행 자체는 막지 않는다 — 제목이 예전처럼 밋밋해질 뿐,
+    스킬을 올리지 못하는 것보다는 낫다.
+    """
+    for args in (
+        ("diff", "--unified=3", "FETCH_HEAD", "HEAD"),
+        ("show", "--unified=3", "--format=", "HEAD"),
+    ):
+        try:
+            code, out = _git_sb(cwd, *args)
+        except Exception:  # noqa: BLE001 - 요약 실패가 발행을 막아서는 안 된다
+            continue
+        if code == 0 and out.strip():
+            try:
+                return summarize_diff(out, max_chars=_PR_TITLE_MAX), summarize_diff(out)
+            except Exception:  # noqa: BLE001
+                return "", ""
+    return "", ""
 
 
 def _create_pr_after_push(
@@ -425,7 +885,7 @@ def _create_pr_after_push(
     pr_url = pr_result.get("html_url", "")
 
     # resource_pull_requests 테이블에 기록
-    _record_resource_pr(
+    record = _record_resource_pr(
         resource_type="skill",
         resource_id=skill_name,
         branch_name=branch,
@@ -437,13 +897,21 @@ def _create_pr_after_push(
         git_repo_url=html_url,
     )
 
-    return (
+    result = (
         f"PR created for '{skill_name}' → {pr_url}\n"
         f"Branch: {branch} → {base_branch}\n"
         f"PR #{pr_number}: {title}\n\n"
         f"기본 브랜치에 직접 커밋하지 않고 PR을 생성했습니다. "
         f"리뷰 후 병합해 주세요."
     )
+    if record is None:
+        # PR 자체는 만들어졌는데 목록 기록이 빠진 상태다. 조용히 넘기면 사용자는
+        # "PR 을 올렸다는데 병합 요청 탭은 비어 있다" 는 상황만 보게 된다.
+        result += (
+            "\n\n주의: 병합 요청 목록에 기록하지 못했습니다. "
+            f"위 PR 링크({pr_url})로 직접 확인해 주세요."
+        )
+    return result
 
 
 def _as_list(value: str | list[str] | None) -> list[str]:
@@ -457,6 +925,28 @@ def _normalize_requester_ids(requester_id: str | list[str] | None) -> list[str]:
     import uuid as _uuid
 
     return _as_list(requester_id) or [str(_uuid.UUID(int=0))]
+
+
+def _skill_owner_id(sb, tenant_id: str, skill_name: str) -> str | None:
+    """이 스킬을 검토할 사람(소유자). 못 찾으면 None — 조회 실패가 PR 기록을 막지는 않는다."""
+    try:
+        resp = (
+            sb.table("tenant_skills")
+            .select("owner_id")
+            .eq("tenant_id", tenant_id)
+            .eq("skill_name", skill_name)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(resp, "data", None) or []
+        return (rows[0].get("owner_id") or None) if rows else None
+    except Exception:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "스킬 소유자 조회 실패 skill=%s tenant=%s", skill_name, tenant_id, exc_info=True
+        )
+        return None
 
 
 def _record_resource_pr(
@@ -474,6 +964,10 @@ def _record_resource_pr(
     """resource_pull_requests 테이블에 PR 레코드를 삽입한다."""
     tenant_id = _current_tenant_id.get()
     if not tenant_id:
+        _note_fallback(
+            "tenant 정보가 없어 병합 요청을 목록(DB)에 기록하지 못했습니다 — "
+            "스킬 상세의 병합 요청 탭에 바로 보이지 않을 수 있습니다."
+        )
         return None
 
     requester_ids = _normalize_requester_ids(_current_user_id.get())
@@ -483,6 +977,11 @@ def _record_resource_pr(
         from ..storage.db import get_supabase
         sb = get_supabase()
         row = {
+            # 이 요청을 검토할 사람을 행에 남긴다. 비워 두면 "누가 봐야 하는 요청인지" 를
+            # 화면이 매번 소유자 테이블과 대조해 유추해야 한다.
+            "reviewer_id": (
+                _skill_owner_id(sb, tenant_id, resource_id) if resource_type == "skill" else None
+            ),
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "resource_id": resource_id,
@@ -500,12 +999,16 @@ def _record_resource_pr(
         resp = sb.table("resource_pull_requests").insert(row).execute()
         data = getattr(resp, "data", None)
         return data[0] if data else None
-    except Exception:
+    except Exception as e:
         import logging as _logging
         _logging.getLogger(__name__).warning(
             "resource_pull_requests 기록 실패: resource=%s/%s branch=%s",
             resource_type, resource_id, branch_name,
             exc_info=True,
+        )
+        _note_fallback(
+            f"병합 요청을 목록(DB)에 기록하지 못했습니다({e}) — "
+            "스킬 상세의 병합 요청 탭에 바로 보이지 않을 수 있습니다. PR 링크로 확인하세요."
         )
         return None
 
@@ -1247,6 +1750,29 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
     return _json.dumps(result, ensure_ascii=False)
 
 
+# 대화방 id / 실행 instance_id 가 그대로 디렉터리명이 된 경우를 알아보기 위한 패턴.
+_ROOM_DIR_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+_SKILL_FM_NAME_RE = re.compile(
+    r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL
+)
+
+
+def _skill_name_from_frontmatter(dir_path: str) -> str:
+    """<dir>/SKILL.md 의 frontmatter 에 적힌 name 을 돌려준다(없으면 빈 문자열)."""
+    rc, out = _sandbox_exec(f"sed -n '1,60p' {shlex.quote(dir_path.rstrip('/') + '/SKILL.md')}")
+    if rc != 0 or not out:
+        return ""
+    m = _SKILL_FM_NAME_RE.match(out if out.endswith("\n") else out + "\n")
+    block = m.group(1) if m else out
+    for line in block.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "name":
+            return _safe_name(value.strip().strip("\"'"))
+    return ""
+
+
 def _safe_name(name: str) -> str:
     """스킬 디렉터리/파일용 안전 이름. 영문은 소문자-하이픈, 한글 등 유니코드 글자는 보존
     (한글 스킬명이 'skill' 로 뭉개지지 않게 한다)."""
@@ -1781,7 +2307,9 @@ def _capture_selection_to_manifest(answer: str) -> None:
     room = _bpmn_work_dir()
     if not room.exists():
         return
-    proc_dirs = sorted([d for d in room.glob("process-*") if d.is_dir()]) or [room]
+    # 이번 생성 시도의 폴더만 대상으로 한다. 예전 시도가 남긴 stale `process-*` 폴더에
+    # 선택 결과를 병합하면 완료 단계가 엉뚱한 프로세스에 스킬/에이전트를 붙인다.
+    proc_dirs = process_work_dirs(room, _current_conversation_id.get()) or [room]
     for d in proc_dirs:
         mf = d / "manifest.json"
         man: dict = {}
@@ -2347,21 +2875,29 @@ def list_git_repos() -> str:
 
 @tool
 def checkout_to_workspace(source: str) -> str:
-    """Bring a skill or Git repository into /workspace/ for editing.
+    """Bring a skill or Git repository into this conversation's workspace for editing.
 
     Call this FIRST whenever you need to read, modify, build, or run code from
     a skill or any Git repository. Never operate on /skills/ paths directly.
 
     **Source resolution order:**
-    1. Git URL (https://…, git@…)  → git clone into /workspace/<repo-name>
-    2. Absolute /skills/ path      → cp -r to /workspace/<skill-name>
-    3. Bare skill/repo name        → search /skills/<tenant-id>/<name> first;
+    1. Git URL (https://…, git@…)  → git clone into the checkout directory
+    2. Absolute /skills/ path      → cp -r into the checkout directory
+    3. Bare skill/repo name        → search /skills/<tenant-id>/… first;
                                      if not found, look up the Git repo by
                                      exact name via the configured provider and clone it.
 
-    Returns the absolute container path of the checked-out directory, e.g.:
-      /workspace/my-skill
-    On failure returns an ERROR: … string.
+    The checkout lives under a directory private to this conversation, so two
+    users editing the same skill at the same time never overwrite each other.
+
+    Returns the absolute container path of the checked-out directory — always use
+    the returned path verbatim and never assume /workspace/<name>. On failure
+    returns an ERROR: … string.
+
+    If a step hit its time limit and a fallback path was taken (e.g. the remote
+    clone was skipped and a local copy used instead), extra lines starting with
+    `NOTE:` follow the path. Those lines are NOT part of the path — pass them on
+    to the user so they know the result came from the fallback.
 
     **Decision rule:** Make this call autonomously based on user context.
     Do NOT ask the user which path to use — resolve it yourself using the
@@ -2370,6 +2906,12 @@ def checkout_to_workspace(source: str) -> str:
     Args:
         source: Git URL, absolute /skills/ path, or bare skill/repo name.
     """
+    with _fallback_notices():
+        return _with_notes(_checkout_impl(source))
+
+
+def _checkout_impl(source: str) -> str:
+    """checkout_to_workspace 본체 — 컨테이너 경로 또는 ERROR 문자열을 돌려준다."""
     if _current_sandbox.get() is None:
         return "ERROR: sandbox not available."
 
@@ -2383,10 +2925,8 @@ def checkout_to_workspace(source: str) -> str:
             auth_url = provider.get_authenticated_clone_url(owner, repo)
         except ValueError:
             auth_url = source.strip()
-        dest = f"/workspace/{repo}"
-        rc, out = _sandbox_exec(
-            f"rm -rf {shlex.quote(dest)} && git clone --depth=50 {shlex.quote(auth_url)} {shlex.quote(dest)}"
-        )
+        dest = _checkout_dest(repo)
+        rc, out = _clone_sb(auth_url, dest)
         if rc != 0:
             return f"ERROR: git clone 실패: {out}"
         return dest
@@ -2394,7 +2934,13 @@ def checkout_to_workspace(source: str) -> str:
     # Case 2: absolute /skills/ path
     if source.startswith("/skills/"):
         p = Path(source)
-        dest = f"/workspace/{p.name}"
+        dest = _checkout_dest(p.name)
+        # 같은 이름의 Git 레포가 있으면 로컬 사본 대신 레포를 클론한다.
+        # 로컬 사본으로 작업하면 PR diff 가 "레포 전체를 로컬본으로 교체" 가 되어
+        # 요청한 변경을 분간할 수 없고, 병합 관리 흐름이 의미를 잃는다.
+        cloned = _try_clone_skill_repo(p.name, dest)
+        if cloned is not None:
+            return cloned
         rc, out = _sandbox_exec(
             f"rm -rf {shlex.quote(dest)} && cp -r {shlex.quote(source)} {shlex.quote(dest)}"
         )
@@ -2406,12 +2952,26 @@ def checkout_to_workspace(source: str) -> str:
     name = source.strip().strip("/")
     tenant_id = _current_tenant_id.get()
 
-    # 3a: local /skills/{tenant_id}/{name}
+    # 3a: local /skills/{tenant_id}/... 아래에서 이름으로 찾는다.
+    #
+    # 디스크 배치는 {tenant_id}/{provider_config_id | "local"}/{skill-name} 이라
+    # {tenant_id}/{name} 만 보면 실제 스킬은 절대 걸리지 않는다. 그러면 이름으로 부른
+    # 체크아웃이 전부 3b(원격 조회+클론)로 새어 나가고, 원격이 느리거나 막힌 환경에서는
+    # 로컬에 멀쩡히 있는 스킬을 두고 매번 네트워크에 매달리게 된다. 한 단계 아래까지 훑는다.
     if tenant_id:
-        local_path = f"/skills/{tenant_id}/{name}"
-        rc, _ = _sandbox_exec(f"test -d {shlex.quote(local_path)}")
-        if rc == 0:
-            dest = f"/workspace/{name}"
+        t_q, n_q = shlex.quote(tenant_id), shlex.quote(name)
+        probe = (
+            f'for d in /skills/{t_q}/{n_q} /skills/{t_q}/*/{n_q}; do '
+            f'if [ -d "$d" ]; then printf %s "$d"; break; fi; done'
+        )
+        _, found = _sandbox_exec(probe)
+        local_path = found.strip()
+        if local_path:
+            dest = _checkout_dest(name)
+            # 같은 이름의 레포가 있으면 Case 2 와 같은 이유로 클론을 우선한다.
+            cloned = _try_clone_skill_repo(name, dest)
+            if cloned is not None:
+                return cloned
             rc2, out = _sandbox_exec(
                 f"rm -rf {shlex.quote(dest)} && cp -r {shlex.quote(local_path)} {shlex.quote(dest)}"
             )
@@ -2433,10 +2993,8 @@ def checkout_to_workspace(source: str) -> str:
         )
 
     auth_url = provider.get_authenticated_clone_url(provider.username, name)
-    dest = f"/workspace/{name}"
-    rc, out = _sandbox_exec(
-        f"rm -rf {shlex.quote(dest)} && git clone --depth=50 {shlex.quote(auth_url)} {shlex.quote(dest)}"
-    )
+    dest = _checkout_dest(name)
+    rc, out = _clone_sb(auth_url, dest)
     if rc != 0:
         return f"ERROR: git clone 실패: {out}"
     return dest
@@ -2453,8 +3011,10 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
     Works with any configured Git provider (GitHub, GitLab, Gitea, etc.).
 
     **Path rules (container paths):**
-      - /workspace/<skill-name>   → publish directly
-      - /skills/<tenant-id>/<skill-name> → copied to /workspace/<skill-name> first
+      - any /workspace/… directory       → publish directly (pass the exact path
+                                           `checkout_to_workspace` returned)
+      - /skills/<tenant-id>/<skill-name> → copied into this conversation's
+                                           checkout directory first
       - /skills/anthropics-skills/...    → rejected (read-only system skills)
 
     **Workflow:**
@@ -2468,7 +3028,17 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
         skill_path: Docker container path to the completed skill folder.
         branch:     Optional custom branch name for the PR. If omitted, an
                     auto-generated branch name is used (skill/<name>/<timestamp>).
+
+    Lines starting with `NOTE:` may follow the result when a step hit its time
+    limit and a fallback path was taken, or when the merge request could not be
+    recorded. Always relay those lines to the user.
     """
+    with _fallback_notices():
+        return _with_notes(_publish_skill_impl(skill_path, branch))
+
+
+def _publish_skill_impl(skill_path: str, branch: str | None = None) -> str:
+    """publish_skill 본체 — 결과/에러 문자열을 돌려준다."""
     if _current_sandbox.get() is None:
         return "ERROR: sandbox not available. 스킬 퍼블리시는 Docker sandbox 환경에서만 가능합니다."
 
@@ -2485,6 +3055,24 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
     p = Path(skill_path)
     skill_name = p.name
 
+    # 방/실행 디렉터리를 그대로 퍼블리시하려는 경우를 막는다.
+    #
+    # 에이전트가 단독 스킬을 `<base>/skills/<name>/SKILL.md` 가 아니라 `<base>/SKILL.md`
+    # 로 떨어뜨리는 일이 있는데, 그때 디렉터리명을 스킬명으로 쓰면 **대화방 UUID 가 그대로
+    # 레포명·스킬명이 된다**(예: ohsy818/ef9ae263-371d-45c3-adff-6c6acbe71129). 예전에는
+    # 이 경로가 push 단계에서 네트워크 문제로 실패해 드러나지 않았을 뿐, 정상 네트워크에서는
+    # 쓰레기 레포와 잘못된 테넌트 스킬이 실제로 만들어진다. 프론트의 산출물 저장 경로는
+    # 이미 frontmatter 의 name 을 우선해 같은 사고를 피하고 있다 — 여기서도 같은 기준을 쓴다.
+    if _ROOM_DIR_UUID_RE.search(skill_name):
+        resolved = _skill_name_from_frontmatter(skill_path)
+        if not resolved:
+            return (
+                f"ERROR: '{skill_path}' 는 대화방/실행 디렉터리라 스킬명을 알 수 없습니다. "
+                "스킬을 `<base>/skills/<skill-name>/` 아래로 옮기거나, SKILL.md frontmatter 에 "
+                "`name:` 을 적은 뒤 그 디렉터리 경로로 다시 호출하세요."
+            )
+        skill_name = resolved
+
     if p.is_relative_to(_CONTAINER_SKILLS / "anthropics-skills"):
         return "ERROR: anthropics-skills 하위 스킬은 수정하거나 퍼블리시할 수 없습니다."
 
@@ -2497,11 +3085,11 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
         if not p.is_relative_to(_CONTAINER_SKILLS / tenant_id):
             return (
                 f"ERROR: '{skill_path}' 는 테넌트({tenant_id}) 소유 스킬 경로가 아닙니다. "
-                "퍼블리시 가능한 경로: /workspace/<skill-name> 또는 "
+                "퍼블리시 가능한 경로: checkout_to_workspace 가 돌려준 /workspace 하위 경로 또는 "
                 f"/skills/{tenant_id}/<skill-name>"
             )
 
-        dest = f"/workspace/{skill_name}"
+        dest = _checkout_dest(skill_name)
         rc, out = _sandbox_exec(
             f"rm -rf {shlex.quote(dest)} && cp -r {shlex.quote(skill_path)} {shlex.quote(dest)}"
         )
@@ -2510,14 +3098,44 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
         cwd = dest
 
     repo_info = provider.repo_exists(skill_name)
-    repo_exists = repo_info is not None
+    repo_missing = repo_info is None
 
-    if not repo_exists:
-        # 신규 레포: 생성 후 main에 초기 커밋 (PR 불필요)
+    # 방 초안(.bpmn/<room>/<skill>/)을 그대로 발행하려는 경우를 체크아웃 위로 옮긴다.
+    #
+    # 같은 대화방에서 스킬을 만들고 이어서 고치면, 생성 때 쓴 초안이 방 작업 디렉터리에
+    # 그대로 남아 있어 에이전트가 checkout_to_workspace 를 부르고도 눈앞의 그 초안을 고친다.
+    # 초안에는 git 이력이 없으므로 여기서 그대로 발행하면 diff 기준이 없어 "레포 전체를
+    # 로컬본으로 교체" 가 되고, 실측에서는 기존 레포가 빈 레포로 잡혀 main 통째 커밋으로
+    # 빠졌다. 그 뒤에는 원격과 로컬이 같아져 PR 을 열 변경분이 0 이 된다 — 병합 전 회귀
+    # 검증이 통째로 우회되는 경로다(_checkout_impl 의 같은 취지 주석 참고).
+    #
+    # 새 대화방에서 고칠 때와 결과가 같아지도록, 레포가 있으면 그 레포를 클론한 뒤 초안의
+    # 파일만 얹어 발행한다. 클론이 안 되면 조용히 main 을 덮어쓰는 대신 실패로 알린다.
+    if not repo_missing and _is_room_draft_dir(cwd):
+        rebased, err = _rebase_draft_onto_checkout(cwd, skill_name, provider)
+        if err:
+            return err
+        cwd = rebased
+
+    # 레포는 있는데 브랜치가 하나도 없는 "빈 레포"는 신규와 동일하게 main 초기 커밋으로 처리한다.
+    # 레포 생성 직후 push 가 실패하면 이 상태로 남는데, PR 경로는 base 브랜치(main)가 없어
+    # 항상 실패하므로 스킬이 영구히 병합 관리 흐름에 진입하지 못한다.
+    empty_repo = False
+    if not repo_missing:
         try:
-            html_url = provider.create_repo(skill_name)
-        except RuntimeError as e:
-            return f"ERROR creating repo: {e}"
+            empty_repo = not provider.list_branches(provider.username, skill_name)
+        except Exception:
+            empty_repo = False  # 조회 실패 시엔 기존 동작(PR 경로)을 유지한다.
+
+    if repo_missing or empty_repo:
+        if repo_missing:
+            # 신규 레포: 생성 후 main에 초기 커밋 (PR 불필요)
+            try:
+                html_url = provider.create_repo(skill_name)
+            except RuntimeError as e:
+                return f"ERROR creating repo: {e}"
+        else:
+            html_url = provider.get_repo_html_url(provider.username, skill_name)
 
         clone_url = provider.get_authenticated_clone_url(provider.username, skill_name)
         return _push_skill_sandbox(
@@ -2541,7 +3159,7 @@ def publish_skill(skill_path: str, branch: str | None = None) -> str:
 
 
 @tool
-def register_skill_as_tenant(skill_path: str) -> str:
+def register_skill_as_tenant(skill_path: str, overwrite: bool = False) -> str:
     """Register a packaged skill (.skill file) as a tenant skill without git.
 
     Use this when there is no git provider configured. After packaging the skill
@@ -2551,8 +3169,16 @@ def register_skill_as_tenant(skill_path: str) -> str:
     The tool extracts the archive, copies files to the tenant skill directory, and
     records the registration in the tenant_skills table. No UI upload needed.
 
+    **New skill vs. existing skill:** by default this tool refuses to touch a skill
+    that already exists, so it cannot be used to update one by accident. To apply an
+    edit to an existing skill, prefer `publish_skill` (it opens a PR for review). Only
+    when no git provider is configured, call this tool again with `overwrite=True` to
+    replace the existing skill files in place.
+
     Args:
         skill_path: Container path to the .skill (or .zip) file, e.g. /workspace/my-skill.skill
+        overwrite:  Replace the files of an already-registered skill instead of failing.
+                    The previous files are kept as a backup until the update succeeds.
     """
     import shutil as _shutil
     import tempfile as _tempfile
@@ -2587,30 +3213,47 @@ def register_skill_as_tenant(skill_path: str) -> str:
         skill_name = skill_root.name if skill_root != tmpdir else skill_name_from_filename(host_path.name)
         dest = get_tenant_skill_dest(tenant_id, skill_name, config_id="local")
 
-        if dest.exists():
-            return f"ERROR: '{skill_name}' 스킬이 이미 존재합니다 (tenant: {tenant_id}). 다른 이름을 사용하거나 기존 스킬을 삭제하세요."
+        already_registered = dest.exists()
+        if already_registered and not overwrite:
+            return (
+                f"ERROR: '{skill_name}' 스킬이 이미 존재합니다 (tenant: {tenant_id}). "
+                "기존 스킬을 수정하려면 publish_skill 로 PR 을 올리세요. "
+                "git 공급자가 없어 직접 반영해야 한다면 overwrite=True 로 다시 호출하세요."
+            )
 
+        # 덮어쓰기는 기존 파일을 백업해 두고 진행한다 — 이후 DB 단계까지 성공하면 백업을 지우고,
+        # 중간에 실패하면 백업을 되돌려 스킬이 사라지지 않게 한다.
+        backup = dest.with_name(f"{dest.name}.bak-{os.getpid()}") if already_registered else None
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
+            if backup is not None:
+                _shutil.rmtree(str(backup), ignore_errors=True)
+                _shutil.move(str(dest), str(backup))
             _shutil.move(str(skill_root), str(dest))
         except Exception as e:
+            if backup is not None and backup.exists() and not dest.exists():
+                _shutil.move(str(backup), str(dest))
             return f"ERROR: 파일 복사 실패: {e}"
     finally:
         _shutil.rmtree(str(tmpdir), ignore_errors=True)
 
     owner_id = _current_user_id.get() or ""
-    try:
-        from ..storage.db import get_supabase
-        get_supabase().table("tenant_skills").insert({
-            "tenant_id": tenant_id,
-            "skill_name": skill_name,
-            "owner_id": owner_id,
-        }).execute()
-    except Exception as e:
-        _logging.getLogger(__name__).warning("tenant_skills 등록 실패 skill=%s: %s", skill_name, e)
-        _shutil.rmtree(str(dest), ignore_errors=True)
-        return f"ERROR: DB 등록 실패로 파일을 롤백했습니다: {e}"
+    if not already_registered:
+        try:
+            from ..storage.db import get_supabase
+            get_supabase().table("tenant_skills").insert({
+                "tenant_id": tenant_id,
+                "skill_name": skill_name,
+                "owner_id": owner_id,
+            }).execute()
+        except Exception as e:
+            _logging.getLogger(__name__).warning("tenant_skills 등록 실패 skill=%s: %s", skill_name, e)
+            _shutil.rmtree(str(dest), ignore_errors=True)
+            return f"ERROR: DB 등록 실패로 파일을 롤백했습니다: {e}"
 
+    if backup is not None:
+        _shutil.rmtree(str(backup), ignore_errors=True)
+        return f"✓ '{skill_name}' 테넌트 스킬 갱신 완료 (경로: {dest})"
     return f"✓ '{skill_name}' 테넌트 스킬로 등록 완료 (경로: {dest})"
 
 

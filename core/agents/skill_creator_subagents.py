@@ -4,7 +4,8 @@ build_skill_creator_subagents()를 호출해 SubAgent 목록을 얻은 뒤
 build_agent(static_subagents=...) 로 전달한다.
 
 포함된 서브에이전트:
-  repo-scout      — skill 생성 전 Git 레포에 동일 스킬이 있는지 탐색
+  skill-creator   — SKILL.md(+부속 파일)를 지정된 경로에 작성
+  repo-scout      — skill 생성 전 Git 레포에 동일 스킬이 있는지 탐색 (현재 파이프라인에서는 제외)
   rule-extractor  — Supabase storage 문서를 60/40 분할해 규칙 추출
   test-runner     — eval 프롬프트를 스킬 유무에 따라 실행하고 출력 저장
   evaluator       — grader.md 지침으로 assertion 채점 및 grading.json 생성
@@ -12,16 +13,19 @@ build_agent(static_subagents=...) 로 전달한다.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from deepagents import SubAgent
 
 from ..skills.tools import (
-    WORKSPACE_ROOT,
     extract_document_structure,
     list_git_repos,
+    tenant_workspace_root,
 )
 from ..storage.storage import download_file
+
+logger = logging.getLogger(__name__)
 
 _BASE_DIR = Path(__file__).parent.parent.parent
 
@@ -92,6 +96,77 @@ Decision rules:
   descriptions only.
 - Do NOT create, push, or modify any repository.
 - Return ONLY the JSON block as your final answer.
+"""
+
+
+# ---------------------------------------------------------------------------
+# 스킬 작성 서브에이전트 시스템 프롬프트
+# ---------------------------------------------------------------------------
+
+_SKILL_CREATOR_SYSTEM = """You are the **skill-creator sub-agent**. You author one reusable Agent Skill as
+files on disk and return a short receipt. You never save to a database, never
+publish to Git, and never talk to the end user.
+
+## Inputs (given in the task description)
+
+  - `output_path`: ABSOLUTE path of the SKILL.md to write
+    (e.g. `/workspace/.bpmn/<room>/process-<id>/skills/<safe-name>/SKILL.md`).
+    Write exactly there — do not invent a different directory.
+  - `skill_name`: the skill's name (may be Korean).
+  - `purpose` / `context`: what the skill must do, plus the activities, roles,
+    inputs and outputs it supports. Use every detail you are given.
+
+## Steps
+
+1. If a reference skill (`/skills/anthropics-skills/skill-creator/SKILL.md`) is
+   readable and you are unsure about format, skim it. Otherwise go straight on —
+   do NOT run its evaluation/benchmark pipeline. No evals, no test runs.
+2. `write_file` the SKILL.md at `output_path` using the template below.
+3. Only if the procedure genuinely needs them, add supporting files next to it
+   (`references/<topic>.md`, `scripts/<name>.py`). Keep it to at most two.
+4. Return one line: `created: <output_path>` plus the frontmatter name.
+
+## SKILL.md template (follow exactly)
+
+```markdown
+---
+name: <skill name — same as skill_name>
+description: <2~4 sentences, Korean. What it does, and the concrete user
+  phrasings/situations that should trigger it. Be specific enough that another
+  agent can decide correctly from this line alone.>
+---
+
+# <skill name>
+
+## 언제 쓰나
+- <trigger 1>
+- <trigger 2>
+
+## 입력
+- <what the performer needs before starting — form fields, documents, prior outputs>
+
+## 절차
+1. <step — imperative, checkable>
+2. <step>
+3. <step>
+
+## 출력 계약
+- <named output 1>: <format/criteria>
+- <named output 2>: <format/criteria>
+
+## 주의
+- <pitfall / rule to never break>
+```
+
+## Rules
+
+- Korean body text. `name` may be Korean; the **directory name in
+  `output_path` is fixed by the caller** — never rename it.
+- Concrete over generic: no "적절히 처리한다" filler. Every step must be
+  something a person or agent can actually execute and verify.
+- Placeholders (`TODO`, `<...>` left unfilled, empty sections) are failures.
+- Do not create process definitions, forms, DMN, or agent profiles — that is the
+  caller's job. You produce the skill files only.
 """
 
 
@@ -328,45 +403,66 @@ Return a concise summary:
 _TEST_RUNNER_SYSTEM = """\
 You are a **test-execution sub-agent** in the skill-creator evaluation pipeline.
 
-Your task description will specify:
-  - skill_path: path to the skill folder to use (or "none" for a baseline run)
-  - skill_root: the root directory of the skill being evaluated
-  - prompt: the eval task to execute
-  - outputs_dir: where to save all output files
-    (always under <skill_root>/iteration-<N>/eval-<name>/<variant>/outputs/)
-  - variant: "with_skill" or "without_skill"
+The main agent gives you one eval run to execute. Your task description specifies:
+  - skill_path:  path to the skill folder to use, or "none" for a baseline run
+  - prompt:      the eval task to execute
+  - files:       input files for the task (Supabase storage paths or local paths), may be empty
+  - outputs_dir: **exact** directory to save all output files into
+  - variant:     "with_skill" | "without_skill" | "old_skill"
 
-## Path conventions
+## Paths
 
-All evaluation artifacts live **inside the skill root directory**:
-  - Eval definitions:  <skill_root>/evals/evals.json
-  - Run outputs:       <skill_root>/iteration-<N>/eval-<name>/with_skill/outputs/
-  - Baseline outputs:  <skill_root>/iteration-<N>/eval-<name>/without_skill/outputs/
-  - Timing data:       <skill_root>/iteration-<N>/eval-<name>/<variant>/timing.json
+`outputs_dir` is computed by the main agent's `plan_skill_eval` tool and handed to you
+verbatim. It looks like:
+
+    /workspace/.bpmn/<room>/.skill-evals/<skill-name>/iteration-<N>/<eval-name>/<variant>/outputs
+
+**Use it exactly as given. Never invent, shorten, or relocate this path** — the completion
+gate (`complete_skill_creation`) looks for grading results next to it, and a run saved
+somewhere else counts as a run that never happened.
+
+Note the run artifacts live under `.skill-evals/`, **outside** the skill folder. Do not
+write anything into the skill folder itself — that folder is packaged and saved as the
+skill, and eval outputs must not end up inside it.
 
 ## How to run
 
-1. Read `outputs_dir`, `prompt`, `skill_path`, and `variant` from your task description.
-2. Create the outputs directory if it doesn't exist.
-3. **If skill_path is provided (with_skill run)**:
+1. Read `outputs_dir`, `prompt`, `skill_path`, `files`, and `variant` from your task description.
+   `outputs_dir` already exists — do not create or list it, just write into it.
+2. **If `files` is a non-empty list, materialise and read the inputs before anything else.**
+   - Entries that look like Supabase storage paths (e.g. `files/<uuid>.docx`) must be fetched
+     with `download_file(storage_path, dest_dir=<outputs_dir>/../inputs)`; entries that are
+     already absolute `/workspace/...` paths are on disk.
+   - **Read every document with `extract_document_structure(file_path)` — never `read_file`.**
+     `read_file` hands a `.docx`/`.pdf`/`.xlsx` to the model as a raw document attachment,
+     which this model rejects outright (`Invalid value: 'file'`), killing the whole run and
+     leaving no outputs at all. `extract_document_structure` returns plain text and works for
+     PDF / DOCX / TXT / MD.
+   The scenario prompt usually assumes the attachment ("review the attached NDA"), so if you
+   skip this the run produces "no document was provided" and every assertion fails — which
+   makes the whole evaluation worthless. If a download or parse fails, say so in `user_notes.md`
+   and keep going.
+3. **If skill_path is a path (with_skill / old_skill run)**:
    - Read the SKILL.md at `skill_path/SKILL.md`
    - Follow its instructions to complete the task prompt
    - Use any scripts bundled with the skill (in `skill_path/scripts/`)
 4. **If skill_path is "none" (baseline run)**:
-   - Complete the task prompt using your own capabilities, without any skill
+   - Complete the task prompt using your own capabilities, without any skill.
+   - This run is the control group. Do NOT read the skill — if you peek at it, the
+     comparison is meaningless and the whole evaluation is worthless.
 5. Save every created or transformed output file to `outputs_dir`.
 6. If you encounter uncertainties or errors, write a brief `user_notes.md`
    in `outputs_dir` — but do not stop working.
-7. After saving outputs, write `outputs_dir/../timing.json`:
-   ```json
-   {"executor_duration_seconds": <float>, "total_duration_seconds": <float>}
-   ```
-   Use the actual wall-clock time you spent.
+7. Do not measure or record timing — no `date`, no `timing.json`. The main agent gets the
+   run's duration and tokens from the task result.
+
 ## Rules
 - Do the work — do not just explain what you would do.
+- **Never `read_file` a document (.docx/.pdf/.xlsx/.pptx) — use `extract_document_structure`.**
 - Save ALL produced files to `outputs_dir`, not to other locations.
 - Keep `outputs_dir` clean: only put task outputs there, not temporary files.
 - Do not fabricate outputs that the task did not actually produce.
+- Always finish by reporting the absolute `outputs_dir` you wrote to.
 """
 
 
@@ -378,25 +474,27 @@ _EVALUATOR_PREAMBLE = """\
 You are a **result-evaluation sub-agent** in the skill-creator eval pipeline.
 
 Your task description will specify:
-  - eval_name: name of the eval case
-  - skill_root: the root directory of the skill being evaluated
-  - outputs_dir: directory containing the skill's output files
-    (always under <skill_root>/iteration-<N>/eval-<name>/<variant>/outputs/)
-  - transcript_path: path to the execution transcript (may not exist)
-  - assertions: JSON array of assertion strings to grade
-  - grading_path: where to save the grading.json result
-    (always under <skill_root>/iteration-<N>/eval-<name>/<variant>/grading.json)
-  - skill_name: kebab-case name of the skill (e.g. "nda-reviewer")
-  - iteration_dir: full path to the iteration directory (e.g. <skill_root>/iteration-1)
-  - ws: workspace root path (for viewer.html output)
+  - eval_name:     name of the eval case
+  - variant:       "with_skill" | "without_skill" | "old_skill"
+  - outputs_dir:   directory containing the run's output files
+  - grading_path:  **exact** path to write grading.json to
+  - assertions:    JSON array of assertion strings to grade
+  - skill_name:    kebab-case name of the skill (e.g. "nda-review")
 
 ## Path conventions
 
-All evaluation artifacts live **inside the skill root directory**:
-  - Grading results: <skill_root>/iteration-<N>/eval-<name>/with_skill/grading.json
-  - Baseline grades: <skill_root>/iteration-<N>/eval-<name>/without_skill/grading.json
-  - Benchmark:       <skill_root>/iteration-<N>/benchmark.json
-  - Feedback:        <skill_root>/iteration-<N>/feedback.json
+Both paths are computed by the main agent's `plan_skill_eval` tool and handed to you
+verbatim. They look like:
+
+    outputs_dir:  /workspace/.bpmn/<room>/.skill-evals/<skill>/iteration-<N>/<eval-name>/<variant>/outputs
+    grading_path: /workspace/.bpmn/<room>/.skill-evals/<skill>/iteration-<N>/<eval-name>/<variant>/grading.json
+
+**Write grading.json to exactly `grading_path`.** The completion gate
+(`complete_skill_creation` / `complete_skill_regression`) reads that exact file to decide
+whether the skill was really tested; a grading saved anywhere else does not count.
+
+Grade the `with_skill` run and its control run (`without_skill` / `old_skill`) with the
+**same standard** — the point of the comparison is to show what the skill actually adds.
 
 Read the assertions from your task description (they are JSON-encoded strings).
 Then follow the grading instructions below precisely.
@@ -408,7 +506,18 @@ Then follow the grading instructions below precisely.
 def _build_evaluator_system(skill_creator_path: Path) -> str:
     """grader.md 내용을 포함한 평가 서브에이전트 시스템 프롬프트를 빌드한다."""
     grader_path = skill_creator_path / "agents" / "grader.md"
-    grader_instructions = grader_path.read_text() if grader_path.exists() else ""
+    # encoding 을 명시하지 않으면 Windows 로컬 실행에서 cp949 로 열려 UnicodeDecodeError 가
+    # 나고, 그 예외가 build_skill_creator_subagents → executor 까지 올라가 채팅 턴 전체가
+    # 실패한다. 파일이 깨져 있어도 서브에이전트 구성을 막지 않도록 errors 도 완화한다.
+    try:
+        grader_instructions = (
+            grader_path.read_text(encoding="utf-8", errors="replace")
+            if grader_path.exists()
+            else ""
+        )
+    except OSError:
+        logger.warning("skill-creator grader.md 읽기 실패 — 평가 지침 없이 진행", exc_info=True)
+        grader_instructions = ""
 
     task_suffix = f"""
 ---
@@ -417,30 +526,60 @@ def _build_evaluator_system(skill_creator_path: Path) -> str:
 
 1. Parse `assertions` from your task description (JSON array of strings).
 2. Grade each assertion against the outputs and transcript.
-3. Save `grading.json` to `grading_path` specified in your task description.
+3. Save `grading.json` to the exact `grading_path` from your task description.
+   It MUST contain an `expectations` array whose entries use the field names
+   `text`, `passed`, and `evidence` — the completion gate and the viewer both
+   depend on those exact names — plus a `summary` object with
+   `passed` / `failed` / `total` / `pass_rate`.
 4. Be objective, cite specific evidence, apply no partial credit.
+5. Report the grading_path you wrote and the pass/total counts back to the main agent.
 
-## Generating the eval viewer (run immediately after grading)
+## Optional: static eval viewer
 
-After saving grading.json, generate a static HTML viewer:
+Only if the main agent explicitly asked for a viewer (the pass/fail data is already
+persisted by the completion gate, so this is not required):
 
-1. Run benchmark aggregation:
    ```
    execute("cd {skill_creator_path} && python -m scripts.aggregate_benchmark <iteration_dir> --skill-name <skill_name>")
-   ```
-
-2. Generate the static viewer:
-   ```
    execute("python {skill_creator_path}/eval-viewer/generate_review.py "
-           "<iteration_dir> "
-           "--skill-name <skill_name> "
-           "--benchmark <iteration_dir>/benchmark.json "
-           "--static <ws>/viewer.html")
+           "<iteration_dir> --skill-name <skill_name> "
+           "--benchmark <iteration_dir>/benchmark.json --static <ws>/viewer.html")
    ```
 
-3. Report the local path `<ws>/viewer.html` in your response to the main agent.
+   If either command fails, say so and move on — do not retry in a loop.
 """
     return _EVALUATOR_PREAMBLE + grader_instructions + task_suffix
+
+
+# ---------------------------------------------------------------------------
+# 평가 서브에이전트의 파일 도구
+# ---------------------------------------------------------------------------
+
+# deepagents 는 서브에이전트마다 기본 FilesystemMiddleware 로 파일 도구 8개를 모두 준다.
+# 평가 서브에이전트는 요청 한 번의 3분의 2가 도구 설명이었는데, 스킬 생성 4회(test-runner
+# 96 요청, evaluator 94 요청) 동안 아래에 없는 도구는 한 번도 쓰지 않았다(2026-10-16).
+# 서브에이전트 정의의 middleware 에 같은 이름의 FilesystemMiddleware 를 두면 기본 자리를
+# 대신한다(deepagents 공식 교체 규칙). 백엔드가 build_agent 에서 정해지므로 거기서 붙인다.
+SUBAGENT_FILESYSTEM_TOOLS: dict[str, list[str]] = {
+    "test-runner": ["ls", "read_file", "write_file", "edit_file", "execute"],
+    "evaluator": ["ls", "read_file", "write_file", "glob", "grep", "execute"],
+}
+
+
+def attach_subagent_filesystem_tools(subagents: list, backend) -> list:
+    """SUBAGENT_FILESYSTEM_TOOLS 에 있는 서브에이전트에 파일 도구를 고른 FilesystemMiddleware 를 붙인다."""
+    from deepagents.middleware.filesystem import FilesystemMiddleware
+
+    result = []
+    for spec in subagents:
+        names = SUBAGENT_FILESYSTEM_TOOLS.get(spec.get("name", "")) if isinstance(spec, dict) else None
+        if names:
+            spec = {
+                **spec,
+                "middleware": [*spec.get("middleware", []), FilesystemMiddleware(backend=backend, tools=names)],
+            }
+        result.append(spec)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +602,7 @@ def build_skill_creator_subagents(
                              None이면 anthropics-skills/skill-creator 기본값 사용.
     """
     sc_path = Path(skill_creator_path) if skill_creator_path else _DEFAULT_SKILL_CREATOR_PATH
-    ws = str(WORKSPACE_ROOT / (task_id or "tmp"))
+    ws = str(tenant_workspace_root() / (task_id or "tmp"))
 
     repo_scout: SubAgent = {
         "name": "repo-scout",
@@ -478,6 +617,21 @@ def build_skill_creator_subagents(
         ),
         "system_prompt": _REPO_SCOUT_SYSTEM,
         "tools": [list_git_repos],
+    }
+
+    skill_creator: SubAgent = {
+        "name": "skill-creator",
+        "description": (
+            "Authors ONE reusable Agent Skill (SKILL.md, plus optional references/ or "
+            "scripts/) at an absolute output path you provide. Use this whenever a skill "
+            "has to be created — standalone skill requests, and the skill candidates "
+            "selected during BPMN process generation. "
+            "Pass `output_path` (absolute path of the SKILL.md to write), `skill_name`, "
+            "and rich `context` (the activities, roles, inputs and outputs the skill "
+            "supports) in the task description. It writes the files and returns a one-line "
+            "receipt — it does not save to a database, publish to Git, or run evals."
+        ),
+        "system_prompt": _SKILL_CREATOR_SYSTEM,
     }
 
     rule_extractor: SubAgent = {
@@ -503,22 +657,34 @@ def build_skill_creator_subagents(
     test_runner: SubAgent = {
         "name": "test-runner",
         "description": (
-            "Executes an eval prompt with or without a specified skill and saves "
-            "all outputs to disk. Use for running skill test cases — both the "
-            "with-skill run and the baseline (without-skill) run. "
-            "Always spawn the with-skill and baseline runs in the same turn "
-            "so they run in parallel."
+            "**Required step of every skill creation.** Executes one eval prompt — with the "
+            "skill (variant `with_skill`) or without it (control group, variant `without_skill`) "
+            "— and saves all produced files to the exact `outputs_dir` it is given. "
+            "Use it proactively as soon as SKILL.md and evals/evals.json exist: call "
+            "`plan_skill_eval` first, then spawn EVERY run it returns — both variants of every "
+            "eval case — in the SAME turn so they run in parallel. "
+            "A skill whose runs were never spawned cannot be completed: the "
+            "`complete_skill_creation` gate rejects it."
         ),
         "system_prompt": _TEST_RUNNER_SYSTEM,
-        "tools": [],
+        # 시나리오가 첨부 문서를 전제로 쓰였는데 그 문서를 가져오고 **읽을** 수단이 없으면,
+        # 실행 결과가 늘 "원문이 없어 검토 불가" 가 되어 채점이 무의미해진다.
+        # extract_document_structure 가 반드시 필요하다 — read_file 로 .docx 를 읽으면
+        # 모델에 문서 첨부 블록이 그대로 전달되고, 그 타입을 거부하는 모델에서는
+        # 실행이 400 으로 죽어 산출물이 하나도 남지 않는다.
+        "tools": [download_file, extract_document_structure],
     }
 
     evaluator: SubAgent = {
         "name": "evaluator",
         "description": (
-            "Grades a set of assertions against eval outputs and writes grading.json. "
-            "Use after test-runner runs have completed. "
-            "Provide the outputs directory, assertions list, and target grading path."
+            "**Required step of every skill creation.** Grades a set of assertions against one "
+            "eval run's outputs and writes `grading.json` to the exact path it is given. "
+            "Use it right after the matching test-runner run finishes — once per eval case per "
+            "variant (with_skill AND the control run). Provide `outputs_dir`, the `assertions` "
+            "array, `variant`, and `grading_path` (all returned by `plan_skill_eval`). "
+            "Without these grading.json files the `complete_skill_creation` gate refuses to "
+            "finish the skill."
         ),
         "system_prompt": _build_evaluator_system(sc_path),
         "tools": [],
@@ -528,4 +694,4 @@ def build_skill_creator_subagents(
     # 스킬은 워크스페이스에 SKILL.md 로 생성되고 프론트가 저장(zip 업로드)하므로 git 접근이 없어야 한다.
     # → list_git_repos/checkout 호출로 step 을 낭비하지 않도록 repo-scout 을 제외한다.
     _ = repo_scout  # 정의는 유지(향후 git 연동 옵션용)하되 파이프라인에선 제외.
-    return [rule_extractor, test_runner, evaluator]
+    return [skill_creator, rule_extractor, test_runner, evaluator]

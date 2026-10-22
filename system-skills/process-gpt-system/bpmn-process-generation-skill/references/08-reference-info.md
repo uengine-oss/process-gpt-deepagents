@@ -14,7 +14,12 @@
 
 ## 참조 형식
 
-참조값은 항상 **`<form_id>.<field_name>`** 형식이다. (7단계에서 만든 폼의 form_id 와 필드 name 을 쓴다.) 예: `leave_request_apply_form.start_date`.
+참조값은 항상 **`<form_id>.<field_name>`** 형식이다. 작성 시점의 `form_id` 는 **그 폼이 속한
+`activity_id`** 다([07-forms.md](07-forms.md) 의 form_id 규칙). 예: 활동 `apply_leave` 의 폼에
+`start_date` 필드가 있으면 참조값은 `apply_leave.start_date`.
+
+저장용 최종 form id(`<프로세스uuid>_<activity_id>_form`)는 마무리 단계가 자동으로 치환하므로
+**직접 uuid 를 붙이지 마라.**
 
 ---
 
@@ -36,7 +41,7 @@
 - 첫 Activity(선행 없음)는 `inputData: []`.
 
 ```json
-"inputData": ["leave_request_apply_form.start_date", "leave_request_apply_form.reason"]
+"inputData": ["apply_leave.start_date", "apply_leave.reason"]
 ```
 
 ---
@@ -72,7 +77,7 @@
 
 ## 프로세스 정의 JSON 반영
 
-`Edit`으로 아래 참조 필드를 요소 ID 기준 갱신:
+`edit_file` 로 아래 참조 필드를 요소 ID 기준 갱신:
 1. 각 Activity 의 `inputData` 를 선행 후보로 한정해 채운다(중복 제거, 상한 적용).
 2. 각 ExclusiveGateway 의 `conditionData` 를 채운다.
 3. 메인 `elements` 와 (있으면) 서브프로세스 `children` 양쪽 모두 동기화한다.
@@ -81,17 +86,16 @@
 
 ---
 
-## 완료 안내
+## 다음 단계 (자동)
 
-참조정보까지 연결하면 프로세스 정의가 완성된다. 사용자에게:
+참조정보까지 연결하면 프로세스 정의가 완성된다. **여기서 사용자에게 다시 묻지 말고**
+곧바로 자체 점검으로 넘어간다: `process-definition.json` 을 `read_file` 로 다시 읽어
+[09-service-execution.md](09-service-execution.md) 의 체크리스트를 대조하고, 결함이 있으면
+`edit_file`/`write_file` 로 보정한다.
 
-> "프로세스 정의가 완성됐어요! **[프로세스명]**
-> - 흐름: ①~ ②~ ③~ (분기: ~)
-> - 역할/에이전트: ~
-> - 스킬: ~ / DMN 규칙: ~
-> - 폼: 단계별 입력 양식 N개
-> - 참조정보: 각 단계가 이전 입력을 참조하도록 연결
->
-> 산출물은 `.bpmn/` 에 있습니다 (`process-definition.json`, `skills/`, `forms/`). 수정하고 싶은 부분이 있으면 말씀해 주세요."
+점검이 끝나면 **더 이상 도구를 호출하지 말고 턴을 끝낸다.** 시스템이 검증·통합해 산출물
+패널로 전달하며, 채팅엔 한 줄만 남긴다:
 
-> 참조정보 연결 뒤에는 사용자에게 다시 묻지 말고 곧바로 4단계(자체 검증)로 넘어간다. `.bpmn/process-definition.json`을 `Read`로 다시 읽어 [02-generate-definition.md](02-generate-definition.md)의 규칙 체크리스트를 직접 대조하고, 결함이 있으면 보정한 뒤에만 5단계 완료 안내로 진행한다.
+> "프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요."
+
+중간 산출물 JSON 을 채팅에 덤프하지 않는다.

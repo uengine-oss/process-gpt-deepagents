@@ -81,9 +81,11 @@ class CtxAccumulator:
                 if c and c not in self.connectors:
                     self.connectors.append(c)
         elif et == "plan_todos":
-            for t in (payload.get("todos") or []):
-                if isinstance(t, dict):
-                    self.todos.append(t)
+            # write_todos 는 매 호출마다 todo 목록 "전체 스냅샷"을 보낸다(델타 아님).
+            # 그래서 append 하면 호출할 때마다 이전 상태가 그대로 남아 쌓인다 — 교체해야 한다.
+            todos = payload.get("todos")
+            if isinstance(todos, list):
+                self.todos = [t for t in todos if isinstance(t, dict)]
 
     def to_context(self) -> dict[str, Any]:
         ctx: dict[str, Any] = {
@@ -209,15 +211,11 @@ def merge_chat_room_context_from_event(
         return json_normalize(ctx)
 
     if et == "plan_todos":
+        # write_todos 는 매 호출마다 todo 목록 "전체 스냅샷"을 보낸다(델타 아님).
+        # 이전 상태와 병합하면 호출할 때마다 지난 스냅샷이 그대로 쌓인다 — 교체해야 한다.
         todos = evt.get("todos")
         if isinstance(todos, list):
-            new_todos = [x for x in todos if isinstance(x, dict)]
-            cur_todos = [x for x in (ctx.get("todos") or []) if isinstance(x, dict)]
-            with_ids = [x for x in new_todos if str(x.get("id") or "").strip()]
-            without_ids = [x for x in new_todos if not str(x.get("id") or "").strip()]
-            merged_todos = _upsert_by_id(cur_todos, with_ids)
-            merged_todos.extend(without_ids)
-            ctx["todos"] = merged_todos
+            ctx["todos"] = [x for x in todos if isinstance(x, dict)]
             en = dict(ctx.get("enabled") or {})
             en["todos"] = bool(ctx["todos"])
             ctx["enabled"] = en

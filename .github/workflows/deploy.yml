@@ -64,6 +64,17 @@ jobs:
 
           yq eval '.spec.template.spec.containers[0].image = "'$IMAGE_NAME'"' -i deployments/process-gpt-deepagents.yaml
 
+          # 세션 런너 Pod 는 Deployment 가 아니라 PodTemplate 에서 만들어진다.
+          # 여기를 같이 갱신하지 않으면 채팅을 실제로 처리하는 파드만 옛 이미지로
+          # 남고, 그 사실이 Deployment 롤아웃에는 드러나지 않는다.
+          if [ -f deployments/agent-runner-templates.yaml ]; then
+            yq eval -i '
+              (. | select(.metadata.name == "agent-runner-deepagents")
+                 | .template.spec.containers[0].image) = "'$IMAGE_NAME'"
+            ' deployments/agent-runner-templates.yaml
+            echo "Updated agent-runner-deepagents PodTemplate to: $IMAGE_NAME"
+          fi
+
           echo "Updated image to: $IMAGE_NAME"
 
       - name: Commit and push changes

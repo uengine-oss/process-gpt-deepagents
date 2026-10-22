@@ -487,6 +487,7 @@ async def check_strategy_alignment(
 # 도구 목록 export
 # ---------------------------------------------------------------------------
 def get_strategy_tools() -> list:
+    """BSC 전략 도구 전체(bsc-strategy-interview 스킬의 include_tools 와 같다)."""
     return [
         get_strategy_map,
         get_strategy_canvas,

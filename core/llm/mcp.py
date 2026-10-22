@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,11 @@ _DISABLED_MCP_TOOLS: set[str] = {
     "create_consulting_process_workitem",
     "create_pdf2bpmn_workitem",
 }
+
+
+def is_mcp_server_enabled(server_config: Any) -> bool:
+    """설정 화면의 켜기/끄기. 값이 없으면 켜진 것으로 본다(화면과 같은 기본값)."""
+    return isinstance(server_config, dict) and server_config.get("enabled", True) is not False
 
 
 def _mcp_connection_config(server_config: dict) -> dict:
@@ -43,20 +49,37 @@ def _mcp_connection_config(server_config: dict) -> dict:
     return conn
 
 
-async def _load_mcp_tools_grouped(server_names: list[str], tenant_mcp: dict) -> dict[str, list]:
+async def _load_mcp_tools_grouped(
+    server_names: list[str],
+    tenant_mcp: dict,
+    tool_filters: dict[str, list[str]] | None = None,
+    errors: dict[str, str] | None = None,
+) -> dict[str, list]:
     """지정된 MCP 서버들에서 LangChain BaseTool 목록을 서버별로 로드한다.
 
     반환값은 실제로 그 도구를 제공한 서버 이름 -> BaseTool 목록. 여러 서버를 한 번에
     로드해도 각 도구가 어느 서버에서 왔는지 유실되지 않도록, 서버별로 개별 조회한다
     (chat_room context 의 connectors 를 정확히 귀속시키기 위해 필요).
+
+    tool_filters 가 주어지면 서버별 허용 도구 이름 목록으로 추가 필터링한다
+    (해당 서버 키가 없거나 빈 리스트면 그 서버는 전체 허용).
+
+    errors 를 넘기면 설정이 없거나 불러오기에 실패한 서버의 이유를 서버 이름으로 담는다.
+
+    설정 화면에서 끈 서버(`enabled: false`)는 불러오지 않는다 — 채팅 루트·업무 지정·서브에이전트·
+    스킬 도구 카탈로그가 모두 여기를 거친다. 끈 것은 실패가 아니므로 errors 에 담지 않는다.
     """
     mcp_servers = tenant_mcp.get("mcpServers", {})
     connections = {}
     for name in server_names:
-        if name in mcp_servers:
+        if name in mcp_servers and not is_mcp_server_enabled(mcp_servers[name]):
+            logger.info("MCP 서버 꺼짐, 건너뜀: %s", name)
+        elif name in mcp_servers:
             connections[name] = _mcp_connection_config(mcp_servers[name])
         else:
             logger.warning("MCP 서버 설정 없음: %s (사용 가능: %s)", name, list(mcp_servers))
+            if errors is not None:
+                errors[name] = "MCP 서버 설정 없음"
 
     if not connections:
         return {}
@@ -73,9 +96,17 @@ async def _load_mcp_tools_grouped(server_names: list[str], tenant_mcp: dict) -> 
                 removed = before - len(tools)
                 if removed:
                     logger.info("MCP 도구 임시 제거: %d개 %s (server=%s)", removed, sorted(_DISABLED_MCP_TOOLS), name)
+            allowed = (tool_filters or {}).get(name)
+            if allowed:
+                before = len(tools)
+                tools = [t for t in tools if getattr(t, "name", "") in allowed]
+                if len(tools) != before:
+                    logger.info("MCP 도구 허용목록 적용: %s → %d개 (server=%s)", allowed, len(tools), name)
             return name, tools
         except Exception as e:
             logger.error("MCP tools 로드 실패 (%s): %s", name, e)
+            if errors is not None:
+                errors[name] = f"{type(e).__name__}: {e}"[:500]
             return name, []
 
     results = await asyncio.gather(*(_load_one(name) for name in connections))
@@ -133,7 +164,9 @@ _LOCAL_BPM_TOOLS = frozenset({
 })
 
 
-async def load_chat_root_tools(tenant_mcp: dict) -> tuple[list, dict[str, str]]:
+async def load_chat_root_tools(
+    tenant_mcp: dict, errors: dict[str, str] | None = None
+) -> tuple[list, dict[str, str]]:
     """채팅 모드 루트 오케스트레이터용 MCP 도구를 로드한다.
 
     tenants.mcp.mcpServers 에 등록된 모든 서버의 도구를 로드하며,
@@ -148,7 +181,7 @@ async def load_chat_root_tools(tenant_mcp: dict) -> tuple[list, dict[str, str]]:
     if not server_names:
         return [], {}
     try:
-        grouped = await _load_mcp_tools_grouped(server_names, tenant_mcp)
+        grouped = await _load_mcp_tools_grouped(server_names, tenant_mcp, errors=errors)
         tools: list = []
         tool_servers: dict[str, str] = {}
         before = 0
@@ -169,3 +202,23 @@ async def load_chat_root_tools(tenant_mcp: dict) -> tuple[list, dict[str, str]]:
     except Exception:
         logger.warning("채팅 루트 MCP 도구 로드 실패", exc_info=True)
         return [], {}
+
+
+def fetch_tenant_mcp(tenant_id: str) -> dict:
+    """테넌트의 MCP 설정(`tenants.mcp`)에 process-gpt-mcp 기본 주입까지 더한 값을 돌려준다.
+
+    채팅 실행(executor)과 스킬 도구 카탈로그가 같은 설정으로 도구를 불러오게 한곳에 둔다.
+    조회에 실패하면 기본 주입만 한 빈 설정을 돌려준다.
+    """
+    tenant_mcp: dict = {}
+    if tenant_id:
+        try:
+            from core.storage.db import get_supabase
+
+            result = get_supabase().table("tenants").select("mcp").eq("id", tenant_id).single().execute()
+            fetched = (result.data or {}).get("mcp")
+            if isinstance(fetched, dict):
+                tenant_mcp = fetched
+        except Exception:
+            logger.warning("tenant_mcp DB 조회 실패 | tenant_id=%s", tenant_id, exc_info=True)
+    return ensure_process_gpt_mcp(tenant_mcp, tenant_id)

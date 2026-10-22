@@ -65,7 +65,7 @@
 
 ## 프로세스 정의 JSON 반영
 
-`Edit`으로 gateway 필드와 top-level DMN 배열을 갱신:
+`edit_file` 로 gateway 필드와 top-level DMN 배열을 갱신:
 
 1. 최상위에 `dmn_decisions` 배열(없으면 생성)에 decision 추가.
 2. 최상위에 `dmn_rules` 배열(없으면 생성)에 rule 들 추가.

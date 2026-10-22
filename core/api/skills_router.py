@@ -19,6 +19,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from processgpt_agent_sdk.tenant_auth import (
+    auth_guard,
+    request_tenant_id,
+    request_user_id,
+    tenant_guard,
+)
+
 logger = logging.getLogger(__name__)
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -95,7 +102,20 @@ def _scan_collection(col_path: str) -> list[dict]:
         try:
             meta = _parse_frontmatter(skill_md.read_text(encoding="utf-8"))
         except OSError:
+            logger.warning(
+                "스킬 SKILL.md 를 읽지 못했습니다 — 설명 없이 목록에 올립니다: %s", entry,
+            )
             meta = {}
+        # description 이 비면 스킬은 목록에는 오르지만 모델이 고를 근거가 없어
+        # 사실상 쓰이지 않는다. 조용히 넘어가면 "등록했는데 왜 안 쓰이지" 로만
+        # 드러나므로 여기서 남긴다 — bpmn-process-generation-skill 이 실제로
+        # 그랬다.
+        if not str(meta.get("description") or "").strip():
+            logger.warning(
+                "스킬 %s 의 SKILL.md 에 frontmatter description 이 없습니다 "
+                "(collection=%s). 목록에는 오르지만 모델이 이 스킬을 고르지 못합니다.",
+                entry.name, collection_name,
+            )
         skills.append({
             "name": entry.name,
             "display_name": meta.get("name") or entry.name,
@@ -162,6 +182,14 @@ def _scan_skills(tenant_id: str = "") -> list[dict]:
     return skills
 
 
+def _is_system_skill_dir(skill_dir: Path) -> bool:
+    """서비스 기본 스킬(`process-gpt-system`)인지. 서버를 다시 띄울 때마다 이미지의 원본으로 덮어써지고
+    모든 테넌트가 함께 쓰므로, 화면에서 고친 내용은 다른 테넌트에도 퍼졌다가 재시작하면 사라진다."""
+    from core.skills.local_system_skills import SYSTEM_COLLECTION_NAME
+
+    return skill_dir.parent.name == SYSTEM_COLLECTION_NAME
+
+
 def _scan_builtin_skills() -> list[dict]:
     from core.skills.skills import _get_skills
 
@@ -215,6 +243,25 @@ def _find_tenant_skill_dir(skill_name: str, tenant_id: str, config_id: str = "")
             candidate = Path(root) / tenant_id / "local" / skill_name
             if candidate.is_dir() and (candidate / "SKILL.md").exists():
                 return candidate
+
+        # 마지막으로 테넌트 하위 컬렉션을 전부 훑는다.
+        #
+        # publish_skill 이 신규 레포를 만들면 스킬 파일은 {tenant}/{provider_config_id}/{skill}
+        # 로 들어간다(_auto_register_tenant_skill). 그런데 위 분기는 config_id 를 넘겨받았을
+        # 때만 그 경로를 보므로, config_id 없이 부르는 호출부(프론트 삭제는 항상 mode="local"
+        # → config_id="")에서는 **목록에는 보이는데 삭제하면 404** 가 난다. 실제로 그렇게
+        # 지워지지 않는 스킬이 생겼다. 목록(_scan_skills)은 provider-keyed 디렉터리까지
+        # 훑으므로 여기서도 같은 범위를 봐야 한다. 탐색은 테넌트 디렉터리 안으로 한정되므로
+        # 다른 테넌트의 스킬이 걸릴 일은 없다.
+        try:
+            for collection in sorted((Path(root) / tenant_id).iterdir()):
+                if not collection.is_dir():
+                    continue
+                candidate = collection / skill_name
+                if candidate.is_dir() and (candidate / "SKILL.md").exists():
+                    return candidate
+        except OSError:
+            pass
     return None
 
 
@@ -264,6 +311,26 @@ def _get_provider(tenant_id: str):
     return get_provider(tenant_id)
 
 
+def _skill_owner_id(sb, tenant_id: str, skill_name: str) -> str | None:
+    """이 스킬을 검토할 사람(소유자). 못 찾으면 None — 조회 실패가 PR 기록을 막지는 않는다."""
+    try:
+        resp = (
+            sb.table("tenant_skills")
+            .select("owner_id")
+            .eq("tenant_id", tenant_id)
+            .eq("skill_name", skill_name)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(resp, "data", None) or []
+        return (rows[0].get("owner_id") or None) if rows else None
+    except Exception:
+        logger.warning(
+            "스킬 소유자 조회 실패 skill=%s tenant=%s", skill_name, tenant_id, exc_info=True
+        )
+        return None
+
+
 def _save_tenant_skill(tenant_id: str, skill_name: str, owner_id: str) -> None:
     """tenant_skills 테이블에 스킬 등록 정보를 저장한다. 에이전트 도구로 노출하지 않는다."""
     from core.storage.db import get_supabase
@@ -301,8 +368,13 @@ def _record_resource_pr_sync(
     git_pr_number: int | None = None,
     git_pr_url: str = "",
     git_repo_url: str = "",
-) -> dict | None:
-    """resource_pull_requests 테이블에 PR 레코드를 삽입한다 (동기 버전, API 라우터용)."""
+) -> tuple[dict | None, str]:
+    """resource_pull_requests 에 PR 레코드를 삽입하고 (레코드, 실패사유) 를 돌려준다.
+
+    실패를 로그로만 남기면 PR 은 깃에 만들어졌는데 병합 요청 목록에는 없는 상태가 되고,
+    화면에서는 "요청을 올렸는데 목록이 비어 있다" 로만 보인다. 호출부가 응답에 실어
+    사용자에게 알릴 수 있도록 사유를 함께 돌려준다.
+    """
     from core.storage.db import get_supabase
 
     requester_ids = _normalize_requester_ids(requester_id)
@@ -311,6 +383,11 @@ def _record_resource_pr_sync(
     try:
         sb = get_supabase()
         row = {
+            # 검토할 사람(스킬 소유자)을 행에 남긴다 — 화면이 소유자 테이블과 대조해
+            # 유추하지 않아도 "누가 봐야 하는 요청인지" 가 기록으로 남는다.
+            "reviewer_id": (
+                _skill_owner_id(sb, tenant_id, resource_id) if resource_type == "skill" else None
+            ),
             "tenant_id": tenant_id,
             "resource_type": resource_type,
             "resource_id": resource_id,
@@ -327,18 +404,21 @@ def _record_resource_pr_sync(
         }
         resp = sb.table("resource_pull_requests").insert(row).execute()
         data = getattr(resp, "data", None)
-        return data[0] if data else None
-    except Exception:
+        if data:
+            return data[0], ""
+        return None, "삽입 결과가 비어 있습니다"
+    except Exception as e:
         logger.warning(
             "resource_pull_requests 기록 실패: resource=%s/%s branch=%s",
             resource_type, resource_id, branch_name,
             exc_info=True,
         )
-        return None
+        return None, str(e)
 
 
+@tenant_guard
 async def list_skills(request: Request) -> JSONResponse:
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     skills = _scan_skills(tenant_id)
     return JSONResponse({"skills": skills, "total": len(skills)})
 
@@ -397,9 +477,10 @@ def _resolve_inheritance_chain(
     }
 
 
+@tenant_guard
 async def get_skill_inheritance(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     config_id = ""
     if tenant_id:
@@ -417,11 +498,13 @@ async def get_skill_inheritance(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
+@auth_guard
 async def list_builtin_skills(_request: Request) -> JSONResponse:
     skills = _scan_builtin_skills()
     return JSONResponse({"skills": skills, "total": len(skills)})
 
 
+@tenant_guard
 async def commit_skill_file(request: Request) -> JSONResponse:
     """스킬 파일을 커밋한다.
 
@@ -436,7 +519,7 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     file_path = body.get("file_path", "")
     content = body.get("content")
     message = body.get("message") or f"update {file_path}"
@@ -446,8 +529,6 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     requester_id = body.get("requester_id") or None
     requester_name = body.get("requester_name") or author_name
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if not file_path or content is None:
         return JSONResponse({"error": "file_path and content are required"}, status_code=400)
 
@@ -517,7 +598,7 @@ async def commit_skill_file(request: Request) -> JSONResponse:
             pr_result = {"pr_created": True, **pr}
 
             # resource_pull_requests DB 기록
-            await asyncio.to_thread(
+            _, record_error = await asyncio.to_thread(
                 _record_resource_pr_sync,
                 tenant_id=tenant_id,
                 resource_type="skill",
@@ -532,6 +613,11 @@ async def commit_skill_file(request: Request) -> JSONResponse:
                 git_pr_url=pr.get("html_url", ""),
                 git_repo_url=provider.get_repo_html_url(provider.username, skill_name),
             )
+            # PR 은 만들어졌는데 기록만 실패한 경우를 응답에 남긴다 — 이 사실을 숨기면
+            # 병합 요청 목록이 비어 보이는 이유를 화면에서 알 길이 없다.
+            pr_result["pr_recorded"] = not record_error
+            if record_error:
+                pr_result["pr_record_error"] = record_error
         except Exception as e:
             logger.warning("PR 생성 실패 skill=%s branch=%s: %s", skill_name, branch, e)
             pr_result = {"pr_created": False, "pr_error": str(e)}
@@ -539,11 +625,10 @@ async def commit_skill_file(request: Request) -> JSONResponse:
     return JSONResponse({"committed": True, "branch": branch, **result, **pr_result})
 
 
+@tenant_guard
 async def list_skill_branches(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+    tenant_id = request_tenant_id(request)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -556,6 +641,14 @@ async def list_skill_branches(request: Request) -> JSONResponse:
             asyncio.to_thread(provider.detect_default_branch, provider.username, skill_name),
         )
     except Exception as e:
+        # 레포가 아직 없는 것(404)은 오류가 아니라 "안 만든 상태"다. 이걸 500 으로 돌려주면
+        # 화면이 "레포 생성" 안내 대신 오류를 띄우고, 반대로 인증 실패(401)까지 빈 목록으로
+        # 돌려주면 이미 있는 레포를 "없다"고 말하게 된다 — 둘을 구분해서 알린다.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 404:
+            return JSONResponse(
+                {"branches": [], "default_branch": "main", "repo_missing": True}
+            )
         logger.exception("list_branches failed for skill=%s tenant=%s", skill_name, tenant_id)
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -563,6 +656,7 @@ async def list_skill_branches(request: Request) -> JSONResponse:
     return JSONResponse({"branches": annotated, "default_branch": default_branch})
 
 
+@tenant_guard
 async def merge_skill_pull_request(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -575,12 +669,10 @@ async def merge_skill_pull_request(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     message = body.get("message", "")
     auto_sync = body.get("auto_sync", True)
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -651,6 +743,7 @@ async def merge_skill_pull_request(request: Request) -> JSONResponse:
     return JSONResponse({"merged": True, "number": number, **result, "sync": sync_result})
 
 
+@tenant_guard
 async def create_skill_pull_request(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -658,14 +751,12 @@ async def create_skill_pull_request(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     title = body.get("title", "")
     description = body.get("description", "")
     head = body.get("head", "")
     base = body.get("base", "main")
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if not title or not head:
         return JSONResponse({"error": "title and head are required"}, status_code=400)
 
@@ -690,6 +781,7 @@ async def create_skill_pull_request(request: Request) -> JSONResponse:
     return JSONResponse({"created": True, **result})
 
 
+@tenant_guard
 async def get_pull_request_files(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -697,9 +789,7 @@ async def get_pull_request_files(request: Request) -> JSONResponse:
     except (KeyError, ValueError):
         return JSONResponse({"error": "invalid PR number"}, status_code=400)
 
-    tenant_id = request.query_params.get("tenant_id", "")
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+    tenant_id = request_tenant_id(request)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -716,13 +806,12 @@ async def get_pull_request_files(request: Request) -> JSONResponse:
     return JSONResponse({"files": files})
 
 
+@tenant_guard
 async def list_skill_pull_requests(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     state = request.query_params.get("state", "open")
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if state not in ("open", "closed", "all"):
         return JSONResponse({"error": "state must be 'open', 'closed', or 'all'"}, status_code=400)
 
@@ -741,17 +830,16 @@ async def list_skill_pull_requests(request: Request) -> JSONResponse:
     return JSONResponse({"pull_requests": pull_requests, "total": len(pull_requests)})
 
 
+@tenant_guard
 async def list_skill_commits(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     branch = request.query_params.get("branch") or None
     try:
         limit = min(int(request.query_params.get("limit", "20")), 100)
     except ValueError:
         limit = 20
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -768,9 +856,10 @@ async def list_skill_commits(request: Request) -> JSONResponse:
     return JSONResponse({"commits": commits})
 
 
+@tenant_guard
 async def list_skill_files(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     config_id = ""
     if tenant_id:
@@ -802,9 +891,10 @@ async def list_skill_files(request: Request) -> JSONResponse:
             "modified": stat.st_mtime,
         })
 
-    return JSONResponse({"skill_name": skill_name, "files": files, "count": len(files)})
+    return JSONResponse({"skill_name": skill_name, "files": files, "count": len(files), "system": _is_system_skill_dir(skill_dir)})
 
 
+@tenant_guard
 async def export_skill(request: Request) -> Response:
     """스킬 디렉토리 전체를 zip으로 묶어 반환한다.
 
@@ -816,7 +906,7 @@ async def export_skill(request: Request) -> Response:
     import zipfile
 
     skill_name = request.path_params["skill_name"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     config_id = ""
     if tenant_id:
@@ -852,6 +942,7 @@ async def export_skill(request: Request) -> Response:
     return Response(content=data, media_type="application/zip", headers=headers)
 
 
+@tenant_guard
 async def delete_skill(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -859,11 +950,9 @@ async def delete_skill(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     mode = body.get("mode", "local")  # "local" | "repo"
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if mode not in ("local", "repo"):
         return JSONResponse({"error": "mode must be 'local' or 'repo'"}, status_code=400)
 
@@ -903,6 +992,7 @@ async def delete_skill(request: Request) -> JSONResponse:
     return JSONResponse({"deleted": True, "mode": "repo", "skill_name": skill_name})
 
 
+@tenant_guard
 async def delete_skill_file(request: Request) -> JSONResponse:
     """스킬 파일을 삭제한다. 기본 브랜치 직접 삭제는 금지 → 피처 브랜치 + PR 워크플로우."""
     skill_name = request.path_params["skill_name"]
@@ -912,7 +1002,7 @@ async def delete_skill_file(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     message = body.get("message") or f"delete {file_path}"
     branch = body.get("branch", "main")
     author_name = body.get("author_name") or None
@@ -920,8 +1010,6 @@ async def delete_skill_file(request: Request) -> JSONResponse:
     requester_id = body.get("requester_id") or None
     requester_name = body.get("requester_name") or author_name
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -975,7 +1063,7 @@ async def delete_skill_file(request: Request) -> JSONResponse:
             )
             pr_result = {"pr_created": True, **pr}
 
-            await asyncio.to_thread(
+            _, record_error = await asyncio.to_thread(
                 _record_resource_pr_sync,
                 tenant_id=tenant_id,
                 resource_type="skill",
@@ -990,6 +1078,9 @@ async def delete_skill_file(request: Request) -> JSONResponse:
                 git_pr_url=pr.get("html_url", ""),
                 git_repo_url=provider.get_repo_html_url(provider.username, skill_name),
             )
+            pr_result["pr_recorded"] = not record_error
+            if record_error:
+                pr_result["pr_record_error"] = record_error
         except Exception as e:
             logger.warning("PR 생성 실패 (delete) skill=%s branch=%s: %s", skill_name, branch, e)
             pr_result = {"pr_created": False, "pr_error": str(e)}
@@ -997,6 +1088,7 @@ async def delete_skill_file(request: Request) -> JSONResponse:
     return JSONResponse({"deleted": True, "branch": branch, "file_path": file_path, **result, **pr_result})
 
 
+@tenant_guard
 async def create_skill_repo(request: Request) -> JSONResponse:
     """원격 Git 레포를 생성하고 로컬 스킬 파일을 초기 커밋으로 push한다."""
     skill_name = request.path_params["skill_name"]
@@ -1005,27 +1097,38 @@ async def create_skill_repo(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
-    owner_id: str = body.get("owner_id", "")
+    tenant_id = request_tenant_id(request)
+    # 소유자는 요청 본문이 아니라 검증된 토큰에서 가져온다(위조 방지).
+    owner_id: str = request_user_id(request) or body.get("owner_id", "")
     initial_content: str | None = body.get("initial_content") or None
     initial_file_path: str = body.get("file_path") or "SKILL.md"
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    # 이미 레포가 있으면 중복 생성 방지
+    # 이미 레포가 있으면 중복 생성 방지.
+    # 단, 레포는 있는데 브랜치가 하나도 없는 "빈 레포"는 레포 생성 직후 초기 커밋 push 가
+    # 실패해 남은 상태다. 이때도 409 로 막아버리면 초기 커밋을 다시 넣을 방법이 없어
+    # 변경 이력·PR 화면이 영구히 "레포 없음"으로 남는다 → 초기 커밋 단계로 진행한다.
     existing = await asyncio.to_thread(provider.repo_exists, skill_name)
+    html_url = ""
     if existing:
-        return JSONResponse({"error": f"repo '{skill_name}' already exists"}, status_code=409)
+        try:
+            branches = await asyncio.to_thread(provider.list_branches, provider.username, skill_name)
+        except Exception:
+            branches = [{"name": "main"}]  # 조회 실패 시엔 보수적으로 "있음" 취급
+        if branches:
+            return JSONResponse({"error": f"repo '{skill_name}' already exists"}, status_code=409)
+        html_url = await asyncio.to_thread(provider.get_repo_html_url, provider.username, skill_name)
+        logger.info("빈 레포에 초기 커밋을 다시 시도합니다 skill=%s", skill_name)
 
-    try:
-        html_url = await asyncio.to_thread(provider.create_repo, skill_name)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    if not existing:
+        try:
+            html_url = await asyncio.to_thread(provider.create_repo, skill_name)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
 
     # GitLab은 토큰 소유자 네임스페이스에 레포를 생성하므로 html_url에서 실제 owner를 추출한다.
     # (DB의 provider.username과 실제 GitLab username이 다를 수 있음)
@@ -1110,6 +1213,7 @@ async def create_skill_repo(request: Request) -> JSONResponse:
     })
 
 
+@tenant_guard
 async def upload_skill(request: Request) -> JSONResponse:
     """압축 파일(.skill, .zip)을 받아 테넌트 스킬 디렉토리에 압축 해제하여 스킬로 등록한다."""
     import tempfile
@@ -1129,9 +1233,7 @@ async def upload_skill(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "multipart/form-data parsing failed"}, status_code=400)
 
-    tenant_id = form.get("tenant_id", "")
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+    tenant_id = request_tenant_id(request)
 
     upload = form.get("file")
     if upload is None:
@@ -1151,7 +1253,8 @@ async def upload_skill(request: Request) -> JSONResponse:
         return JSONResponse({"error": str(e)}, status_code=413)
 
     skill_name_override = form.get("skill_name", "")
-    owner_id = form.get("owner_id", "")
+    # 소유자는 요청 본문이 아니라 검증된 토큰에서 가져온다(위조 방지).
+    owner_id = request_user_id(request) or form.get("owner_id", "")
 
     tmpdir = tempfile.mkdtemp(prefix="skill-upload-")
     tmp_path = Path(tmpdir)
@@ -1173,27 +1276,51 @@ async def upload_skill(request: Request) -> JSONResponse:
             or (skill_root.name if skill_root != tmp_path else skill_name_from_filename(filename))
         )
 
+        # overwrite=true 는 "이미 등록된 스킬의 내용을 교체한다"는 명시적 의사표시다.
+        # (채팅 산출물 패널의 저장 버튼처럼 사용자가 직접 누른 경우.) 없으면 종전대로 409.
+        overwrite = str(form.get("overwrite", "")).strip().lower() in ("1", "true", "yes")
+
         dest = get_tenant_skill_dest(tenant_id, skill_name, config_id="local")
-        if dest.exists():
+        already_exists = dest.exists()
+        if already_exists and not overwrite:
             return JSONResponse(
                 {"error": f"skill '{skill_name}' already exists for tenant '{tenant_id}'"},
                 status_code=409,
             )
 
         dest.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(shutil.move, str(skill_root), str(dest))
+        # 교체는 기존 디렉터리를 백업해 두고 진행한다 — 이동이 실패해도 스킬이 사라지지 않는다.
+        backup = dest.with_name(f"{dest.name}.bak-{os.getpid()}") if already_exists else None
+        if backup is not None:
+            await asyncio.to_thread(shutil.rmtree, str(backup), True)
+            await asyncio.to_thread(shutil.move, str(dest), str(backup))
+        try:
+            await asyncio.to_thread(shutil.move, str(skill_root), str(dest))
+        except Exception as e:
+            if backup is not None and backup.exists() and not dest.exists():
+                await asyncio.to_thread(shutil.move, str(backup), str(dest))
+            return JSONResponse({"error": f"failed to write skill files: {e}"}, status_code=500)
+        if backup is not None:
+            await asyncio.to_thread(shutil.rmtree, str(backup), True)
         files = list_skill_files(dest)
 
-        try:
-            await asyncio.to_thread(_save_tenant_skill, tenant_id, skill_name, owner_id)
-        except Exception as e:
-            logger.error("tenant_skills 저장 실패 skill=%s tenant=%s: %s", skill_name, tenant_id, e)
+        # 교체(overwrite)는 이미 tenant_skills 에 행이 있으므로 다시 insert 하지 않는다
+        # (_save_tenant_skill 은 upsert 가 아니라 insert 라 중복 행이 생긴다).
+        if not already_exists:
+            try:
+                await asyncio.to_thread(_save_tenant_skill, tenant_id, skill_name, owner_id)
+            except Exception as e:
+                logger.error("tenant_skills 저장 실패 skill=%s tenant=%s: %s", skill_name, tenant_id, e)
 
-        return JSONResponse({"registered": True, "skill_name": skill_name, "files": files}, status_code=201)
+        return JSONResponse(
+            {"registered": True, "skill_name": skill_name, "files": files, "overwritten": already_exists},
+            status_code=201,
+        )
     finally:
         await asyncio.to_thread(shutil.rmtree, tmpdir, True)
 
 
+@tenant_guard
 async def upload_skill_from_git(request: Request) -> JSONResponse:
     """Git 레포지토리 URL을 받아 테넌트 스킬 디렉토리에 clone하여 스킬로 등록한다."""
     import subprocess
@@ -1212,13 +1339,12 @@ async def upload_skill_from_git(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     repo_url = body.get("repo_url", "")
     skill_name_override = body.get("skill_name", "")
-    owner_id = body.get("owner_id", "")
+    # 소유자는 요청 본문이 아니라 검증된 토큰에서 가져온다(위조 방지).
+    owner_id = request_user_id(request) or body.get("owner_id", "")
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if not repo_url:
         return JSONResponse({"error": "repo_url is required"}, status_code=400)
     if not owner_id:
@@ -1277,6 +1403,7 @@ async def upload_skill_from_git(request: Request) -> JSONResponse:
         await asyncio.to_thread(shutil.rmtree, tmpdir, True)
 
 
+@tenant_guard
 async def create_skill_branch(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     try:
@@ -1284,12 +1411,10 @@ async def create_skill_branch(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
     new_branch = body.get("branch", "")
     from_branch = body.get("from", "main")
 
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
     if not new_branch:
         return JSONResponse({"error": "branch is required"}, status_code=400)
 
@@ -1308,16 +1433,15 @@ async def create_skill_branch(request: Request) -> JSONResponse:
     return JSONResponse({"created": True, **result})
 
 
+@tenant_guard
 async def list_remote_skill_files(request: Request) -> JSONResponse:
     """원격 Git 레포의 특정 브랜치 파일 목록을 반환한다 (로컬 디스크 미사용)."""
     skill_name = request.path_params["skill_name"]
     branch = request.query_params.get("branch", "")
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     if not branch:
         return JSONResponse({"error": "branch is required"}, status_code=400)
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -1335,17 +1459,16 @@ async def list_remote_skill_files(request: Request) -> JSONResponse:
     return JSONResponse({"skill_name": skill_name, "branch": branch, "files": files, "count": len(files)})
 
 
+@tenant_guard
 async def get_remote_skill_file(request: Request) -> JSONResponse:
     """원격 Git 레포의 특정 브랜치에서 파일 내용을 반환한다 (로컬 디스크 미사용)."""
     skill_name = request.path_params["skill_name"]
     branch = request.query_params.get("branch", "")
     file_path = request.path_params["file_path"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     if not branch:
         return JSONResponse({"error": "branch is required"}, status_code=400)
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -1379,6 +1502,7 @@ async def get_remote_skill_file(request: Request) -> JSONResponse:
     })
 
 
+@tenant_guard
 async def sync_skill(request: Request) -> JSONResponse:
     """main 브랜치를 원격에서 가져와 로컬 디스크를 갱신한다."""
     skill_name = request.path_params["skill_name"]
@@ -1387,9 +1511,7 @@ async def sync_skill(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
-    tenant_id = body.get("tenant_id", "")
-    if not tenant_id:
-        return JSONResponse({"error": "tenant_id is required"}, status_code=400)
+    tenant_id = request_tenant_id(request)
 
     try:
         provider = await asyncio.to_thread(_get_provider, tenant_id)
@@ -1440,10 +1562,67 @@ async def sync_skill(request: Request) -> JSONResponse:
     })
 
 
+@tenant_guard
+async def put_skill_file_local(request: Request) -> JSONResponse:
+    """스킬 파일 하나를 테넌트 스킬 디렉터리에 **git 없이** 직접 쓴다.
+
+    Git 공급자가 연결되지 않은 테넌트도 스킬을 편집·저장할 수 있어야 한다(버전·병합 관리는
+    git 이 연결된 경우에만 제공). git 커밋 경로(`/skills/{name}/commit`)는 provider 를
+    요구하므로, 그것과 별개의 경로가 필요하다.
+    """
+    skill_name = request.path_params["skill_name"]
+    file_path = request.path_params["file_path"]
+    tenant_id = request_tenant_id(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    content = body.get("content")
+    if not isinstance(content, str):
+        return JSONResponse({"error": "content (string) is required"}, status_code=400)
+
+    # git provider 가 있으면 그 config_id 디렉터리를, 없으면 'local' 업로드 디렉터리를 찾는다.
+    # (_find_tenant_skill_dir 는 config_id 가 주어지면 provider 경로 → local 경로 순으로 본다.)
+    config_id = "local"
+    try:
+        provider = await asyncio.to_thread(_get_provider, tenant_id)
+        config_id = provider.config_id or "local"
+    except Exception:
+        pass
+
+    skill_dir = await asyncio.to_thread(_find_skill_dir, skill_name, tenant_id, config_id)
+    if skill_dir is None:
+        return JSONResponse({"error": f"skill '{skill_name}' not found"}, status_code=404)
+    if _is_system_skill_dir(skill_dir):
+        return JSONResponse({"error": "서비스 기본 스킬은 바꿀 수 없습니다", "code": "system_skill_read_only"}, status_code=403)
+
+    # path traversal 방지: resolve 후 skill_dir 하위인지 확인
+    resolved_skill = skill_dir.resolve()
+    target = (skill_dir / file_path).resolve()
+    try:
+        target.relative_to(resolved_skill)
+    except ValueError:
+        return JSONResponse({"error": "invalid file_path"}, status_code=400)
+    if target.is_dir():
+        return JSONResponse({"error": f"'{file_path}' is a directory"}, status_code=400)
+
+    try:
+        await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(target.write_text, content, "utf-8")
+    except Exception as e:
+        return JSONResponse({"error": f"failed to write file: {e}"}, status_code=500)
+
+    logger.info("스킬 파일 로컬 저장 skill=%s file=%s tenant=%s", skill_name, file_path, tenant_id)
+    return JSONResponse({"saved": True, "skill_name": skill_name, "file_path": file_path, "bytes": len(content.encode())})
+
+
+@tenant_guard
 async def get_skill_file(request: Request) -> JSONResponse:
     skill_name = request.path_params["skill_name"]
     file_path = request.path_params["file_path"]
-    tenant_id = request.query_params.get("tenant_id", "")
+    tenant_id = request_tenant_id(request)
 
     config_id = ""
     if tenant_id:
@@ -1496,6 +1675,382 @@ async def get_skill_file(request: Request) -> JSONResponse:
     })
 
 
+# ---------------------------------------------------------------------------
+# 병합 전 검증 (pre-merge verification)
+#
+# "이 병합 요청을 병합하면 기존 동작이 깨지는가" 를 병합 전에 답한다.
+# 리뷰어가 PR 화면에서 실행하면, 저장된 주요 시나리오를 base(변경 전)/head(변경 후)
+# 두 벌로 돌려 채점하고, 통과하던 단계가 깨진 것을 골라낸다.
+# 오케스트레이션은 core/skills/pr_verification.py 가 결정론적으로 수행한다.
+# ---------------------------------------------------------------------------
+
+# 진행 중인 검증 태스크. 같은 PR 에 중복 실행이 겹치지 않게 잡아 둔다.
+_verification_tasks: dict[str, "asyncio.Task"] = {}
+
+
+def _find_pr_record(tenant_id: str, skill_name: str, number: int) -> dict | None:
+    """git PR 번호로 resource_pull_requests 행을 찾는다."""
+    from core.storage.db import get_supabase
+
+    rows = (
+        get_supabase()
+        .table("resource_pull_requests")
+        .select("id,resource_type,resource_id,branch_name,base_branch,status,git_pr_number")
+        .eq("tenant_id", tenant_id)
+        .eq("resource_type", "skill")
+        .eq("resource_id", skill_name)
+        .eq("git_pr_number", number)
+        .limit(1)
+        .execute()
+    )
+    return (rows.data or [None])[0]
+
+
+def _verification_payload(tenant_id: str, run: dict | None) -> dict:
+    """회차 + (완료된 경우) variant 별 결과를 화면이 쓰는 형태로 만든다."""
+    if not run:
+        return {"run": None, "results": []}
+    from core.skills import pr_verification as prv
+
+    results = prv.run_results(tenant_id, run["id"]) if run.get("status") == "succeeded" else []
+    return {"run": run, "results": results}
+
+
+@tenant_guard
+async def start_pr_verification(request: Request) -> JSONResponse:
+    """병합 요청 검증을 시작한다(백그라운드). 이미 돌고 있으면 그 회차를 그대로 돌려준다."""
+    skill_name = request.path_params["skill_name"]
+    number = request.path_params["number"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import pr_verification as prv
+
+    pr = await asyncio.to_thread(_find_pr_record, tenant_id, skill_name, number)
+    if not pr:
+        return JSONResponse(
+            {"error": f"#{number} 병합 요청 기록을 찾을 수 없습니다."}, status_code=404
+        )
+
+    existing = await asyncio.to_thread(prv.latest_run_for_pr, tenant_id, pr["id"])
+    if existing and existing.get("status") == "running":
+        return JSONResponse(_verification_payload(tenant_id, existing))
+
+    created = await asyncio.to_thread(
+        prv.create_run, tenant_id=tenant_id, pr=pr, created_by=request_user_id(request) or ""
+    )
+    if created.get("error"):
+        return JSONResponse(
+            {"error": created["error"], "message": created["message"]}, status_code=409
+        )
+
+    run = created["run"]
+    task = asyncio.create_task(
+        prv.execute_run(
+            tenant_id=tenant_id, run=run, cases=created["cases"], suite_id=created["suite_id"]
+        )
+    )
+    _verification_tasks[run["id"]] = task
+    task.add_done_callback(lambda _t, rid=run["id"]: _verification_tasks.pop(rid, None))
+
+    return JSONResponse(_verification_payload(tenant_id, run), status_code=202)
+
+
+@tenant_guard
+async def get_pr_verification(request: Request) -> JSONResponse:
+    """이 병합 요청의 최신 검증 결과(진행 상태 포함)를 돌려준다."""
+    skill_name = request.path_params["skill_name"]
+    number = request.path_params["number"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import eval_backfill as ebf, eval_tools, pr_verification as prv
+
+    pr = await asyncio.to_thread(_find_pr_record, tenant_id, skill_name, number)
+    if not pr:
+        return JSONResponse(
+            {"error": f"#{number} 병합 요청 기록을 찾을 수 없습니다."}, status_code=404
+        )
+
+    def _load() -> dict:
+        run = prv.latest_run_for_pr(tenant_id, pr["id"])
+        payload = _verification_payload(tenant_id, run)
+        # 검증에 쓰이는(또는 쓰일) 시나리오도 함께 준다 — 아직 실행 전이어도 화면이
+        # "무엇을 검증하게 되는지" 를 보여줄 수 있어야 한다.
+        suite_id = eval_tools.find_suite(tenant_id, pr["resource_id"], pr["resource_type"])
+        payload["cases"] = eval_tools.load_suite_cases(suite_id) if suite_id else []
+        # 케이스 기준으로 판단한다 — 시나리오 확보 회차가 스위트 행을 먼저 만들어 두므로,
+        # 스위트 존재만 보면 아직 시나리오가 없는데도 "있다" 로 보인다.
+        payload["has_suite"] = bool(payload["cases"])
+        # 시나리오가 없을 때 화면이 "생성 중/실패" 를 같은 폴링으로 볼 수 있게 함께 싣는다.
+        payload["backfill"] = ebf.latest_run(
+            tenant_id, pr["resource_id"], pr["resource_type"]
+        )
+        return payload
+
+    try:
+        return JSONResponse(await asyncio.to_thread(_load))
+    except Exception as e:
+        logger.exception("병합 전 검증 조회 실패 skill=%s pr=%s", skill_name, number)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@tenant_guard
+async def start_eval_backfill(request: Request) -> JSONResponse:
+    """시나리오가 없는 스킬에 회귀 테스트 시나리오를 만들어 붙인다(백그라운드).
+
+    기준은 **PR 의 base 브랜치**다 — 변경 후(head)를 보고 만들면 바뀐 동작을 기준선으로
+    굳혀 버려서 그 검증이 아무것도 잡아내지 못한다(core/skills/eval_backfill.py).
+    """
+    skill_name = request.path_params["skill_name"]
+    number = request.path_params["number"]
+    tenant_id = request_tenant_id(request)
+
+    # replace=true 는 "지금 시나리오가 미덥지 않으니 다시 만들어라" 는 리뷰어의 명시적 지시다.
+    # 이 플래그가 없으면 기존 스위트는 그대로 지켜진다(create_run 의 suite_exists).
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    replace = bool((body or {}).get("replace"))
+
+    from core.skills import eval_backfill as ebf
+
+    pr = await asyncio.to_thread(_find_pr_record, tenant_id, skill_name, number)
+    if not pr:
+        return JSONResponse(
+            {"error": f"#{number} 병합 요청 기록을 찾을 수 없습니다."}, status_code=404
+        )
+
+    existing = await asyncio.to_thread(
+        ebf.latest_run, tenant_id, pr["resource_id"], pr["resource_type"]
+    )
+    if existing and existing.get("status") == "running":
+        return JSONResponse({"backfill": existing})
+
+    created = await asyncio.to_thread(
+        ebf.create_run,
+        tenant_id=tenant_id,
+        resource_id=pr["resource_id"],
+        resource_type=pr["resource_type"] or "skill",
+        base_ref=pr.get("base_branch") or "main",
+        created_by=request_user_id(request) or "",
+        replace=replace,
+    )
+    if created.get("error"):
+        return JSONResponse(
+            {"error": created["error"], "message": created["message"]}, status_code=409
+        )
+
+    run = created["run"]
+    task = asyncio.create_task(
+        ebf.execute_run(tenant_id=tenant_id, run=run, suite_id=created["suite_id"])
+    )
+    _verification_tasks[run["id"]] = task
+    task.add_done_callback(lambda _t, rid=run["id"]: _verification_tasks.pop(rid, None))
+
+    return JSONResponse({"backfill": run}, status_code=202)
+
+
+# ---------------------------------------------------------------------------
+# 프로세스 회귀 시나리오
+# 생성 시 실엔진 검증(`/validate-and-improve`)이 통과시킨 분기 케이스를 스위트로 옮긴다.
+# 시나리오를 새로 만들지 않으므로 이 경로에는 모델 호출이 없다.
+# ---------------------------------------------------------------------------
+
+def _find_resource_pr(tenant_id: str, resource_type: str, resource_id: str, pr_id: str) -> dict | None:
+    """병합 요청 행을 id 로 찾는다.
+
+    스킬은 깃 PR 번호로 찾지만 프로세스·DMN 병합 요청에는 깃 PR 이 없다 —
+    `resource_pull_requests.id` 만 있다. 그래서 경로도 번호가 아니라 id 를 받는다.
+    """
+    from core.storage.db import get_supabase
+
+    rows = (
+        get_supabase()
+        .table("resource_pull_requests")
+        .select("id,resource_type,resource_id,branch_name,base_branch,status")
+        .eq("tenant_id", tenant_id)
+        .eq("resource_type", resource_type)
+        .eq("resource_id", resource_id)
+        .eq("id", pr_id)
+        .limit(1)
+        .execute()
+    )
+    return (rows.data or [None])[0]
+
+
+@tenant_guard
+async def get_resource_verification(request: Request) -> JSONResponse:
+    """리소스 타입을 가리지 않는 검증 결과 조회."""
+    resource_type = request.path_params["resource_type"]
+    resource_id = request.path_params["resource_id"]
+    pr_id = request.path_params["pr_id"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import eval_tools, pr_verification as prv
+
+    def _load() -> dict:
+        pr = _find_resource_pr(tenant_id, resource_type, resource_id, pr_id)
+        if not pr:
+            return {"error": "병합 요청 기록을 찾을 수 없습니다."}
+        payload = _verification_payload(tenant_id, prv.latest_run_for_pr(tenant_id, pr["id"]))
+        suite_id = eval_tools.find_suite(tenant_id, resource_id, resource_type)
+        payload["cases"] = eval_tools.load_suite_cases(suite_id) if suite_id else []
+        payload["has_suite"] = bool(payload["cases"])
+        # 이 시나리오가 어느 버전 기준인지 — 통과/실패 숫자는 그 기준에 대한 상대값이라,
+        # 기준 버전이 보이지 않으면 화면의 숫자가 무엇을 뜻하는지 읽을 수 없다.
+        payload["baseline_ref"] = eval_tools.suite_baseline_ref(suite_id) if suite_id else ""
+        return payload
+
+    try:
+        payload = await asyncio.to_thread(_load)
+        if payload.get("error"):
+            return JSONResponse(payload, status_code=404)
+        return JSONResponse(payload)
+    except Exception as e:
+        logger.exception("검증 조회 실패 %s/%s pr=%s", resource_type, resource_id, pr_id)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@tenant_guard
+async def start_resource_verification(request: Request) -> JSONResponse:
+    """리소스 타입을 가리지 않는 검증 시작(백그라운드)."""
+    resource_type = request.path_params["resource_type"]
+    resource_id = request.path_params["resource_id"]
+    pr_id = request.path_params["pr_id"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import pr_verification as prv
+
+    pr = await asyncio.to_thread(_find_resource_pr, tenant_id, resource_type, resource_id, pr_id)
+    if not pr:
+        return JSONResponse({"error": "병합 요청 기록을 찾을 수 없습니다."}, status_code=404)
+
+    existing = await asyncio.to_thread(prv.latest_run_for_pr, tenant_id, pr["id"])
+    if existing and existing.get("status") == "running":
+        return JSONResponse(_verification_payload(tenant_id, existing))
+
+    created = await asyncio.to_thread(
+        prv.create_run, tenant_id=tenant_id, pr=pr, created_by=request_user_id(request) or ""
+    )
+    if created.get("error"):
+        return JSONResponse(
+            {"error": created["error"], "message": created["message"]}, status_code=409
+        )
+
+    run = created["run"]
+    task = asyncio.create_task(
+        prv.execute_run(
+            tenant_id=tenant_id, run=run, cases=created["cases"], suite_id=created["suite_id"]
+        )
+    )
+    _verification_tasks[run["id"]] = task
+    task.add_done_callback(lambda _t, rid=run["id"]: _verification_tasks.pop(rid, None))
+
+    return JSONResponse(_verification_payload(tenant_id, run), status_code=202)
+
+
+@tenant_guard
+async def get_dmn_scenarios(request: Request) -> JSONResponse:
+    """이 의사결정에 병합 전 비교에 쓸 시나리오가 있는지 돌려준다."""
+    resource_id = request.path_params["resource_id"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import dmn_scenarios as ds
+
+    payload = await asyncio.to_thread(ds.summary, tenant_id, resource_id)
+    return JSONResponse(payload)
+
+
+@tenant_guard
+async def build_dmn_scenarios(request: Request) -> JSONResponse:
+    """규칙 표에서 회귀 시나리오를 만들어 붙인다.
+
+    기준은 **변경 전(base) 버전**이다 — 변경 후를 보고 만들면 바뀐 결론을 기준선으로 굳혀
+    버려서 그 검증이 아무것도 잡아내지 못한다. 표에서 파생하므로 모델 호출이 없어
+    백그라운드로 돌릴 이유도 없다(바로 끝난다).
+    """
+    resource_id = request.path_params["resource_id"]
+    tenant_id = request_tenant_id(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    from core.skills import dmn_scenarios as ds
+
+    result = await ds.promote(
+        tenant_id=tenant_id,
+        resource_id=resource_id,
+        base_ref=str((body or {}).get("base_ref") or ""),
+        replace=bool((body or {}).get("replace")),
+    )
+    if result.get("error"):
+        return JSONResponse(result, status_code=409)
+    return JSONResponse(result, status_code=201)
+
+
+@tenant_guard
+async def get_process_scenarios(request: Request) -> JSONResponse:
+    """이 프로세스에 병합 전 비교에 쓸 시나리오가 있는지 돌려준다."""
+    resource_id = request.path_params["resource_id"]
+    tenant_id = request_tenant_id(request)
+
+    from core.skills import process_scenarios as ps
+
+    payload = await asyncio.to_thread(ps.summary, tenant_id, resource_id)
+    return JSONResponse(payload)
+
+
+@tenant_guard
+async def promote_process_scenarios(request: Request) -> JSONResponse:
+    """검증이 통과시킨 케이스를 회귀 스위트로 승격한다.
+
+    프론트가 draft 를 정식 프로세스로 저장하는 시점에 부른다 — 검증은 draft 에 대해 돌지만
+    스위트는 정식 정의에 붙어야, 채팅에서 버린 draft 의 케이스가 남지 않는다.
+
+    `passing_cases` 없이 부르면 **base 정의에서 직접 시나리오를 만든다**(build). 생성 시
+    검증 게이트를 거치지 않은 프로세스는 승격할 케이스가 애초에 없어서, 병합 요청 화면이
+    시나리오를 확보할 다른 길이 필요하다. 의사결정(build_dmn_scenarios)과 같은 자리다.
+    """
+    resource_id = request.path_params["resource_id"]
+    tenant_id = request_tenant_id(request)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    passing_cases = (body or {}).get("passing_cases")
+    if passing_cases is not None and not isinstance(passing_cases, list):
+        return JSONResponse(
+            {"error": "bad_request", "message": "passing_cases 는 배열이어야 합니다."},
+            status_code=400,
+        )
+
+    from core.skills import process_scenarios as ps
+
+    if passing_cases:
+        result = await asyncio.to_thread(
+            ps.promote,
+            tenant_id=tenant_id,
+            resource_id=resource_id,
+            passing_cases=passing_cases,
+            replace=bool((body or {}).get("replace")),
+        )
+    else:
+        # 파생은 실행기(completion)에 맡기므로 이 경로는 코루틴이다 — to_thread 로 감싸면
+        # 코루틴 객체만 만들고 아무 일도 일어나지 않는다.
+        result = await ps.build(
+            tenant_id=tenant_id,
+            resource_id=resource_id,
+            base_ref=str((body or {}).get("base_ref") or ""),
+            replace=bool((body or {}).get("replace")),
+        )
+    if result.get("error"):
+        return JSONResponse(result, status_code=409)
+    return JSONResponse(result, status_code=201)
+
+
 routes = [
     Route("/skills", list_skills, methods=["GET"]),
     Route("/skills-builtin", list_builtin_skills, methods=["GET"]),
@@ -1515,8 +2070,22 @@ routes = [
     Route("/skills/{skill_name}/pull-requests", create_skill_pull_request, methods=["POST"]),
     Route("/skills/{skill_name}/pull-requests/{number:int}/files", get_pull_request_files, methods=["GET"]),
     Route("/skills/{skill_name}/pull-requests/{number:int}/merge", merge_skill_pull_request, methods=["POST"]),
+    Route("/skills/{skill_name}/pull-requests/{number:int}/verification", get_pr_verification, methods=["GET"]),
+    Route("/skills/{skill_name}/pull-requests/{number:int}/verification", start_pr_verification, methods=["POST"]),
+    Route("/skills/{skill_name}/pull-requests/{number:int}/verification/scenarios", start_eval_backfill, methods=["POST"]),
+    Route("/resources/bpmn/{resource_id}/verification/scenarios", get_process_scenarios, methods=["GET"]),
+    Route("/resources/bpmn/{resource_id}/verification/scenarios", promote_process_scenarios, methods=["POST"]),
+    Route("/resources/dmn/{resource_id}/verification/scenarios", get_dmn_scenarios, methods=["GET"]),
+    Route("/resources/dmn/{resource_id}/verification/scenarios", build_dmn_scenarios, methods=["POST"]),
+    # 스킬 경로는 깃 PR 번호를 받지만 프로세스·DMN 병합 요청에는 깃 PR 이 없다 — id 로 찾는다.
+    Route("/resources/{resource_type}/{resource_id}/pull-requests/{pr_id}/verification",
+          get_resource_verification, methods=["GET"]),
+    Route("/resources/{resource_type}/{resource_id}/pull-requests/{pr_id}/verification",
+          start_resource_verification, methods=["POST"]),
     Route("/skills/{skill_name}/export", export_skill, methods=["GET"]),
     Route("/skills/{skill_name}/files", list_skill_files, methods=["GET"]),
     Route("/skills/{skill_name}/files/{file_path:path}", get_skill_file, methods=["GET"]),
+    # git 없이 로컬 스킬 디렉터리에 직접 저장(버전·병합 관리 제외)
+    Route("/skills/{skill_name}/files/{file_path:path}", put_skill_file_local, methods=["PUT"]),
     Route("/skills/{skill_name}/files/{file_path:path}", delete_skill_file, methods=["DELETE"]),
 ]
