@@ -73,6 +73,8 @@ SANDBOX_CONTRACT = "tenant-workspace-v1"
 # SANDBOX_NETWORK_MTU=0 으로 두면 종전처럼 기본 브리지를 쓴다.
 # ---------------------------------------------------------------------
 SANDBOX_NETWORK_NAME = os.getenv("SANDBOX_NETWORK_NAME", "deepagent-sandbox-net")
+# 컨테이너 이름 접두사 — 같은 Docker 에 deepagents 를 두 벌 띄울 때 서로의 샌드박스를 지우지 않게 바꾼다
+SANDBOX_CONTAINER_PREFIX = os.getenv("SANDBOX_CONTAINER_PREFIX", "deepagent-sandbox")
 try:
     SANDBOX_NETWORK_MTU = int(os.getenv("SANDBOX_NETWORK_MTU", "1400") or 0)
 except ValueError:
@@ -396,7 +398,7 @@ class DockerSandboxBackend(BaseSandbox):
         return SANDBOX_NETWORK_NAME
 
     def _start_container(self) -> docker.models.containers.Container:
-        name = f"deepagent-sandbox-{self._tenant_id or 'shared'}"
+        name = f"{SANDBOX_CONTAINER_PREFIX}-{self._tenant_id or 'shared'}"
         network = self._ensure_network()
 
         # 이전 실행에서 남은 중단된 컨테이너 정리
