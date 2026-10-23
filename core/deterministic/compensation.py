@@ -25,6 +25,8 @@ completion 의 `compensation` 과 같은 규칙이다 — 굳힐 때 "되돌릴 
 
 from __future__ import annotations
 
+import json
+
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -92,9 +94,39 @@ def _known_content_before(path: str, earlier: list[Action]) -> str | None:
     return None
 
 
+def _declared_undo(result: Any) -> dict[str, Any] | None:
+    """도구가 결과에 스스로 밝힌 되돌리기 방법 — {"undo": {"tool", "args"}}.
+
+    업무 API 를 감싼 도구는 SQL 이 아니라 역함수(보상 도구)로 되돌린다. 그 방법은 관측(도구 결과)
+    안에 있으므로, 관측으로 되돌린다는 원칙 그대로 쓸 수 있다.
+    """
+    items = result if isinstance(result, list) else [result]
+    for item in items:
+        data = item
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            data = item["text"]
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (ValueError, TypeError):
+                continue
+        undo = data.get("undo") if isinstance(data, dict) else None
+        if isinstance(undo, dict) and undo.get("tool"):
+            return undo
+    return None
+
+
 def _invert_one(action: Action, earlier: list[Action]) -> tuple[UndoStep | None, str]:
     """행위 하나를 되돌리는 단계. 되돌릴 수 없으면 (None, 사유)."""
     if action.kind == MCP_CALL:
+        declared = _declared_undo(action.result)
+        if declared:
+            return UndoStep(
+                kind=UNDO_TOOL,
+                describes=f"{action.tool} → {declared['tool']}",
+                tool=str(declared["tool"]),
+                args=dict(declared.get("args") or {}),
+            ), ""
         found = _sql_argument(action)
         if found is None:
             # 메일 발송처럼 바깥 세상에 나간 호출. 취소 방법은 도구마다 다르고,
@@ -150,12 +182,18 @@ def invert(actions: Iterable[Action]) -> tuple[list[UndoStep], list[str]]:
     effects = [action for action in history if action.has_effect]
     steps: list[UndoStep] = []
     reasons: list[str] = []
+    seen: set[str] = set()
     for action in reversed(effects):
         earlier = history[: history.index(action)]
         step, reason = _invert_one(action, earlier)
         if step is None:
             reasons.append(reason)
             continue
+        key = json.dumps(step.as_dict(), ensure_ascii=False, sort_keys=True, default=str)
+        if key in seen:
+            # 멱등 재호출(같은 키로 두 번 부른 실행)은 되돌리기도 한 번이다.
+            continue
+        seen.add(key)
         steps.append(step)
     return steps, reasons
 

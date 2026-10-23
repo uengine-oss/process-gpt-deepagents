@@ -7,6 +7,7 @@ from deepagents import SubAgent
 
 from .tool_retry import build_tool_retry_middleware
 from ..llm.mcp import _load_mcp_tools_grouped
+from ..observability import get_context, set_context
 from ..skills.skills import FilteredSkillsMiddleware, _get_skills
 from ..skills.git_providers.factory import get_provider as _get_git_provider
 
@@ -93,7 +94,21 @@ async def _build_subagents(
         tool_filters = _normalize_tool_filters(agent.get("tool_filters"))
         tools = []
         if mcp_server_names and tenant_mcp:
-            grouped = await _load_mcp_tools_grouped(mcp_server_names, tenant_mcp, tool_filters=tool_filters)
+            # 서브에이전트의 MCP 스팬은 부모와 같은 trace 에 묶이되,
+            # parent_span_id 로 계층이 드러나야 한다.
+            _parent = get_context()
+            _token = None
+            if _parent is not None:
+                _token = set_context(
+                    _parent.child(
+                        agent_id=str(agent.get("id") or _parent.agent_id or "") or None,
+                    )
+                )
+            try:
+                grouped = await _load_mcp_tools_grouped(mcp_server_names, tenant_mcp, tool_filters=tool_filters)
+            finally:
+                if _token is not None:
+                    set_context(_parent)
             for srv, srv_tools in grouped.items():
                 tools.extend(srv_tools)
                 if srv not in mcp_connectors:

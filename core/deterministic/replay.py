@@ -427,6 +427,23 @@ def _previous_run_events(db: Any, row: dict[str, Any]) -> list[dict[str, Any]] |
     )
 
 
+def _compensation_event_logs(db: Any, row: dict[str, Any]) -> list[dict[str, Any]]:
+    """completion 이 이벤트 로그로 만든 보상 코드는 같은 모양의 입력을 기대한다 — 이전 회차의 도구 호출 종료 이벤트를 그 모양으로 싣는다."""
+    out: list[dict[str, Any]] = []
+    for event in _previous_run_events(db, row) or []:
+        if event.get("event_type") != "tool_usage_finished":
+            continue
+        data = event.get("data")
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except ValueError:
+                continue
+        if isinstance(data, dict) and (data.get("tool_name") or data.get("tool")):
+            out.append({"timestamp": event.get("timestamp"), "log_data": {**data, "tool_name": data.get("tool_name") or data.get("tool")}})
+    return out
+
+
 def _previous_undo_decision(db: Any, row: dict[str, Any]) -> UndoDecision:
     """직전 실행을 되돌릴 수 있는지 관측으로 판정한다.
 
@@ -902,7 +919,7 @@ async def try_deterministic_execution(
                 )
             try:
                 undo = await _run_code(
-                    record["compensation"], decision.plan, config, tenant_id
+                    record["compensation"], {**(decision.plan or {}), "event_logs": _compensation_event_logs(db, row)}, config, tenant_id
                 )
             except Exception as error:
                 # 보상 코드가 죽었다고 해서 되돌릴 일이 사라지는 것은 아니다. 여기서
@@ -965,6 +982,8 @@ async def try_deterministic_execution(
         inputs = _parameter_values(
             str(row.get("query") or ""), specification, row, related
         )
+        # 업무 값이 지시문에 없고 인스턴스로 정해지는 활동(예: 사건 실행)을 위해 워크아이템 식별자를 함께 넘긴다.
+        inputs["_workitem"] = {k: (None if row.get(k) is None else str(row.get(k))) for k in ("id", "proc_inst_id", "root_proc_inst_id", "proc_def_id", "activity_id", "rework_count")}
         forward = await _run_code(record["code"], inputs, config, tenant_id)
     except Exception:
         logger.warning(

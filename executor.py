@@ -78,7 +78,8 @@ from core.chat.chat_room import (
 )
 from core.chat.event_tap import EventTapStreamer
 from core.chat.tool_arg_stream import ToolArgTextStreamer
-from core.llm.mcp import fetch_tenant_mcp, load_chat_root_tools
+from core.llm.mcp import fetch_tenant_mcp, load_chat_root_tools, resolve_user_placeholders
+from core.observability import MCPContext, set_context as set_mcp_trace_context
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
 from core.skills.skills import add_skill_reload_inputs, resolve_slash_skill
@@ -1223,6 +1224,20 @@ class DeepAgentExecutor(AgentExecutor):
         _skill_tenant_id.set(tenant_id)
         _skill_user_id.set(str(extras.get("user_id") or row.get("user_id") or "").strip())
         set_process_context(root_proc_inst_id, current_workitem_id, current_proc_def_id)
+
+        # MCP/LLM 스팬 상관키. 여기가 proc_inst_id·todo_id·agent_id 가 모두
+        # 확보되는 지점이라 계측 컨텍스트를 거는 자리로 맞다.
+        set_mcp_trace_context(
+            MCPContext(
+                tenant_id=tenant_id,
+                engine="deepagents",
+                proc_inst_id=root_proc_inst_id or None,
+                todo_id=current_workitem_id or None,
+                job_id=context_id or None,
+                agent_id=str(row.get("user_id") or "").strip() or None,
+                user_id=str(extras.get("user_id") or "").strip() or None,
+            )
+        )
         # 채팅 경로(ChatRequestContext)에서는 프론트가 보낸 run_state/human_response_answer 가
         # extras["metadata"] 안에 들어온다. worklist 경로는 extras 최상위/draft 에 둔다.
         # 두 위치를 모두 확인해 채팅에서도 HITL resume 이 트리거되게 한다.
@@ -1356,8 +1371,12 @@ class DeepAgentExecutor(AgentExecutor):
             streamer = EventTapStreamer(streamer, on_event=_on_context_event)
 
         tenant_mcp: dict[str, Any] = await asyncio.to_thread(fetch_tenant_mcp, tenant_id) if tenant_id else {}
+        tenant_mcp = resolve_user_placeholders(tenant_mcp, user_jwt, user_email) if tenant_mcp else tenant_mcp
+        # mcp-hub 는 이 에이전트(채팅이면 대화 중인 사용자)에 바인딩된 서버만 허용한다.
+        _root_agent_id = str(row.get("user_id") or "").strip()
         chat_root_tools, _root_tool_servers = (
-            await load_chat_root_tools(tenant_mcp) if is_chat else ([], {})
+            await load_chat_root_tools(tenant_mcp, tenant_id, _root_agent_id)
+            if is_chat else ([], {})
         )
 
         if is_chat and chat_room_id and tenant_id:

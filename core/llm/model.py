@@ -4,6 +4,21 @@ from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
 
+def _tracing_clients() -> dict:
+    """상관키를 매 요청 헤더에 붙이는 httpx 클라이언트.
+
+    LiteLLM 프록시 콜백이 이 헤더를 읽어, LLM 스팬을 MCP 스팬과 같은
+    trace_id 로 묶는다. 실패하면 빈 dict — 계측 때문에 LLM 호출이
+    막히면 안 된다.
+    """
+    try:
+        from ..observability import tracing_http_clients
+
+        return tracing_http_clients()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _build_model():
     proxy_url = os.getenv("LLM_PROXY_URL")
     proxy_key = os.getenv("LLM_PROXY_API_KEY")
@@ -16,6 +31,7 @@ def _build_model():
             api_key=proxy_key,
             timeout=180,
             max_retries=2,
+            **_tracing_clients(),
         )
 
     if os.getenv("ANTHROPIC_API_KEY"):
