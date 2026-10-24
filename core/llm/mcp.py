@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any
@@ -19,6 +20,48 @@ _DISABLED_MCP_TOOLS: set[str] = {
 def is_mcp_server_enabled(server_config: Any) -> bool:
     """설정 화면의 켜기/끄기. 값이 없으면 켜진 것으로 본다(화면과 같은 기본값)."""
     return isinstance(server_config, dict) and server_config.get("enabled", True) is not False
+
+
+_USER_PLACEHOLDERS = ("{{user_jwt}}", "{{user_email}}")
+
+
+def resolve_user_placeholders(tenant_mcp: dict, user_jwt: str | None, user_email: str | None) -> dict:
+    """mcpServers 의 headers·env 에 있는 {{user_jwt}}·{{user_email}} 을 요청 사용자 값으로 바꾼다.
+
+    사용자별 자격증명을 쓰는 MCP 서버(예: 사용자 OAuth 토큰을 쥔 게이트웨이)를 테넌트 설정 하나로
+    등록할 수 있게 한다. 값이 없어 치환하지 못한 서버는 잘못된 인증으로 호출하지 않도록 뺀다.
+    """
+    servers = (tenant_mcp or {}).get("mcpServers")
+    if not isinstance(servers, dict):
+        return tenant_mcp
+    values = {"{{user_jwt}}": user_jwt or "", "{{user_email}}": user_email or ""}
+
+    def sub(v):
+        if not isinstance(v, str):
+            return v
+        for k, val in values.items():
+            v = v.replace(k, val)
+        return v
+
+    out = {}
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            out[name] = cfg
+            continue
+        blob = json.dumps({k: cfg.get(k) for k in ("headers", "env")}, ensure_ascii=False)
+        used = [k for k in _USER_PLACEHOLDERS if k in blob]
+        if not used:
+            out[name] = cfg
+            continue
+        if any(not values[k] for k in used):
+            logger.info("[MCP] skip %s: needs %s but the request has none", name, used)
+            continue
+        cfg = dict(cfg)
+        for key in ("headers", "env"):
+            if isinstance(cfg.get(key), dict):
+                cfg[key] = {k: sub(v) for k, v in cfg[key].items()}
+        out[name] = cfg
+    return {**tenant_mcp, "mcpServers": out}
 
 
 def _mcp_connection_config(server_config: dict) -> dict:

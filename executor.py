@@ -78,7 +78,7 @@ from core.chat.chat_room import (
 )
 from core.chat.event_tap import EventTapStreamer
 from core.chat.tool_arg_stream import ToolArgTextStreamer
-from core.llm.mcp import fetch_tenant_mcp, load_chat_root_tools
+from core.llm.mcp import fetch_tenant_mcp, load_chat_root_tools, resolve_user_placeholders
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
 from core.skills.skills import add_skill_reload_inputs, resolve_slash_skill
@@ -1356,6 +1356,8 @@ class DeepAgentExecutor(AgentExecutor):
             streamer = EventTapStreamer(streamer, on_event=_on_context_event)
 
         tenant_mcp: dict[str, Any] = await asyncio.to_thread(fetch_tenant_mcp, tenant_id) if tenant_id else {}
+        # 사용자별 자격증명 MCP 서버(예: pgpt-lite 커넥터 게이트웨이)의 {{user_jwt}}·{{user_email}} 을 요청 사용자 값으로 치환
+        tenant_mcp = resolve_user_placeholders(tenant_mcp, user_jwt, user_email) if tenant_mcp else tenant_mcp
         chat_root_tools, _root_tool_servers = (
             await load_chat_root_tools(tenant_mcp) if is_chat else ([], {})
         )
