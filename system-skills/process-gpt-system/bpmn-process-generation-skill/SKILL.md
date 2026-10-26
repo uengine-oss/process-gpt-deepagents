@@ -85,6 +85,9 @@ disclosure). 경로·파일명·자동 마무리 규칙은 [references/12-deepag
 
 ## 진입 패턴
 
+- **식별된 흐름 전환**("인계 기록에서 식별된 업무 흐름입니다…") — 흐름이 이미 프로세스 폴더의
+  `process-definition.json` 에 있다. **컨설팅·초안 승인 없이** 그 흐름을 그대로 두고
+  폼·스킬·에이전트만 보강한다. [references/13-identified-process.md](references/13-identified-process.md) 를 먼저 읽는다.
 - **자연어 요청**("휴가 신청 프로세스 만들어줘") 또는 **문서 업로드**("이 매뉴얼대로") —
   둘 다 1단계 컨설팅으로 진입한다. 문서가 있으면 `search_documents` 로 먼저 읽어 as-is
   흐름을 파악한다([references/10-document-intake.md](references/10-document-intake.md)).
@@ -163,6 +166,7 @@ disclosure). 경로·파일명·자동 마무리 규칙은 [references/12-deepag
 | [references/09-service-execution.md](references/09-service-execution.md) | **실행 모델** — 5단계 상세 + 자체 점검 체크리스트 + 역할 분담 |
 | [references/10-document-intake.md](references/10-document-intake.md) | **문서 업로드 기반 생성** — 업로드 문서에서 as-is 흐름 추출 → 컨설팅 초안 |
 | [references/11-multi-process.md](references/11-multi-process.md) | **여러 프로세스 생성** — 일괄 컨설팅/일괄 후보 선택 JSON 페이로드, 폴더 분리 |
+| [references/13-identified-process.md](references/13-identified-process.md) | **식별된 흐름 전환** — 인계 기록에서 도출된 흐름을 바꾸지 않고 폼·스킬·에이전트만 보강 |
 | [references/12-deepagents-execution.md](references/12-deepagents-execution.md) | **실행 환경 규격** — 산출물 경로·파일명, 도구 제한, 턴 종료 후 자동 마무리, 멀티 프로세스 폴더 |
 
 템플릿은 [assets/templates/](assets/templates/) 에 있습니다.

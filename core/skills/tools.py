@@ -1644,6 +1644,14 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
     if isinstance(pd, dict) and isinstance(pd.get("processDefinition"), dict):
         pd = pd["processDefinition"]
 
+    # 식별 화면에서 전환한 방이면 도출 구조로 되돌리고(보강 필드만 남김) 아래 LLM 교정을 하지 않는다 —
+    # 교정은 흐름을 다시 그리는 일이라, 인계 때와 다른 담당자·순서가 실행된다.
+    from .identified import apply_to_file as _keep_identified
+
+    identified_notes = _keep_identified(_current_conversation_id.get(), target)
+    if identified_notes is not None:
+        pd = _json.loads(target.read_text(encoding="utf-8"))
+
     # 일반 BPMN(Camunda)식으로 생성됐어도 ProcessGPT 규격으로 결정적 변환(안전망) 후 파일에 반영.
     pd, _normalized = _normalize_to_processgpt_schema(pd)
     manifest = {}
@@ -1691,7 +1699,12 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
     defects = _check(pd)
     repaired = False
     iterations = 0
-    for _ in range(2):
+    if identified_notes is not None and defects:
+        # 도출 구조는 고치지 않는다. 걸린 이유를 그대로 돌려 사용자에게 보인다.
+        for item in defects:
+            item.setdefault("detail", "")
+            item["detail"] = f"[인계 기록에서 도출된 흐름] {item['detail']}"
+    for _ in range(0 if identified_notes is not None else 2):
         if not defects:
             break
         iterations += 1
@@ -1952,6 +1965,7 @@ def _ensure_gateway_decision_contract(pd: dict, work: Path) -> bool:
     gateway.conditionData가 그 필드를 참조하도록 한다.
     """
     import html as _html
+    import json as _json
 
     elements = pd.get("elements") or []
     if not isinstance(elements, list):
@@ -2023,13 +2037,14 @@ def _ensure_gateway_decision_contract(pd: dict, work: Path) -> bool:
         if re.search(rf"\bname\s*=\s*['\"]{re.escape(field_name)}['\"]", content):
             continue
         label = _html.escape(str(gateway.get("name") or "분기 판단"), quote=True)
-        option_html = "".join(
-            f"<option value='{_html.escape(value, quote=True)}'>{_html.escape(value)}</option>"
-            for value in options
+        # ProcessGPT select-field 는 선택지를 items 속성(JSON)으로만 읽는다. <option> 자식은 무시돼
+        # 드롭다운이 비고, 실행 때 갈래를 고를 수 없다.
+        items = _html.escape(
+            _json.dumps([{value: value} for value in options], ensure_ascii=False), quote=True
         )
         field_html = (
-            f"      <select-field name='{field_name}' alias='{label}' disabled='false' readonly='false'>"
-            f"{option_html}</select-field>\n"
+            f"      <select-field name='{field_name}' alias='{label}' is_dynamic_load='fixed' "
+            f"items='{items}' disabled='false' readonly='false'></select-field>\n"
         )
         insert_at = content.rfind("</div>")
         if insert_at < 0:
@@ -2662,6 +2677,17 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
                                        "resolutionRule": ""})
         if seen_roles:
             pd["roles"] = seen_roles
+
+    # 식별 화면에서 전환한 방: 위 보강(폼·스킬·에이전트 연결)까지 마친 뒤 구조를 도출 정의로 고정한다.
+    # 스킬을 붙인 사람 단계가 '완전 자동'으로 바뀌는 것도 여기서 초안 모드로 되돌린다.
+    from .identified import keep_identified_structure, load_identified_definition, record_notes
+
+    _original = load_identified_definition(_current_conversation_id.get())
+    if _original:
+        pd, _notes = keep_identified_structure(_original, pd)
+        pd["processDefinitionId"] = proc_id
+        if _notes:
+            record_notes(work, _notes)
 
     # elements[] → flattened(activities/events/gateways/sequences) — pdf2bpmn 저장 스키마
     flat = None

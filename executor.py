@@ -142,6 +142,35 @@ def _validation_failure_summary(failures: list[dict], max_items: int = 3) -> str
     return "\n".join(lines[:max_items])
 
 
+def _completion_error_summary(result: str, max_items: int = 3) -> str:
+    """complete_process_generation 의 "ERROR: {...}" 결과에서 사용자에게 보일 이유를 뽑는다."""
+    body = result[len("ERROR:"):].strip() if result.startswith("ERROR:") else result
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return f"- {body[:300]}" if body else "- 통합 결과를 확인하지 못했습니다."
+    failures = obj.get("validation_errors") if isinstance(obj, dict) else None
+    if isinstance(failures, list) and failures:
+        return _validation_failure_summary(failures, max_items)
+    return f"- {obj.get('message') if isinstance(obj, dict) else body}"
+
+
+def _identified_notes_text(room_dir, conversation_id: str) -> str:
+    """식별 화면에서 전환한 방이면, 흐름을 그대로 두었다는 안내와 되돌린 변경의 이유를 붙인다."""
+    from core.skills.identified import load_identified_definition, read_notes
+    from core.skills.tools import process_work_dirs as _process_work_dirs
+
+    if not load_identified_definition(conversation_id):
+        return ""
+    notes: list[str] = []
+    for directory in _process_work_dirs(room_dir, conversation_id):
+        notes.extend(n for n in read_notes(directory) if n not in notes)
+    text = "\n\n인계 기록에서 도출된 흐름(단계·담당자·순서·분기)은 그대로 두고 폼·스킬·에이전트만 보강했어요."
+    if notes:
+        text += "\n생성 중 바꾸려던 흐름은 반영하지 않았어요:\n" + "\n".join(f"- {n}" for n in notes[:5])
+    return text
+
+
 def _ws_file_meta(path: str) -> tuple[str, str]:
     """container 경로 → (파일명, 확장자 소문자)."""
     from pathlib import PurePosixPath
@@ -1434,6 +1463,21 @@ class DeepAgentExecutor(AgentExecutor):
             except Exception:
                 logger.warning("워크스페이스 하이드레이션 실패(무시하고 진행) | room_id=%s", chat_room_id, exc_info=True)
 
+        if is_chat and chat_room_id and tenant_id:
+            # 식별 화면에서 전환한 방: 도출된 흐름을 프로세스 폴더에 미리 깔아 둔다.
+            # 에이전트가 흐름을 옮겨 적거나 다시 그리지 않고 폼·스킬·에이전트만 보강하게 한다.
+            try:
+                from core.skills.identified import seed_identified_process
+                from core.skills.tools import canonical_process_dir_name as _canonical_dir
+
+                await asyncio.to_thread(
+                    seed_identified_process,
+                    chat_room_id,
+                    _bpmn_work_dir() / _canonical_dir(chat_room_id),
+                )
+            except Exception:
+                logger.warning("도출 정의 깔기 실패 | room_id=%s", chat_room_id, exc_info=True)
+
         # 이전 turn 정리(대체할지 기다릴지), in-flight 등록, 재접속 등록, 토큰
         # 브로드캐스트는 모두 SDK 가 한다 — 채팅 출력 큐를 가로채 레지스트리에
         # 남기므로 재접속한 클라이언트가 받는 것과 원래 클라이언트가 받는 것이
@@ -2407,6 +2451,8 @@ class DeepAgentExecutor(AgentExecutor):
             # previous turn. Detect the durable room artifact as well as this
             # turn's write_file event, otherwise a resumed process is mistaken
             # for a standalone skill generation and never post-processed.
+            # 이번 턴에 에이전트가 작업 폴더에 무엇이든 썼는가(생성 턴) — 아래에서 방의 기존 산출물로 덮어쓰기 전에 남긴다
+            definition_written_this_turn = process_json_written or workspace_write_made
             if not process_json_written and chat_room_id:
                 try:
                     from core.skills.tools import process_work_dirs as _process_work_dirs, _conv_slug
@@ -2469,8 +2515,9 @@ class DeepAgentExecutor(AgentExecutor):
                         complete_called = True
                         if str(_cres or "").startswith("ERROR"):
                             raw_text = (
-                                "프로세스 산출물을 통합하는 중 문제가 생겨 결과 전달을 보류했어요. "
-                                "다시 시도하거나 수정할 부분을 알려주세요."
+                                "프로세스 산출물을 통합하는 중 문제가 생겨 결과 전달을 보류했어요.\n"
+                                + _completion_error_summary(str(_cres))
+                                + "\n다시 시도하거나 수정할 부분을 알려주세요."
                             )
                         else:
                             await _reemit_room_artifacts(streamer, chat_room_id or "")
@@ -2481,8 +2528,19 @@ class DeepAgentExecutor(AgentExecutor):
                                 {"content": "4. 프로세스 검증 & 자동 보정", "status": "completed"},
                                 {"content": "5. 결과 통합 & 완료", "status": "completed"},
                             ]})
+                            identified_notes = _identified_notes_text(_room_dir, chat_room_id or "")
                             if "확인 후 저장" not in (raw_text or ""):
-                                raw_text = "프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요."
+                                # 식별 화면에서 전환한 방에서 정의를 쓰지 않은 대화 턴(질문 패널 답이 아닌 새 메시지)은 에이전트 답을 지우지 않는다 —
+                                # 흐름을 바꿔 달라는 요청에 '바꾸지 않는 이유'를 답한 경우, 덮어쓰면 그 이유가 사라진다.
+                                agent_text = (
+                                    str(raw_text or "").strip()
+                                    if identified_notes and not definition_written_this_turn and not human_answer_stripped
+                                    else ""
+                                )
+                                raw_text = (agent_text + "\n\n" if agent_text else "") + (
+                                    "프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요."
+                                )
+                            raw_text += identified_notes
                 except Exception:
                     logger.exception("auto-complete 실패")
                     complete_called = True
