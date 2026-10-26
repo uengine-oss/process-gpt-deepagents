@@ -33,9 +33,10 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# if os.getenv('ENV') == "local":
-os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
+# 키가 있을 때만 추적을 켠다. 명시한 LANGSMITH_TRACING=false 가 이긴다.
+if os.getenv("LANGSMITH_API_KEY"):
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    os.environ.setdefault("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8888"))
