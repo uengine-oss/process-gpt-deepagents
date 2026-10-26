@@ -1569,6 +1569,18 @@ class DeepAgentExecutor(AgentExecutor):
             )
         pinned_skills = [_forced_skill_name] if _forced_skill_name else []
         recent_msgs = collect_recent_messages(extras) if is_chat else []
+        # 인계로 받은 방이면 앞선 방들의 대화를 이력으로 싣는다(받은 방 화면의 '이전 대화'와 같은 규칙).
+        # 할 일 폴러로 실행되는 인계 할 일뿐 아니라, 받은 사람이 그 방에서 에이전트와 대화할 때도 같다 —
+        # 대화창이 넘기는 최근 대화는 이 방 것뿐이라, 넘겨받은 맥락을 물어도 에이전트가 답하지 못했다.
+        # 프로세스 이름을 고르는 원 요청 후보(recent_msgs)에는 섞지 않고 그래프 입력에만 넣는다.
+        handover_history: list[dict[str, Any]] = []
+        history_room_id = handover_room_id or (chat_room_id if is_chat else "")
+        # 체크포인트가 있으면 build_graph_inputs 가 이력을 다시 싣지 않으므로 중복되지 않는다.
+        if history_room_id and tenant_id:
+            from core.chat.handover_history import build_handover_history
+            from core.storage.db import get_supabase
+
+            handover_history = await asyncio.to_thread(build_handover_history, get_supabase(), history_room_id, tenant_id)
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).
         _user_input_text = ""
         try:
@@ -1792,7 +1804,7 @@ class DeepAgentExecutor(AgentExecutor):
             run_state=run_state,
             checkpointer=checkpointer,
             checkpoint_thread_id=checkpoint_thread_id,
-            recent_messages=recent_msgs,
+            recent_messages=[*handover_history, *recent_msgs],
             has_checkpoint=has_checkpoint,
             has_pending_interrupt=has_pending_interrupt,
             pinned_skills=pinned_skills,
