@@ -27,8 +27,9 @@ ROOMS = [{"id": "A", "name": "견적 요청 · 서울전자"}, {"id": "B", "name
 
 
 class _Query:
-    def __init__(self, table):
+    def __init__(self, table, data):
         self.table = table
+        self.events, self.chats, self.rooms = data
         self.filters = {}
         self.in_filter = None
 
@@ -55,18 +56,21 @@ class _Query:
 
         r = R()
         if self.table == "handover_events":
-            r.data = [e for e in EVENTS if all(e.get(k) == v for k, v in self.filters.items())]
+            r.data = [e for e in self.events if all(e.get(k) == v for k, v in self.filters.items())]
         elif self.table == "chats":
-            r.data = [{"uuid": str(i), "messages": m} for i, m in enumerate(CHATS.get(self.filters.get("id"), []))]
+            r.data = [{"uuid": str(i), "messages": m} for i, m in enumerate(self.chats.get(self.filters.get("id"), []))]
         else:
             k, vs = self.in_filter
-            r.data = [x for x in ROOMS if x[k] in vs]
+            r.data = [x for x in self.rooms if x[k] in vs]
         return r
 
 
 class _Sb:
+    def __init__(self, events=None, chats=None, rooms=None):
+        self.data = (EVENTS if events is None else events, CHATS if chats is None else chats, ROOMS if rooms is None else rooms)
+
     def table(self, name):
-        return _Query(name)
+        return _Query(name, self.data)
 
 
 def test_받은_방은_시작_방부터_앞선_대화를_순서대로_받는다():
@@ -128,3 +132,72 @@ def test_대화창_대화에서도_앞선_대화가_이_방_대화보다_먼저_
     assert "서버 3대" in msgs[0]["content"]
     assert msgs[-1]["content"] == "앞선 대화에서 고객이 요청한 수량이 몇 대였지?"
     assert len(msgs) == 2
+
+
+# 합류(2026-10-27) — 홍길동이 생산 계획(P)을 1공장(이팀장)·2공장(박대리)에게 나눠 준 뒤,
+# 같은 방에서 결과를 모아 최과장(J)에게 넘긴다. 2공장은 중간에 김주임(C2)에게 한 번 더 넘겼다.
+G = "g-1"
+MERGE_EVENTS = [
+    {"tenant_id": "t", "from_room_id": "P", "to_room_id": "B1", "occurred_at": "2026-10-27T01:00:00+00:00",
+     "from_user_name": "홍길동", "to_user_name": "이팀장", "group_id": G, "next_activity_label": "1공장 생산"},
+    {"tenant_id": "t", "from_room_id": "P", "to_room_id": "B2", "occurred_at": "2026-10-27T01:00:00.200+00:00",
+     "from_user_name": "홍길동", "to_user_name": "박대리", "group_id": G, "next_activity_label": "2공장 생산"},
+    {"tenant_id": "t", "from_room_id": "B2", "to_room_id": "C2", "occurred_at": "2026-10-27T02:00:00+00:00",
+     "from_user_name": "박대리", "to_user_name": "김주임", "group_id": None, "next_activity_label": "2공장 검수"},
+    {"tenant_id": "t", "from_room_id": "P", "to_room_id": "J", "occurred_at": "2026-10-27T03:00:00+00:00",
+     "from_user_name": "홍길동", "to_user_name": "최과장", "group_id": None, "next_activity_label": "생산 결과 보고"},
+]
+MERGE_CHATS = {
+    "P": [{"role": "user", "name": "홍길동", "content": "이번 달 생산 계획을 공장별로 나눠 진행", "timeStamp": "2026-10-27T00:50:00+00:00"}],
+    "B1": [
+        {"role": "assistant", "name": "이팀장", "content": "1공장 생산 수량 1,200대 확정", "timeStamp": "2026-10-27T01:30:00+00:00"},
+        {"role": "user", "name": "이팀장", "content": "합류 뒤에 쓴 1공장 메모", "timeStamp": "2026-10-27T04:00:00+00:00"},
+    ],
+    "B2": [{"role": "assistant", "name": "박대리", "content": "2공장 생산 수량 850대", "timeStamp": "2026-10-27T01:40:00+00:00"}],
+    "C2": [{"role": "assistant", "name": "김주임", "content": "2공장 검수 불량 3대", "timeStamp": "2026-10-27T02:30:00+00:00"}],
+}
+MERGE_ROOMS = [
+    {"id": "P", "name": "생산 계획"}, {"id": "B1", "name": "1공장 생산"},
+    {"id": "B2", "name": "2공장 생산"}, {"id": "C2", "name": "2공장 검수"},
+]
+
+
+def _merge_sb():
+    return _Sb(MERGE_EVENTS, MERGE_CHATS, MERGE_ROOMS)
+
+
+def test_합류한_방은_모든_갈래의_대화를_갈래별로_받는다():
+    text = build_handover_history(_merge_sb(), "J", "t")[0]["content"]
+    assert "공장별로 나눠 진행" in text
+    assert "갈래 1: 이팀장 · 1공장 생산" in text and "갈래 2: 박대리 · 2공장 생산" in text
+    assert "1,200대" in text and "850대" in text
+    # 시작 방 → 1공장 갈래 → 2공장 갈래
+    assert text.index("생산 계획") < text.index("1,200대") < text.index("850대")
+
+
+def test_갈래_안에서_이어_넘긴_방도_그_갈래에_들어간다():
+    text = build_handover_history(_merge_sb(), "J", "t")[0]["content"]
+    assert "불량 3대" in text
+    assert text.index("갈래 2") < text.index("불량 3대")
+
+
+def test_갈래_방은_합류_시각까지만_싣는다():
+    text = build_handover_history(_merge_sb(), "J", "t")[0]["content"]
+    assert "합류 뒤에 쓴 1공장 메모" not in text
+
+
+def test_갈래_방은_형제_갈래를_받지_않는다():
+    text = build_handover_history(_merge_sb(), "B1", "t")[0]["content"]
+    assert "공장별로 나눠 진행" in text
+    assert "850대" not in text and "갈래" not in text.split("\n\n", 1)[1]
+
+
+def test_나눠_주기_전에_넘긴_인계는_합류가_아니다():
+    """나눠 준 뒤에 일어난 인계만 합류다. 나눠 주기 전 인계의 받은 방은 갈래를 받지 않는다."""
+    events = [
+        {"tenant_id": "t", "from_room_id": "P", "to_room_id": "E", "occurred_at": "2026-10-27T00:55:00+00:00",
+         "from_user_name": "홍길동", "to_user_name": "정사원", "group_id": None, "next_activity_label": "자재 확인"},
+        *MERGE_EVENTS,
+    ]
+    text = build_handover_history(_Sb(events, MERGE_CHATS, MERGE_ROOMS), "E", "t")[0]["content"]
+    assert "1,200대" not in text and "갈래 1" not in text
