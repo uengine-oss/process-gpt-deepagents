@@ -552,10 +552,11 @@ class DockerSandboxBackend(BaseSandbox):
     # ------------------------------------------------------------------
     # 실행 격리 스코프 강제 — set_workspace_scope() 로 등록된 이번 실행의 허용 경로
     # 밖에 있는 "다른 실행 전용" 산출물(.bpmn/<다른 방>, <다른 instance_id>/inputs·outputs)에
-    # 대한 읽기 계열 호출(ls/read/glob/grep)을 차단한다. write/edit 은 제한하지 않는다 —
-    # 에이전트가 스스로 고른 새 경로에 쓰는 것이라 다른 실행 결과를 "재사용"하는 경로가 아니고,
-    # checkout_to_workspace 가 이번 방의 체크아웃 트리를 새로 만들며 쓰기 때문에,
-    # write 까지 막으면 그 정상 흐름을 깬다.
+    # 대한 읽기 계열 호출(ls/read/glob/grep)을 차단한다.
+    # write/edit 도 다른 방·다른 실행 전용 폴더에는 쓰지 못하게 한다. 인계받은 방은 자기 브랜치를
+    # 작업 폴더로 펼쳐 일하고 턴 끝에 그 폴더만 커밋한다 — 앞선 대화에 남은 앞 방 경로
+    # (.bpmn/<앞 방>/견적서.md)에 고치면 결과가 어느 브랜치에도 남지 않는다. 이번 방 폴더와
+    # 체크아웃(checkout_to_workspace 가 쓰는 .checkouts/<이번 방>)은 스코프 안이라 그대로 쓴다.
     # ------------------------------------------------------------------
 
     def _in_workspace_scope(self, path: str) -> bool:
@@ -614,6 +615,13 @@ class DockerSandboxBackend(BaseSandbox):
         index = zlib.crc32(key.encode("utf-8")) % self._FILE_LOCK_STRIPES
         return self._file_locks[index]
 
+    def _write_scope_error(self, file_path: str) -> str | None:
+        if self._in_workspace_scope(file_path):
+            return None
+        scope = _workspace_scope.get()
+        home = f" 이번 방 작업 폴더({scope[0]}) 안의 같은 이름 파일을 고치거나 거기에 쓰세요." if scope else ""
+        return f"File '{file_path}': 다른 방(실행)의 작업 폴더에는 쓸 수 없습니다.{home}"
+
     def edit(
         self,
         file_path: str,
@@ -621,10 +629,14 @@ class DockerSandboxBackend(BaseSandbox):
         new_string: str,
         replace_all: bool = False,  # noqa: FBT001, FBT002
     ) -> EditResult:
+        if err := self._write_scope_error(file_path):
+            return EditResult(error=err)
         with self._file_lock(file_path):
             return super().edit(file_path, old_string, new_string, replace_all)
 
     def write(self, file_path: str, content: str) -> WriteResult:
+        if err := self._write_scope_error(file_path):
+            return WriteResult(error=err)
         with self._file_lock(file_path):
             return super().write(file_path, content)
 
