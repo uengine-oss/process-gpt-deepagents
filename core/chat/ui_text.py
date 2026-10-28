@@ -63,9 +63,14 @@ DONE_TODOS: dict[str, list[str]] = {
 _SAVE_MARKERS = ("확인 후 저장", "press Save")
 
 
+# 프론트가 사용자 글 뒤에 붙이는 시스템 블록(한국어 지시문 포함) — 언어 판단에서 뺀다
+_SYSTEM_BLOCK = re.compile(r"\n?\[(?:ExecutionPolicy|InputData|OpenUIForm)\]")
+
+
 def reply_lang(text: str) -> str:
-    """요청 원문의 언어 — 한글이 없고 영문자가 3자 이상이면 'en', 아니면 'ko'."""
-    t = str(text or "")
+    """요청 원문의 언어 — 한글이 없고 영문자가 3자 이상이면 'en', 아니면 'ko'.
+    사용자 글 뒤에 붙는 [ExecutionPolicy] 등 시스템 블록 앞까지만 본다."""
+    t = _SYSTEM_BLOCK.split(str(text or ""), maxsplit=1)[0]
     if _HANGUL.search(t):
         return "ko"
     return "en" if len(_LATIN.findall(t)) >= 3 else "ko"

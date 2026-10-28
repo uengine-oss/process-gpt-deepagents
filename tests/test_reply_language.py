@@ -41,3 +41,10 @@ def test_capture_selection_korean_unchanged(tmp_path, monkeypatch):
     tools._capture_selection_to_manifest("[에이전트] 재고 확인 에이전트, [에이전트] 견적 산출 에이전트")
     man = json.loads((room / "process-1" / "manifest.json").read_text(encoding="utf-8"))
     assert [a["name"] for a in man["agents"]] == ["재고 확인 에이전트", "견적 산출 에이전트"]
+
+
+def test_reply_lang_ignores_system_blocks():
+    msg = ("Create a bulk order quote process.\n[ExecutionPolicy]\n- ask_user는 마지막 수단입니다.\n"
+           "\n[InputData]\n{\"files\": []}")
+    assert ui_text.reply_lang(msg) == "en"
+    assert ui_text.reply_lang("견적 프로세스를 만들어 줘\n[ExecutionPolicy]\n- policy") == "ko"
