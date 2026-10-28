@@ -23,6 +23,7 @@ import io
 import logging
 import os
 import re
+import socket
 import tarfile
 import threading
 import time
@@ -241,6 +242,44 @@ _FALLBACK_SOCKETS = [
 ]
 
 
+_DAEMON_MOUNTS: list[tuple[str, str]] | None = None
+
+
+def _daemon_mounts(client: docker.DockerClient) -> list[tuple[str, str]]:
+    """이 프로세스가 도는 컨테이너의 (컨테이너 안 경로, 데몬이 보는 원본 경로) 목록. 컨테이너 밖이면 빈 목록."""
+    global _DAEMON_MOUNTS
+    if _DAEMON_MOUNTS is not None:
+        return _DAEMON_MOUNTS
+    mounts: list[tuple[str, str]] = []
+    if os.path.exists("/.dockerenv"):
+        try:
+            me = client.containers.get(socket.gethostname())
+            for m in me.attrs.get("Mounts") or []:
+                dst, src = m.get("Destination"), m.get("Source")
+                if dst and src:
+                    mounts.append((dst.rstrip("/"), src.rstrip("/")))
+        except Exception as exc:
+            logger.warning("샌드박스: 이 컨테이너의 마운트를 읽지 못해 경로를 그대로 씁니다: %s", exc)
+    mounts.sort(key=lambda item: len(item[0]), reverse=True)
+    _DAEMON_MOUNTS = mounts
+    return mounts
+
+
+def _daemon_path(client: docker.DockerClient, path: Path | str) -> str:
+    """형제 컨테이너(샌드박스)에 bind-mount 할 원본 경로를 데몬이 보는 경로로 바꾼다.
+
+    deepagents 가 컨테이너로 돌며 호스트 Docker 소켓으로 샌드박스를 띄우면, bind-mount 원본은 이 컨테이너가
+    아니라 데몬 쪽에서 해석된다. 그래서 /app/workspace 처럼 컨테이너 안 경로를 그대로 넘기면 호스트에 같은 경로가
+    있어야만 동작한다(Docker Desktop 의 Mac·Windows 에는 /app 이 없다). 이 컨테이너가 그 경로를 받은 마운트의
+    원본(이름 있는 볼륨이면 /var/lib/docker/volumes/<볼륨>/_data)으로 바꿔 넘긴다. 맞는 마운트가 없으면 그대로.
+    """
+    p = str(path)
+    for dst, src in _daemon_mounts(client):
+        if p == dst or p.startswith(dst + "/"):
+            return src + p[len(dst):]
+    return p
+
+
 def _get_docker_client() -> docker.DockerClient:
     """DOCKER_HOST가 없으면 알려진 소켓 경로를 순서대로 시도한다."""
     if os.environ.get("DOCKER_HOST"):
@@ -356,7 +395,7 @@ class DockerSandboxBackend(BaseSandbox):
         try:
             for entry in sorted(self._skills_host.iterdir()):
                 if entry.is_dir() and entry.name in allowed:
-                    volumes[str(entry)] = {"bind": f"/skills/{entry.name}", "mode": "ro"}
+                    volumes[_daemon_path(self._client, entry)] = {"bind": f"/skills/{entry.name}", "mode": "ro"}
         except OSError:
             pass
         return volumes
@@ -422,7 +461,7 @@ class DockerSandboxBackend(BaseSandbox):
             pass
 
         self._workspace_host.mkdir(parents=True, exist_ok=True)
-        volumes: dict = {str(self._workspace_host): {"bind": _CONTAINER_WORKSPACE, "mode": "rw"}}
+        volumes: dict = {_daemon_path(self._client, self._workspace_host): {"bind": _CONTAINER_WORKSPACE, "mode": "rw"}}
         volumes.update(self._skill_volumes())
 
         run_kwargs: dict = dict(
