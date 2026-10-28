@@ -125,8 +125,14 @@ def build_user_message(
     return message
 
 
-def resolve_chat_room_id(extras: dict[str, Any], row: dict[str, Any]) -> str:
-    """요청 컨텍스트에서 채팅룸 식별자를 추출한다."""
+def resolve_chat_room_id(extras: dict[str, Any], row: dict[str, Any], new_conversation_id: str = "") -> str:
+    """요청 컨텍스트에서 채팅룸 식별자를 추출한다.
+
+    new_conversation_id: 채팅인데 대화 id 없이 온 새 대화의 첫 메시지라면, SDK 가 이 대화에 새로
+    매겨 화면에 돌려준 id(context_id). 그게 이 대화의 방이다. 비워 두면 방 없이 테넌트 공용
+    작업 폴더(.bpmn/)에서 일해, 다른 실행이 남긴 파일이 이번 산출물·답에 섞이고 다음 턴(같은 id)은
+    이번에 만든 파일을 찾지 못한다.
+    """
     for key in ("conversation_id", "room_id", "chat_room_id"):
         v = extras.get(key)
         if isinstance(v, str) and v.strip():
@@ -134,7 +140,7 @@ def resolve_chat_room_id(extras: dict[str, Any], row: dict[str, Any]) -> str:
     v2 = row.get("conversation_id")
     if isinstance(v2, str) and v2.strip():
         return v2.strip()
-    return ""
+    return (new_conversation_id or "").strip()
 
 
 # 대화창 인계로 만든 할 일은 query 에 받은 방을 '[ChatRoom] <방 id>' 한 줄로 싣는다

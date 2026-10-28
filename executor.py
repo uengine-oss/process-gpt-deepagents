@@ -1438,7 +1438,10 @@ class DeepAgentExecutor(AgentExecutor):
         ).strip()
 
         is_chat = streamer is not None
-        chat_room_id = resolve_chat_room_id(extras, row if isinstance(row, dict) else {})
+        # 대화 id 없이 온 새 대화의 첫 메시지는 SDK 가 매겨 화면에 돌려준 id(context_id)가 방이다.
+        chat_room_id = resolve_chat_room_id(
+            extras, row if isinstance(row, dict) else {}, new_conversation_id=context_id if is_chat else ""
+        )
         # 대화창 인계로 받은 할 일은 폴러로 실행돼도 그 방의 작업 폴더에서 일한다 —
         # 넘겨받은 파일이 거기 있고, 만든 결과도 넘긴 사람이 그 방에서 본다.
         handover_room_id = "" if is_chat else resolve_handover_room_id(row if isinstance(row, dict) else {})
