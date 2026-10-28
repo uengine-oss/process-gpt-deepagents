@@ -261,7 +261,10 @@ def root_service_tools(*, is_chat: bool, agent_mode: str = "") -> list:
     # BSC 전략 도구(조회·저장·수정·정합성 점검 9개). bsc-strategy-interview 스킬이 include_tools 로 9개를 모두
     # 연결하므로, 관리자가 스킬 전용으로 지정하면 그 스킬을 읽은 대화에만 실려 첫 요청의 도구 수는 늘지 않는다.
     # 전략 서비스가 없으면 각 도구가 {"error": ...} 를 돌려줄 뿐 실행을 죽이지 않는다.
-    tools += get_strategy_tools()
+    # 다만 서비스가 아예 없는 설치(Process GPT Lite)에서는 프로세스 생성 중에도 정합성 점검을 시도하다
+    # 실패를 사용자에게 되묻는다 — STRATEGY_TOOLS=off 로 뺀다.
+    if os.getenv("STRATEGY_TOOLS", "on").strip().lower() not in ("off", "false", "0"):
+        tools += get_strategy_tools()
     # 웹페이지 조회 도구(fetch_webpage — Claude Code의 WebFetch에 대응). 지금 쓰는 곳은 bsc-strategy-interview 의
     # 0단계(회사 정보 확보)뿐이라 그 스킬이 include_tools 로 연결한다. 스킬 전용으로 지정하면 그 스킬을 읽은 대화에만 실린다.
     tools += get_web_tools()
