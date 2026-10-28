@@ -23,6 +23,7 @@ from a2a.types import TaskState
 from google.protobuf.json_format import ParseDict
 
 from processgpt_agent_sdk.artifacts import download_file
+from core.chat.ui_text import asks_to_save, done_todos, reply_lang, t as ui_t
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Overwrite
 from typing_extensions import override
@@ -1605,6 +1606,8 @@ class DeepAgentExecutor(AgentExecutor):
             handover_history = await asyncio.to_thread(build_handover_history, get_supabase(), history_room_id, tenant_id)
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).
         _user_input_text = ""
+        # 채팅에 직접 남기는 고정 안내(완료·보류·todo)의 언어 — 아래에서 원 요청 원문으로 정한다
+        _ui_lang = "ko"
         try:
             _user_input_text = str(context.get_user_input() or "")
             # HITL resume 턴의 current input은 "승인" 또는 후보 선택 답변뿐이다. 원 요청을
@@ -1616,7 +1619,10 @@ class DeepAgentExecutor(AgentExecutor):
             request_candidates.append(_user_input_text)
             non_hitl = [
                 text for text in request_candidates
-                if not re.search(r"\[(?:스킬|에이전트|DMN)\]|^\s*(?:승인|반려)\s*$", text, re.IGNORECASE)
+                if not re.search(
+                    r"\[(?:스킬|에이전트|DMN|skill|agent)\]|^\s*(?:승인|반려|approved?|reject(?:ed)?)\s*$",
+                    text, re.IGNORECASE,
+                )
             ]
             original_request = max(
                 non_hitl or request_candidates or [""],
@@ -1627,6 +1633,7 @@ class DeepAgentExecutor(AgentExecutor):
                 ),
             )
             _skill_user_request.set(original_request)
+            _ui_lang = reply_lang(original_request)
         except Exception:
             pass
         # 후보 선택 HITL 답변이면([스킬]/[에이전트]/[DMN]) manifest 로 캡처(에이전트가 안 써도 스킬/연결 보장).
@@ -2324,13 +2331,7 @@ class DeepAgentExecutor(AgentExecutor):
                                     if tool_name == "complete_process_generation":
                                         complete_called = True
                                     if tool_name == "complete_process_generation" and not str(result_content or "").startswith("ERROR"):
-                                        _done_todos = [
-                                            {"content": "1. 프로세스 초안 설계 & JSON 생성", "status": "completed"},
-                                            {"content": "2. 스킬·에이전트·DMN 선택 & 생성", "status": "completed"},
-                                            {"content": "3. 입력 폼 & 참조정보 생성", "status": "completed"},
-                                            {"content": "4. 프로세스 검증 & 자동 보정", "status": "completed"},
-                                            {"content": "5. 결과 통합 & 완료", "status": "completed"},
-                                        ]
+                                        _done_todos = done_todos(_ui_lang)
                                         await streamer.send_json({"type": "plan_todos", "todos": _done_todos})
 
                                     # 도구 출력의 출력계약(JSON)을 잡아 프론트에 구조화 이벤트로
@@ -2539,9 +2540,9 @@ class DeepAgentExecutor(AgentExecutor):
                             _validation_failures,
                         )
                         raw_text = (
-                            "프로세스 정의가 검증을 통과하지 못해 결과 전달을 보류했어요.\n"
+                            ui_t("validation_hold", _ui_lang) + "\n"
                             + _validation_failure_summary(_validation_failures)
-                            + "\n어떻게 고칠지 알려주시면 이어서 수정할게요."
+                            + "\n" + ui_t("validation_hold_tail", _ui_lang)
                         )
                     else:
                         _cres = await asyncio.to_thread(_cpg.invoke, {})
@@ -2549,21 +2550,15 @@ class DeepAgentExecutor(AgentExecutor):
                         complete_called = True
                         if str(_cres or "").startswith("ERROR"):
                             raw_text = (
-                                "프로세스 산출물을 통합하는 중 문제가 생겨 결과 전달을 보류했어요.\n"
+                                ui_t("integration_hold", _ui_lang) + "\n"
                                 + _completion_error_summary(str(_cres))
-                                + "\n다시 시도하거나 수정할 부분을 알려주세요."
+                                + "\n" + ui_t("retry_tail", _ui_lang)
                             )
                         else:
                             await _reemit_room_artifacts(streamer, chat_room_id or "")
-                            await streamer.send_json({"type": "plan_todos", "todos": [
-                                {"content": "1. 프로세스 초안 설계 & JSON 생성", "status": "completed"},
-                                {"content": "2. 스킬·에이전트·DMN 선택 & 생성", "status": "completed"},
-                                {"content": "3. 입력 폼 & 참조정보 생성", "status": "completed"},
-                                {"content": "4. 프로세스 검증 & 자동 보정", "status": "completed"},
-                                {"content": "5. 결과 통합 & 완료", "status": "completed"},
-                            ]})
+                            await streamer.send_json({"type": "plan_todos", "todos": done_todos(_ui_lang)})
                             identified_notes = _identified_notes_text(_room_dir, chat_room_id or "")
-                            if "확인 후 저장" not in (raw_text or ""):
+                            if not asks_to_save(raw_text):
                                 # 식별 화면에서 전환한 방에서 정의를 쓰지 않은 대화 턴(질문 패널 답이 아닌 새 메시지)은 에이전트 답을 지우지 않는다 —
                                 # 흐름을 바꿔 달라는 요청에 '바꾸지 않는 이유'를 답한 경우, 덮어쓰면 그 이유가 사라진다.
                                 agent_text = (
@@ -2571,17 +2566,12 @@ class DeepAgentExecutor(AgentExecutor):
                                     if identified_notes and not definition_written_this_turn and not human_answer_stripped
                                     else ""
                                 )
-                                raw_text = (agent_text + "\n\n" if agent_text else "") + (
-                                    "프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요."
-                                )
+                                raw_text = (agent_text + "\n\n" if agent_text else "") + ui_t("process_created", _ui_lang)
                             raw_text += identified_notes
                 except Exception:
                     logger.exception("auto-complete 실패")
                     complete_called = True
-                    raw_text = (
-                        "프로세스 마무리 처리 중 오류가 발생했어요. "
-                        "잠시 후 다시 시도하거나 수정할 부분을 알려주세요."
-                    )
+                    raw_text = ui_t("finalize_error", _ui_lang)
 
             # 단독 스킬 생성: process-definition.json 이 없어 위 complete 폴백을 타지 않으므로,
             # 방 산출물(base/skills/*/SKILL.md)을 file_artifact 로 재전송해 프론트 패널 표시 + 저장을 보장한다.
@@ -2594,8 +2584,8 @@ class DeepAgentExecutor(AgentExecutor):
                     # PR(병합 요청)을 올린 턴은 사용자가 저장 버튼을 누를 일이 없다. 그런데도
                     # 이 문구로 덮어쓰면 PR 링크와 병합 위치 안내가 사라지고 "저장하라"는
                     # 잘못된 안내만 남는다. 그런 응답은 에이전트의 원문을 그대로 둔다.
-                    if "확인 후 저장" not in (raw_text or "") and not _reports_pull_request(raw_text):
-                        raw_text = "스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요."
+                    if not asks_to_save(raw_text) and not _reports_pull_request(raw_text):
+                        raw_text = ui_t("skill_created", _ui_lang)
                 except Exception:
                     logger.exception("단독 스킬 산출물 재전송 실패")
 

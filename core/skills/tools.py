@@ -2300,23 +2300,29 @@ def _capture_selection_to_manifest(answer: str) -> None:
     직접 캡처해 각 process-* 폴더 manifest 에 기록한다(이후 complete 가 SKILL.md 생성·활동 연결)."""
     import json as _json
     a = str(answer or "")
-    if not any(k in a for k in ("[스킬]", "[에이전트]", "[DMN]", "스킬:", "에이전트:", "DMN:")):
+    # 영어로 묻는 사용자에게는 후보가 [Skill]/[Agent]/[DMN] 으로 나간다 — 두 언어 모두 받는다.
+    if not re.search(r"\[(?:스킬|에이전트|DMN|skill|agent)\]|(?:스킬|에이전트|DMN|skill|agent)\s*:", a, re.IGNORECASE):
         return
     skills: list = []
     agents: list = []
     dmns: list = []
-    _bad = {"(없음)", "없음", "", "skipped"}
-    # 1) "[스킬] 이름" / "[에이전트] 이름" / "[DMN] 이름"
-    for cat, name in re.findall(r"\[(스킬|에이전트|DMN)\]\s*([^,\n/]+)", a):
+    _bad = {"(없음)", "없음", "", "skipped", "none", "(none)"}
+
+    def _bucket(cat: str) -> list:
+        c = cat.lower()
+        return skills if c in ("스킬", "skill") else agents if c in ("에이전트", "agent") else dmns
+
+    # 1) "[스킬] 이름" / "[에이전트] 이름" / "[DMN] 이름" (영어: [Skill] / [Agent])
+    for cat, name in re.findall(r"\[(스킬|에이전트|DMN|skill|agent)\]\s*([^,\n/]+)", a, re.IGNORECASE):
         nm = name.strip()
-        if nm in _bad:
+        if nm.lower() in _bad:
             continue
-        (skills if cat == "스킬" else agents if cat == "에이전트" else dmns).append(nm)
+        _bucket(cat).append(nm)
     # 2) "스킬: A, B" / "에이전트: C" (멀티프로세스 줄 형식)
-    for cat, val in re.findall(r"(스킬|에이전트|DMN)\s*:\s*([^/\n]+)", a):
+    for cat, val in re.findall(r"(스킬|에이전트|DMN|skill|agent)\s*:\s*([^/\n]+)", a, re.IGNORECASE):
         for nm in [x.strip() for x in val.split(",")]:
-            if nm and nm not in _bad:
-                (skills if cat == "스킬" else agents if cat == "에이전트" else dmns).append(nm)
+            if nm and nm.lower() not in _bad:
+                _bucket(cat).append(nm)
     if not (skills or agents or dmns):
         return
     room = _bpmn_work_dir()

@@ -5,6 +5,21 @@ description: 업무 프로세스/워크플로우/BPMN 을 만들거나 설계·�
 
 # BPMN Process Generation
 
+## 🌐 언어 — 사용자가 쓴 말로
+
+사용자 요청에 한글이 없고 영어로 쓰였으면, **사용자에게 보이는 글은 모두 영어로** 쓴다 —
+`write_todos` 의 5단계 이름, `request_human_input` 의 `question`·`context`·후보, 채팅 안내,
+그리고 정의 안의 이름(프로세스·역할·활동·게이트웨이·폼 라벨). 파일 이름·JSON 키·id 는 언어와 관계없이 그대로 둔다.
+한국어로 물으면 지금처럼 한국어. 이 문서의 고정 문구는 영어일 때 아래처럼 바꿔 쓴다(프론트가 이 글자로 패널을 그린다).
+
+| 한국어 | English |
+|---|---|
+| `1. 프로세스 초안 설계 & JSON 생성` · `2. 스킬·에이전트·DMN 선택 & 생성` · `3. 입력 폼 & 참조정보 생성` · `4. 프로세스 검증 & 자동 보정` · `5. 결과 통합 & 완료` | `1. Draft the process & generate JSON` · `2. Pick & create skills, agents, DMN` · `3. Generate input forms & reference info` · `4. Validate & auto-fix the process` · `5. Assemble & finish` |
+| 이대로 진행할까요? 추가하거나 바꿀 단계가 있으면 알려주세요. | Shall I proceed as drafted? Tell me if you want to add or change any steps. |
+| 이 프로세스에 추가할 항목을 골라주세요 (안 고르면 건너뜁니다) | Pick the items to add to this process (skip if none) |
+| `[스킬]` · `[에이전트]` · `[DMN]` | `[Skill]` · `[Agent]` · `[DMN]` |
+| 프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요. | I've created the process. Review it, then press Save. |
+
 ## ⛔ 단일 5단계 절차 (항상 동일 — 모드 분기 없음)
 
 이 스킬이 트리거되면 **항상 아래 5단계를 그대로** 수행한다. 산출물은 **대화
