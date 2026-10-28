@@ -84,7 +84,9 @@ async def main() -> None:
     server.mount_chat_routes(
         app,
         health_path="/health",
-        health_extra=lambda: {"agent_type": AGENT_TYPE},
+        # worktree: 방 브랜치를 펼치고 턴 끝에 커밋한다(core/storage/worktree.py). Lite 가 이걸 보고
+        # '이어서 작업'을 브랜치 위에서 돌릴지, 예전처럼 첨부로 넘길지 정한다.
+        health_extra=lambda: {"agent_type": AGENT_TYPE, "worktree": True},
     )
 
     uvicorn_server = uvicorn.Server(
