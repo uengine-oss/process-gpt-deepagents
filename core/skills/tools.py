@@ -2293,6 +2293,232 @@ def _ensure_forms_refs_skills(pd: dict, work, manifest: dict) -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# 참조정보(inputData) — 실행 엔진이 읽는 `<폼 id>.<필드>` 로 맞춘다
+# ---------------------------------------------------------------------------
+# 실행 엔진(completion get_input_data)은 inputData 를 `<폼 id>.<필드>` 로만 읽는다. 모델이 정의 초안 규격의
+# 「"inputData": ["입력 데이터명"]」을 따라 데이터 이름(「견적요청서」)을 남기면 엔진은 그 칸을 하나도 읽지 못하고
+# 바로 앞 단계의 산출물만 넘긴다. 튜토리얼 VM 의 견적 산출 에이전트가 앞 단계 폼(제품·수량)을 못 받아
+# 가격표를 찾고도 0원 견적을 낸 까닭이다.
+
+# 값이 없는 폼 컴포넌트 — 참조로 넘길 것이 없다.
+_NON_VALUE_FIELD_TYPES = frozenset({"label"})
+
+
+def _norm_data_name(value) -> str:
+    """데이터 이름 비교용 — 공백·대소문자 차이(「견적 요청서」/「견적요청서」)를 지운다."""
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def _form_field_keys(html: str) -> list[str]:
+    """폼 HTML 의 값 필드 이름 — 저장 때 form_def.fields_json 을 만드는 규칙(html_to_fields_json)과 같다."""
+    fields: list = []
+    _ensure_skill_scripts_on_path()
+    try:
+        from save_to_supabase import html_to_fields_json  # type: ignore
+
+        fields = html_to_fields_json(html or "")
+    except Exception:
+        fields = [
+            {"key": key, "type": ""}
+            for key in re.findall(r"<[a-z-]+-field\b[^>]*\bname\s*=\s*['\"]([^'\"]+)['\"]", html or "", re.I)
+        ]
+    keys: list[str] = []
+    for field in fields:
+        key = str(field.get("key") or "").strip()
+        if key and key not in keys and str(field.get("type") or "").lower() not in _NON_VALUE_FIELD_TYPES:
+            keys.append(key)
+    return keys
+
+
+def _upstream_activities(elements: list) -> dict[str, list[str]]:
+    """Activity 마다 시작에서 그 단계로 오는 길 위의 앞선 Activity id 들(흐름 순).
+
+    되돌아가는 연결(「반려 → 다시 산출」)은 뺀다 — 그 뒤 단계 폼은 처음 지날 때 아직 비어 있다.
+    """
+    by_id = {
+        str(e.get("id")): e for e in elements or []
+        if isinstance(e, dict) and e.get("id") and e.get("elementType") in ("Event", "Activity", "Gateway")
+    }
+    succ: dict[str, list[str]] = {nid: [] for nid in by_id}
+
+    def _edge(src, tgt) -> None:
+        src, tgt = str(src or ""), str(tgt or "")
+        if src in succ and tgt in succ and src != tgt and tgt not in succ[src]:
+            succ[src].append(tgt)
+
+    for e in elements or []:
+        if isinstance(e, dict) and e.get("elementType") == "Sequence":
+            _edge(e.get("source"), e.get("target"))
+    # 연결선 없이 요소의 source 로만 이은 초안도 같은 흐름으로 본다.
+    for nid, e in by_id.items():
+        if isinstance(e.get("source"), str):
+            _edge(e.get("source"), nid)
+
+    incoming = {t for ts in succ.values() for t in ts}
+    starts = [nid for nid, e in by_id.items() if "start" in str(e.get("type") or "").lower()]
+    starts += [nid for nid in by_id if nid not in incoming and nid not in starts]
+
+    # 깊이 우선으로 돌며 지금 걷는 길 위의 마디로 돌아가는 연결(되돌림)을 찾는다.
+    state: dict[str, int] = {}
+    back: set = set()
+    for root in starts + list(by_id):
+        if root in state:
+            continue
+        state[root] = 1
+        stack = [(root, iter(succ[root]))]
+        while stack:
+            node, it = stack[-1]
+            nxt = next(it, None)
+            if nxt is None:
+                state[node] = 2
+                stack.pop()
+            elif state.get(nxt) == 1:
+                back.add((node, nxt))
+            elif nxt not in state:
+                state[nxt] = 1
+                stack.append((nxt, iter(succ[nxt])))
+
+    preds: dict[str, list[str]] = {nid: [] for nid in by_id}
+    indeg = {nid: 0 for nid in by_id}
+    for src, tgts in succ.items():
+        for tgt in tgts:
+            if (src, tgt) not in back:
+                preds[tgt].append(src)
+                indeg[tgt] += 1
+    # 흐름 순(위상 정렬, 같은 차례면 정의에 적힌 순)
+    rank: dict[str, int] = {}
+    ready = [nid for nid in by_id if indeg[nid] == 0]
+    while ready:
+        nid = ready.pop(0)
+        rank[nid] = len(rank)
+        for tgt in succ[nid]:
+            if (nid, tgt) in back:
+                continue
+            indeg[tgt] -= 1
+            if indeg[tgt] == 0:
+                ready.append(tgt)
+
+    out: dict[str, list[str]] = {}
+    for nid, e in by_id.items():
+        if e.get("elementType") != "Activity":
+            continue
+        seen: set = set()
+        todo = list(preds[nid])
+        while todo:
+            cur = todo.pop()
+            if cur in seen or cur == nid:
+                continue
+            seen.add(cur)
+            todo.extend(preds[cur])
+        ups = [a for a in seen if by_id[a].get("elementType") == "Activity"]
+        out[nid] = sorted(ups, key=lambda a: rank.get(a, len(by_id)))
+    return out
+
+
+def _is_agent_step(el: dict) -> bool:
+    """에이전트가 수행하는 단계인지 — 에이전트가 붙었거나 agentMode 가 draft/complete."""
+    mode = str(el.get("agentMode") or "").strip().lower()
+    return bool(el.get("agent")) or mode in ("draft", "complete")
+
+
+def _link_input_data_refs(elements: list, forms: list[dict], old_form_ids: dict[str, str]) -> None:
+    """activity.inputData 를 실행 엔진이 읽는 `<저장 폼 id>.<필드>` 참조로 맞춘다(제자리 수정).
+
+    - `<작성 때 폼 id>.<필드>`(`check_stock.qty`, `check_stock_form.qty`, `formHandler` 옛 id)는 저장 폼 id 로.
+    - 데이터 이름(「견적요청서」)은 그 이름을 outputData 로 내는 단계(또는 그 이름의 단계) 폼의 모든 필드로.
+    - 에이전트 단계에는 앞선 모든 단계 폼의 필드를 더한다 — 사람이 낸 요청서와 앞 에이전트의 결과를 다 받아야
+      일할 수 있다(모델이 고른 참조가 모자라도).
+    - 어느 폼인지 모르는 이름은 그대로 둔다(엔진이 그 인스턴스의 완료 산출물을 넘긴다).
+    """
+    acts = [e for e in elements or [] if isinstance(e, dict) and e.get("elementType") == "Activity" and e.get("id")]
+    if not acts:
+        return
+    final_by_aid: dict[str, str] = {}
+    fields_by_aid: dict[str, list[str]] = {}
+    for form in forms or []:
+        aid = str(form.get("activity_id") or "")
+        if aid and form.get("form_id"):
+            final_by_aid[aid] = str(form["form_id"])
+            fields_by_aid[aid] = _form_field_keys(str(form.get("html") or ""))
+    if not final_by_aid:
+        return
+    final_ids = set(final_by_aid.values())
+    alias_to_final: dict[str, str] = {}
+    for aid, final in final_by_aid.items():
+        for alias in (aid, f"{aid}_form", old_form_ids.get(aid) or ""):
+            if alias and alias not in final_ids:
+                alias_to_final.setdefault(alias, final)
+    aids_longest_first = sorted(final_by_aid, key=len, reverse=True)
+
+    def _final_form(prefix: str) -> str | None:
+        p = prefix.strip()
+        if p.startswith("formHandler:"):
+            p = p[len("formHandler:"):]
+        if p in final_ids:
+            return p
+        if p in alias_to_final:
+            return alias_to_final[p]
+        base = p[: -len("_form")] if p.endswith("_form") else p
+        # `<옛 프로세스 id>_<activity id>_form` (스키마 예시의 꼴)
+        for aid in aids_longest_first:
+            if base == aid or base.endswith(f"_{aid}"):
+                return final_by_aid[aid]
+        return None
+
+    producers: dict[str, list[str]] = {}
+    for a in acts:
+        aid = str(a["id"])
+        names = [a.get("name")] + [
+            (o.get("name") if isinstance(o, dict) else o) for o in (a.get("outputData") or [])
+        ]
+        for name in names:
+            key = _norm_data_name(name)
+            if key and aid not in producers.setdefault(key, []):
+                producers[key].append(aid)
+
+    def _all_fields(aid: str) -> list[str]:
+        final = final_by_aid.get(aid)
+        return [f"{final}.{key}" for key in fields_by_aid.get(aid, [])] if final else []
+
+    upstream = _upstream_activities(elements)
+    for a in acts:
+        aid = str(a["id"])
+        linked: list[str] = []
+
+        def _add(refs) -> None:
+            for ref in refs:
+                if ref and ref not in linked:
+                    linked.append(ref)
+
+        for entry in a.get("inputData") or []:
+            raw = str((entry.get("name") if isinstance(entry, dict) else entry) or "").strip()
+            if not raw:
+                continue
+            if "." in raw:
+                prefix, field = raw.split(".", 1)
+                final = _final_form(prefix)
+                if final and field:
+                    _add([f"{final}.{field}"])
+                    continue
+                # 「견적요청서.제품명」처럼 데이터 이름에 필드를 붙인 꼴
+                named = [src for src in producers.get(_norm_data_name(prefix), []) if src != aid]
+                refs = []
+                for src in named:
+                    refs += [f"{final_by_aid[src]}.{field}"] if field in fields_by_aid.get(src, []) else _all_fields(src)
+                _add(refs or [raw])
+                continue
+            named = producers.get(_norm_data_name(raw), [])
+            if named and all(src == aid for src in named):
+                continue  # 제 산출물 이름을 입력으로 적은 것 — 읽을 앞 단계가 없다
+            refs = [ref for src in named if src != aid for ref in _all_fields(src)]
+            _add(refs or [raw])
+        if _is_agent_step(a):
+            for src in upstream.get(aid, []):
+                _add(_all_fields(src))
+        a["inputData"] = linked
+
+
 def _capture_selection_to_manifest(answer: str) -> None:
     """후보 선택 HITL 답변에서 [스킬]/[에이전트]/[DMN] 선택을 파싱해 manifest.json 에 병합한다.
 
@@ -2677,6 +2903,10 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
                                        "resolutionRule": ""})
         if seen_roles:
             pd["roles"] = seen_roles
+
+    # 참조정보: 데이터 이름·작성 때 폼 id 로 적힌 inputData 를 엔진이 읽는 `<저장 폼 id>.<필드>` 로,
+    # 에이전트 단계에는 앞선 단계 폼의 필드까지(요청서·앞 에이전트 결과를 받아야 일한다).
+    _link_input_data_refs(elements, forms, old_form_ids)
 
     # 식별 화면에서 전환한 방: 위 보강(폼·스킬·에이전트 연결)까지 마친 뒤 구조를 도출 정의로 고정한다.
     # 스킬을 붙인 사람 단계가 '완전 자동'으로 바뀌는 것도 여기서 초안 모드로 되돌린다.
