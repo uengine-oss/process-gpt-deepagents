@@ -1,0 +1,8 @@
+{
+  "skills": [],
+  "agents": [
+    {"id": "stock_agent", "activity_ids": ["check_stock"]},
+    {"id": "quote_calc_agent", "activity_ids": ["calc_quote"]}
+  ],
+  "dmn": []
+}

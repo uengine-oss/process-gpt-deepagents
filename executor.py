@@ -159,12 +159,12 @@ def _completion_error_summary(result: str, max_items: int = 3) -> str:
 def _identified_notes_text(room_dir, conversation_id: str) -> str:
     """식별 화면에서 전환한 방이면, 흐름을 그대로 두었다는 안내와 되돌린 변경의 이유를 붙인다."""
     from core.skills.identified import load_identified_definition, read_notes
-    from core.skills.tools import process_work_dirs as _process_work_dirs
+    from core.skills.tools import definition_work_dirs as _definition_dirs
 
     if not load_identified_definition(conversation_id):
         return ""
     notes: list[str] = []
-    for directory in _process_work_dirs(room_dir, conversation_id):
+    for directory in _definition_dirs(room_dir, conversation_id):
         notes.extend(n for n in read_notes(directory) if n not in notes)
     text = "\n\n인계 기록에서 도출된 흐름(단계·담당자·순서·분기)은 그대로 두고 폼·스킬·에이전트만 보강했어요."
     if notes:
@@ -2123,6 +2123,8 @@ class DeepAgentExecutor(AgentExecutor):
         # 찾아 거둔다(`_room_document_paths`). 이 표식이 없으면 지난 턴의 문서까지 다시
         # 올라가 화면에 같은 것이 여러 번 뜬다.
         turn_started_ns = time.time_ns()
+        # 이번 턴에 부른 도구 이름 — 고쳤다는 답을 확인할 때(파일만 다룬 턴인지) 쓴다.
+        turn_tool_names: set[str] = set()
 
         try:
             async for _ns, stream_evt, data in graph.astream(
@@ -2193,6 +2195,7 @@ class DeepAgentExecutor(AgentExecutor):
                                         active_tool_calls[_tc_id] = tool_name
                                         if isinstance(tool_args, dict):
                                             pending_tool_args[_tc_id] = tool_args
+                                    turn_tool_names.add(str(tool_name or ""))
                                     if tool_name == "request_human_input":
                                         pending_hitl_payload = normalize_hitl_payload(tool_args)
                                     # 파일 산출물 추적: write_file/edit_file 의 대상 경로를 기록해두고
@@ -2478,6 +2481,29 @@ class DeepAgentExecutor(AgentExecutor):
                     streamer=streamer,
                 )
 
+            # 고치기 차례에 「수정했습니다」라고만 하고 정의·산출물이 마지막으로 넘긴 때와 같으면 보류한다
+            # (VM 실측: 「이미 규정대로 … 수정했습니다」인데 그 턴에 도구 호출이 없었고 저장된 흐름이 그대로).
+            if streamer and chat_room_id and not complete_called:
+                try:
+                    from core.skills.definition_guard import unapplied_change_notice
+                    from core.skills.tools import _conv_slug as _guard_slug
+                    from core.skills.tools import tenant_workspace_root as _guard_ws
+
+                    _unapplied = await asyncio.to_thread(
+                        unapplied_change_notice,
+                        _guard_ws() / ".bpmn" / _guard_slug(chat_room_id),
+                        chat_room_id,
+                        request=f"{human_answer_stripped}\n{_user_input_text}",
+                        reply=str(raw_text or ""),
+                        tools_used=turn_tool_names,
+                    )
+                    if _unapplied:
+                        logger.warning("고쳤다는 답인데 정의·산출물이 그대로 — 보류 | room=%s", chat_room_id)
+                        raw_text = _unapplied
+                        complete_called = True  # 같은 결과를 다시 「생성했어요」로 넘기지 않는다
+                except Exception:
+                    logger.warning("고치기 반영 확인 실패(무시) | room=%s", chat_room_id, exc_info=True)
+
             # 폴백: 에이전트가 process-definition.json 은 만들었으나(이번 턴) complete 를 호출하지 않고
             # 인터럽트 없이 턴을 끝낸 경우 — 스킬 생성 등으로 step 이 소진되면 발생한다.
             # 결과 통합이 누락되므로 executor 가 직접 complete 를 호출해 최종본을 만들고 프론트에 전달한다.
@@ -2489,12 +2515,13 @@ class DeepAgentExecutor(AgentExecutor):
             definition_written_this_turn = process_json_written or workspace_write_made
             if not process_json_written and chat_room_id:
                 try:
-                    from core.skills.tools import process_work_dirs as _process_work_dirs, _conv_slug
+                    from core.skills.tools import definition_work_dirs as _definition_dirs, _conv_slug
                     from core.skills.tools import tenant_workspace_root as _tenant_ws
                     room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id)
+                    # 정의가 방 루트(.bpmn/<room>/process-definition.json)에 있어도 본다 — 못 보면 검증 없이 넘어간다
                     process_json_written = any(
                         (directory / "process-definition.json").is_file()
-                        for directory in _process_work_dirs(room_dir, chat_room_id)
+                        for directory in _definition_dirs(room_dir, chat_room_id)
                     )
                 except Exception:
                     pass
@@ -2505,7 +2532,7 @@ class DeepAgentExecutor(AgentExecutor):
                         complete_process_generation as _cpg,
                         validate_process_definition as _vpd,
                         _current_conversation_id as _ccid,
-                        process_work_dirs as _process_work_dirs,
+                        definition_work_dirs as _definition_dirs,
                         _conv_slug,
                     )
                     from core.skills.tools import tenant_workspace_root as _tenant_ws
@@ -2513,7 +2540,7 @@ class DeepAgentExecutor(AgentExecutor):
                     _ccid.set(chat_room_id or "")
                     _room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id or "")
                     _validation_failures = []
-                    for _work_dir in _process_work_dirs(_room_dir, chat_room_id or ""):
+                    for _work_dir in _definition_dirs(_room_dir, chat_room_id or ""):
                         _definition_path = _work_dir / "process-definition.json"
                         if not _definition_path.is_file():
                             continue
