@@ -549,10 +549,14 @@ async def build_agent(
     # 도구 결과의 `file` 블록 하나가 대화 이력에 남으면 이후 모든 모델 호출이 400 으로
     # 실패해 대화방을 쓸 수 없게 된다. 모델에 넘기는 사본에서 텍스트 안내로 바꾼다.
     from ..llm.tool_content_sanitizer import ToolContentBlockSanitizerMiddleware
+    # 병렬로 쓴 에이전트 파일 중 두 번째의 끝 `}` 가 빠지는 일이 되풀이됐다 — 쓰기 전에 돌려보내
+    # 같은 턴에서 다시 쓰게 한다(json_write_guard 모듈 설명).
+    from .json_write_guard import JsonWriteGuardMiddleware
 
     kwargs["middleware"] = [
         build_tool_retry_middleware(),
         ToolContentBlockSanitizerMiddleware(),
+        JsonWriteGuardMiddleware(),
         *extra_middleware,
     ]
 
