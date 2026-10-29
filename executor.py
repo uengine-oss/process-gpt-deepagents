@@ -1057,6 +1057,35 @@ def _detect_process_result(text: Any) -> dict | None:
     return _extract_output_contract(text)
 
 
+def _room_process_result(chat_room_id: str) -> dict | None:
+    """이 대화의 프로세스 폴더(`.bpmn/<room>/process-*/`)에 이번 생성이 쓴 정의로 출력계약을 만든다.
+
+    도구 입출력에서 처음 보인 계약 모양 JSON 을 그대로 보내면, 스킬 참고자료(스키마 예시
+    '휴가 신청 프로세스')나 조회한 다른 프로세스 정의를 읽은 순간 그것이 결과 카드가 되고
+    정작 이번에 만든 정의는 묻혔다. 결과는 완료(complete_process_generation)가 정리한 폴더에서만 읽는다."""
+    try:
+        from core.skills.tools import (
+            _complete_one_process,
+            _conv_slug,
+            process_work_dirs,
+            tenant_workspace_root,
+        )
+    except Exception:
+        return None
+    room = tenant_workspace_root() / ".bpmn" / _conv_slug(chat_room_id or "")
+    for directory in process_work_dirs(room, chat_room_id or ""):
+        if not (directory / "process-definition.json").is_file():
+            continue
+        try:
+            out = _complete_one_process(directory, persist=False)
+        except Exception:
+            logger.warning("프로세스 결과 계약 생성 실패 | dir=%s", directory, exc_info=True)
+            continue
+        if isinstance(out, dict) and isinstance(out.get("processDefinition"), dict):
+            return out
+    return None
+
+
 def _resolve_run_state(extras: dict, row: dict, metadata: dict) -> dict:
     """이번 요청이 이어받는 이전 turn 의 상태. 없으면 빈 dict.
 
@@ -2058,28 +2087,9 @@ class DeepAgentExecutor(AgentExecutor):
                                             "type": "plan_tools",
                                             "tools": [{"tool": tool_name, "name": tool_name, "args": tool_args}],
                                         })
-                                        # 도구 호출 인자에서 출력계약을 잡아 프론트에 process_result 카드로 전달.
-                                        # complete_process_generation 은 검증된 '출력'(tool_end)에서 잡으므로 입력으로는 띄우지 않음.
-                                        if not process_result_sent and tool_name not in ("complete_process_generation",):
-                                            # tool_args 의 raw 문자열 값들(=execute command 의 heredoc JSON 등)을
-                                            # 그대로 모아 스캔한다. json.dumps 로 감싸면 내부 JSON 이 escape 돼 못 잡는다.
-                                            _arg_strings: list[str] = []
-
-                                            def _collect_strs(v: Any) -> None:
-                                                if isinstance(v, str):
-                                                    _arg_strings.append(v)
-                                                elif isinstance(v, dict):
-                                                    for x in v.values():
-                                                        _collect_strs(x)
-                                                elif isinstance(v, list):
-                                                    for x in v:
-                                                        _collect_strs(x)
-
-                                            _collect_strs(tool_args)
-                                            _pr_in = _detect_process_result("\n".join(_arg_strings))
-                                            if _pr_in is not None:
-                                                process_result_sent = True
-                                                await streamer.send_json({"type": "process_result", "data": _pr_in})
+                                        # process_result 는 도구 입력에서 잡지 않는다 — 참고자료·다른 정의를 읽거나
+                                        # 쓰는 도중의 JSON 이 결과 카드가 됐다. 완료 뒤 방의 프로세스 폴더에서 만든다
+                                        # (_room_process_result).
                                         skill_names = _skills_from_tool_args(tool_args)
                                         if skill_names:
                                             await streamer.send_json({"type": "plan_skills", "skills": skill_names})
@@ -2150,14 +2160,13 @@ class DeepAgentExecutor(AgentExecutor):
                                             {"content": "5. 결과 통합 & 완료", "status": "completed"},
                                         ]
                                         await streamer.send_json({"type": "plan_todos", "todos": _done_todos})
-
-                                    # 도구 출력의 출력계약(JSON)을 잡아 프론트에 구조화 이벤트로
-                                    # 전달 → 생성 결과 카드(프로세스/스킬/에이전트) 렌더. 저장은 하지 않는다.
-                                    if not process_result_sent:
-                                        _pr = _detect_process_result(result_content)
-                                        if _pr is not None:
-                                            process_result_sent = True
-                                            await streamer.send_json({"type": "process_result", "data": _pr})
+                                        # 생성 결과 카드: 완료가 정리한 이 대화의 프로세스 폴더에서(저장은 하지 않는다).
+                                        # 도구 출력(read_file 한 스키마 예시, 조회한 다른 정의)에서 잡던 것은 결과가 아니다.
+                                        if not process_result_sent:
+                                            _pr = await asyncio.to_thread(_room_process_result, chat_room_id or "")
+                                            if _pr is not None:
+                                                process_result_sent = True
+                                                await streamer.send_json({"type": "process_result", "data": _pr})
 
                                 if subprocess_alias_map and tool_name == "task":
                                     _subagent_slug = pending_task_calls.pop(msg.tool_call_id, None)
@@ -2275,12 +2284,7 @@ class DeepAgentExecutor(AgentExecutor):
                 except Exception:
                     logger.warning("문서 산출물 작업 폴더 emit 실패", exc_info=True)
 
-            # 도구 출력에서 못 잡았을 때 대비: 최종 텍스트에 요약/출력계약 JSON 이 있으면 결과 카드용 이벤트 emit.
-            if streamer and not process_result_sent:
-                _pr_final = _detect_process_result(raw_text)
-                if _pr_final is not None:
-                    process_result_sent = True
-                    await streamer.send_json({"type": "process_result", "data": _pr_final})
+            # (결과 카드는 답변 본문의 JSON 에서 잡지 않는다 — 완료 뒤 프로세스 폴더에서 만든다.)
 
             interrupt_payload = extract_interrupt_payload(final_state) or pending_hitl_payload
 
@@ -2370,6 +2374,11 @@ class DeepAgentExecutor(AgentExecutor):
                             )
                         else:
                             await _reemit_room_artifacts(streamer, chat_room_id or "")
+                            if not process_result_sent:
+                                _pr = await asyncio.to_thread(_room_process_result, chat_room_id or "")
+                                if _pr is not None:
+                                    process_result_sent = True
+                                    await streamer.send_json({"type": "process_result", "data": _pr})
                             await streamer.send_json({"type": "plan_todos", "todos": [
                                 {"content": "1. 프로세스 초안 설계 & JSON 생성", "status": "completed"},
                                 {"content": "2. 스킬·에이전트·DMN 선택 & 생성", "status": "completed"},
