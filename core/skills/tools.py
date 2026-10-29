@@ -1569,6 +1569,137 @@ def _write_validation_receipt(target: Path, result: dict) -> None:
         receipt.unlink()
 
 
+# 폼 HTML 에서 닫는 태그가 없는 요소(이것만 열린 채 끝나도 된다).
+_FORM_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr",
+})
+
+
+def _form_structure_problem(html: str) -> str:
+    """폼 HTML 의 태그가 열고 닫힌 짝이 맞는지 본다. 맞으면 빈 문자열, 아니면 사람이 읽을 까닭."""
+    from html.parser import HTMLParser
+
+    class _Balance(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.stack: list[str] = []
+            self.problem = ""
+
+        def handle_starttag(self, tag, attrs):
+            if tag not in _FORM_VOID_TAGS:
+                self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            if self.problem or tag in _FORM_VOID_TAGS:
+                return
+            if tag in self.stack:
+                while self.stack:
+                    opened = self.stack.pop()
+                    if opened == tag:
+                        return
+                    self.problem = f"<{opened}> 를 닫지 않고 </{tag}> 가 왔습니다"
+                    return
+            self.problem = f"열지 않은 </{tag}> 가 있습니다"
+
+    parser = _Balance()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception as exc:  # pragma: no cover - HTMLParser 는 거의 던지지 않는다
+        return f"HTML 을 읽지 못했습니다({exc})"
+    if parser.problem:
+        return parser.problem
+    if parser.stack:
+        return "닫히지 않은 태그로 끝납니다: " + ", ".join(f"<{t}>" for t in parser.stack[-3:])
+    return ""
+
+
+def _work_file_defects(work: Path) -> list:
+    """정의 폴더의 에이전트·manifest·폼 파일이 저장에 쓸 수 있는 꼴인지 본다.
+
+    마무리(_complete_one_process)와 프론트 저장은 읽지 못한 파일을 말없이 건너뛴다. 튜토리얼 VM 에서
+    모델이 agents/quote_calc_agent.json 끝의 `}` 를 빠뜨리자 그 에이전트가 통째로 빠지고 정의에는
+    슬러그만 남았다(고른 에이전트 둘 중 하나만 저장). 정의 결함처럼 막아 모델이 고치게 한다.
+    """
+    import json as _json
+
+    defects: list = []
+
+    def _rel(path: Path) -> str:
+        try:
+            return path.relative_to(work).as_posix()
+        except ValueError:
+            return path.name
+
+    def _defect(kind: str, path: Path, detail: str) -> None:
+        defects.append({"severity": "critical", "type": kind, "file": _rel(path), "detail": detail})
+
+    def _load_json(path: Path, label: str):
+        try:
+            return True, _json.loads(path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            _defect(f"{label}_encoding", path, f"'{_rel(path)}' 을 UTF-8 로 읽을 수 없습니다. 파일을 다시 써 주세요.")
+        except ValueError as exc:
+            where = f"{exc.lineno}행 {exc.colno}열" if hasattr(exc, "lineno") else ""
+            _defect(
+                f"{label}_invalid_json", path,
+                f"'{_rel(path)}' 이 올바른 JSON 이 아닙니다({getattr(exc, 'msg', exc)}"
+                + (f", {where}" if where else "")
+                + "). 내용 전체를 다시 써 주세요(끝의 '}' 누락 등).",
+            )
+        except OSError as exc:
+            _defect(f"{label}_unreadable", path, f"'{_rel(path)}' 을 읽지 못했습니다({exc}).")
+        return False, None
+
+    agent_files = sorted((work / "agents").glob("*.json")) if (work / "agents").is_dir() else []
+    legacy = work / "agents.json"
+    if legacy.is_file():
+        agent_files.append(legacy)
+    for path in agent_files:
+        ok, obj = _load_json(path, "agent_file")
+        if not ok:
+            continue
+        if path == legacy and isinstance(obj, dict) and isinstance(obj.get("agents"), list):
+            items = obj["agents"]
+        elif isinstance(obj, list):
+            items = obj
+        else:
+            items = [obj]
+        if not items or any(not isinstance(item, dict) for item in items):
+            _defect("agent_file_shape", path, f"'{_rel(path)}' 은 에이전트 1명을 담은 JSON 객체여야 합니다.")
+            continue
+        for item in items:
+            if not str(item.get("name") or "").strip():
+                _defect("agent_file_missing_name", path,
+                        f"'{_rel(path)}' 에이전트에 name(화면에 보일 이름)이 없습니다.")
+                break
+
+    manifest = work / "manifest.json"
+    if manifest.is_file():
+        ok, obj = _load_json(manifest, "manifest")
+        if ok and not isinstance(obj, dict):
+            _defect("manifest_shape", manifest, "'manifest.json' 은 skills/agents/dmn 을 담은 JSON 객체여야 합니다.")
+
+    form_dir = work / "forms"
+    if form_dir.is_dir():
+        for path in sorted(list(form_dir.glob("*.form")) + list(form_dir.glob("*.html"))):
+            try:
+                html = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                _defect("form_encoding", path, f"폼 '{_rel(path)}' 을 UTF-8 로 읽을 수 없습니다. 다시 써 주세요.")
+                continue
+            except OSError as exc:
+                _defect("form_unreadable", path, f"폼 '{_rel(path)}' 을 읽지 못했습니다({exc}).")
+                continue
+            if not html.strip():
+                _defect("form_empty", path, f"폼 '{_rel(path)}' 이 비어 있습니다.")
+                continue
+            problem = _form_structure_problem(html)
+            if problem:
+                _defect("form_broken", path, f"폼 '{_rel(path)}' 이 깨졌습니다 — {problem}. 폼 전체를 다시 써 주세요.")
+    return defects
+
+
 def _validated_definition_defects(target: Path) -> list:
     """Return completion-blocking defects for a definition/validation receipt."""
     import json as _json
@@ -1578,6 +1709,7 @@ def _validated_definition_defects(target: Path) -> list:
     except Exception as exc:
         return [{"severity": "critical", "type": "parse_error", "detail": str(exc)}]
     _, defects = _static_process_defects(pd)
+    defects = defects + _work_file_defects(target.parent)
     if defects:
         return defects
     receipt_path = target.parent / _VALIDATION_RECEIPT
@@ -1751,6 +1883,9 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
             _atomic_write_json(target, pd)
         except Exception:
             pass
+
+    # 정의 밖 산출물(에이전트·manifest·폼)은 LLM 교정 대상이 아니다 — 결함으로 돌려 모델이 파일을 다시 쓰게 한다.
+    defects = defects + _work_file_defects(target.parent)
 
     criticals = [d for d in defects if str(d.get("severity") or "").lower() == "critical"]
     result = {
@@ -2477,7 +2612,11 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
         for af in sorted(adir.glob("*.json")):
             try:
                 obj = _json.loads(af.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as exc:
+                # 검증(_work_file_defects)이 먼저 막는다. 여기까지 왔다면 그 길을 건너뛴 호출이라 흔적을 남긴다.
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning("에이전트 파일을 읽지 못해 빠뜨림 | file=%s err=%s", af, exc)
                 continue
             if isinstance(obj, dict):
                 # 파일 1개 = 에이전트 1명. id 가 없으면 파일명(stem)을 id 로 사용.
