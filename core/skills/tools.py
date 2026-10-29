@@ -2554,8 +2554,13 @@ def _align_agent_modes(pd: dict, elements: list, agent_ids: set) -> None:
       (draft, 또는 none — none 이면 엔진이 실제 담당자로 정한다).
     - 사용자가 사람 검토를 명시적으로 요청해 단계에 humanReview: true 를 둔 경우도 draft 를 유지한다.
     """
-    agents = {str(a).strip() for a in agent_ids or () if str(a or "").strip()}
-    if not agents:
+    # 역할 endpoint 는 stock_agent, 에이전트 파일 id 는 stock-agent 처럼 밑줄·하이픈만 다른 회차가 있다 — 같은 에이전트로 본다
+    # (프론트의 슬러그 → 저장 id 변환 remapAgentRefs 도 같은 규칙). 단계에 채우는 값은 에이전트 파일의 id 로.
+    def _key(x) -> str:
+        return re.sub(r"[\s_]+", "-", str(x or "").strip().lower())
+
+    canonical = {_key(a): str(a).strip() for a in agent_ids or () if str(a or "").strip()}
+    if not canonical:
         return
     roles = {
         str(r.get("name") or "").strip(): r for r in pd.get("roles") or []
@@ -2566,14 +2571,14 @@ def _align_agent_modes(pd: dict, elements: list, agent_ids: set) -> None:
             continue
         role = roles.get(str(el.get("role") or "").strip())
         holders = _role_holders(role) if role else []
-        if not holders or not all(h in agents for h in holders):
+        if not holders or not all(_key(h) in canonical for h in holders):
             continue
         if _truthy(el.get("humanReview")):
             if str(el.get("agentMode") or "").strip().lower() in ("", "none", "null"):
                 el["agentMode"] = "draft"
             continue
         if not el.get("agent"):
-            el["agent"] = holders[0]
+            el["agent"] = canonical[_key(holders[0])]
         el["agentMode"] = "complete"
         # 이 런타임이 todolist 를 폴링할 때 쓰는 실행기 이름(server.AGENT_TYPE).
         if str(el.get("orchestration") or "").strip().lower() in ("", "none", "null"):

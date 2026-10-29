@@ -148,3 +148,19 @@ def test_agent_only_step_also_receives_the_earlier_forms(tmp_path):
     ])
     assert [ref.split(".", 1)[1] for ref in acts["calculate_quote"]["inputData"]] == ["memo"]
     assert acts["calculate_quote"]["inputData"][0].endswith("_collect_request_form.memo")
+
+
+def test_role_endpoint_differing_only_by_underscore_still_completes(tmp_path):
+    # 10-30 회차: 역할 endpoint 는 stock_checker_agent(밑줄), 에이전트 파일 id 는 stock-checker-agent(하이픈) → draft 로 남았다
+    roles = [
+        {"name": "영업담당자", "endpoint": "sales_rep", "origin": "created"},
+        {"name": "재고확인에이전트", "endpoint": "stock_checker_agent", "origin": "used"},
+    ]
+    acts = _complete(tmp_path, roles, [
+        _activity("collect_request", "영업담당자"),
+        _activity("check_stock", "재고확인에이전트", agentMode="draft"),
+    ])
+    assert acts["check_stock"]["agentMode"] == "complete"
+    # 단계에는 에이전트 파일의 id 를 넣는다(저장 때 프론트가 이 id 로 users.id 를 정한다)
+    assert acts["check_stock"]["agent"] == "stock-checker-agent"
+    assert acts["check_stock"]["orchestration"] == "deepagents"
