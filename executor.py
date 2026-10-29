@@ -23,7 +23,7 @@ from a2a.types import TaskState
 from google.protobuf.json_format import ParseDict
 
 from processgpt_agent_sdk.artifacts import download_file
-from core.chat.ui_text import asks_to_save, done_todos, reply_lang, t as ui_t
+from core.chat.ui_text import NO_DETAIL, NO_RESULT, asks_to_save, defect_line, done_todos, reply_lang, t as ui_t
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Overwrite
 from typing_extensions import override
@@ -129,31 +129,31 @@ _WS_BINARY_FILE_RE = re.compile(
 )
 
 
-def _validation_failure_summary(failures: list[dict], max_items: int = 3) -> str:
+def _validation_failure_summary(failures: list[dict], max_items: int = 3, lang: str = "ko") -> str:
     """검증 실패 목록을 사용자에게 보여줄 짧은 불릿으로 요약한다."""
     lines: list[str] = []
     for failure in failures:
         for defect in (failure.get("defects") or [])[:max_items]:
             if not isinstance(defect, dict):
                 continue
-            detail = str(defect.get("detail") or defect.get("type") or "").strip()
+            detail = defect_line(defect, lang)
             if detail:
                 lines.append(f"- {detail}")
     if not lines:
-        return "- 정의 구조 검사에서 결함이 남아 있습니다."
+        return f"- {NO_DETAIL.get(lang) or NO_DETAIL['ko']}"
     return "\n".join(lines[:max_items])
 
 
-def _completion_error_summary(result: str, max_items: int = 3) -> str:
+def _completion_error_summary(result: str, max_items: int = 3, lang: str = "ko") -> str:
     """complete_process_generation 의 "ERROR: {...}" 결과에서 사용자에게 보일 이유를 뽑는다."""
     body = result[len("ERROR:"):].strip() if result.startswith("ERROR:") else result
     try:
         obj = json.loads(body)
     except Exception:
-        return f"- {body[:300]}" if body else "- 통합 결과를 확인하지 못했습니다."
+        return f"- {body[:300]}" if body else f"- {NO_RESULT.get(lang) or NO_RESULT['ko']}"
     failures = obj.get("validation_errors") if isinstance(obj, dict) else None
     if isinstance(failures, list) and failures:
-        return _validation_failure_summary(failures, max_items)
+        return _validation_failure_summary(failures, max_items, lang)
     return f"- {obj.get('message') if isinstance(obj, dict) else body}"
 
 
@@ -2545,7 +2545,7 @@ class DeepAgentExecutor(AgentExecutor):
                         )
                         raw_text = (
                             ui_t("validation_hold", _ui_lang) + "\n"
-                            + _validation_failure_summary(_validation_failures)
+                            + _validation_failure_summary(_validation_failures, lang=_ui_lang)
                             + "\n" + ui_t("validation_hold_tail", _ui_lang)
                         )
                     else:
@@ -2555,7 +2555,7 @@ class DeepAgentExecutor(AgentExecutor):
                         if str(_cres or "").startswith("ERROR"):
                             raw_text = (
                                 ui_t("integration_hold", _ui_lang) + "\n"
-                                + _completion_error_summary(str(_cres))
+                                + _completion_error_summary(str(_cres), lang=_ui_lang)
                                 + "\n" + ui_t("retry_tail", _ui_lang)
                             )
                         else:

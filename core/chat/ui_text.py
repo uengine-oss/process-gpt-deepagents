@@ -64,6 +64,32 @@ DONE_TODOS: dict[str, list[str]] = {
     ],
 }
 
+# 보류 안내 아래 붙는 결함 줄 — 검사기는 detail 을 한국어로만 쓴다(에이전트가 읽고 고치는 용도)
+DEFECT_TEXT_EN: dict[str, str] = {
+    "validation_required": "There's no passing validate_process_definition record yet.",
+    "definition_changed_after_validation": "process-definition.json changed after validation, so it has to be validated again.",
+}
+NO_DETAIL = {
+    "ko": "정의 구조 검사에서 결함이 남아 있습니다.",
+    "en": "The definition check still reports defects.",
+}
+NO_RESULT = {
+    "ko": "통합 결과를 확인하지 못했습니다.",
+    "en": "Couldn't read the result of putting the files together.",
+}
+
+
+def defect_line(defect: dict, lang: str) -> str:
+    """결함 하나를 사용자에게 보일 한 줄로. 영어면 아는 종류는 영어 문장, 모르는 종류의 한국어 detail 은 type 으로."""
+    detail = str(defect.get("detail") or defect.get("type") or "").strip()
+    if lang != "en":
+        return detail
+    kind = str(defect.get("type") or "").strip()
+    if kind in DEFECT_TEXT_EN:
+        return DEFECT_TEXT_EN[kind]
+    return kind if _HANGUL.search(detail) and kind else detail
+
+
 # 이미 저장 안내가 들어 있는지(에이전트가 스스로 썼는지) — 두 언어 모두
 _SAVE_MARKERS = ("확인 후 저장", "press Save")
 

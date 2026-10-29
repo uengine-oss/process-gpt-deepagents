@@ -54,3 +54,10 @@ def test_english_request_gets_reply_language_rule():
     from core.chat.ui_text import t
     assert "Reply in English" in t("reply_language_rule", "en")
     assert t("reply_language_rule", "ko") == ""
+
+
+def test_hold_reasons_in_english():
+    from core.chat.ui_text import defect_line
+    assert defect_line({"type": "validation_required", "detail": "validate_process_definition 검증 통과 기록이 없습니다."}, "en").startswith("There's no passing")
+    assert defect_line({"type": "lane_overlap", "detail": "레인이 겹칩니다."}, "en") == "lane_overlap"
+    assert defect_line({"type": "lane_overlap", "detail": "레인이 겹칩니다."}, "ko") == "레인이 겹칩니다."
