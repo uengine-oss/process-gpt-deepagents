@@ -21,6 +21,11 @@
 저장용 최종 form id(`<프로세스uuid>_<activity_id>_form`)는 마무리 단계가 자동으로 치환하므로
 **직접 uuid 를 붙이지 마라.**
 
+**데이터 이름(`outputData` 의 「견적요청서」 같은 말)은 참조가 아니다.** 실행 엔진은 `<form_id>.<field_name>`
+만 읽는다. 이름만 적으면 그 단계는 앞 단계 폼 값을 하나도 받지 못하고(엔진은 바로 앞 단계 산출물만 넘긴다),
+에이전트 단계는 「입력 데이터에 제품명, 수량 등의 정보가 없어…」처럼 일을 못 한다. 마무리 단계가 남은 이름을 그
+이름을 내는 단계 폼의 모든 필드로 바꿔 두긴 하지만, 처음부터 필드 참조로 쓴다.
+
 ---
 
 ## 후보는 "선행 태스크"의 폼 필드만
@@ -39,9 +44,22 @@
 - 후보(선행 폼 필드) 중 **이 태스크 수행에 참고하면 좋은 것**만 고른다. 불필요한 참조는 넣지 않는다.
 - 적절한 게 분명치 않으면 **선행 후보 전체**를 넣는 폴백도 허용(과하지 않게 상한 내에서).
 - 첫 Activity(선행 없음)는 `inputData: []`.
+- **에이전트 단계**(`agent` 가 있거나 `agentMode` 가 `draft`/`complete`)는 앞선 사람 단계 폼(요청서 등)의 **모든 필드**와
+  바로 앞 에이전트 단계 폼의 필드를 넣는다. 에이전트는 화면을 보지 못하고 이 값만 받는다 — 제품·수량·설치 지역처럼
+  계산에 필요한 값이 하나라도 빠지면 지어내거나 0으로 낸다. (마무리 단계도 앞선 단계 폼 필드를 빠짐없이 더한다.)
 
 ```json
 "inputData": ["apply_leave.start_date", "apply_leave.reason"]
+```
+
+에이전트 단계 예 — 견적 요청 접수(사람) → 재고 확인(에이전트) → 견적 산출(에이전트):
+
+```json
+"inputData": [
+  "collect_request.customer_company", "collect_request.products_quantities",
+  "collect_request.delivery_location", "collect_request.desired_date",
+  "check_stock.product_name", "check_stock.available_qty", "check_stock.can_meet_deadline"
+]
 ```
 
 ---
