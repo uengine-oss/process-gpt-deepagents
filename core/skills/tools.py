@@ -2519,6 +2519,67 @@ def _link_input_data_refs(elements: list, forms: list[dict], old_form_ids: dict[
         a["inputData"] = linked
 
 
+# ---------------------------------------------------------------------------
+# agentMode — 역할을 누가 맡는지에 맞춘다(실행 엔진의 담당자 규칙과 같게)
+# ---------------------------------------------------------------------------
+# 실행 엔진(completion determine_agent_mode)은 정의의 agentMode 가 있으면 그것을 따르고, 없을 때만 담당자로
+# 정한다 — 에이전트만 → COMPLETE, 사람과 에이전트 → DRAFT, 사람만 → 없음. 마무리는 에이전트를 붙인 단계를
+# 늘 draft 로 두어서, 역할을 에이전트만 맡은 단계는 초안이 끝나도 확인·제출할 사람이 없어 멈췄다(튜토리얼 VM
+# 견적 산출 — 화면은 담당자 본인에게만 제출을 연다, WorkItem.vue isOwnWorkItem).
+
+def _truthy(value) -> bool:
+    return value is True or str(value or "").strip().lower() in ("true", "yes", "1", "y")
+
+
+def _role_holders(role: dict) -> list[str]:
+    """역할을 맡는 담당자 식별자 — endpoint(문자열·쉼표 목록·배열), 비었으면 default."""
+    def _values(value) -> list[str]:
+        if isinstance(value, dict):
+            value = value.get("id") or value.get("endpoint") or ""
+        if isinstance(value, list):
+            return [v for item in value for v in _values(item)]
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return []
+
+    return _values(role.get("endpoint")) or _values(role.get("default"))
+
+
+def _align_agent_modes(pd: dict, elements: list, agent_ids: set) -> None:
+    """역할을 에이전트만 맡는 단계는 agentMode=complete 로(제자리 수정).
+
+    - 역할 endpoint 가 모두 에이전트(이 정의의 agents/*.json · manifest · activity.agent)면 complete.
+      단계에 agent 가 비었으면 그 역할의 에이전트를 넣는다.
+    - 사람도 그 역할을 맡거나(endpoint 에 사람·사람 역할이 있음) 역할 담당이 정해지지 않았으면 그대로 둔다
+      (draft, 또는 none — none 이면 엔진이 실제 담당자로 정한다).
+    - 사용자가 사람 검토를 명시적으로 요청해 단계에 humanReview: true 를 둔 경우도 draft 를 유지한다.
+    """
+    agents = {str(a).strip() for a in agent_ids or () if str(a or "").strip()}
+    if not agents:
+        return
+    roles = {
+        str(r.get("name") or "").strip(): r for r in pd.get("roles") or []
+        if isinstance(r, dict) and str(r.get("name") or "").strip()
+    }
+    for el in elements or []:
+        if not isinstance(el, dict) or el.get("elementType") != "Activity":
+            continue
+        role = roles.get(str(el.get("role") or "").strip())
+        holders = _role_holders(role) if role else []
+        if not holders or not all(h in agents for h in holders):
+            continue
+        if _truthy(el.get("humanReview")):
+            if str(el.get("agentMode") or "").strip().lower() in ("", "none", "null"):
+                el["agentMode"] = "draft"
+            continue
+        if not el.get("agent"):
+            el["agent"] = holders[0]
+        el["agentMode"] = "complete"
+        # 이 런타임이 todolist 를 폴링할 때 쓰는 실행기 이름(server.AGENT_TYPE).
+        if str(el.get("orchestration") or "").strip().lower() in ("", "none", "null"):
+            el["orchestration"] = "deepagents"
+
+
 def _capture_selection_to_manifest(answer: str) -> None:
     """후보 선택 HITL 답변에서 [스킬]/[에이전트]/[DMN] 선택을 파싱해 manifest.json 에 병합한다.
 
@@ -2903,6 +2964,15 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
                                        "resolutionRule": ""})
         if seen_roles:
             pd["roles"] = seen_roles
+
+    # 역할을 에이전트만 맡는 단계는 complete — 초안을 제출할 사람이 없다(엔진의 담당자 규칙과 같게).
+    _agent_ids = {str(a.get("id")) for a in agents if isinstance(a, dict) and a.get("id")}
+    _agent_ids |= {
+        str(ag.get("id") or "").strip() for ag in (manifest.get("agents") or [])
+        if isinstance(ag, dict) and str(ag.get("id") or "").strip()
+    }
+    _agent_ids |= {str(el.get("agent")) for el in elements if isinstance(el, dict) and el.get("agent")}
+    _align_agent_modes(pd, elements, _agent_ids)
 
     # 참조정보: 데이터 이름·작성 때 폼 id 로 적힌 inputData 를 엔진이 읽는 `<저장 폼 id>.<필드>` 로,
     # 에이전트 단계에는 앞선 단계 폼의 필드까지(요청서·앞 에이전트 결과를 받아야 일한다).
