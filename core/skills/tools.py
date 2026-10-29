@@ -2725,6 +2725,13 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
                 if isinstance(_el, dict) and not (_el.get("name") or "").strip():
                     _el["name"] = _el.get("id") or _el.get("name") or ""
 
+    # 이 정의를 만든 대화의 지식 베이스 자료(문서와 그 폴더)를 정의와 에이전트 단계에 남긴다 —
+    # 실행 때 단계 에이전트가 같은 자료(규정 옆의 가격표 등)를 찾는다. flatten 이 모르는 키는 버리므로
+    # 원본(pd)에 모델이 단계별로 적어 둔 값은 여기서 되살린다.
+    from core.rag.process_knowledge import stamp_definition as _stamp_knowledge
+
+    _stamp_knowledge(flat, source=pd)
+
     # 최종 flattened 정의를 process-definition.json 에 그대로 기록(파일 UI·저장이 이 최종본을 본다)
     if persist:
         try:
