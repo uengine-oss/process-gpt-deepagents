@@ -90,6 +90,12 @@ from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
 from core.deterministic import MODE_UNDO_PENDING, try_deterministic_execution
+from core.rag.process_knowledge import (
+    chat_selection as _kb_chat_selection,
+    knowledge_note as _kb_note,
+    prepare_task_knowledge,
+    set_generation_knowledge,
+)
 # 우리 기능(프로세스 생성 HITL 캡처/이름도출)에서 사용하는 contextvar — incoming 에는 없으나 유지.
 from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
@@ -1547,6 +1553,17 @@ class DeepAgentExecutor(AgentExecutor):
                     "chat_room start upsert 실패 | room_id=%s", chat_room_id, exc_info=True
                 )
 
+        # 할 일 실행 단계가 검색할 지식 베이스 문서. 채팅은 사용자가 고른 자료가 범위지만 할 일에는
+        # 고를 사람이 없다 — 정의에 남긴 자료(단계 → 정의)를 쓰고, 없으면 지식 베이스 전체로 폴백한다.
+        task_knowledge: list[dict] = []
+        task_knowledge_origin = ""
+        if not is_chat:
+            task_knowledge, task_knowledge_origin = await prepare_task_knowledge(
+                tenant_id=tenant_id,
+                proc_def_id=current_proc_def_id,
+                activity_id=activity_id,
+            )
+
         # [InputData] 섹션의 큰 필드를 workspace 파일로 오프로드해 초기 LLM 컨텍스트 크기를 줄인다.
         # 피드백 재작업(FB_REQUESTED)이면 feedback 배열의 가장 최근 항목의 content만 추출해
         # 메시지를 구성한다(build_user_message 미사용 — 소스/폼 형식 안내가 재작업 지시와 섞이지 않게).
@@ -1589,6 +1606,8 @@ class DeepAgentExecutor(AgentExecutor):
                 suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
                 agents=_exclude_root_profile(agents),
             )
+        if task_knowledge:
+            user_message = f"{_kb_note(task_knowledge, task_knowledge_origin)}\n\n{user_message}"
         pinned_skills = [_forced_skill_name] if _forced_skill_name else []
         recent_msgs = collect_recent_messages(extras) if is_chat else []
         # 인계로 받은 방이면 앞선 방들의 대화를 이력으로 싣는다(받은 방 화면의 '이전 대화'와 같은 규칙).
@@ -1982,9 +2001,15 @@ class DeepAgentExecutor(AgentExecutor):
             _kid = str(_kid).strip()
             if _kid:
                 knowledge_doc_ids.append(_kid)
+        # 할 일 실행: 정의에 남긴 자료(또는 지식 베이스 전체 폴백)도 검색 범위로.
+        knowledge_doc_ids += [d["id"] for d in task_knowledge]
         # memento 청크의 file_id 는 storage 경로(예: 'files/<uuid>.pdf') 다.
         # 프론트가 publicURL/sign URL 을 보내도 storage 경로로 정규화해 매칭시킨다.
         knowledge_doc_ids = _normalize_doc_ids(knowledge_doc_ids)
+        if is_chat:
+            # 이번 턴이 프로세스를 만들면 마무리(_complete_one_process)가 이 선택을 정의와
+            # 에이전트 단계에 남긴다 — 실행 때 그 단계가 같은 자료를 찾는다.
+            set_generation_knowledge(_kb_chat_selection(metadata, extras, _normalize_doc_id))
         logger.info(
             "knowledge_doc_ids 구성 | n=%d ids=%s",
             len(knowledge_doc_ids), knowledge_doc_ids[:5],
