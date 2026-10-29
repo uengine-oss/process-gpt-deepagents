@@ -2125,6 +2125,9 @@ class DeepAgentExecutor(AgentExecutor):
         turn_started_ns = time.time_ns()
         # 이번 턴에 부른 도구 이름 — 고쳤다는 답을 확인할 때(파일만 다룬 턴인지) 쓴다.
         turn_tool_names: set[str] = set()
+        # 이번 턴 끝에 결과 전달을 보류했으면 그 사유({"kind", "failures"|"error"}) — 턴이 끝날 때
+        # 모델의 대화 기록에 남겨 다음 턴의 모델이 보류와 결함을 알게 한다(core/chat/delivery_hold.py).
+        delivery_hold: dict[str, Any] | None = None
 
         try:
             async for _ns, stream_evt, data in graph.astream(
@@ -2501,6 +2504,7 @@ class DeepAgentExecutor(AgentExecutor):
                         logger.warning("고쳤다는 답인데 정의·산출물이 그대로 — 보류 | room=%s", chat_room_id)
                         raw_text = _unapplied
                         complete_called = True  # 같은 결과를 다시 「생성했어요」로 넘기지 않는다
+                        delivery_hold = {"kind": "unapplied", "failures": []}
                 except Exception:
                     logger.warning("고치기 반영 확인 실패(무시) | room=%s", chat_room_id, exc_info=True)
 
@@ -2560,6 +2564,7 @@ class DeepAgentExecutor(AgentExecutor):
                         # 정상적인 실패 경로다(예외 아님). 예외로 올려 스택트레이스를 남기는
                         # 대신 사용자에게 무엇이 걸렸는지 한 줄로 알려주고 이 턴을 마친다.
                         complete_called = True  # 이번 턴의 무검증 재시도 방지
+                        delivery_hold = {"kind": "validation", "failures": _validation_failures}
                         logger.error(
                             "auto-complete 검증 실패 | room=%s failures=%s",
                             chat_room_id,
@@ -2574,6 +2579,8 @@ class DeepAgentExecutor(AgentExecutor):
                         _cres = await asyncio.to_thread(_cpg.invoke, {})
                         logger.info("auto-complete | room=%s result=%.140s", chat_room_id, str(_cres))
                         complete_called = True
+                        if str(_cres or "").startswith("ERROR"):
+                            delivery_hold = {"kind": "integration", "error": str(_cres)}
                         if str(_cres or "").startswith("ERROR"):
                             raw_text = (
                                 "프로세스 산출물을 통합하는 중 문제가 생겨 결과 전달을 보류했어요.\n"
@@ -2625,6 +2632,14 @@ class DeepAgentExecutor(AgentExecutor):
                         raw_text = "스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요."
                 except Exception:
                     logger.exception("단독 스킬 산출물 재전송 실패")
+
+            # 결과 전달을 보류한 턴: 화면에는 보류 안내가 나가지만 체크포인트에는 모델 자신의 마지막 답
+            # (「…성공적으로 생성되었습니다」)이 남고, 다음 턴은 새 사용자 메시지만 이어 붙인다. 보류 사유와
+            # 결함을 대화 기록에 덧붙여 다음 턴의 모델이 그 파일부터 고치게 한다. 보류 없는 턴은 그대로.
+            if delivery_hold is not None and checkpoint_thread_id:
+                from core.chat.delivery_hold import record_delivery_hold
+
+                await record_delivery_hold(graph, checkpoint_thread_id, delivery_hold, str(raw_text or ""))
 
             # 빈 턴 방지: 모델이 아무 텍스트도 내지 않고(도구 호출도 없이) 끝난 경우
             # 빈 어시스턴트 메시지가 저장돼 사용자 화면에는 "답변했는데 반응이 없는" 상태로 보인다.

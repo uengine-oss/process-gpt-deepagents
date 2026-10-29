@@ -106,6 +106,10 @@
 - 폼은 `<프로세스폴더>/forms/<activity_id>.form` 로 저장(`write_file`).
 - (참조정보 단계를 위해) 각 폼의 필드 `name` 목록을 기억해 둔다 — 참조정보(08)가
   `<activity_id>.<field_name>` 형식을 쓴다.
+- **한 파일에 호출 하나**: `process-definition.json` 의 `tool` 값은 한 번의 `edit_file`(또는 정의 전체를 한 번 `write_file`)로
+  모두 바꾼다. 같은 파일을 고치는 `edit_file` 여러 개를 한 응답의 병렬 호출로 묶지 마라 — 「parallel file mutations to the
+  same path are not allowed」로 거절되고, 다시 시도하면 바뀐 내용에서 원래 문자열을 못 찾는다(「String not found」).
+  폼 파일(`forms/*.form`)도 응답마다 하나씩 쓰는 것이 안전하다.
 
 ---
 
