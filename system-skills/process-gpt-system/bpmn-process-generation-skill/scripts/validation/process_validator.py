@@ -578,13 +578,15 @@ class ProcessValidator:
         # 게이트웨이가 아닌 노드가 후행 경로를 2개 이상 가지면 = 게이트웨이 없는 분기(fan-out).
         # 엔진은 비게이트웨이 노드의 모든 후행 시퀀스를 동시에 진행시키므로, 흐름이
         # 의도치 않게 여러 갈래로 갈라져 프로세스가 정상 종료하지 못한다.
+        # → critical: 경고로 두면 검증 도구는 통과시키는데 완료 관문은 막아, 모델은 멈추고 사용자는
+        #   고칠 수 없는 「결과 전달을 보류」에 갇혔다(승인 단계가 게이트웨이 없이 승인/반려로 갈라진 회차).
         gw_ids = {str(g.get("id") or "") for g in gateways if g.get("id")}
         for nid, outs in adj.items():
             if nid in gw_ids or nid in start_ids:
                 continue
             if len(outs) > 1:
                 defects.append(_defect(
-                    WARNING, "uncontrolled_split",
+                    CRITICAL, "uncontrolled_split",
                     f"노드 '{nid}' 가 게이트웨이 없이 {len(outs)}개 경로로 분기합니다 "
                     f"(→ {sorted(outs)}). 분기는 반드시 게이트웨이를 거쳐야 합니다. "
                     f"이대로면 실행 시 여러 갈래로 동시에 진행되어 흐름이 깨집니다.",

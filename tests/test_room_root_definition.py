@@ -66,7 +66,8 @@ def test_missing_start_sequence_is_rebuilt_from_source():
     normalized, defects = tools._static_process_defects(definition)
 
     assert ("start", "request_quote") in _sequences(normalized)
-    assert not [d for d in defects if d["severity"] == "critical"]
+    # 도달 불가가 사라진다. 남는 critical 은 이 회차의 게이트웨이 없는 승인/반려 갈라짐뿐이다.
+    assert {d["type"] for d in defects if d["severity"] == "critical"} == {"uncontrolled_split"}
 
 
 def test_stale_source_does_not_add_a_second_incoming_edge():
@@ -87,17 +88,19 @@ def test_room_root_definition_is_validated_and_completed(room):
     definition_file = room / "process-definition.json"
     assert tools.definition_work_dirs(room, ROOM) == [room]
 
-    # 깨진 에이전트 파일은 검증에서 막힌다(시작 연결선은 채워져 흐름 critical 은 더 없다).
+    # 깨진 에이전트 파일과 게이트웨이 없는 승인/반려 갈라짐이 검증에서 막힌다(시작 연결선은 채워져 도달 불가는 없다).
     first = _validate(definition_file)
     assert first["passed"] is False
     criticals = [d for d in first["remaining_defects"] if d["severity"] == "critical"]
-    assert [d["type"] for d in criticals] == ["agent_file_invalid_json"]
+    assert {d["type"] for d in criticals} == {"agent_file_invalid_json", "uncontrolled_split"}
 
     agent_file = room / "agents" / "quote_calc_agent.json"
     agent_file.write_text(agent_file.read_text(encoding="utf-8") + "}\n", encoding="utf-8")
-    assert _validate(definition_file)["passed"] is True
+    second = _validate(definition_file)
+    assert second["passed"] is False
+    assert {d["type"] for d in second["remaining_defects"] if d["severity"] == "critical"} == {"uncontrolled_split"}
 
-    # 이 회차의 승인 단계는 게이트웨이 없이 승인/반려로 갈라진다 — 완료 관문은 이 경고도 막는다(기존 규칙).
+    # 갈라짐이 남아 있으면 완료 관문도 막는다 — 검증 도구와 같은 결함이라 모델이 검증 단계에서 고친다.
     held = tools.complete_process_generation.invoke({})
     assert held.startswith("ERROR:")
     blockers = json.loads(held[len("ERROR:"):])["validation_errors"][0]["defects"]
