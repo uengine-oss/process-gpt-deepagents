@@ -3080,6 +3080,15 @@ def complete_process_generation() -> str:
     if not processes:
         return ("ERROR: 처리할 process-definition.json 이 없습니다. "
                 "각 프로세스를 `.bpmn/<room>/process-<id>/process-definition.json` 으로 생성했는지 확인하세요.")
+    # 넘긴 결과의 지문 — 다음 고치기 차례가 「고쳤다」고만 하고 바꾸지 않았는지 이것과 견준다.
+    try:
+        from .definition_guard import record_delivered
+
+        record_delivered(room, proc_dirs)
+    except Exception as exc:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning("결과 지문 기록 실패(무시) | room=%s err=%s", room, exc)
     return _json.dumps({"count": len(processes), "processes": processes}, ensure_ascii=False)
 
 

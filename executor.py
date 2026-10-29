@@ -2123,6 +2123,8 @@ class DeepAgentExecutor(AgentExecutor):
         # 찾아 거둔다(`_room_document_paths`). 이 표식이 없으면 지난 턴의 문서까지 다시
         # 올라가 화면에 같은 것이 여러 번 뜬다.
         turn_started_ns = time.time_ns()
+        # 이번 턴에 부른 도구 이름 — 고쳤다는 답을 확인할 때(파일만 다룬 턴인지) 쓴다.
+        turn_tool_names: set[str] = set()
 
         try:
             async for _ns, stream_evt, data in graph.astream(
@@ -2193,6 +2195,7 @@ class DeepAgentExecutor(AgentExecutor):
                                         active_tool_calls[_tc_id] = tool_name
                                         if isinstance(tool_args, dict):
                                             pending_tool_args[_tc_id] = tool_args
+                                    turn_tool_names.add(str(tool_name or ""))
                                     if tool_name == "request_human_input":
                                         pending_hitl_payload = normalize_hitl_payload(tool_args)
                                     # 파일 산출물 추적: write_file/edit_file 의 대상 경로를 기록해두고
@@ -2477,6 +2480,29 @@ class DeepAgentExecutor(AgentExecutor):
                     job_id=job_id,
                     streamer=streamer,
                 )
+
+            # 고치기 차례에 「수정했습니다」라고만 하고 정의·산출물이 마지막으로 넘긴 때와 같으면 보류한다
+            # (VM 실측: 「이미 규정대로 … 수정했습니다」인데 그 턴에 도구 호출이 없었고 저장된 흐름이 그대로).
+            if streamer and chat_room_id and not complete_called:
+                try:
+                    from core.skills.definition_guard import unapplied_change_notice
+                    from core.skills.tools import _conv_slug as _guard_slug
+                    from core.skills.tools import tenant_workspace_root as _guard_ws
+
+                    _unapplied = await asyncio.to_thread(
+                        unapplied_change_notice,
+                        _guard_ws() / ".bpmn" / _guard_slug(chat_room_id),
+                        chat_room_id,
+                        request=f"{human_answer_stripped}\n{_user_input_text}",
+                        reply=str(raw_text or ""),
+                        tools_used=turn_tool_names,
+                    )
+                    if _unapplied:
+                        logger.warning("고쳤다는 답인데 정의·산출물이 그대로 — 보류 | room=%s", chat_room_id)
+                        raw_text = _unapplied
+                        complete_called = True  # 같은 결과를 다시 「생성했어요」로 넘기지 않는다
+                except Exception:
+                    logger.warning("고치기 반영 확인 실패(무시) | room=%s", chat_room_id, exc_info=True)
 
             # 폴백: 에이전트가 process-definition.json 은 만들었으나(이번 턴) complete 를 호출하지 않고
             # 인터럽트 없이 턴을 끝낸 경우 — 스킬 생성 등으로 step 이 소진되면 발생한다.
