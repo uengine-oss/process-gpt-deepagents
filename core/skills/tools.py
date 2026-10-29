@@ -2383,6 +2383,27 @@ def _capture_selection_to_manifest(answer: str) -> None:
             pass
 
 
+# 이 런타임이 todolist 를 폴링할 때 쓰는 실행기 이름(server.AGENT_TYPE 과 같아야 한다).
+# 생성한 프로세스의 에이전트 단계는 이 값을 들고 있어야 실행 때 이 런타임이 집는다.
+_AGENT_ORCH = "deepagents"
+# 설치에 소비자가 없는 실행기 이름. 참고 문서의 옛 규칙(에이전트만 배정 → crewai-action)을 따랐거나
+# 엔진 옛 기본값(crewai-deep-research)을 적은 정의도, 그대로 두면 단계가 만들어지기만 하고 아무도 집지 않는다.
+_RETIRED_AGENT_ORCH = frozenset({"crewai-action", "crewai-deep-research"})
+
+
+def _assign_agent_orchestration(elements: list) -> None:
+    """에이전트·스킬이 맡은(agentMode 가 none 이 아닌) Activity 의 orchestration 을 이 런타임으로 맞춘다."""
+    for el in elements or []:
+        if not isinstance(el, dict) or el.get("elementType") != "Activity":
+            continue
+        mode = str(el.get("agentMode") or "").strip().lower()
+        if not (el.get("agent") or el.get("skills") or mode not in ("", "none", "null")):
+            continue
+        current = str(el.get("orchestration") or "").strip()
+        if current.lower() in ("", "none", "null") or current in _RETIRED_AGENT_ORCH:
+            el["orchestration"] = _AGENT_ORCH
+
+
 def _complete_one_process(work, *, persist: bool = True) -> dict | None:
     """한 프로세스 폴더(work)의 산출물을 ProcessGPT 규격(flattened+통합)으로 조립하고
     process-definition.json 에 최종본을 기록한다. 출력계약 dict 반환(없으면 None)."""
@@ -2664,6 +2685,9 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
             pd["dmn_decisions"] = _dmn_dec
         if _dmn_rules:
             pd["dmn_rules"] = _dmn_rules
+
+    # 에이전트 단계의 실행기 — 비었거나 소비자 없는 옛 이름이면 이 런타임(deepagents)으로.
+    _assign_agent_orchestration(elements)
 
     # roles 보강(없으면 elements 의 role 들로 생성) — 예시 스키마의 roles[] 형식
     if not isinstance(pd.get("roles"), list) or not pd.get("roles"):
