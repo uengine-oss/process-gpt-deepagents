@@ -445,6 +445,10 @@ class DockerSandboxBackend(BaseSandbox):
                 if not self._contract_matches(old):
                     # 옛 구성(볼륨 전체 마운트·모델 키 env)으로 떠 있는 컨테이너다.
                     logger.info("sandbox 재생성: %s 의 구성이 %s 가 아님", name, SANDBOX_CONTRACT)
+                elif not self._workspace_alive(old):
+                    # 다시 설치(볼륨 삭제)한 뒤에도 남은 컨테이너다. 지워진 작업 볼륨을 물고 있어 모든 exec 가
+                    # "current working directory is outside of container mount namespace root" 로 실패한다.
+                    logger.info("sandbox 재생성: %s 의 %s 에 들어갈 수 없음", name, _CONTAINER_WORKSPACE)
                 elif self._network_matches(old, network):
                     self._container = old
                     # 이전 실행에서 살아남은 컨테이너에도 safe.directory 를 보장한다.
@@ -498,6 +502,15 @@ class DockerSandboxBackend(BaseSandbox):
         except Exception:
             return False
         return labels.get(_CONTRACT_LABEL) == SANDBOX_CONTRACT
+
+    @staticmethod
+    def _workspace_alive(container) -> bool:
+        """컨테이너 안에서 작업 폴더에 실제로 들어갈 수 있는지. 확인하지 못하면 재사용하지 않는다."""
+        try:
+            result = container.exec_run(["sh", "-c", f"cd {_CONTAINER_WORKSPACE} && ls >/dev/null"])
+        except Exception:
+            return False
+        return getattr(result, "exit_code", 1) == 0
 
     @staticmethod
     def _network_matches(container, network: str | None) -> bool:
