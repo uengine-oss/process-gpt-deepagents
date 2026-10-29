@@ -36,6 +36,11 @@ TEXT: dict[str, dict[str, str]] = {
         "ko": "다시 시도하거나 수정할 부분을 알려주세요.",
         "en": "Try again, or tell me what to change.",
     },
+    # 에이전트 입력 끝에 붙이는 언어 지시(영어일 때만 쓴다)
+    "reply_language_rule": {
+        "ko": "",
+        "en": "[Language]\nThe user wrote in English. Reply in English — headings, tables, questions and summaries too.",
+    },
     "finalize_error": {
         "ko": "프로세스 마무리 처리 중 오류가 발생했어요. 잠시 후 다시 시도하거나 수정할 부분을 알려주세요.",
         "en": "An error occurred while finishing the process. Try again in a moment, or tell me what to change.",

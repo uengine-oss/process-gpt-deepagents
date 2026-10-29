@@ -1636,6 +1636,10 @@ class DeepAgentExecutor(AgentExecutor):
             _ui_lang = reply_lang(original_request)
         except Exception:
             pass
+        # 영어로 물었으면 답도 영어로. 사용자 글 뒤에 붙는 한국어 시스템 블록·지식 베이스 안내 때문에
+        # 「Reply in Korean unless …」 기본 지시를 따라 한국어로 답하곤 했다(영어 모드 VM 실측).
+        if _ui_lang == "en":
+            user_message = f"{user_message}\n\n{ui_t('reply_language_rule', _ui_lang)}"
         # 후보 선택 HITL 답변이면([스킬]/[에이전트]/[DMN]) manifest 로 캡처(에이전트가 안 써도 스킬/연결 보장).
         # process-* 폴더는 1단계에서 이미 생성됨(이번 턴은 후보선택 resume). 방은 contextvar(위에서 set)로 찾는다.
         try:

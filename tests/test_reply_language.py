@@ -48,3 +48,9 @@ def test_reply_lang_ignores_system_blocks():
            "\n[InputData]\n{\"files\": []}")
     assert ui_text.reply_lang(msg) == "en"
     assert ui_text.reply_lang("견적 프로세스를 만들어 줘\n[ExecutionPolicy]\n- policy") == "ko"
+
+
+def test_english_request_gets_reply_language_rule():
+    from core.chat.ui_text import t
+    assert "Reply in English" in t("reply_language_rule", "en")
+    assert t("reply_language_rule", "ko") == ""
