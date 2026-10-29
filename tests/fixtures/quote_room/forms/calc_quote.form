@@ -1,0 +1,12 @@
+<section>
+  <div class='row' name='quote_calc_layout' alias='견적 산출 결과' is_multidata_mode='false'>
+    <div class='col-sm-6'>
+      <text-field name='total_amount' alias='견적 총액(부가세 별도)' type='number' disabled='false' readonly='false'></text-field>
+      <text-field name='discount' alias='할인액' type='number' disabled='false' readonly='false'></text-field>
+      <text-field name='install_cost' alias='설치비' type='number' disabled='false' readonly='false'></text-field>
+    </div>
+    <div class='col-sm-6'>
+      <textarea-field name='item_details' alias='항목별 금액 및 상세' rows='6' disabled='false' readonly='false'></textarea-field>
+    </div>
+  </div>
+</section>

@@ -159,12 +159,12 @@ def _completion_error_summary(result: str, max_items: int = 3) -> str:
 def _identified_notes_text(room_dir, conversation_id: str) -> str:
     """식별 화면에서 전환한 방이면, 흐름을 그대로 두었다는 안내와 되돌린 변경의 이유를 붙인다."""
     from core.skills.identified import load_identified_definition, read_notes
-    from core.skills.tools import process_work_dirs as _process_work_dirs
+    from core.skills.tools import definition_work_dirs as _definition_dirs
 
     if not load_identified_definition(conversation_id):
         return ""
     notes: list[str] = []
-    for directory in _process_work_dirs(room_dir, conversation_id):
+    for directory in _definition_dirs(room_dir, conversation_id):
         notes.extend(n for n in read_notes(directory) if n not in notes)
     text = "\n\n인계 기록에서 도출된 흐름(단계·담당자·순서·분기)은 그대로 두고 폼·스킬·에이전트만 보강했어요."
     if notes:
@@ -2489,12 +2489,13 @@ class DeepAgentExecutor(AgentExecutor):
             definition_written_this_turn = process_json_written or workspace_write_made
             if not process_json_written and chat_room_id:
                 try:
-                    from core.skills.tools import process_work_dirs as _process_work_dirs, _conv_slug
+                    from core.skills.tools import definition_work_dirs as _definition_dirs, _conv_slug
                     from core.skills.tools import tenant_workspace_root as _tenant_ws
                     room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id)
+                    # 정의가 방 루트(.bpmn/<room>/process-definition.json)에 있어도 본다 — 못 보면 검증 없이 넘어간다
                     process_json_written = any(
                         (directory / "process-definition.json").is_file()
-                        for directory in _process_work_dirs(room_dir, chat_room_id)
+                        for directory in _definition_dirs(room_dir, chat_room_id)
                     )
                 except Exception:
                     pass
@@ -2505,7 +2506,7 @@ class DeepAgentExecutor(AgentExecutor):
                         complete_process_generation as _cpg,
                         validate_process_definition as _vpd,
                         _current_conversation_id as _ccid,
-                        process_work_dirs as _process_work_dirs,
+                        definition_work_dirs as _definition_dirs,
                         _conv_slug,
                     )
                     from core.skills.tools import tenant_workspace_root as _tenant_ws
@@ -2513,7 +2514,7 @@ class DeepAgentExecutor(AgentExecutor):
                     _ccid.set(chat_room_id or "")
                     _room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id or "")
                     _validation_failures = []
-                    for _work_dir in _process_work_dirs(_room_dir, chat_room_id or ""):
+                    for _work_dir in _definition_dirs(_room_dir, chat_room_id or ""):
                         _definition_path = _work_dir / "process-definition.json"
                         if not _definition_path.is_file():
                             continue

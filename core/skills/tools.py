@@ -1258,6 +1258,44 @@ def _normalize_to_processgpt_schema(pd: dict) -> tuple:
                 if src in id_map:
                     e["source"] = id_map[src]
 
+    # 요소에 `source`(앞 요소 id)만 적고 그 연결 Sequence 를 빠뜨린 경우(02 규격 12번 위반) — 들어오는
+    # Sequence 가 하나도 없는 요소에 한해 source → 요소 Sequence 를 채운다. 프론트 그림(BPMNXmlGenerator 의
+    # source 기반 보정)에는 화살표가 있는데 정의 JSON 에는 없어, 실행이 첫 단계를 건너뛰고 고치기가
+    # 「startEvent 에서 도달 불가능」으로 막혔다(VM 실측: 시작 이벤트 → 견적 요청 접수). 다른 들어오는
+    # 연결이 있는 요소의 source 는 낡은 값일 수 있어(흐름을 고친 뒤 안 바꿈) 연결을 새로 만들지 않는다.
+    _nodes = {
+        str(e.get("id")): e for e in new_els
+        if isinstance(e, dict) and e.get("elementType") != "Sequence" and e.get("id")
+    }
+    _incoming = {
+        str(e.get("target")) for e in new_els
+        if isinstance(e, dict) and e.get("elementType") == "Sequence" and e.get("target")
+    }
+    _seq_ids = {
+        str(e.get("id")) for e in new_els
+        if isinstance(e, dict) and e.get("elementType") == "Sequence" and e.get("id")
+    }
+    for e in list(new_els):
+        if not isinstance(e, dict) or e.get("elementType") == "Sequence":
+            continue
+        eid = str(e.get("id") or "")
+        src = str(e.get("source") or "").strip()
+        if not eid or not src or src == eid or eid in _incoming or src not in _nodes:
+            continue
+        if e.get("elementType") == "Event" and e.get("type") == "StartEvent":
+            continue
+        if _nodes[src].get("elementType") == "Event" and _nodes[src].get("type") == "EndEvent":
+            continue
+        sid = f"seq_{src}_{eid}"
+        n = 2
+        while sid in _seq_ids:
+            sid = f"seq_{src}_{eid}_{n}"
+            n += 1
+        _seq_ids.add(sid)
+        _incoming.add(eid)
+        new_els.append({"elementType": "Sequence", "id": sid, "source": src, "target": eid})
+        changed = True
+
     pd["elements"] = new_els
     # flattened 잔재 제거(중복 방지)
     for key in ("activities", "events", "gateways", "sequences"):
@@ -2954,6 +2992,20 @@ def _reconcile_scattered_room_dirs(room: Path) -> None:
                         pass
 
 
+def definition_work_dirs(room: Path, conversation_id: str = "") -> list[Path]:
+    """이번 생성 시도의 정의 폴더들 — process-* 폴더가 없으면 정의를 둔 방 루트.
+
+    `.bpmn/process-definition.json` 기본 경로(write/validate_process_definition)는 방 루트로 풀린다.
+    process_work_dirs 는 process-* 하위 폴더만 돌려주므로, 정의가 방 루트에 있으면 턴 끝 자동
+    검증·마무리가 그 정의를 못 보고 건너뛰었다(VM 실측: 검증 없이 모델의 「프로세스를 생성했어요」만
+    나가 시작 연결선이 빠진 정의가 저장됨). 완료 도구의 하위호환 규칙과 같은 기준을 한곳에 둔다.
+    """
+    dirs = process_work_dirs(room, conversation_id)
+    if dirs:
+        return dirs
+    return [room] if (room / "process-definition.json").is_file() else []
+
+
 @tool
 def complete_process_generation() -> str:
     """**5단계: 생성 완료.** 이 대화의 모든 프로세스 폴더(`.bpmn/<room>/process-*/`)를 모아
@@ -2970,9 +3022,7 @@ def complete_process_generation() -> str:
 
     room = _bpmn_work_dir()
     _reconcile_scattered_room_dirs(room)  # 오타로 흩어진 거의 동일한 방 폴더 병합
-    proc_dirs = process_work_dirs(room, _current_conversation_id.get())
-    if not proc_dirs:
-        proc_dirs = [room] if (room / "process-definition.json").is_file() else []  # 단일 프로세스 하위호환
+    proc_dirs = definition_work_dirs(room, _current_conversation_id.get())  # 단일 프로세스는 방 루트(하위호환)
 
     validation_errors: list[dict] = []
     for directory in proc_dirs:

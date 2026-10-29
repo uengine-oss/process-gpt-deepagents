@@ -1,0 +1,13 @@
+<section>
+  <div class='row' name='quote_request_main' alias='견적 요청 정보' is_multidata_mode='false'>
+    <div class='col-sm-6'>
+      <text-field name='company_name' alias='회사명' type='text' disabled='false' readonly='false'></text-field>
+      <text-field name='contact_person' alias='담당자' type='text' disabled='false' readonly='false'></text-field>
+      <text-field name='region' alias='설치 지역' type='text' disabled='false' readonly='false'></text-field>
+    </div>
+    <div class='col-sm-6'>
+      <text-field name='product_list' alias='제품 및 수량' type='text' disabled='false' readonly='false'></text-field>
+      <text-field name='required_date' alias='희망 납기' type='date' disabled='false' readonly='false'></text-field>
+    </div>
+  </div>
+</section>

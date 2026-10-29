@@ -1,0 +1,49 @@
+{
+  "processDefinitionName": "한빛오피스 대량 주문 견적 승인",
+  "processDefinitionId": "",
+  "description": "20개 이상 대량 주문 시 견적 요청부터 승인, 고객 회신까지의 프로세스. 금액 요건에 따라 승인 절차가 다르고, 각 단계별로 담당과 입력 정보 및 자동화 요소가 분리됨.",
+  "isHorizontal": true,
+  "data": [
+    {"name": "견적요청정보", "description": "고객, 제품, 수량 등 요청서 정보", "type": "Form"},
+    {"name": "재고확인결과", "description": "제품별 재고 현황 및 납기 충족 가능 여부", "type": "Text"},
+    {"name": "견적내역", "description": "산출된 견적 항목별 금액, 할인, 설치비 등", "type": "Form"},
+    {"name": "승인결과", "description": "승인/반려 결과 및 사유", "type": "Text"},
+    {"name": "고객회신정보", "description": "고객에게 보낸 견적·회신일·유효기간 등", "type": "Form"}
+  ],
+  "roles": [
+    {"name": "영업 담당", "endpoint": "sales_staff", "resolutionRule": "created", "origin": "created"},
+    {"name": "재고 확인 에이전트", "endpoint": "stock_agent", "resolutionRule": "created", "origin": "created"},
+    {"name": "견적 산출 에이전트", "endpoint": "quote_calc_agent", "resolutionRule": "created", "origin": "created"},
+    {"name": "영업팀장", "endpoint": "sales_lead", "resolutionRule": "created", "origin": "created"},
+    {"name": "재무 담당", "endpoint": "finance_manager", "resolutionRule": "created", "origin": "created"}
+  ],
+  "elements": [
+    {"elementType": "Event","id": "start","name": "견적 요청 접수 시작","role": "영업 담당","type": "StartEvent","description": "고객의 대량 주문 견적 요청이 시작됨."},
+    {"elementType": "Activity","id": "request_quote","name": "견적 요청 접수","type": "UserActivity","role": "영업 담당","source": "start","description": "고객(회사명, 담당자, 제품, 수량, 지역, 납기) 정보를 받아 견적 요청서를 작성.","instruction": "누락 시 고객에게 보완 요청.","inputData": ["견적요청정보"],"outputData": ["견적요청정보"]},
+    {"elementType": "Sequence","id": "seq_req_to_stock","source": "request_quote","target": "check_stock"},
+
+    {"elementType": "Activity","id": "check_stock","name": "재고 확인","type": "UserActivity","role": "재고 확인 에이전트","source": "request_quote","description": "제품별 재고·입고 예정일·납기 충족 여부 확인.","instruction": "재고 시스템 및 입고 일정 확인 후 결과 기록.","inputData": ["견적요청정보"],"outputData": ["재고확인결과"]},
+    {"elementType": "Sequence","id": "seq_stock_to_quote","source": "check_stock","target": "calc_quote"},
+
+    {"elementType": "Activity","id": "calc_quote","name": "견적 산출","type": "UserActivity","role": "견적 산출 에이전트","source": "check_stock","description": "제품별 금액·할인·설치비 반영 견적 초안 계산.","instruction": "제품 가격표, 할인율, 설치비 기준 반영.","inputData": ["견적요청정보", "재고확인결과"],"outputData": ["견적내역"]},
+    {"elementType": "Sequence","id": "seq_quote_to_approval_gw","source": "calc_quote","target": "approval_gateway"},
+
+    {"elementType": "Gateway","id": "approval_gateway","name": "총액에 따른 승인 분기","role": "영업팀장","source": "calc_quote","type": "ExclusiveGateway","description": "총액에 따라 결재자 분기: 3,000만 원 미만 또는 이상."},
+    {"elementType": "Sequence","id": "seq_gw_to_saleslead","source": "approval_gateway","target": "approve_saleslead","condition": "견적 총액이 3,000만 원 미만"},
+    {"elementType": "Sequence","id": "seq_gw_to_saleslead2","source": "approval_gateway","target": "approve_saleslead_post","condition": "견적 총액이 3,000만 원 이상"},
+
+    {"elementType": "Activity","id": "approve_saleslead","name": "1차 승인 (영업팀장)","type": "UserActivity","role": "영업팀장","source": "approval_gateway","description": "영업팀장이 승인 또는 반려.","instruction": "견적 검토 후 승인 또는 반려, 반려시 사유 기재.","inputData": ["견적내역"],"outputData": ["승인결과"]},
+    {"elementType": "Sequence","id": "seq_saleslead_approve_to_notify","source": "approve_saleslead","target": "notify_customer","condition": "승인"},
+    {"elementType": "Sequence","id": "seq_saleslead_reject_to_calc","source": "approve_saleslead","target": "calc_quote","condition": "반려"},
+
+    {"elementType": "Activity","id": "approve_saleslead_post","name": "2차 승인 (재무 담당)","type": "UserActivity","role": "재무 담당","source": "approval_gateway","description": "3,000만 원 이상 견적은 재무 담당 추가 승인 또는 반려.","instruction": "영업팀장 승인 후, 재무 담당이 최종 승인 또는 반려, 반려시 사유 기재.","inputData": ["견적내역", "승인결과"],"outputData": ["승인결과"]},
+    {"elementType": "Sequence","id": "seq_post_approve_to_notify","source": "approve_saleslead_post","target": "notify_customer","condition": "승인"},
+    {"elementType": "Sequence","id": "seq_post_reject_to_calc","source": "approve_saleslead_post","target": "calc_quote","condition": "반려"},
+
+    {"elementType": "Activity","id": "notify_customer","name": "고객 회신","type": "UserActivity","role": "영업 담당","source": "approve_saleslead","description": "승인된 견적서를 고객에게 발송.&nbsp;회신일, 유효기간 기록.","instruction": "고객에게 견적서 전송, 발송일과 유효기간(30일) 기록.","inputData": ["견적내역", "승인결과"],"outputData": ["고객회신정보"]},
+    {"elementType": "Sequence","id": "seq_notify_to_end","source": "notify_customer","target": "end"},
+
+    {"elementType": "Event","id": "end","name": "견적 프로세스 종료","role": "영업 담당","type": "EndEvent","description": "견적 프로세스 종료."}
+  ],
+  "subProcesses": []
+}
