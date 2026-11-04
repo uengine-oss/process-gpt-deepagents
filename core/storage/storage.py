@@ -278,15 +278,23 @@ def workspace_file_set(dir_path: str | Path) -> set[str]:
     return {p.relative_to(base).as_posix() for p in base.glob("**/*") if p.is_file()}
 
 
-def _seed_key(tenant_id: str, task_id: str, rel: str) -> str:
-    """하위 폴더 파일을 경로 전체 한 조각으로 인코딩한 키.
+def _seed_keys(tenant_id: str, task_id: str, rel: str) -> list[str]:
+    """경로 뒷부분을 한 조각으로 인코딩한 키들(어느 깊이에서 묶였든).
 
-    Lite 서버는 공유 폴더 파일을 이 키로 넣어 둔다 — storage 목록 API 가 폴더 이름을
+    Lite 서버는 공유 폴더 체크아웃(방 안의 folders/<slug>) 아래 하위 폴더 파일을
+    '자료/Docs/문서.md' 통째 한 조각으로 넣어 둔다 — storage 목록 API 가 폴더 이름을
     소문자로 돌려줘(Docs → docs) 폴더를 걸어서는 다시 찾지 못하기 때문이다. 다운로드는
-    한 조각을 풀면 같은 경로가 되므로 그대로 받는다.
+    한 조각을 풀면 같은 경로가 되므로 그대로 받는다. 지울 때는 어디서 묶였는지 모르므로
+    가능한 자리를 모두 지운다.
     """
-    raw = base64.urlsafe_b64encode(rel.encode("utf-8")).decode("ascii").rstrip("=")
-    return f"{_PREFIX}/{tenant_id}/{task_id}/{_ENCODED_MARK}{raw}"
+    parts = rel.split("/")
+    keys = []
+    for i in range(len(parts) - 1):
+        tail = "/".join(parts[i:])
+        raw = base64.urlsafe_b64encode(tail.encode("utf-8")).decode("ascii").rstrip("=")
+        head = "/".join(encode_key_segment(p) for p in parts[:i])
+        keys.append(f"{_PREFIX}/{tenant_id}/{task_id}/" + (f"{head}/" if head else "") + f"{_ENCODED_MARK}{raw}")
+    return keys
 
 
 def remove_workspace_files(task_id: str, rels: list[str] | set[str]) -> str:
@@ -295,7 +303,7 @@ def remove_workspace_files(task_id: str, rels: list[str] | set[str]) -> str:
     업로드는 있는 파일만 올리므로, 지운 파일은 storage 에 남아 다음 턴이나 결과를 거두는
     쪽(Lite 공유 폴더 변형)에서 되살아났다. 에이전트가 "삭제했어요"라고 답해도 변경안에
     삭제가 빠진 원인이다. 한 파일이 두 키(경로별 인코딩, 경로 전체 한 조각)로 있을 수
-    있어 둘 다 지운다. 없는 키 삭제는 무시된다.
+    있어 둘 다 지운다(Lite 가 넣은 키는 `_seed_keys`). 없는 키 삭제는 무시된다.
     """
     try:
         rels = sorted({str(r).replace("\\", "/") for r in rels if r})
@@ -305,8 +313,7 @@ def remove_workspace_files(task_id: str, rels: list[str] | set[str]) -> str:
         keys: list[str] = []
         for rel in rels:
             keys.append(_storage_path(tenant_id, task_id, rel))
-            if "/" in rel:
-                keys.append(_seed_key(tenant_id, task_id, rel))
+            keys.extend(_seed_keys(tenant_id, task_id, rel))
         get_supabase().storage.from_(_BUCKET).remove(keys)
         return f"Removed {len(rels)} file(s): " + ", ".join(rels)
     except Exception as exc:

@@ -42,17 +42,28 @@ def _patch(monkeypatch, log):
     monkeypatch.setattr(storage, "get_supabase", lambda: _client(log))
 
 
-def test_removes_both_keys_of_a_nested_korean_file(monkeypatch):
+def _lite_seed_key(room: str, checkout: str, rel: str) -> str:
+    """Lite server/lib/roomStore.js pushRoomDir 가 넣는 키 그대로:
+    roomPrefix('/workspace/.bpmn/<room>/<checkout>') + '/' + seedKey(rel),
+    seedKey 는 하위 폴더 파일이면 '__u8__' + base64url(rel 전체)."""
+    import base64
+
+    raw = base64.urlsafe_b64encode(rel.encode()).decode().rstrip("=")
+    return f"skills/ohsy/{room}/{checkout}/__u8__{raw}"
+
+
+def test_removes_the_key_lite_seeded_and_the_key_upload_made(monkeypatch):
     log = []
     _patch(monkeypatch, log)
-    storage.remove_workspace_files("room-1", {"folders/docs/자료/Docs/지울 문서.md"})
+    rel = "folders/folder-2f3d35/자료/Docs/삭제대상.md"
+    storage.remove_workspace_files("room-1", {rel})
     [(op, keys)] = log
     assert op == "remove"
-    rel = "folders/docs/자료/Docs/지울 문서.md"
+    # 턴 끝 업로드가 만든 키
     assert f"skills/ohsy/room-1/{storage.encode_key_path(rel)}" in keys
-    # Lite 가 넣어 둔 키(경로 전체 한 조각)도 지워야 다음에 내려받을 때 되살아나지 않는다
-    seed = [k for k in keys if k.count("/") == 3]
-    assert len(seed) == 1 and storage.decode_key_path(seed[0].rsplit("/", 1)[1]) == rel
+    # Lite 가 체크아웃 아래에 넣어 둔 키 — 남으면 변경안에서 삭제가 빠진다
+    assert _lite_seed_key("room-1", "folders/folder-2f3d35", "자료/Docs/삭제대상.md") in keys
+    assert all(storage.decode_key_path(k.split("/", 3)[3]) == rel for k in keys)
 
 
 def test_nothing_to_remove_calls_nothing(monkeypatch):
