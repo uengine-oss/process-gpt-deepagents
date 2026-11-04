@@ -100,8 +100,10 @@ from core.sandbox.docker_sandbox import set_workspace_scope
 from core.storage.worktree import BranchState, commit_turn, materialize as materialize_branch
 from core.storage.storage import (
     download_workspace_directory,
+    remove_workspace_files,
     set_tenant_id as _set_storage_tenant_id,
     upload_workspace_directory,
+    workspace_file_set,
 )
 
 logger = logging.getLogger(__name__)
@@ -610,11 +612,17 @@ def _readable_result(text: str) -> str:
     return "\n\n".join(parts) if parts else raw
 
 
-async def _sync_room_workspace(tenant_id: str, room_id: str, worktree_state: BranchState | None) -> None:
+async def _sync_room_workspace(
+    tenant_id: str, room_id: str, worktree_state: BranchState | None, files_before: set[str] | None = None,
+) -> None:
     """턴이 만든·고친 작업 폴더 파일을 남겨 다음 턴(다른 파드 포함)이 이어서 읽게 한다.
 
     인계 워크트리 방은 방 브랜치에 커밋한다(바뀐 것이 없으면 커밋하지 않는다).
-    브랜치가 없는 방은 예전처럼 방 폴더를 통째로 올린다.
+    브랜치가 없는 방은 예전처럼 방 폴더를 통째로 올린다. `files_before`(턴 시작의 파일
+    목록)가 있으면 이번 턴에 지운 파일을 먼저 storage 에서 지운다 — 올리기만 하면 지운
+    파일이 storage 에 남아 Lite 공유 폴더 변형에서 삭제가 빠진다. 턴 시작에 이 파드에
+    없던 파일(다른 파드가 만든 것)은 건드리지 않는다. 지우기를 올리기보다 먼저 해, 올린
+    파일의 새 시각을 보고 끝을 판단하는 Lite 가 삭제 전 목록을 거두지 않게 한다.
     """
     room_dir = _bpmn_work_dir()
     if not room_dir.exists():
@@ -624,13 +632,18 @@ async def _sync_room_workspace(tenant_id: str, room_id: str, worktree_state: Bra
         res = await asyncio.to_thread(commit_turn, tenant_id, worktree_state, room_dir)
         logger.info("워크트리 커밋 | room_id=%s created=%s commit=%s", room_id, res.get("created"), res.get("commit_id"))
         return
+    if files_before:
+        gone = files_before - workspace_file_set(room_dir)
+        if gone:
+            removed = await asyncio.to_thread(remove_workspace_files, room_id, gone)
+            logger.info("워크스페이스 삭제 반영 | room_id=%s | %s", room_id, removed)
     result = await asyncio.to_thread(upload_workspace_directory, room_id, room_dir)
     logger.info("워크스페이스 동기화 | room_id=%s | %s", room_id, result.splitlines()[0] if result else "")
 
 
 async def _post_handover_result(
     *, tenant_id: str, room_id: str, todo_id: str, text: str, agent: dict, since_ns: int,
-    worktree_state: BranchState | None = None,
+    worktree_state: BranchState | None = None, files_before: set[str] | None = None,
 ) -> None:
     """인계받은 할 일을 마친 결과를 그 방의 에이전트 답으로 남긴다.
 
@@ -647,7 +660,7 @@ async def _post_handover_result(
         logger.warning("인계 결과 산출물 보관 실패 | room=%s", room_id, exc_info=True)
         content, records = _readable_result(text), []
     try:
-        await _sync_room_workspace(tenant_id, room_id, worktree_state)
+        await _sync_room_workspace(tenant_id, room_id, worktree_state, files_before)
     except Exception:
         logger.warning("인계 방 작업 폴더 동기화 실패 | room=%s", room_id, exc_info=True)
     message = {
@@ -1469,6 +1482,7 @@ class DeepAgentExecutor(AgentExecutor):
         set_workspace_scope(*_scope_prefixes)
 
         worktree_state = None
+        room_files_before: set[str] = set()
         if (is_chat or handover_room_id) and chat_room_id and tenant_id:
             # 이 파드가 이 방을 처음 다루는 경우(로컬에 파일이 없음) 다른 파드가 이전 턴에
             # 만들었을 수 있는 워크스페이스 파일을 Supabase Storage에서 미리 내려받는다.
@@ -1487,6 +1501,8 @@ class DeepAgentExecutor(AgentExecutor):
                     logger.info("워크스페이스 하이드레이션 | room_id=%s | %s", chat_room_id, result.splitlines()[0] if result else "")
             except Exception:
                 logger.warning("워크스페이스 하이드레이션 실패(무시하고 진행) | room_id=%s", chat_room_id, exc_info=True)
+            # 턴 끝에 이번 턴이 지운 파일을 storage 에서도 지우려고 지금 있는 파일을 적어 둔다.
+            room_files_before = await asyncio.to_thread(workspace_file_set, _bpmn_work_dir())
 
         if is_chat and chat_room_id and tenant_id:
             # 식별 화면에서 전환한 방: 도출된 흐름을 프로세스 폴더에 미리 깔아 둔다.
@@ -2671,6 +2687,7 @@ class DeepAgentExecutor(AgentExecutor):
                     agent=_handover_agent(row, agents),
                     since_ns=turn_started_ns,
                     worktree_state=worktree_state,
+                    files_before=room_files_before,
                 )
             await _enqueue_status(
                 event_queue,
@@ -2712,7 +2729,7 @@ class DeepAgentExecutor(AgentExecutor):
                     # 이번 턴이 만든/수정한 워크스페이스 파일을 Supabase Storage에 올려서,
                     # 다음 턴이 다른 파드로 라우팅돼도 이어서 읽을 수 있게 한다.
                     try:
-                        await _sync_room_workspace(tenant_id, chat_room_id, worktree_state)
+                        await _sync_room_workspace(tenant_id, chat_room_id, worktree_state, room_files_before)
                     except Exception:
                         logger.warning("워크스페이스 동기화 실패(무시) | room_id=%s", chat_room_id, exc_info=True)
 

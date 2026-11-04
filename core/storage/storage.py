@@ -270,6 +270,49 @@ def upload_workspace_directory(task_id: str, dir_path: str | Path, pattern: str 
         return f"ERROR: {exc}"
 
 
+def workspace_file_set(dir_path: str | Path) -> set[str]:
+    """작업 폴더의 파일 상대 경로 집합. 턴 시작에 찍어 두고 끝에 비교해 지운 파일을 찾는다."""
+    base = Path(dir_path)
+    if not base.is_dir():
+        return set()
+    return {p.relative_to(base).as_posix() for p in base.glob("**/*") if p.is_file()}
+
+
+def _seed_key(tenant_id: str, task_id: str, rel: str) -> str:
+    """하위 폴더 파일을 경로 전체 한 조각으로 인코딩한 키.
+
+    Lite 서버는 공유 폴더 파일을 이 키로 넣어 둔다 — storage 목록 API 가 폴더 이름을
+    소문자로 돌려줘(Docs → docs) 폴더를 걸어서는 다시 찾지 못하기 때문이다. 다운로드는
+    한 조각을 풀면 같은 경로가 되므로 그대로 받는다.
+    """
+    raw = base64.urlsafe_b64encode(rel.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"{_PREFIX}/{tenant_id}/{task_id}/{_ENCODED_MARK}{raw}"
+
+
+def remove_workspace_files(task_id: str, rels: list[str] | set[str]) -> str:
+    """이번 턴에 작업 폴더에서 지운 파일을 storage 에서도 지운다.
+
+    업로드는 있는 파일만 올리므로, 지운 파일은 storage 에 남아 다음 턴이나 결과를 거두는
+    쪽(Lite 공유 폴더 변형)에서 되살아났다. 에이전트가 "삭제했어요"라고 답해도 변경안에
+    삭제가 빠진 원인이다. 한 파일이 두 키(경로별 인코딩, 경로 전체 한 조각)로 있을 수
+    있어 둘 다 지운다. 없는 키 삭제는 무시된다.
+    """
+    try:
+        rels = sorted({str(r).replace("\\", "/") for r in rels if r})
+        if not rels:
+            return "Removed 0 file(s)"
+        tenant_id = _require_tenant_id()
+        keys: list[str] = []
+        for rel in rels:
+            keys.append(_storage_path(tenant_id, task_id, rel))
+            if "/" in rel:
+                keys.append(_seed_key(tenant_id, task_id, rel))
+        get_supabase().storage.from_(_BUCKET).remove(keys)
+        return f"Removed {len(rels)} file(s): " + ", ".join(rels)
+    except Exception as exc:
+        return f"ERROR: {exc}"
+
+
 def _list_all_objects(client, prefix: str) -> list[str]:
     """prefix 하위 모든 파일의 버킷 키를 재귀적으로 나열한다.
 
