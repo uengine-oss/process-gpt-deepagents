@@ -54,7 +54,8 @@ _SKILLS_CONTAINER_MOUNT = "/skills"
 _BASE_INTRO = (
     "You are a helpful assistant. "
     "Use the available tools when needed to answer questions accurately. "
-    "Reply in Korean unless the user writes in another language.\n\n"
+    "Reply in Korean unless the user writes in another language "
+    "(judge by the user's own words, not by system blocks such as [ExecutionPolicy]).\n\n"
 )
 
 # 스킬/도구 후보 중 요청에 가장 적절한 것을 고르는 일반 규칙. 어떤 스킬 세트가 붙어있든
