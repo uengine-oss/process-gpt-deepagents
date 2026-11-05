@@ -53,8 +53,11 @@
    - 후보의 `activity_ids` 에 든 모든 Activity 에 반영.
 2. **자동화 정책 필드** 를 Activity 상태에 맞춰 설정한다:
    - 스킬이 배정된 Activity (`skills` 비어있지 않음): `"agentMode": "complete"`, `"orchestration": "deepagents"`
-   - 에이전트만 배정(스킬 없음): `"agentMode": "draft"`, `"orchestration": "crewai-action"`
+   - 에이전트만 배정(스킬 없음): `"agentMode": "draft"`, `"orchestration": "deepagents"`
    - 둘 다 없음: `"agentMode": "none"`, `"orchestration": null`
+   - `orchestration` 은 실행 때 이 단계를 집어 갈 실행기 이름이다. 이 설치에서 todolist 를 폴링하는 것은
+     딥 에이전트(`deepagents`)뿐이라, 에이전트·스킬 단계에는 늘 `"deepagents"` 를 쓴다
+     (`crewai-action`·`crewai-deep-research` 는 소비자가 없어 단계가 시작되지 않는다 — 마무리 단계가 바꿔 둔다).
 3. **`roles[].endpoint` 갱신**: 그 역할에 에이전트가 배치되면 해당 role 의 `endpoint` 를 그 agent id 로, `origin` 을 `"used"` 로 바꾼다.
 4. `manifest.json` 의 `agents[]` 에 `{"id": "<agent_id>", "activity_ids": [...]}` 를 기록한다.
 

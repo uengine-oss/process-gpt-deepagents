@@ -1258,6 +1258,44 @@ def _normalize_to_processgpt_schema(pd: dict) -> tuple:
                 if src in id_map:
                     e["source"] = id_map[src]
 
+    # 요소에 `source`(앞 요소 id)만 적고 그 연결 Sequence 를 빠뜨린 경우(02 규격 12번 위반) — 들어오는
+    # Sequence 가 하나도 없는 요소에 한해 source → 요소 Sequence 를 채운다. 프론트 그림(BPMNXmlGenerator 의
+    # source 기반 보정)에는 화살표가 있는데 정의 JSON 에는 없어, 실행이 첫 단계를 건너뛰고 고치기가
+    # 「startEvent 에서 도달 불가능」으로 막혔다(VM 실측: 시작 이벤트 → 견적 요청 접수). 다른 들어오는
+    # 연결이 있는 요소의 source 는 낡은 값일 수 있어(흐름을 고친 뒤 안 바꿈) 연결을 새로 만들지 않는다.
+    _nodes = {
+        str(e.get("id")): e for e in new_els
+        if isinstance(e, dict) and e.get("elementType") != "Sequence" and e.get("id")
+    }
+    _incoming = {
+        str(e.get("target")) for e in new_els
+        if isinstance(e, dict) and e.get("elementType") == "Sequence" and e.get("target")
+    }
+    _seq_ids = {
+        str(e.get("id")) for e in new_els
+        if isinstance(e, dict) and e.get("elementType") == "Sequence" and e.get("id")
+    }
+    for e in list(new_els):
+        if not isinstance(e, dict) or e.get("elementType") == "Sequence":
+            continue
+        eid = str(e.get("id") or "")
+        src = str(e.get("source") or "").strip()
+        if not eid or not src or src == eid or eid in _incoming or src not in _nodes:
+            continue
+        if e.get("elementType") == "Event" and e.get("type") == "StartEvent":
+            continue
+        if _nodes[src].get("elementType") == "Event" and _nodes[src].get("type") == "EndEvent":
+            continue
+        sid = f"seq_{src}_{eid}"
+        n = 2
+        while sid in _seq_ids:
+            sid = f"seq_{src}_{eid}_{n}"
+            n += 1
+        _seq_ids.add(sid)
+        _incoming.add(eid)
+        new_els.append({"elementType": "Sequence", "id": sid, "source": src, "target": eid})
+        changed = True
+
     pd["elements"] = new_els
     # flattened 잔재 제거(중복 방지)
     for key in ("activities", "events", "gateways", "sequences"):
@@ -1569,6 +1607,137 @@ def _write_validation_receipt(target: Path, result: dict) -> None:
         receipt.unlink()
 
 
+# 폼 HTML 에서 닫는 태그가 없는 요소(이것만 열린 채 끝나도 된다).
+_FORM_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr",
+})
+
+
+def _form_structure_problem(html: str) -> str:
+    """폼 HTML 의 태그가 열고 닫힌 짝이 맞는지 본다. 맞으면 빈 문자열, 아니면 사람이 읽을 까닭."""
+    from html.parser import HTMLParser
+
+    class _Balance(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.stack: list[str] = []
+            self.problem = ""
+
+        def handle_starttag(self, tag, attrs):
+            if tag not in _FORM_VOID_TAGS:
+                self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            if self.problem or tag in _FORM_VOID_TAGS:
+                return
+            if tag in self.stack:
+                while self.stack:
+                    opened = self.stack.pop()
+                    if opened == tag:
+                        return
+                    self.problem = f"<{opened}> 를 닫지 않고 </{tag}> 가 왔습니다"
+                    return
+            self.problem = f"열지 않은 </{tag}> 가 있습니다"
+
+    parser = _Balance()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception as exc:  # pragma: no cover - HTMLParser 는 거의 던지지 않는다
+        return f"HTML 을 읽지 못했습니다({exc})"
+    if parser.problem:
+        return parser.problem
+    if parser.stack:
+        return "닫히지 않은 태그로 끝납니다: " + ", ".join(f"<{t}>" for t in parser.stack[-3:])
+    return ""
+
+
+def _work_file_defects(work: Path) -> list:
+    """정의 폴더의 에이전트·manifest·폼 파일이 저장에 쓸 수 있는 꼴인지 본다.
+
+    마무리(_complete_one_process)와 프론트 저장은 읽지 못한 파일을 말없이 건너뛴다. 튜토리얼 VM 에서
+    모델이 agents/quote_calc_agent.json 끝의 `}` 를 빠뜨리자 그 에이전트가 통째로 빠지고 정의에는
+    슬러그만 남았다(고른 에이전트 둘 중 하나만 저장). 정의 결함처럼 막아 모델이 고치게 한다.
+    """
+    import json as _json
+
+    defects: list = []
+
+    def _rel(path: Path) -> str:
+        try:
+            return path.relative_to(work).as_posix()
+        except ValueError:
+            return path.name
+
+    def _defect(kind: str, path: Path, detail: str) -> None:
+        defects.append({"severity": "critical", "type": kind, "file": _rel(path), "detail": detail})
+
+    def _load_json(path: Path, label: str):
+        try:
+            return True, _json.loads(path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            _defect(f"{label}_encoding", path, f"'{_rel(path)}' 을 UTF-8 로 읽을 수 없습니다. 파일을 다시 써 주세요.")
+        except ValueError as exc:
+            where = f"{exc.lineno}행 {exc.colno}열" if hasattr(exc, "lineno") else ""
+            _defect(
+                f"{label}_invalid_json", path,
+                f"'{_rel(path)}' 이 올바른 JSON 이 아닙니다({getattr(exc, 'msg', exc)}"
+                + (f", {where}" if where else "")
+                + "). 내용 전체를 다시 써 주세요(끝의 '}' 누락 등).",
+            )
+        except OSError as exc:
+            _defect(f"{label}_unreadable", path, f"'{_rel(path)}' 을 읽지 못했습니다({exc}).")
+        return False, None
+
+    agent_files = sorted((work / "agents").glob("*.json")) if (work / "agents").is_dir() else []
+    legacy = work / "agents.json"
+    if legacy.is_file():
+        agent_files.append(legacy)
+    for path in agent_files:
+        ok, obj = _load_json(path, "agent_file")
+        if not ok:
+            continue
+        if path == legacy and isinstance(obj, dict) and isinstance(obj.get("agents"), list):
+            items = obj["agents"]
+        elif isinstance(obj, list):
+            items = obj
+        else:
+            items = [obj]
+        if not items or any(not isinstance(item, dict) for item in items):
+            _defect("agent_file_shape", path, f"'{_rel(path)}' 은 에이전트 1명을 담은 JSON 객체여야 합니다.")
+            continue
+        for item in items:
+            if not str(item.get("name") or "").strip():
+                _defect("agent_file_missing_name", path,
+                        f"'{_rel(path)}' 에이전트에 name(화면에 보일 이름)이 없습니다.")
+                break
+
+    manifest = work / "manifest.json"
+    if manifest.is_file():
+        ok, obj = _load_json(manifest, "manifest")
+        if ok and not isinstance(obj, dict):
+            _defect("manifest_shape", manifest, "'manifest.json' 은 skills/agents/dmn 을 담은 JSON 객체여야 합니다.")
+
+    form_dir = work / "forms"
+    if form_dir.is_dir():
+        for path in sorted(list(form_dir.glob("*.form")) + list(form_dir.glob("*.html"))):
+            try:
+                html = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                _defect("form_encoding", path, f"폼 '{_rel(path)}' 을 UTF-8 로 읽을 수 없습니다. 다시 써 주세요.")
+                continue
+            except OSError as exc:
+                _defect("form_unreadable", path, f"폼 '{_rel(path)}' 을 읽지 못했습니다({exc}).")
+                continue
+            if not html.strip():
+                _defect("form_empty", path, f"폼 '{_rel(path)}' 이 비어 있습니다.")
+                continue
+            problem = _form_structure_problem(html)
+            if problem:
+                _defect("form_broken", path, f"폼 '{_rel(path)}' 이 깨졌습니다 — {problem}. 폼 전체를 다시 써 주세요.")
+    return defects
+
+
 def _validated_definition_defects(target: Path) -> list:
     """Return completion-blocking defects for a definition/validation receipt."""
     import json as _json
@@ -1578,6 +1747,7 @@ def _validated_definition_defects(target: Path) -> list:
     except Exception as exc:
         return [{"severity": "critical", "type": "parse_error", "detail": str(exc)}]
     _, defects = _static_process_defects(pd)
+    defects = defects + _work_file_defects(target.parent)
     if defects:
         return defects
     receipt_path = target.parent / _VALIDATION_RECEIPT
@@ -1751,6 +1921,9 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
             _atomic_write_json(target, pd)
         except Exception:
             pass
+
+    # 정의 밖 산출물(에이전트·manifest·폼)은 LLM 교정 대상이 아니다 — 결함으로 돌려 모델이 파일을 다시 쓰게 한다.
+    defects = defects + _work_file_defects(target.parent)
 
     criticals = [d for d in defects if str(d.get("severity") or "").lower() == "critical"]
     result = {
@@ -2383,6 +2556,27 @@ def _capture_selection_to_manifest(answer: str) -> None:
             pass
 
 
+# 이 런타임이 todolist 를 폴링할 때 쓰는 실행기 이름(server.AGENT_TYPE 과 같아야 한다).
+# 생성한 프로세스의 에이전트 단계는 이 값을 들고 있어야 실행 때 이 런타임이 집는다.
+_AGENT_ORCH = "deepagents"
+# 설치에 소비자가 없는 실행기 이름. 참고 문서의 옛 규칙(에이전트만 배정 → crewai-action)을 따랐거나
+# 엔진 옛 기본값(crewai-deep-research)을 적은 정의도, 그대로 두면 단계가 만들어지기만 하고 아무도 집지 않는다.
+_RETIRED_AGENT_ORCH = frozenset({"crewai-action", "crewai-deep-research"})
+
+
+def _assign_agent_orchestration(elements: list) -> None:
+    """에이전트·스킬이 맡은(agentMode 가 none 이 아닌) Activity 의 orchestration 을 이 런타임으로 맞춘다."""
+    for el in elements or []:
+        if not isinstance(el, dict) or el.get("elementType") != "Activity":
+            continue
+        mode = str(el.get("agentMode") or "").strip().lower()
+        if not (el.get("agent") or el.get("skills") or mode not in ("", "none", "null")):
+            continue
+        current = str(el.get("orchestration") or "").strip()
+        if current.lower() in ("", "none", "null") or current in _RETIRED_AGENT_ORCH:
+            el["orchestration"] = _AGENT_ORCH
+
+
 def _complete_one_process(work, *, persist: bool = True) -> dict | None:
     """한 프로세스 폴더(work)의 산출물을 ProcessGPT 규격(flattened+통합)으로 조립하고
     process-definition.json 에 최종본을 기록한다. 출력계약 dict 반환(없으면 None)."""
@@ -2456,7 +2650,11 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
         for af in sorted(adir.glob("*.json")):
             try:
                 obj = _json.loads(af.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as exc:
+                # 검증(_work_file_defects)이 먼저 막는다. 여기까지 왔다면 그 길을 건너뛴 호출이라 흔적을 남긴다.
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning("에이전트 파일을 읽지 못해 빠뜨림 | file=%s err=%s", af, exc)
                 continue
             if isinstance(obj, dict):
                 # 파일 1개 = 에이전트 1명. id 가 없으면 파일명(stem)을 id 로 사용.
@@ -2665,6 +2863,9 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
         if _dmn_rules:
             pd["dmn_rules"] = _dmn_rules
 
+    # 에이전트 단계의 실행기 — 비었거나 소비자 없는 옛 이름이면 이 런타임(deepagents)으로.
+    _assign_agent_orchestration(elements)
+
     # roles 보강(없으면 elements 의 role 들로 생성) — 예시 스키마의 roles[] 형식
     if not isinstance(pd.get("roles"), list) or not pd.get("roles"):
         seen_roles: list = []
@@ -2791,6 +2992,20 @@ def _reconcile_scattered_room_dirs(room: Path) -> None:
                         pass
 
 
+def definition_work_dirs(room: Path, conversation_id: str = "") -> list[Path]:
+    """이번 생성 시도의 정의 폴더들 — process-* 폴더가 없으면 정의를 둔 방 루트.
+
+    `.bpmn/process-definition.json` 기본 경로(write/validate_process_definition)는 방 루트로 풀린다.
+    process_work_dirs 는 process-* 하위 폴더만 돌려주므로, 정의가 방 루트에 있으면 턴 끝 자동
+    검증·마무리가 그 정의를 못 보고 건너뛰었다(VM 실측: 검증 없이 모델의 「프로세스를 생성했어요」만
+    나가 시작 연결선이 빠진 정의가 저장됨). 완료 도구의 하위호환 규칙과 같은 기준을 한곳에 둔다.
+    """
+    dirs = process_work_dirs(room, conversation_id)
+    if dirs:
+        return dirs
+    return [room] if (room / "process-definition.json").is_file() else []
+
+
 @tool
 def complete_process_generation() -> str:
     """**5단계: 생성 완료.** 이 대화의 모든 프로세스 폴더(`.bpmn/<room>/process-*/`)를 모아
@@ -2807,9 +3022,7 @@ def complete_process_generation() -> str:
 
     room = _bpmn_work_dir()
     _reconcile_scattered_room_dirs(room)  # 오타로 흩어진 거의 동일한 방 폴더 병합
-    proc_dirs = process_work_dirs(room, _current_conversation_id.get())
-    if not proc_dirs:
-        proc_dirs = [room] if (room / "process-definition.json").is_file() else []  # 단일 프로세스 하위호환
+    proc_dirs = definition_work_dirs(room, _current_conversation_id.get())  # 단일 프로세스는 방 루트(하위호환)
 
     validation_errors: list[dict] = []
     for directory in proc_dirs:
@@ -2867,6 +3080,15 @@ def complete_process_generation() -> str:
     if not processes:
         return ("ERROR: 처리할 process-definition.json 이 없습니다. "
                 "각 프로세스를 `.bpmn/<room>/process-<id>/process-definition.json` 으로 생성했는지 확인하세요.")
+    # 넘긴 결과의 지문 — 다음 고치기 차례가 「고쳤다」고만 하고 바꾸지 않았는지 이것과 견준다.
+    try:
+        from .definition_guard import record_delivered
+
+        record_delivered(room, proc_dirs)
+    except Exception as exc:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning("결과 지문 기록 실패(무시) | room=%s err=%s", room, exc)
     return _json.dumps({"count": len(processes), "processes": processes}, ensure_ascii=False)
 
 

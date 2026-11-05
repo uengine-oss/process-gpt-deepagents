@@ -1,0 +1,10 @@
+<section>
+  <div class='row' name='stock_check_layout' alias='재고 확인 결과' is_multidata_mode='false'>
+    <div class='col-sm-6'>
+      <text-field name='stock_ok' alias='납기 충족 여부' type='text' disabled='false' readonly='false'></text-field>
+    </div>
+    <div class='col-sm-6'>
+      <textarea-field name='stock_note' alias='확인 결과/메모' rows='5' disabled='false' readonly='false'></textarea-field>
+    </div>
+  </div>
+</section>
