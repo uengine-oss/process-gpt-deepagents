@@ -225,6 +225,9 @@ async def grep_document(
     params: list[tuple[str, str]] = [
         ("tenant_id", tenant_id),
         ("file_name", file_name),
+        # 지금의 memento 는 문서를 path(폴더 포함 상대경로, 없으면 파일 이름으로 다시 찾음)로 받는다.
+        # file_name 만 보내면 422 — 옛 memento 는 path 를 무시하므로 둘 다 보낸다.
+        ("path", file_name),
         ("pattern", pattern),
         ("regex", "true" if regex else "false"),
         ("case_sensitive", "true" if case_sensitive else "false"),
@@ -275,6 +278,7 @@ async def read_pages(
     params: list[tuple[str, str]] = [
         ("tenant_id", tenant_id),
         ("file_name", file_name),
+        ("path", file_name),  # grep_document 와 같은 이유
         ("pages", pages),
     ]
     try:
