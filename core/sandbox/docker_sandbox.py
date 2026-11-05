@@ -351,6 +351,13 @@ class DockerSandboxBackend(BaseSandbox):
         allowed = _global_collection_names()
         if self._tenant_id:
             allowed = allowed | {self._tenant_id}
+            # 이 테넌트 디렉토리는 첫 스킬을 올리기 전에도 만들어 마운트한다. 없을 때 띄운
+            # 컨테이너는 /skills/<tenant> 없이 계속 재사용돼, 나중에 올린 스킬(에이전트에
+            # 붙인 스킬)을 SkillsMiddleware 가 「path_not_found」로 못 읽었다.
+            try:
+                (self._skills_host / self._tenant_id).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
 
         volumes: dict = {}
         try:
@@ -403,9 +410,13 @@ class DockerSandboxBackend(BaseSandbox):
         try:
             old = self._client.containers.get(name)
             if old.status == "running":
+                missing_skills = self._missing_skill_mounts(old)
                 if not self._contract_matches(old):
                     # 옛 구성(볼륨 전체 마운트·모델 키 env)으로 떠 있는 컨테이너다.
                     logger.info("sandbox 재생성: %s 의 구성이 %s 가 아님", name, SANDBOX_CONTRACT)
+                elif missing_skills:
+                    # 테넌트 스킬 디렉토리가 생기기 전에 띄운 컨테이너다 — 지금 올린 스킬이 안 보인다.
+                    logger.info("sandbox 재생성: %s 에 스킬 마운트 %s 가 없음", name, missing_skills)
                 elif self._network_matches(old, network):
                     self._container = old
                     # 이전 실행에서 살아남은 컨테이너에도 safe.directory 를 보장한다.
@@ -459,6 +470,18 @@ class DockerSandboxBackend(BaseSandbox):
         except Exception:
             return False
         return labels.get(_CONTRACT_LABEL) == SANDBOX_CONTRACT
+
+    def _missing_skill_mounts(self, container) -> list[str]:
+        """지금 띄우면 붙을 /skills/<name> 마운트 중 이 컨테이너에 없는 것. 확인하지 못하면 빈 목록."""
+        expected = {v["bind"] for v in self._skill_volumes().values()}
+        if not expected:
+            return []
+        try:
+            container.reload()
+            mounted = {m.get("Destination") for m in (container.attrs.get("Mounts") or [])}
+        except Exception:  # pragma: no cover - best effort
+            return []
+        return sorted(expected - mounted)
 
     @staticmethod
     def _network_matches(container, network: str | None) -> bool:
