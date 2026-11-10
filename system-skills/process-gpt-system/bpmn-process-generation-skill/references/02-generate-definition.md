@@ -156,6 +156,7 @@
 ```
 - 모든 Sequence 는 `source` 와 `target` 을 둘 다 가져야 한다.
 - non-sequence 요소(Event/Activity/Gateway)가 `source` 를 가지면, 그 source 에서 연결되는 Sequence 요소를 반드시 함께 정의한다. 즉 **각 요소 바로 뒤에 그 요소를 다음으로 잇는 Sequence 를 둔다.**
+- **흐름은 Sequence 만 정한다.** 요소의 `source` 는 참고용이라 바꿔도 흐름이 바뀌지 않는다 — StartEvent → 첫 단계도 Sequence 로 쓰고, 흐름을 고칠 때는 Sequence 의 `source`/`target` 을 고친다.
 
 ---
 
