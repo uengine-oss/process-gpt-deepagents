@@ -90,6 +90,7 @@ from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _ski
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
+from core.chat.stream_scope import is_subagent_namespace
 from core.deterministic import MODE_UNDO_PENDING, try_deterministic_execution
 from core.rag.process_knowledge import (
     chat_selection as _kb_chat_selection,
@@ -2190,6 +2191,9 @@ class DeepAgentExecutor(AgentExecutor):
             ):
                 if stream_evt == "messages":
                     msg, _meta = data
+                    # 서브에이전트(task 도구)의 글은 사용자 답이 아니다 — 메인 에이전트가 도구 결과로 받는다.
+                    if is_subagent_namespace(_ns):
+                        continue
                     if isinstance(msg, AIMessageChunk):
                         text = msg.content if isinstance(msg.content, str) else "".join(
                             b.get("text", "") for b in msg.content

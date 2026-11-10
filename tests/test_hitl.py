@@ -156,3 +156,34 @@ def test_human_answered_event_only_in_chat():
     # 워크아이템에서 내면 event_type enum 에 없는 값이라 같은 묶음 이벤트까지 유실된다.
     assert records_human_answered(is_chat=True) is True
     assert records_human_answered(is_chat=False) is False
+
+
+# ── 후보 선택에 아무것도 고르지 않은 답 (2026-11-10, VM 3장 프롬프트에서 「없음」 뒤 스킬을 만든 회차) ──
+
+from core.chat.hitl import explain_empty_candidate_answer  # noqa: E402
+
+_CANDIDATES_Q = "이 프로세스에 추가할 항목을 골라주세요 (안 고르면 건너뜁니다)\n[스킬]\n• 영업 제안서 작성 자동화: …"
+
+
+@pytest.mark.parametrize("answer", ["없음", "(없음)", "선택 없음", "건너뜀", "", "  없음 "])
+def test_empty_candidate_answer_says_nothing_was_picked(answer):
+    out = explain_empty_candidate_answer(_CANDIDATES_Q, answer)
+    assert "하나도 고르지 않았습니다" in out
+    assert "만들지 않습니다" in out
+    assert "폼과 참조정보" in out
+
+
+def test_picked_candidates_pass_through_unchanged():
+    assert explain_empty_candidate_answer(_CANDIDATES_Q, "영업 제안서 작성 자동화") == "영업 제안서 작성 자동화"
+    # 이름에 '없음'이 들어간 후보를 고른 답은 건드리지 않는다
+    assert explain_empty_candidate_answer(_CANDIDATES_Q, "재고 없음 알림") == "재고 없음 알림"
+
+
+def test_other_questions_keep_their_answer():
+    assert explain_empty_candidate_answer("이대로 진행할까요?", "없음") == "없음"
+    assert explain_empty_candidate_answer("이대로 진행할까요?", "승인") == "승인"
+
+
+def test_empty_candidate_answer_in_english():
+    out = explain_empty_candidate_answer("Pick the items to add to this process (skip if none)", "None")
+    assert "picked none" in out and "Do not create" in out
