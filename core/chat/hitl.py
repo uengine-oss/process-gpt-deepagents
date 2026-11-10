@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import StructuredTool
@@ -123,6 +125,40 @@ class AskUserArgs(BaseModel):
         return self
 
 
+# 「이 프로세스에 추가할 항목을 골라주세요」(bpmn-process-generation-skill 의 후보 선택) 질문인가.
+_CANDIDATE_QUESTION = re.compile(r"추가할\s*항목을\s*골라|pick the items to add", re.IGNORECASE)
+# 아무것도 고르지 않았을 때 프론트가 보내는 답(건너뛰기 · 빈 제출) — 「없음」, 「(없음)」, 「선택 없음」 등
+_NOTHING_PICKED = re.compile(
+    r"^\(?\s*(없음|선택\s*없음|응답\s*없음|건너뜀|건너뛰기|none|nothing|skip(ped)?|no)\s*\)?[.!]?$",
+    re.IGNORECASE,
+)
+
+
+def explain_empty_candidate_answer(question: str, answer: str) -> str:
+    """후보 선택에 아무것도 고르지 않은 답을 모델이 오해하지 않게 풀어 쓴다.
+
+    「없음」 한 낱말만 돌려주면 모델이 후보를 그대로 만드는 회차가 있었다(VM 2026-11-10, 3장 프롬프트:
+    「없음」에 답한 뒤 스킬 「영업 제안서 작성 자동화」를 만들었다). 스킬 문서(03-elicit-artifacts)는
+    "아무것도 안 고르면 그 종류는 건너뛴다"고 하지만, 답만 보고는 '후보가 없다'는 뜻인지 '고르지 않았다'는
+    뜻인지 갈린다. 그래서 고르지 않았다는 사실과 할 일을 답에 적어 돌려준다. 다른 질문·다른 답은 그대로다.
+    """
+    text = str(answer or "").strip()
+    if not _CANDIDATE_QUESTION.search(str(question or "")):
+        return str(answer)
+    if text and not _NOTHING_PICKED.match(text):
+        return str(answer)
+    if re.search(r"pick the items to add", str(question or ""), re.IGNORECASE):
+        return (
+            f"{text or 'None'} — the user picked none of the suggested items. Do not create any skill, "
+            "agent or DMN (no files, no manifest entries, no references in the definition). "
+            "Still create the forms and reference info, then continue."
+        )
+    return (
+        f"{text or '없음'} — 사용자가 제안한 항목을 하나도 고르지 않았습니다. 스킬·에이전트·DMN 은 만들지 않습니다"
+        "(파일도, manifest 항목도, 정의 안의 참조도 만들지 않는다). 폼과 참조정보는 그대로 만들고 다음 단계로 진행하세요."
+    )
+
+
 def _ask_user_impl(
     question: str,
     context: str = "",
@@ -135,8 +171,10 @@ def _ask_user_impl(
         payload["multi_select"] = bool(multi_select)
     response = interrupt(payload)
     if isinstance(response, dict):
-        return response.get("answer", str(response))
-    return str(response)
+        answer = response.get("answer", str(response))
+    else:
+        answer = str(response)
+    return explain_empty_candidate_answer(question, answer)
 
 
 ask_user = StructuredTool.from_function(
