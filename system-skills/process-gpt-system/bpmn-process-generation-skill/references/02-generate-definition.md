@@ -115,7 +115,7 @@
   "instruction": "사용자 지침(한글)",
   "role": "역할명",
   "skills": ["재사용 가능한 스킬 ID(선택)"],
-  "inputData": ["입력 데이터명"],
+  "inputData": [],
   "outputData": ["출력 데이터명"],
   "checkpoints": ["체크포인트1", "체크포인트2"],
   "duration": "5"
@@ -125,6 +125,9 @@
 - `instruction` 은 합의된 흐름의 원문 지침을 최우선으로 사용. 요약·재작성하지 말고 원문을 최대한 유지. 지침이 없으면 빈 문자열로 둔다(임의 생성 금지).
 - **모든 Activity 는 `outputData` 를 최소 1개 이상** 가져야 한다. 빈 배열이거나 누락되면 안 됨.
 - `skills` 는 2단계에서는 보통 비워두고, 4단계에서 사용자가 선택한 스킬을 채운다.
+- `inputData` 는 이 단계에서 **비워 둔다.** 폼이 생긴 뒤 [08-reference-info.md](08-reference-info.md) 가 앞 단계 폼 필드
+  참조(`<activity_id>.<field_name>`)로 채운다. 데이터 이름(「견적요청서」)을 넣지 마라 — 실행 엔진은 `<폼 id>.<필드>`
+  만 읽어서, 이름만 적힌 단계는 앞 단계 폼 값을 못 받는다.
 
 ### Gateway
 ```json
