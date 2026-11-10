@@ -216,7 +216,13 @@ def process_work_dirs(room: Path, conversation_id: str = "") -> list[Path]:
             match = pattern.fullmatch(child.name)
             if match:
                 candidates.append((int(match.group(1) or "1"), child))
-    return [path for _, path in sorted(candidates, key=lambda item: item[0])]
+    if candidates or not room.is_dir():
+        return [path for _, path in sorted(candidates, key=lambda item: item[0])]
+    # 모델이 안내받은 폴더(process-xxxxxxx) 대신 제 이름(sales-proposal 등)으로 정의를 만든 경우 —
+    # 정의 파일이 있는 하위 폴더 중 가장 최근 것 하나를 이번 시도의 폴더로 본다.
+    strays = [child for child in room.iterdir()
+              if child.is_dir() and not child.name.startswith(".") and (child / "process-definition.json").is_file()]
+    return [max(strays, key=lambda p: (p / "process-definition.json").stat().st_mtime)] if strays else []
 
 
 def write_upload_to_workspace(file_name: str, content: bytes) -> str:
