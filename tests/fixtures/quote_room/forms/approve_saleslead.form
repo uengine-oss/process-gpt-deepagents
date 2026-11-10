@@ -1,0 +1,10 @@
+<section>
+  <div class='row' name='saleslead_approval_layout' alias='1차 승인(영업팀장)' is_multidata_mode='false'>
+    <div class='col-sm-6'>
+      <select-field name='approval_decision' alias='승인 여부' is_dynamic_load='fixed' items='[{"approve":"승인"},{"reject":"반려"}]'></select-field>
+    </div>
+    <div class='col-sm-6'>
+      <textarea-field name='approval_reason' alias='승인/반려 사유' rows='4' disabled='false' readonly='false'></textarea-field>
+    </div>
+  </div>
+</section>

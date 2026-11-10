@@ -113,6 +113,28 @@ def test_process_work_dirs_ignore_stale_hitl_directories(tmp_path):
     assert tools.process_work_dirs(room, "conversation-1") == expected
 
 
+def test_process_work_dirs_fall_back_to_self_named_directory(tmp_path):
+    # 모델이 안내받은 process-<hash> 대신 제 이름으로 폴더를 만들면, 정의 파일이 있는 가장 최근 폴더를 쓴다.
+    import os
+
+    room = tmp_path / "room"
+    for name, mtime in (("older-draft", 1_000), ("sales-proposal", 2_000)):
+        folder = room / name
+        folder.mkdir(parents=True)
+        definition = folder / "process-definition.json"
+        definition.write_text("{}", encoding="utf-8")
+        os.utime(definition, (mtime, mtime))
+    (room / ".skill-evals" / "x").mkdir(parents=True)
+    (room / ".skill-evals" / "x" / "process-definition.json").write_text("{}", encoding="utf-8")
+    (room / "notes").mkdir()
+
+    assert tools.process_work_dirs(room, "conversation-1") == [room / "sales-proposal"]
+
+    primary = room / tools.canonical_process_dir_name("conversation-1")
+    primary.mkdir()
+    assert tools.process_work_dirs(room, "conversation-1") == [primary]
+
+
 def test_exclusive_gateway_gets_real_form_decision_contract(tmp_path):
     definition = _valid_definition()
     definition["elements"] = [

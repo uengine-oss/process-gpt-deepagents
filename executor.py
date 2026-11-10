@@ -23,6 +23,7 @@ from a2a.types import TaskState
 from google.protobuf.json_format import ParseDict
 
 from processgpt_agent_sdk.artifacts import download_file
+from core.chat.ui_text import NO_DETAIL, NO_RESULT, asks_to_save, defect_line, done_todos, reply_lang, t as ui_t
 from langchain_core.messages import AIMessageChunk, ToolMessage
 from langgraph.types import Overwrite
 from typing_extensions import override
@@ -89,7 +90,14 @@ from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _ski
 from core.utils.output_utils import extract_final_text, extract_json_text
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
+from core.chat.stream_scope import is_subagent_namespace
 from core.deterministic import MODE_UNDO_PENDING, try_deterministic_execution
+from core.rag.process_knowledge import (
+    chat_selection as _kb_chat_selection,
+    knowledge_note as _kb_note,
+    prepare_task_knowledge,
+    set_generation_knowledge,
+)
 # 우리 기능(프로세스 생성 HITL 캡처/이름도출)에서 사용하는 contextvar — incoming 에는 없으나 유지.
 from core.skills.tools import _current_conversation_id as _skill_conversation_id
 from core.skills.tools import _current_user_request as _skill_user_request
@@ -130,43 +138,43 @@ _WS_BINARY_FILE_RE = re.compile(
 )
 
 
-def _validation_failure_summary(failures: list[dict], max_items: int = 3) -> str:
+def _validation_failure_summary(failures: list[dict], max_items: int = 3, lang: str = "ko") -> str:
     """검증 실패 목록을 사용자에게 보여줄 짧은 불릿으로 요약한다."""
     lines: list[str] = []
     for failure in failures:
         for defect in (failure.get("defects") or [])[:max_items]:
             if not isinstance(defect, dict):
                 continue
-            detail = str(defect.get("detail") or defect.get("type") or "").strip()
+            detail = defect_line(defect, lang)
             if detail:
                 lines.append(f"- {detail}")
     if not lines:
-        return "- 정의 구조 검사에서 결함이 남아 있습니다."
+        return f"- {NO_DETAIL.get(lang) or NO_DETAIL['ko']}"
     return "\n".join(lines[:max_items])
 
 
-def _completion_error_summary(result: str, max_items: int = 3) -> str:
+def _completion_error_summary(result: str, max_items: int = 3, lang: str = "ko") -> str:
     """complete_process_generation 의 "ERROR: {...}" 결과에서 사용자에게 보일 이유를 뽑는다."""
     body = result[len("ERROR:"):].strip() if result.startswith("ERROR:") else result
     try:
         obj = json.loads(body)
     except Exception:
-        return f"- {body[:300]}" if body else "- 통합 결과를 확인하지 못했습니다."
+        return f"- {body[:300]}" if body else f"- {NO_RESULT.get(lang) or NO_RESULT['ko']}"
     failures = obj.get("validation_errors") if isinstance(obj, dict) else None
     if isinstance(failures, list) and failures:
-        return _validation_failure_summary(failures, max_items)
+        return _validation_failure_summary(failures, max_items, lang)
     return f"- {obj.get('message') if isinstance(obj, dict) else body}"
 
 
 def _identified_notes_text(room_dir, conversation_id: str) -> str:
     """식별 화면에서 전환한 방이면, 흐름을 그대로 두었다는 안내와 되돌린 변경의 이유를 붙인다."""
     from core.skills.identified import load_identified_definition, read_notes
-    from core.skills.tools import process_work_dirs as _process_work_dirs
+    from core.skills.tools import definition_work_dirs as _definition_dirs
 
     if not load_identified_definition(conversation_id):
         return ""
     notes: list[str] = []
-    for directory in _process_work_dirs(room_dir, conversation_id):
+    for directory in _definition_dirs(room_dir, conversation_id):
         notes.extend(n for n in read_notes(directory) if n not in notes)
     text = "\n\n인계 기록에서 도출된 흐름(단계·담당자·순서·분기)은 그대로 두고 폼·스킬·에이전트만 보강했어요."
     if notes:
@@ -1566,6 +1574,17 @@ class DeepAgentExecutor(AgentExecutor):
                     "chat_room start upsert 실패 | room_id=%s", chat_room_id, exc_info=True
                 )
 
+        # 할 일 실행 단계가 검색할 지식 베이스 문서. 채팅은 사용자가 고른 자료가 범위지만 할 일에는
+        # 고를 사람이 없다 — 정의에 남긴 자료(단계 → 정의)를 쓰고, 없으면 지식 베이스 전체로 폴백한다.
+        task_knowledge: list[dict] = []
+        task_knowledge_origin = ""
+        if not is_chat:
+            task_knowledge, task_knowledge_origin = await prepare_task_knowledge(
+                tenant_id=tenant_id,
+                proc_def_id=current_proc_def_id,
+                activity_id=activity_id,
+            )
+
         # [InputData] 섹션의 큰 필드를 workspace 파일로 오프로드해 초기 LLM 컨텍스트 크기를 줄인다.
         # 피드백 재작업(FB_REQUESTED)이면 feedback 배열의 가장 최근 항목의 content만 추출해
         # 메시지를 구성한다(build_user_message 미사용 — 소스/폼 형식 안내가 재작업 지시와 섞이지 않게).
@@ -1608,6 +1627,8 @@ class DeepAgentExecutor(AgentExecutor):
                 suggest_related_outputs=(not is_chat and bool(root_proc_inst_id)),
                 agents=_exclude_root_profile(agents),
             )
+        if task_knowledge:
+            user_message = f"{_kb_note(task_knowledge, task_knowledge_origin)}\n\n{user_message}"
         pinned_skills = [_forced_skill_name] if _forced_skill_name else []
         recent_msgs = collect_recent_messages(extras) if is_chat else []
         # 인계로 받은 방이면 앞선 방들의 대화를 이력으로 싣는다(받은 방 화면의 '이전 대화'와 같은 규칙).
@@ -1624,6 +1645,8 @@ class DeepAgentExecutor(AgentExecutor):
             handover_history = await asyncio.to_thread(build_handover_history, get_supabase(), history_room_id, tenant_id)
         # 프로세스명 도출용: 이번 사용자 요청 원문을 contextvar 로 전달(complete 가 이름이 비면 사용).
         _user_input_text = ""
+        # 채팅에 직접 남기는 고정 안내(완료·보류·todo)의 언어 — 아래에서 원 요청 원문으로 정한다
+        _ui_lang = "ko"
         try:
             _user_input_text = str(context.get_user_input() or "")
             # HITL resume 턴의 current input은 "승인" 또는 후보 선택 답변뿐이다. 원 요청을
@@ -1635,7 +1658,10 @@ class DeepAgentExecutor(AgentExecutor):
             request_candidates.append(_user_input_text)
             non_hitl = [
                 text for text in request_candidates
-                if not re.search(r"\[(?:스킬|에이전트|DMN)\]|^\s*(?:승인|반려)\s*$", text, re.IGNORECASE)
+                if not re.search(
+                    r"\[(?:스킬|에이전트|DMN|skill|agent)\]|^\s*(?:승인|반려|approved?|reject(?:ed)?)\s*$",
+                    text, re.IGNORECASE,
+                )
             ]
             original_request = max(
                 non_hitl or request_candidates or [""],
@@ -1646,8 +1672,13 @@ class DeepAgentExecutor(AgentExecutor):
                 ),
             )
             _skill_user_request.set(original_request)
+            _ui_lang = reply_lang(original_request)
         except Exception:
             pass
+        # 영어로 물었으면 답도 영어로. 사용자 글 뒤에 붙는 한국어 시스템 블록·지식 베이스 안내 때문에
+        # 「Reply in Korean unless …」 기본 지시를 따라 한국어로 답하곤 했다(영어 모드 VM 실측).
+        if _ui_lang == "en":
+            user_message = f"{user_message}\n\n{ui_t('reply_language_rule', _ui_lang)}"
         # 후보 선택 HITL 답변이면([스킬]/[에이전트]/[DMN]) manifest 로 캡처(에이전트가 안 써도 스킬/연결 보장).
         # process-* 폴더는 1단계에서 이미 생성됨(이번 턴은 후보선택 resume). 방은 contextvar(위에서 set)로 찾는다.
         try:
@@ -2001,9 +2032,15 @@ class DeepAgentExecutor(AgentExecutor):
             _kid = str(_kid).strip()
             if _kid:
                 knowledge_doc_ids.append(_kid)
+        # 할 일 실행: 정의에 남긴 자료(또는 지식 베이스 전체 폴백)도 검색 범위로.
+        knowledge_doc_ids += [d["id"] for d in task_knowledge]
         # memento 청크의 file_id 는 storage 경로(예: 'files/<uuid>.pdf') 다.
         # 프론트가 publicURL/sign URL 을 보내도 storage 경로로 정규화해 매칭시킨다.
         knowledge_doc_ids = _normalize_doc_ids(knowledge_doc_ids)
+        if is_chat:
+            # 이번 턴이 프로세스를 만들면 마무리(_complete_one_process)가 이 선택을 정의와
+            # 에이전트 단계에 남긴다 — 실행 때 그 단계가 같은 자료를 찾는다.
+            set_generation_knowledge(_kb_chat_selection(metadata, extras, _normalize_doc_id))
         logger.info(
             "knowledge_doc_ids 구성 | n=%d ids=%s",
             len(knowledge_doc_ids), knowledge_doc_ids[:5],
@@ -2142,6 +2179,11 @@ class DeepAgentExecutor(AgentExecutor):
         # 찾아 거둔다(`_room_document_paths`). 이 표식이 없으면 지난 턴의 문서까지 다시
         # 올라가 화면에 같은 것이 여러 번 뜬다.
         turn_started_ns = time.time_ns()
+        # 이번 턴에 부른 도구 이름 — 고쳤다는 답을 확인할 때(파일만 다룬 턴인지) 쓴다.
+        turn_tool_names: set[str] = set()
+        # 이번 턴 끝에 결과 전달을 보류했으면 그 사유({"kind", "failures"|"error"}) — 턴이 끝날 때
+        # 모델의 대화 기록에 남겨 다음 턴의 모델이 보류와 결함을 알게 한다(core/chat/delivery_hold.py).
+        delivery_hold: dict[str, Any] | None = None
 
         try:
             async for _ns, stream_evt, data in graph.astream(
@@ -2149,6 +2191,9 @@ class DeepAgentExecutor(AgentExecutor):
             ):
                 if stream_evt == "messages":
                     msg, _meta = data
+                    # 서브에이전트(task 도구)의 글은 사용자 답이 아니다 — 메인 에이전트가 도구 결과로 받는다.
+                    if is_subagent_namespace(_ns):
+                        continue
                     if isinstance(msg, AIMessageChunk):
                         text = msg.content if isinstance(msg.content, str) else "".join(
                             b.get("text", "") for b in msg.content
@@ -2212,6 +2257,7 @@ class DeepAgentExecutor(AgentExecutor):
                                         active_tool_calls[_tc_id] = tool_name
                                         if isinstance(tool_args, dict):
                                             pending_tool_args[_tc_id] = tool_args
+                                    turn_tool_names.add(str(tool_name or ""))
                                     if tool_name == "request_human_input":
                                         pending_hitl_payload = normalize_hitl_payload(tool_args)
                                     # 파일 산출물 추적: write_file/edit_file 의 대상 경로를 기록해두고
@@ -2343,13 +2389,7 @@ class DeepAgentExecutor(AgentExecutor):
                                     if tool_name == "complete_process_generation":
                                         complete_called = True
                                     if tool_name == "complete_process_generation" and not str(result_content or "").startswith("ERROR"):
-                                        _done_todos = [
-                                            {"content": "1. 프로세스 초안 설계 & JSON 생성", "status": "completed"},
-                                            {"content": "2. 스킬·에이전트·DMN 선택 & 생성", "status": "completed"},
-                                            {"content": "3. 입력 폼 & 참조정보 생성", "status": "completed"},
-                                            {"content": "4. 프로세스 검증 & 자동 보정", "status": "completed"},
-                                            {"content": "5. 결과 통합 & 완료", "status": "completed"},
-                                        ]
+                                        _done_todos = done_todos(_ui_lang)
                                         await streamer.send_json({"type": "plan_todos", "todos": _done_todos})
 
                                     # 도구 출력의 출력계약(JSON)을 잡아 프론트에 구조화 이벤트로
@@ -2497,6 +2537,30 @@ class DeepAgentExecutor(AgentExecutor):
                     streamer=streamer,
                 )
 
+            # 고치기 차례에 「수정했습니다」라고만 하고 정의·산출물이 마지막으로 넘긴 때와 같으면 보류한다
+            # (VM 실측: 「이미 규정대로 … 수정했습니다」인데 그 턴에 도구 호출이 없었고 저장된 흐름이 그대로).
+            if streamer and chat_room_id and not complete_called:
+                try:
+                    from core.skills.definition_guard import unapplied_change_notice
+                    from core.skills.tools import _conv_slug as _guard_slug
+                    from core.skills.tools import tenant_workspace_root as _guard_ws
+
+                    _unapplied = await asyncio.to_thread(
+                        unapplied_change_notice,
+                        _guard_ws() / ".bpmn" / _guard_slug(chat_room_id),
+                        chat_room_id,
+                        request=f"{human_answer_stripped}\n{_user_input_text}",
+                        reply=str(raw_text or ""),
+                        tools_used=turn_tool_names,
+                    )
+                    if _unapplied:
+                        logger.warning("고쳤다는 답인데 정의·산출물이 그대로 — 보류 | room=%s", chat_room_id)
+                        raw_text = _unapplied
+                        complete_called = True  # 같은 결과를 다시 「생성했어요」로 넘기지 않는다
+                        delivery_hold = {"kind": "unapplied", "failures": []}
+                except Exception:
+                    logger.warning("고치기 반영 확인 실패(무시) | room=%s", chat_room_id, exc_info=True)
+
             # 폴백: 에이전트가 process-definition.json 은 만들었으나(이번 턴) complete 를 호출하지 않고
             # 인터럽트 없이 턴을 끝낸 경우 — 스킬 생성 등으로 step 이 소진되면 발생한다.
             # 결과 통합이 누락되므로 executor 가 직접 complete 를 호출해 최종본을 만들고 프론트에 전달한다.
@@ -2508,12 +2572,13 @@ class DeepAgentExecutor(AgentExecutor):
             definition_written_this_turn = process_json_written or workspace_write_made
             if not process_json_written and chat_room_id:
                 try:
-                    from core.skills.tools import process_work_dirs as _process_work_dirs, _conv_slug
+                    from core.skills.tools import definition_work_dirs as _definition_dirs, _conv_slug
                     from core.skills.tools import tenant_workspace_root as _tenant_ws
                     room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id)
+                    # 정의가 방 루트(.bpmn/<room>/process-definition.json)에 있어도 본다 — 못 보면 검증 없이 넘어간다
                     process_json_written = any(
                         (directory / "process-definition.json").is_file()
-                        for directory in _process_work_dirs(room_dir, chat_room_id)
+                        for directory in _definition_dirs(room_dir, chat_room_id)
                     )
                 except Exception:
                     pass
@@ -2524,7 +2589,7 @@ class DeepAgentExecutor(AgentExecutor):
                         complete_process_generation as _cpg,
                         validate_process_definition as _vpd,
                         _current_conversation_id as _ccid,
-                        process_work_dirs as _process_work_dirs,
+                        definition_work_dirs as _definition_dirs,
                         _conv_slug,
                     )
                     from core.skills.tools import tenant_workspace_root as _tenant_ws
@@ -2532,7 +2597,7 @@ class DeepAgentExecutor(AgentExecutor):
                     _ccid.set(chat_room_id or "")
                     _room_dir = _tenant_ws() / ".bpmn" / _conv_slug(chat_room_id or "")
                     _validation_failures = []
-                    for _work_dir in _process_work_dirs(_room_dir, chat_room_id or ""):
+                    for _work_dir in _definition_dirs(_room_dir, chat_room_id or ""):
                         _definition_path = _work_dir / "process-definition.json"
                         if not _definition_path.is_file():
                             continue
@@ -2552,37 +2617,34 @@ class DeepAgentExecutor(AgentExecutor):
                         # 정상적인 실패 경로다(예외 아님). 예외로 올려 스택트레이스를 남기는
                         # 대신 사용자에게 무엇이 걸렸는지 한 줄로 알려주고 이 턴을 마친다.
                         complete_called = True  # 이번 턴의 무검증 재시도 방지
+                        delivery_hold = {"kind": "validation", "failures": _validation_failures}
                         logger.error(
                             "auto-complete 검증 실패 | room=%s failures=%s",
                             chat_room_id,
                             _validation_failures,
                         )
                         raw_text = (
-                            "프로세스 정의가 검증을 통과하지 못해 결과 전달을 보류했어요.\n"
-                            + _validation_failure_summary(_validation_failures)
-                            + "\n어떻게 고칠지 알려주시면 이어서 수정할게요."
+                            ui_t("validation_hold", _ui_lang) + "\n"
+                            + _validation_failure_summary(_validation_failures, lang=_ui_lang)
+                            + "\n" + ui_t("validation_hold_tail", _ui_lang)
                         )
                     else:
                         _cres = await asyncio.to_thread(_cpg.invoke, {})
                         logger.info("auto-complete | room=%s result=%.140s", chat_room_id, str(_cres))
                         complete_called = True
                         if str(_cres or "").startswith("ERROR"):
+                            delivery_hold = {"kind": "integration", "error": str(_cres)}
+                        if str(_cres or "").startswith("ERROR"):
                             raw_text = (
-                                "프로세스 산출물을 통합하는 중 문제가 생겨 결과 전달을 보류했어요.\n"
-                                + _completion_error_summary(str(_cres))
-                                + "\n다시 시도하거나 수정할 부분을 알려주세요."
+                                ui_t("integration_hold", _ui_lang) + "\n"
+                                + _completion_error_summary(str(_cres), lang=_ui_lang)
+                                + "\n" + ui_t("retry_tail", _ui_lang)
                             )
                         else:
                             await _reemit_room_artifacts(streamer, chat_room_id or "")
-                            await streamer.send_json({"type": "plan_todos", "todos": [
-                                {"content": "1. 프로세스 초안 설계 & JSON 생성", "status": "completed"},
-                                {"content": "2. 스킬·에이전트·DMN 선택 & 생성", "status": "completed"},
-                                {"content": "3. 입력 폼 & 참조정보 생성", "status": "completed"},
-                                {"content": "4. 프로세스 검증 & 자동 보정", "status": "completed"},
-                                {"content": "5. 결과 통합 & 완료", "status": "completed"},
-                            ]})
+                            await streamer.send_json({"type": "plan_todos", "todos": done_todos(_ui_lang)})
                             identified_notes = _identified_notes_text(_room_dir, chat_room_id or "")
-                            if "확인 후 저장" not in (raw_text or ""):
+                            if not asks_to_save(raw_text):
                                 # 식별 화면에서 전환한 방에서 정의를 쓰지 않은 대화 턴(질문 패널 답이 아닌 새 메시지)은 에이전트 답을 지우지 않는다 —
                                 # 흐름을 바꿔 달라는 요청에 '바꾸지 않는 이유'를 답한 경우, 덮어쓰면 그 이유가 사라진다.
                                 agent_text = (
@@ -2590,17 +2652,12 @@ class DeepAgentExecutor(AgentExecutor):
                                     if identified_notes and not definition_written_this_turn and not human_answer_stripped
                                     else ""
                                 )
-                                raw_text = (agent_text + "\n\n" if agent_text else "") + (
-                                    "프로세스를 생성했어요. 확인 후 저장 버튼을 눌러주세요."
-                                )
+                                raw_text = (agent_text + "\n\n" if agent_text else "") + ui_t("process_created", _ui_lang)
                             raw_text += identified_notes
                 except Exception:
                     logger.exception("auto-complete 실패")
                     complete_called = True
-                    raw_text = (
-                        "프로세스 마무리 처리 중 오류가 발생했어요. "
-                        "잠시 후 다시 시도하거나 수정할 부분을 알려주세요."
-                    )
+                    raw_text = ui_t("finalize_error", _ui_lang)
 
             # 단독 스킬 생성: process-definition.json 이 없어 위 complete 폴백을 타지 않으므로,
             # 방 산출물(base/skills/*/SKILL.md)을 file_artifact 로 재전송해 프론트 패널 표시 + 저장을 보장한다.
@@ -2613,10 +2670,18 @@ class DeepAgentExecutor(AgentExecutor):
                     # PR(병합 요청)을 올린 턴은 사용자가 저장 버튼을 누를 일이 없다. 그런데도
                     # 이 문구로 덮어쓰면 PR 링크와 병합 위치 안내가 사라지고 "저장하라"는
                     # 잘못된 안내만 남는다. 그런 응답은 에이전트의 원문을 그대로 둔다.
-                    if "확인 후 저장" not in (raw_text or "") and not _reports_pull_request(raw_text):
-                        raw_text = "스킬을 생성했어요. 확인 후 저장 버튼을 눌러주세요."
+                    if not asks_to_save(raw_text) and not _reports_pull_request(raw_text):
+                        raw_text = ui_t("skill_created", _ui_lang)
                 except Exception:
                     logger.exception("단독 스킬 산출물 재전송 실패")
+
+            # 결과 전달을 보류한 턴: 화면에는 보류 안내가 나가지만 체크포인트에는 모델 자신의 마지막 답
+            # (「…성공적으로 생성되었습니다」)이 남고, 다음 턴은 새 사용자 메시지만 이어 붙인다. 보류 사유와
+            # 결함을 대화 기록에 덧붙여 다음 턴의 모델이 그 파일부터 고치게 한다. 보류 없는 턴은 그대로.
+            if delivery_hold is not None and checkpoint_thread_id:
+                from core.chat.delivery_hold import record_delivery_hold
+
+                await record_delivery_hold(graph, checkpoint_thread_id, delivery_hold, str(raw_text or ""))
 
             # 빈 턴 방지: 모델이 아무 텍스트도 내지 않고(도구 호출도 없이) 끝난 경우
             # 빈 어시스턴트 메시지가 저장돼 사용자 화면에는 "답변했는데 반응이 없는" 상태로 보인다.

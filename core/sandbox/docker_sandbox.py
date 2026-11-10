@@ -23,6 +23,7 @@ import io
 import logging
 import os
 import re
+import socket
 import tarfile
 import threading
 import time
@@ -241,6 +242,44 @@ _FALLBACK_SOCKETS = [
 ]
 
 
+_DAEMON_MOUNTS: list[tuple[str, str]] | None = None
+
+
+def _daemon_mounts(client: docker.DockerClient) -> list[tuple[str, str]]:
+    """이 프로세스가 도는 컨테이너의 (컨테이너 안 경로, 데몬이 보는 원본 경로) 목록. 컨테이너 밖이면 빈 목록."""
+    global _DAEMON_MOUNTS
+    if _DAEMON_MOUNTS is not None:
+        return _DAEMON_MOUNTS
+    mounts: list[tuple[str, str]] = []
+    if os.path.exists("/.dockerenv"):
+        try:
+            me = client.containers.get(socket.gethostname())
+            for m in me.attrs.get("Mounts") or []:
+                dst, src = m.get("Destination"), m.get("Source")
+                if dst and src:
+                    mounts.append((dst.rstrip("/"), src.rstrip("/")))
+        except Exception as exc:
+            logger.warning("샌드박스: 이 컨테이너의 마운트를 읽지 못해 경로를 그대로 씁니다: %s", exc)
+    mounts.sort(key=lambda item: len(item[0]), reverse=True)
+    _DAEMON_MOUNTS = mounts
+    return mounts
+
+
+def _daemon_path(client: docker.DockerClient, path: Path | str) -> str:
+    """형제 컨테이너(샌드박스)에 bind-mount 할 원본 경로를 데몬이 보는 경로로 바꾼다.
+
+    deepagents 가 컨테이너로 돌며 호스트 Docker 소켓으로 샌드박스를 띄우면, bind-mount 원본은 이 컨테이너가
+    아니라 데몬 쪽에서 해석된다. 그래서 /app/workspace 처럼 컨테이너 안 경로를 그대로 넘기면 호스트에 같은 경로가
+    있어야만 동작한다(Docker Desktop 의 Mac·Windows 에는 /app 이 없다). 이 컨테이너가 그 경로를 받은 마운트의
+    원본(이름 있는 볼륨이면 /var/lib/docker/volumes/<볼륨>/_data)으로 바꿔 넘긴다. 맞는 마운트가 없으면 그대로.
+    """
+    p = str(path)
+    for dst, src in _daemon_mounts(client):
+        if p == dst or p.startswith(dst + "/"):
+            return src + p[len(dst):]
+    return p
+
+
 def _get_docker_client() -> docker.DockerClient:
     """DOCKER_HOST가 없으면 알려진 소켓 경로를 순서대로 시도한다."""
     if os.environ.get("DOCKER_HOST"):
@@ -351,12 +390,19 @@ class DockerSandboxBackend(BaseSandbox):
         allowed = _global_collection_names()
         if self._tenant_id:
             allowed = allowed | {self._tenant_id}
+            # 이 테넌트 디렉토리는 첫 스킬을 올리기 전에도 만들어 마운트한다. 없을 때 띄운
+            # 컨테이너는 /skills/<tenant> 없이 계속 재사용돼, 나중에 올린 스킬(에이전트에
+            # 붙인 스킬)을 SkillsMiddleware 가 「path_not_found」로 못 읽었다.
+            try:
+                (self._skills_host / self._tenant_id).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
 
         volumes: dict = {}
         try:
             for entry in sorted(self._skills_host.iterdir()):
                 if entry.is_dir() and entry.name in allowed:
-                    volumes[str(entry)] = {"bind": f"/skills/{entry.name}", "mode": "ro"}
+                    volumes[_daemon_path(self._client, entry)] = {"bind": f"/skills/{entry.name}", "mode": "ro"}
         except OSError:
             pass
         return volumes
@@ -403,9 +449,17 @@ class DockerSandboxBackend(BaseSandbox):
         try:
             old = self._client.containers.get(name)
             if old.status == "running":
+                missing_skills = self._missing_skill_mounts(old)
                 if not self._contract_matches(old):
                     # 옛 구성(볼륨 전체 마운트·모델 키 env)으로 떠 있는 컨테이너다.
                     logger.info("sandbox 재생성: %s 의 구성이 %s 가 아님", name, SANDBOX_CONTRACT)
+                elif not self._workspace_alive(old):
+                    # 다시 설치(볼륨 삭제)한 뒤에도 남은 컨테이너다. 지워진 작업 볼륨을 물고 있어 모든 exec 가
+                    # "current working directory is outside of container mount namespace root" 로 실패한다.
+                    logger.info("sandbox 재생성: %s 의 %s 에 들어갈 수 없음", name, _CONTAINER_WORKSPACE)
+                elif missing_skills:
+                    # 테넌트 스킬 디렉토리가 생기기 전에 띄운 컨테이너다 — 지금 올린 스킬이 안 보인다.
+                    logger.info("sandbox 재생성: %s 에 스킬 마운트 %s 가 없음", name, missing_skills)
                 elif self._network_matches(old, network):
                     self._container = old
                     # 이전 실행에서 살아남은 컨테이너에도 safe.directory 를 보장한다.
@@ -422,7 +476,7 @@ class DockerSandboxBackend(BaseSandbox):
             pass
 
         self._workspace_host.mkdir(parents=True, exist_ok=True)
-        volumes: dict = {str(self._workspace_host): {"bind": _CONTAINER_WORKSPACE, "mode": "rw"}}
+        volumes: dict = {_daemon_path(self._client, self._workspace_host): {"bind": _CONTAINER_WORKSPACE, "mode": "rw"}}
         volumes.update(self._skill_volumes())
 
         run_kwargs: dict = dict(
@@ -459,6 +513,27 @@ class DockerSandboxBackend(BaseSandbox):
         except Exception:
             return False
         return labels.get(_CONTRACT_LABEL) == SANDBOX_CONTRACT
+
+    def _missing_skill_mounts(self, container) -> list[str]:
+        """지금 띄우면 붙을 /skills/<name> 마운트 중 이 컨테이너에 없는 것. 확인하지 못하면 빈 목록."""
+        expected = {v["bind"] for v in self._skill_volumes().values()}
+        if not expected:
+            return []
+        try:
+            container.reload()
+            mounted = {m.get("Destination") for m in (container.attrs.get("Mounts") or [])}
+        except Exception:  # pragma: no cover - best effort
+            return []
+        return sorted(expected - mounted)
+
+    @staticmethod
+    def _workspace_alive(container) -> bool:
+        """컨테이너 안에서 작업 폴더에 실제로 들어갈 수 있는지. 확인하지 못하면 재사용하지 않는다."""
+        try:
+            result = container.exec_run(["sh", "-c", f"cd {_CONTAINER_WORKSPACE} && ls >/dev/null"])
+        except Exception:
+            return False
+        return getattr(result, "exit_code", 1) == 0
 
     @staticmethod
     def _network_matches(container, network: str | None) -> bool:

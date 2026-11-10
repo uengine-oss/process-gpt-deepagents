@@ -20,6 +20,7 @@
 
      ```
      이 프로세스에 추가할 항목을 골라주세요 (안 고르면 건너뜁니다)
+     (영어로 묻는 사용자: "Pick the items to add to this process (skip if none)", 머리글은 [Skill] / [Agent] / [DMN])
 
      [스킬]
      • 휴가 잔여일수 검증: 신청 전 잔여 연차 확인 (활동 2개)

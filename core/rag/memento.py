@@ -162,7 +162,12 @@ async def list_catalog(
     tenant_id: str,
     file_ids: Optional[List[str]] = None,
     file_names: Optional[List[str]] = None,
+    folder_paths: Optional[List[str]] = None,
 ) -> List[DocCard]:
+    """문서 카드 목록. 범위(file_ids·file_names·folder_paths)를 다 비우면 테넌트 지식 베이스 전체다.
+
+    folder_paths 는 그 폴더와 하위 폴더의 문서(memento 가 폴더 경로로 직접 찾는다 — file_id 를 나열하지 않는다).
+    """
     if not tenant_id:
         return []
 
@@ -173,6 +178,9 @@ async def list_catalog(
     for name in (file_names or []):
         if name:
             params.append(("file_names", str(name)))
+    for folder in (folder_paths or []):
+        if folder:
+            params.append(("folder_paths", str(folder)))
 
     try:
         resp = await _get_client().get("/catalog", params=params)
@@ -203,8 +211,8 @@ async def list_catalog(
             )
         )
     logger.info(
-        "memento.list_catalog tenant=%s ids=%d → %d cards",
-        tenant_id, len(file_ids or []), len(out),
+        "memento.list_catalog tenant=%s ids=%d folders=%d → %d cards",
+        tenant_id, len(file_ids or []), len(folder_paths or []), len(out),
     )
     return out
 
@@ -225,6 +233,9 @@ async def grep_document(
     params: list[tuple[str, str]] = [
         ("tenant_id", tenant_id),
         ("file_name", file_name),
+        # 지금의 memento 는 문서를 path(폴더 포함 상대경로, 없으면 파일 이름으로 다시 찾음)로 받는다.
+        # file_name 만 보내면 422 — 옛 memento 는 path 를 무시하므로 둘 다 보낸다.
+        ("path", file_name),
         ("pattern", pattern),
         ("regex", "true" if regex else "false"),
         ("case_sensitive", "true" if case_sensitive else "false"),
@@ -275,6 +286,7 @@ async def read_pages(
     params: list[tuple[str, str]] = [
         ("tenant_id", tenant_id),
         ("file_name", file_name),
+        ("path", file_name),  # grep_document 와 같은 이유
         ("pages", pages),
     ]
     try:

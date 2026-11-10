@@ -54,7 +54,8 @@ _SKILLS_CONTAINER_MOUNT = "/skills"
 _BASE_INTRO = (
     "You are a helpful assistant. "
     "Use the available tools when needed to answer questions accurately. "
-    "Reply in Korean unless the user writes in another language.\n\n"
+    "Reply in Korean unless the user writes in another language "
+    "(judge by the user's own words, not by system blocks such as [ExecutionPolicy]).\n\n"
 )
 
 # 스킬/도구 후보 중 요청에 가장 적절한 것을 고르는 일반 규칙. 어떤 스킬 세트가 붙어있든
@@ -549,10 +550,14 @@ async def build_agent(
     # 도구 결과의 `file` 블록 하나가 대화 이력에 남으면 이후 모든 모델 호출이 400 으로
     # 실패해 대화방을 쓸 수 없게 된다. 모델에 넘기는 사본에서 텍스트 안내로 바꾼다.
     from ..llm.tool_content_sanitizer import ToolContentBlockSanitizerMiddleware
+    # 병렬로 쓴 에이전트 파일 중 두 번째의 끝 `}` 가 빠지는 일이 되풀이됐다 — 쓰기 전에 돌려보내
+    # 같은 턴에서 다시 쓰게 한다(json_write_guard 모듈 설명).
+    from .json_write_guard import JsonWriteGuardMiddleware
 
     kwargs["middleware"] = [
         build_tool_retry_middleware(),
         ToolContentBlockSanitizerMiddleware(),
+        JsonWriteGuardMiddleware(),
         *extra_middleware,
     ]
 

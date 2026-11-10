@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import types
+
 import docker.errors
 import pytest
 
@@ -27,6 +29,10 @@ class _FakeContainer:
 
     def reload(self):
         pass
+
+    def exec_run(self, cmd, **kwargs):
+        # 작업 폴더에 들어갈 수 있는 살아 있는 컨테이너(_workspace_alive)
+        return types.SimpleNamespace(exit_code=0, output=b"")
 
     def remove(self, force=False):
         self.removed = True

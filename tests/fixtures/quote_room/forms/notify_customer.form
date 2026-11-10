@@ -1,0 +1,11 @@
+<section>
+  <div class='row' name='customer_notify_layout' alias='고객 회신 내용' is_multidata_mode='false'>
+    <div class='col-sm-6'>
+      <text-field name='sent_date' alias='견적 발송일' type='date' disabled='false' readonly='false'></text-field>
+      <text-field name='quote_valid_until' alias='제안 유효기간(자동계산)' type='date' disabled='true' readonly='true'></text-field>
+    </div>
+    <div class='col-sm-6'>
+      <textarea-field name='customer_note' alias='특이사항/메모' rows='4' disabled='false' readonly='false'></textarea-field>
+    </div>
+  </div>
+</section>

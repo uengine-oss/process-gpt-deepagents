@@ -108,7 +108,7 @@
       "tool": "formHandler:leave_request_review_leave_form",
       "agent": "team_lead_review_agent",
       "agentMode": "draft",
-      "orchestration": "crewai-action",
+      "orchestration": "deepagents",
       "inputData": ["leave_request_apply_leave_form.leave_type", "leave_request_apply_leave_form.period"],
       "outputData": ["결재결과"],
       "checkpoints": ["결재 의견 작성 여부"],

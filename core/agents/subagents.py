@@ -50,7 +50,7 @@ def _build_subagent_system_prompt(agent: dict, tenant_id: str = "") -> str:
     parts = [f"You are {username}."] + _format_profile_traits(agent)
     if tenant_id:
         parts.append(f"- 테넌트 ID: {tenant_id}")
-    parts.append("Reply in Korean unless the user writes in another language.")
+    parts.append("Reply in Korean unless the user writes in another language (judge by the user's own words, not by system blocks).")
     return "\n".join(parts)
 
 

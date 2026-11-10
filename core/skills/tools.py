@@ -216,7 +216,13 @@ def process_work_dirs(room: Path, conversation_id: str = "") -> list[Path]:
             match = pattern.fullmatch(child.name)
             if match:
                 candidates.append((int(match.group(1) or "1"), child))
-    return [path for _, path in sorted(candidates, key=lambda item: item[0])]
+    if candidates or not room.is_dir():
+        return [path for _, path in sorted(candidates, key=lambda item: item[0])]
+    # 모델이 안내받은 폴더(process-xxxxxxx) 대신 제 이름(sales-proposal 등)으로 정의를 만든 경우 —
+    # 정의 파일이 있는 하위 폴더 중 가장 최근 것 하나를 이번 시도의 폴더로 본다.
+    strays = [child for child in room.iterdir()
+              if child.is_dir() and not child.name.startswith(".") and (child / "process-definition.json").is_file()]
+    return [max(strays, key=lambda p: (p / "process-definition.json").stat().st_mtime)] if strays else []
 
 
 def write_upload_to_workspace(file_name: str, content: bytes) -> str:
@@ -1258,6 +1264,44 @@ def _normalize_to_processgpt_schema(pd: dict) -> tuple:
                 if src in id_map:
                     e["source"] = id_map[src]
 
+    # 요소에 `source`(앞 요소 id)만 적고 그 연결 Sequence 를 빠뜨린 경우(02 규격 12번 위반) — 들어오는
+    # Sequence 가 하나도 없는 요소에 한해 source → 요소 Sequence 를 채운다. 프론트 그림(BPMNXmlGenerator 의
+    # source 기반 보정)에는 화살표가 있는데 정의 JSON 에는 없어, 실행이 첫 단계를 건너뛰고 고치기가
+    # 「startEvent 에서 도달 불가능」으로 막혔다(VM 실측: 시작 이벤트 → 견적 요청 접수). 다른 들어오는
+    # 연결이 있는 요소의 source 는 낡은 값일 수 있어(흐름을 고친 뒤 안 바꿈) 연결을 새로 만들지 않는다.
+    _nodes = {
+        str(e.get("id")): e for e in new_els
+        if isinstance(e, dict) and e.get("elementType") != "Sequence" and e.get("id")
+    }
+    _incoming = {
+        str(e.get("target")) for e in new_els
+        if isinstance(e, dict) and e.get("elementType") == "Sequence" and e.get("target")
+    }
+    _seq_ids = {
+        str(e.get("id")) for e in new_els
+        if isinstance(e, dict) and e.get("elementType") == "Sequence" and e.get("id")
+    }
+    for e in list(new_els):
+        if not isinstance(e, dict) or e.get("elementType") == "Sequence":
+            continue
+        eid = str(e.get("id") or "")
+        src = str(e.get("source") or "").strip()
+        if not eid or not src or src == eid or eid in _incoming or src not in _nodes:
+            continue
+        if e.get("elementType") == "Event" and e.get("type") == "StartEvent":
+            continue
+        if _nodes[src].get("elementType") == "Event" and _nodes[src].get("type") == "EndEvent":
+            continue
+        sid = f"seq_{src}_{eid}"
+        n = 2
+        while sid in _seq_ids:
+            sid = f"seq_{src}_{eid}_{n}"
+            n += 1
+        _seq_ids.add(sid)
+        _incoming.add(eid)
+        new_els.append({"elementType": "Sequence", "id": sid, "source": src, "target": eid})
+        changed = True
+
     pd["elements"] = new_els
     # flattened 잔재 제거(중복 방지)
     for key in ("activities", "events", "gateways", "sequences"):
@@ -1569,6 +1613,137 @@ def _write_validation_receipt(target: Path, result: dict) -> None:
         receipt.unlink()
 
 
+# 폼 HTML 에서 닫는 태그가 없는 요소(이것만 열린 채 끝나도 된다).
+_FORM_VOID_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr",
+})
+
+
+def _form_structure_problem(html: str) -> str:
+    """폼 HTML 의 태그가 열고 닫힌 짝이 맞는지 본다. 맞으면 빈 문자열, 아니면 사람이 읽을 까닭."""
+    from html.parser import HTMLParser
+
+    class _Balance(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.stack: list[str] = []
+            self.problem = ""
+
+        def handle_starttag(self, tag, attrs):
+            if tag not in _FORM_VOID_TAGS:
+                self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            if self.problem or tag in _FORM_VOID_TAGS:
+                return
+            if tag in self.stack:
+                while self.stack:
+                    opened = self.stack.pop()
+                    if opened == tag:
+                        return
+                    self.problem = f"<{opened}> 를 닫지 않고 </{tag}> 가 왔습니다"
+                    return
+            self.problem = f"열지 않은 </{tag}> 가 있습니다"
+
+    parser = _Balance()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception as exc:  # pragma: no cover - HTMLParser 는 거의 던지지 않는다
+        return f"HTML 을 읽지 못했습니다({exc})"
+    if parser.problem:
+        return parser.problem
+    if parser.stack:
+        return "닫히지 않은 태그로 끝납니다: " + ", ".join(f"<{t}>" for t in parser.stack[-3:])
+    return ""
+
+
+def _work_file_defects(work: Path) -> list:
+    """정의 폴더의 에이전트·manifest·폼 파일이 저장에 쓸 수 있는 꼴인지 본다.
+
+    마무리(_complete_one_process)와 프론트 저장은 읽지 못한 파일을 말없이 건너뛴다. 튜토리얼 VM 에서
+    모델이 agents/quote_calc_agent.json 끝의 `}` 를 빠뜨리자 그 에이전트가 통째로 빠지고 정의에는
+    슬러그만 남았다(고른 에이전트 둘 중 하나만 저장). 정의 결함처럼 막아 모델이 고치게 한다.
+    """
+    import json as _json
+
+    defects: list = []
+
+    def _rel(path: Path) -> str:
+        try:
+            return path.relative_to(work).as_posix()
+        except ValueError:
+            return path.name
+
+    def _defect(kind: str, path: Path, detail: str) -> None:
+        defects.append({"severity": "critical", "type": kind, "file": _rel(path), "detail": detail})
+
+    def _load_json(path: Path, label: str):
+        try:
+            return True, _json.loads(path.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            _defect(f"{label}_encoding", path, f"'{_rel(path)}' 을 UTF-8 로 읽을 수 없습니다. 파일을 다시 써 주세요.")
+        except ValueError as exc:
+            where = f"{exc.lineno}행 {exc.colno}열" if hasattr(exc, "lineno") else ""
+            _defect(
+                f"{label}_invalid_json", path,
+                f"'{_rel(path)}' 이 올바른 JSON 이 아닙니다({getattr(exc, 'msg', exc)}"
+                + (f", {where}" if where else "")
+                + "). 내용 전체를 다시 써 주세요(끝의 '}' 누락 등).",
+            )
+        except OSError as exc:
+            _defect(f"{label}_unreadable", path, f"'{_rel(path)}' 을 읽지 못했습니다({exc}).")
+        return False, None
+
+    agent_files = sorted((work / "agents").glob("*.json")) if (work / "agents").is_dir() else []
+    legacy = work / "agents.json"
+    if legacy.is_file():
+        agent_files.append(legacy)
+    for path in agent_files:
+        ok, obj = _load_json(path, "agent_file")
+        if not ok:
+            continue
+        if path == legacy and isinstance(obj, dict) and isinstance(obj.get("agents"), list):
+            items = obj["agents"]
+        elif isinstance(obj, list):
+            items = obj
+        else:
+            items = [obj]
+        if not items or any(not isinstance(item, dict) for item in items):
+            _defect("agent_file_shape", path, f"'{_rel(path)}' 은 에이전트 1명을 담은 JSON 객체여야 합니다.")
+            continue
+        for item in items:
+            if not str(item.get("name") or "").strip():
+                _defect("agent_file_missing_name", path,
+                        f"'{_rel(path)}' 에이전트에 name(화면에 보일 이름)이 없습니다.")
+                break
+
+    manifest = work / "manifest.json"
+    if manifest.is_file():
+        ok, obj = _load_json(manifest, "manifest")
+        if ok and not isinstance(obj, dict):
+            _defect("manifest_shape", manifest, "'manifest.json' 은 skills/agents/dmn 을 담은 JSON 객체여야 합니다.")
+
+    form_dir = work / "forms"
+    if form_dir.is_dir():
+        for path in sorted(list(form_dir.glob("*.form")) + list(form_dir.glob("*.html"))):
+            try:
+                html = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                _defect("form_encoding", path, f"폼 '{_rel(path)}' 을 UTF-8 로 읽을 수 없습니다. 다시 써 주세요.")
+                continue
+            except OSError as exc:
+                _defect("form_unreadable", path, f"폼 '{_rel(path)}' 을 읽지 못했습니다({exc}).")
+                continue
+            if not html.strip():
+                _defect("form_empty", path, f"폼 '{_rel(path)}' 이 비어 있습니다.")
+                continue
+            problem = _form_structure_problem(html)
+            if problem:
+                _defect("form_broken", path, f"폼 '{_rel(path)}' 이 깨졌습니다 — {problem}. 폼 전체를 다시 써 주세요.")
+    return defects
+
+
 def _validated_definition_defects(target: Path) -> list:
     """Return completion-blocking defects for a definition/validation receipt."""
     import json as _json
@@ -1578,6 +1753,7 @@ def _validated_definition_defects(target: Path) -> list:
     except Exception as exc:
         return [{"severity": "critical", "type": "parse_error", "detail": str(exc)}]
     _, defects = _static_process_defects(pd)
+    defects = defects + _work_file_defects(target.parent)
     if defects:
         return defects
     receipt_path = target.parent / _VALIDATION_RECEIPT
@@ -1751,6 +1927,9 @@ def validate_process_definition(path: str = ".bpmn/process-definition.json") -> 
             _atomic_write_json(target, pd)
         except Exception:
             pass
+
+    # 정의 밖 산출물(에이전트·manifest·폼)은 LLM 교정 대상이 아니다 — 결함으로 돌려 모델이 파일을 다시 쓰게 한다.
+    defects = defects + _work_file_defects(target.parent)
 
     criticals = [d for d in defects if str(d.get("severity") or "").lower() == "critical"]
     result = {
@@ -2293,6 +2472,298 @@ def _ensure_forms_refs_skills(pd: dict, work, manifest: dict) -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# 참조정보(inputData) — 실행 엔진이 읽는 `<폼 id>.<필드>` 로 맞춘다
+# ---------------------------------------------------------------------------
+# 실행 엔진(completion get_input_data)은 inputData 를 `<폼 id>.<필드>` 로만 읽는다. 모델이 정의 초안 규격의
+# 「"inputData": ["입력 데이터명"]」을 따라 데이터 이름(「견적요청서」)을 남기면 엔진은 그 칸을 하나도 읽지 못하고
+# 바로 앞 단계의 산출물만 넘긴다. 튜토리얼 VM 의 견적 산출 에이전트가 앞 단계 폼(제품·수량)을 못 받아
+# 가격표를 찾고도 0원 견적을 낸 까닭이다.
+
+# 값이 없는 폼 컴포넌트 — 참조로 넘길 것이 없다.
+_NON_VALUE_FIELD_TYPES = frozenset({"label"})
+
+
+def _norm_data_name(value) -> str:
+    """데이터 이름 비교용 — 공백·대소문자 차이(「견적 요청서」/「견적요청서」)를 지운다."""
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def _form_field_keys(html: str) -> list[str]:
+    """폼 HTML 의 값 필드 이름 — 저장 때 form_def.fields_json 을 만드는 규칙(html_to_fields_json)과 같다."""
+    fields: list = []
+    _ensure_skill_scripts_on_path()
+    try:
+        from save_to_supabase import html_to_fields_json  # type: ignore
+
+        fields = html_to_fields_json(html or "")
+    except Exception:
+        fields = [
+            {"key": key, "type": ""}
+            for key in re.findall(r"<[a-z-]+-field\b[^>]*\bname\s*=\s*['\"]([^'\"]+)['\"]", html or "", re.I)
+        ]
+    keys: list[str] = []
+    for field in fields:
+        key = str(field.get("key") or "").strip()
+        if key and key not in keys and str(field.get("type") or "").lower() not in _NON_VALUE_FIELD_TYPES:
+            keys.append(key)
+    return keys
+
+
+def _upstream_activities(elements: list) -> dict[str, list[str]]:
+    """Activity 마다 시작에서 그 단계로 오는 길 위의 앞선 Activity id 들(흐름 순).
+
+    되돌아가는 연결(「반려 → 다시 산출」)은 뺀다 — 그 뒤 단계 폼은 처음 지날 때 아직 비어 있다.
+    """
+    by_id = {
+        str(e.get("id")): e for e in elements or []
+        if isinstance(e, dict) and e.get("id") and e.get("elementType") in ("Event", "Activity", "Gateway")
+    }
+    succ: dict[str, list[str]] = {nid: [] for nid in by_id}
+
+    def _edge(src, tgt) -> None:
+        src, tgt = str(src or ""), str(tgt or "")
+        if src in succ and tgt in succ and src != tgt and tgt not in succ[src]:
+            succ[src].append(tgt)
+
+    for e in elements or []:
+        if isinstance(e, dict) and e.get("elementType") == "Sequence":
+            _edge(e.get("source"), e.get("target"))
+    # 연결선 없이 요소의 source 로만 이은 초안도 같은 흐름으로 본다.
+    for nid, e in by_id.items():
+        if isinstance(e.get("source"), str):
+            _edge(e.get("source"), nid)
+
+    incoming = {t for ts in succ.values() for t in ts}
+    starts = [nid for nid, e in by_id.items() if "start" in str(e.get("type") or "").lower()]
+    starts += [nid for nid in by_id if nid not in incoming and nid not in starts]
+
+    # 깊이 우선으로 돌며 지금 걷는 길 위의 마디로 돌아가는 연결(되돌림)을 찾는다.
+    state: dict[str, int] = {}
+    back: set = set()
+    for root in starts + list(by_id):
+        if root in state:
+            continue
+        state[root] = 1
+        stack = [(root, iter(succ[root]))]
+        while stack:
+            node, it = stack[-1]
+            nxt = next(it, None)
+            if nxt is None:
+                state[node] = 2
+                stack.pop()
+            elif state.get(nxt) == 1:
+                back.add((node, nxt))
+            elif nxt not in state:
+                state[nxt] = 1
+                stack.append((nxt, iter(succ[nxt])))
+
+    preds: dict[str, list[str]] = {nid: [] for nid in by_id}
+    indeg = {nid: 0 for nid in by_id}
+    for src, tgts in succ.items():
+        for tgt in tgts:
+            if (src, tgt) not in back:
+                preds[tgt].append(src)
+                indeg[tgt] += 1
+    # 흐름 순(위상 정렬, 같은 차례면 정의에 적힌 순)
+    rank: dict[str, int] = {}
+    ready = [nid for nid in by_id if indeg[nid] == 0]
+    while ready:
+        nid = ready.pop(0)
+        rank[nid] = len(rank)
+        for tgt in succ[nid]:
+            if (nid, tgt) in back:
+                continue
+            indeg[tgt] -= 1
+            if indeg[tgt] == 0:
+                ready.append(tgt)
+
+    out: dict[str, list[str]] = {}
+    for nid, e in by_id.items():
+        if e.get("elementType") != "Activity":
+            continue
+        seen: set = set()
+        todo = list(preds[nid])
+        while todo:
+            cur = todo.pop()
+            if cur in seen or cur == nid:
+                continue
+            seen.add(cur)
+            todo.extend(preds[cur])
+        ups = [a for a in seen if by_id[a].get("elementType") == "Activity"]
+        out[nid] = sorted(ups, key=lambda a: rank.get(a, len(by_id)))
+    return out
+
+
+def _is_agent_step(el: dict) -> bool:
+    """에이전트가 수행하는 단계인지 — 에이전트가 붙었거나 agentMode 가 draft/complete."""
+    mode = str(el.get("agentMode") or "").strip().lower()
+    return bool(el.get("agent")) or mode in ("draft", "complete")
+
+
+def _link_input_data_refs(elements: list, forms: list[dict], old_form_ids: dict[str, str]) -> None:
+    """activity.inputData 를 실행 엔진이 읽는 `<저장 폼 id>.<필드>` 참조로 맞춘다(제자리 수정).
+
+    - `<작성 때 폼 id>.<필드>`(`check_stock.qty`, `check_stock_form.qty`, `formHandler` 옛 id)는 저장 폼 id 로.
+    - 데이터 이름(「견적요청서」)은 그 이름을 outputData 로 내는 단계(또는 그 이름의 단계) 폼의 모든 필드로.
+    - 에이전트 단계에는 앞선 모든 단계 폼의 필드를 더한다 — 사람이 낸 요청서와 앞 에이전트의 결과를 다 받아야
+      일할 수 있다(모델이 고른 참조가 모자라도).
+    - 어느 폼인지 모르는 이름은 그대로 둔다(엔진이 그 인스턴스의 완료 산출물을 넘긴다).
+    """
+    acts = [e for e in elements or [] if isinstance(e, dict) and e.get("elementType") == "Activity" and e.get("id")]
+    if not acts:
+        return
+    final_by_aid: dict[str, str] = {}
+    fields_by_aid: dict[str, list[str]] = {}
+    for form in forms or []:
+        aid = str(form.get("activity_id") or "")
+        if aid and form.get("form_id"):
+            final_by_aid[aid] = str(form["form_id"])
+            fields_by_aid[aid] = _form_field_keys(str(form.get("html") or ""))
+    if not final_by_aid:
+        return
+    final_ids = set(final_by_aid.values())
+    alias_to_final: dict[str, str] = {}
+    for aid, final in final_by_aid.items():
+        for alias in (aid, f"{aid}_form", old_form_ids.get(aid) or ""):
+            if alias and alias not in final_ids:
+                alias_to_final.setdefault(alias, final)
+    aids_longest_first = sorted(final_by_aid, key=len, reverse=True)
+
+    def _final_form(prefix: str) -> str | None:
+        p = prefix.strip()
+        if p.startswith("formHandler:"):
+            p = p[len("formHandler:"):]
+        if p in final_ids:
+            return p
+        if p in alias_to_final:
+            return alias_to_final[p]
+        base = p[: -len("_form")] if p.endswith("_form") else p
+        # `<옛 프로세스 id>_<activity id>_form` (스키마 예시의 꼴)
+        for aid in aids_longest_first:
+            if base == aid or base.endswith(f"_{aid}"):
+                return final_by_aid[aid]
+        return None
+
+    producers: dict[str, list[str]] = {}
+    for a in acts:
+        aid = str(a["id"])
+        names = [a.get("name")] + [
+            (o.get("name") if isinstance(o, dict) else o) for o in (a.get("outputData") or [])
+        ]
+        for name in names:
+            key = _norm_data_name(name)
+            if key and aid not in producers.setdefault(key, []):
+                producers[key].append(aid)
+
+    def _all_fields(aid: str) -> list[str]:
+        final = final_by_aid.get(aid)
+        return [f"{final}.{key}" for key in fields_by_aid.get(aid, [])] if final else []
+
+    upstream = _upstream_activities(elements)
+    for a in acts:
+        aid = str(a["id"])
+        linked: list[str] = []
+
+        def _add(refs) -> None:
+            for ref in refs:
+                if ref and ref not in linked:
+                    linked.append(ref)
+
+        for entry in a.get("inputData") or []:
+            raw = str((entry.get("name") if isinstance(entry, dict) else entry) or "").strip()
+            if not raw:
+                continue
+            if "." in raw:
+                prefix, field = raw.split(".", 1)
+                final = _final_form(prefix)
+                if final and field:
+                    _add([f"{final}.{field}"])
+                    continue
+                # 「견적요청서.제품명」처럼 데이터 이름에 필드를 붙인 꼴
+                named = [src for src in producers.get(_norm_data_name(prefix), []) if src != aid]
+                refs = []
+                for src in named:
+                    refs += [f"{final_by_aid[src]}.{field}"] if field in fields_by_aid.get(src, []) else _all_fields(src)
+                _add(refs or [raw])
+                continue
+            named = producers.get(_norm_data_name(raw), [])
+            if named and all(src == aid for src in named):
+                continue  # 제 산출물 이름을 입력으로 적은 것 — 읽을 앞 단계가 없다
+            refs = [ref for src in named if src != aid for ref in _all_fields(src)]
+            _add(refs or [raw])
+        if _is_agent_step(a):
+            for src in upstream.get(aid, []):
+                _add(_all_fields(src))
+        a["inputData"] = linked
+
+
+# ---------------------------------------------------------------------------
+# agentMode — 역할을 누가 맡는지에 맞춘다(실행 엔진의 담당자 규칙과 같게)
+# ---------------------------------------------------------------------------
+# 실행 엔진(completion determine_agent_mode)은 정의의 agentMode 가 있으면 그것을 따르고, 없을 때만 담당자로
+# 정한다 — 에이전트만 → COMPLETE, 사람과 에이전트 → DRAFT, 사람만 → 없음. 마무리는 에이전트를 붙인 단계를
+# 늘 draft 로 두어서, 역할을 에이전트만 맡은 단계는 초안이 끝나도 확인·제출할 사람이 없어 멈췄다(튜토리얼 VM
+# 견적 산출 — 화면은 담당자 본인에게만 제출을 연다, WorkItem.vue isOwnWorkItem).
+
+def _truthy(value) -> bool:
+    return value is True or str(value or "").strip().lower() in ("true", "yes", "1", "y")
+
+
+def _role_holders(role: dict) -> list[str]:
+    """역할을 맡는 담당자 식별자 — endpoint(문자열·쉼표 목록·배열), 비었으면 default."""
+    def _values(value) -> list[str]:
+        if isinstance(value, dict):
+            value = value.get("id") or value.get("endpoint") or ""
+        if isinstance(value, list):
+            return [v for item in value for v in _values(item)]
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return []
+
+    return _values(role.get("endpoint")) or _values(role.get("default"))
+
+
+def _align_agent_modes(pd: dict, elements: list, agent_ids: set) -> None:
+    """역할을 에이전트만 맡는 단계는 agentMode=complete 로(제자리 수정).
+
+    - 역할 endpoint 가 모두 에이전트(이 정의의 agents/*.json · manifest · activity.agent)면 complete.
+      단계에 agent 가 비었으면 그 역할의 에이전트를 넣는다.
+    - 사람도 그 역할을 맡거나(endpoint 에 사람·사람 역할이 있음) 역할 담당이 정해지지 않았으면 그대로 둔다
+      (draft, 또는 none — none 이면 엔진이 실제 담당자로 정한다).
+    - 사용자가 사람 검토를 명시적으로 요청해 단계에 humanReview: true 를 둔 경우도 draft 를 유지한다.
+    """
+    # 역할 endpoint 는 stock_agent, 에이전트 파일 id 는 stock-agent 처럼 밑줄·하이픈만 다른 회차가 있다 — 같은 에이전트로 본다
+    # (프론트의 슬러그 → 저장 id 변환 remapAgentRefs 도 같은 규칙). 단계에 채우는 값은 에이전트 파일의 id 로.
+    def _key(x) -> str:
+        return re.sub(r"[\s_]+", "-", str(x or "").strip().lower())
+
+    canonical = {_key(a): str(a).strip() for a in agent_ids or () if str(a or "").strip()}
+    if not canonical:
+        return
+    roles = {
+        str(r.get("name") or "").strip(): r for r in pd.get("roles") or []
+        if isinstance(r, dict) and str(r.get("name") or "").strip()
+    }
+    for el in elements or []:
+        if not isinstance(el, dict) or el.get("elementType") != "Activity":
+            continue
+        role = roles.get(str(el.get("role") or "").strip())
+        holders = _role_holders(role) if role else []
+        if not holders or not all(_key(h) in canonical for h in holders):
+            continue
+        if _truthy(el.get("humanReview")):
+            if str(el.get("agentMode") or "").strip().lower() in ("", "none", "null"):
+                el["agentMode"] = "draft"
+            continue
+        if not el.get("agent"):
+            el["agent"] = canonical[_key(holders[0])]
+        el["agentMode"] = "complete"
+        # 이 런타임이 todolist 를 폴링할 때 쓰는 실행기 이름(server.AGENT_TYPE).
+        if str(el.get("orchestration") or "").strip().lower() in ("", "none", "null"):
+            el["orchestration"] = "deepagents"
+
+
 def _capture_selection_to_manifest(answer: str) -> None:
     """후보 선택 HITL 답변에서 [스킬]/[에이전트]/[DMN] 선택을 파싱해 manifest.json 에 병합한다.
 
@@ -2300,23 +2771,29 @@ def _capture_selection_to_manifest(answer: str) -> None:
     직접 캡처해 각 process-* 폴더 manifest 에 기록한다(이후 complete 가 SKILL.md 생성·활동 연결)."""
     import json as _json
     a = str(answer or "")
-    if not any(k in a for k in ("[스킬]", "[에이전트]", "[DMN]", "스킬:", "에이전트:", "DMN:")):
+    # 영어로 묻는 사용자에게는 후보가 [Skill]/[Agent]/[DMN] 으로 나간다 — 두 언어 모두 받는다.
+    if not re.search(r"\[(?:스킬|에이전트|DMN|skill|agent)\]|(?:스킬|에이전트|DMN|skill|agent)\s*:", a, re.IGNORECASE):
         return
     skills: list = []
     agents: list = []
     dmns: list = []
-    _bad = {"(없음)", "없음", "", "skipped"}
-    # 1) "[스킬] 이름" / "[에이전트] 이름" / "[DMN] 이름"
-    for cat, name in re.findall(r"\[(스킬|에이전트|DMN)\]\s*([^,\n/]+)", a):
+    _bad = {"(없음)", "없음", "", "skipped", "none", "(none)"}
+
+    def _bucket(cat: str) -> list:
+        c = cat.lower()
+        return skills if c in ("스킬", "skill") else agents if c in ("에이전트", "agent") else dmns
+
+    # 1) "[스킬] 이름" / "[에이전트] 이름" / "[DMN] 이름" (영어: [Skill] / [Agent])
+    for cat, name in re.findall(r"\[(스킬|에이전트|DMN|skill|agent)\]\s*([^,\n/]+)", a, re.IGNORECASE):
         nm = name.strip()
-        if nm in _bad:
+        if nm.lower() in _bad:
             continue
-        (skills if cat == "스킬" else agents if cat == "에이전트" else dmns).append(nm)
+        _bucket(cat).append(nm)
     # 2) "스킬: A, B" / "에이전트: C" (멀티프로세스 줄 형식)
-    for cat, val in re.findall(r"(스킬|에이전트|DMN)\s*:\s*([^/\n]+)", a):
+    for cat, val in re.findall(r"(스킬|에이전트|DMN|skill|agent)\s*:\s*([^/\n]+)", a, re.IGNORECASE):
         for nm in [x.strip() for x in val.split(",")]:
-            if nm and nm not in _bad:
-                (skills if cat == "스킬" else agents if cat == "에이전트" else dmns).append(nm)
+            if nm and nm.lower() not in _bad:
+                _bucket(cat).append(nm)
     if not (skills or agents or dmns):
         return
     room = _bpmn_work_dir()
@@ -2381,6 +2858,27 @@ def _capture_selection_to_manifest(answer: str) -> None:
             mf.write_text(_json.dumps(man, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+
+# 이 런타임이 todolist 를 폴링할 때 쓰는 실행기 이름(server.AGENT_TYPE 과 같아야 한다).
+# 생성한 프로세스의 에이전트 단계는 이 값을 들고 있어야 실행 때 이 런타임이 집는다.
+_AGENT_ORCH = "deepagents"
+# 설치에 소비자가 없는 실행기 이름. 참고 문서의 옛 규칙(에이전트만 배정 → crewai-action)을 따랐거나
+# 엔진 옛 기본값(crewai-deep-research)을 적은 정의도, 그대로 두면 단계가 만들어지기만 하고 아무도 집지 않는다.
+_RETIRED_AGENT_ORCH = frozenset({"crewai-action", "crewai-deep-research"})
+
+
+def _assign_agent_orchestration(elements: list) -> None:
+    """에이전트·스킬이 맡은(agentMode 가 none 이 아닌) Activity 의 orchestration 을 이 런타임으로 맞춘다."""
+    for el in elements or []:
+        if not isinstance(el, dict) or el.get("elementType") != "Activity":
+            continue
+        mode = str(el.get("agentMode") or "").strip().lower()
+        if not (el.get("agent") or el.get("skills") or mode not in ("", "none", "null")):
+            continue
+        current = str(el.get("orchestration") or "").strip()
+        if current.lower() in ("", "none", "null") or current in _RETIRED_AGENT_ORCH:
+            el["orchestration"] = _AGENT_ORCH
 
 
 def _complete_one_process(work, *, persist: bool = True) -> dict | None:
@@ -2456,7 +2954,11 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
         for af in sorted(adir.glob("*.json")):
             try:
                 obj = _json.loads(af.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as exc:
+                # 검증(_work_file_defects)이 먼저 막는다. 여기까지 왔다면 그 길을 건너뛴 호출이라 흔적을 남긴다.
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning("에이전트 파일을 읽지 못해 빠뜨림 | file=%s err=%s", af, exc)
                 continue
             if isinstance(obj, dict):
                 # 파일 1개 = 에이전트 1명. id 가 없으면 파일명(stem)을 id 로 사용.
@@ -2665,6 +3167,9 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
         if _dmn_rules:
             pd["dmn_rules"] = _dmn_rules
 
+    # 에이전트 단계의 실행기 — 비었거나 소비자 없는 옛 이름이면 이 런타임(deepagents)으로.
+    _assign_agent_orchestration(elements)
+
     # roles 보강(없으면 elements 의 role 들로 생성) — 예시 스키마의 roles[] 형식
     if not isinstance(pd.get("roles"), list) or not pd.get("roles"):
         seen_roles: list = []
@@ -2677,6 +3182,19 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
                                        "resolutionRule": ""})
         if seen_roles:
             pd["roles"] = seen_roles
+
+    # 역할을 에이전트만 맡는 단계는 complete — 초안을 제출할 사람이 없다(엔진의 담당자 규칙과 같게).
+    _agent_ids = {str(a.get("id")) for a in agents if isinstance(a, dict) and a.get("id")}
+    _agent_ids |= {
+        str(ag.get("id") or "").strip() for ag in (manifest.get("agents") or [])
+        if isinstance(ag, dict) and str(ag.get("id") or "").strip()
+    }
+    _agent_ids |= {str(el.get("agent")) for el in elements if isinstance(el, dict) and el.get("agent")}
+    _align_agent_modes(pd, elements, _agent_ids)
+
+    # 참조정보: 데이터 이름·작성 때 폼 id 로 적힌 inputData 를 엔진이 읽는 `<저장 폼 id>.<필드>` 로,
+    # 에이전트 단계에는 앞선 단계 폼의 필드까지(요청서·앞 에이전트 결과를 받아야 일한다).
+    _link_input_data_refs(elements, forms, old_form_ids)
 
     # 식별 화면에서 전환한 방: 위 보강(폼·스킬·에이전트 연결)까지 마친 뒤 구조를 도출 정의로 고정한다.
     # 스킬을 붙인 사람 단계가 '완전 자동'으로 바뀌는 것도 여기서 초안 모드로 되돌린다.
@@ -2724,6 +3242,13 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
             for _el in flat.get(_key, []) or []:
                 if isinstance(_el, dict) and not (_el.get("name") or "").strip():
                     _el["name"] = _el.get("id") or _el.get("name") or ""
+
+    # 이 정의를 만든 대화의 지식 베이스 자료(문서와 그 폴더)를 정의와 에이전트 단계에 남긴다 —
+    # 실행 때 단계 에이전트가 같은 자료(규정 옆의 가격표 등)를 찾는다. flatten 이 모르는 키는 버리므로
+    # 원본(pd)에 모델이 단계별로 적어 둔 값은 여기서 되살린다.
+    from core.rag.process_knowledge import stamp_definition as _stamp_knowledge
+
+    _stamp_knowledge(flat, source=pd)
 
     # 최종 flattened 정의를 process-definition.json 에 그대로 기록(파일 UI·저장이 이 최종본을 본다)
     if persist:
@@ -2791,6 +3316,20 @@ def _reconcile_scattered_room_dirs(room: Path) -> None:
                         pass
 
 
+def definition_work_dirs(room: Path, conversation_id: str = "") -> list[Path]:
+    """이번 생성 시도의 정의 폴더들 — process-* 폴더가 없으면 정의를 둔 방 루트.
+
+    `.bpmn/process-definition.json` 기본 경로(write/validate_process_definition)는 방 루트로 풀린다.
+    process_work_dirs 는 process-* 하위 폴더만 돌려주므로, 정의가 방 루트에 있으면 턴 끝 자동
+    검증·마무리가 그 정의를 못 보고 건너뛰었다(VM 실측: 검증 없이 모델의 「프로세스를 생성했어요」만
+    나가 시작 연결선이 빠진 정의가 저장됨). 완료 도구의 하위호환 규칙과 같은 기준을 한곳에 둔다.
+    """
+    dirs = process_work_dirs(room, conversation_id)
+    if dirs:
+        return dirs
+    return [room] if (room / "process-definition.json").is_file() else []
+
+
 @tool
 def complete_process_generation() -> str:
     """**5단계: 생성 완료.** 이 대화의 모든 프로세스 폴더(`.bpmn/<room>/process-*/`)를 모아
@@ -2807,9 +3346,7 @@ def complete_process_generation() -> str:
 
     room = _bpmn_work_dir()
     _reconcile_scattered_room_dirs(room)  # 오타로 흩어진 거의 동일한 방 폴더 병합
-    proc_dirs = process_work_dirs(room, _current_conversation_id.get())
-    if not proc_dirs:
-        proc_dirs = [room] if (room / "process-definition.json").is_file() else []  # 단일 프로세스 하위호환
+    proc_dirs = definition_work_dirs(room, _current_conversation_id.get())  # 단일 프로세스는 방 루트(하위호환)
 
     validation_errors: list[dict] = []
     for directory in proc_dirs:
@@ -2867,6 +3404,15 @@ def complete_process_generation() -> str:
     if not processes:
         return ("ERROR: 처리할 process-definition.json 이 없습니다. "
                 "각 프로세스를 `.bpmn/<room>/process-<id>/process-definition.json` 으로 생성했는지 확인하세요.")
+    # 넘긴 결과의 지문 — 다음 고치기 차례가 「고쳤다」고만 하고 바꾸지 않았는지 이것과 견준다.
+    try:
+        from .definition_guard import record_delivered
+
+        record_delivered(room, proc_dirs)
+    except Exception as exc:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning("결과 지문 기록 실패(무시) | room=%s err=%s", room, exc)
     return _json.dumps({"count": len(processes), "processes": processes}, ensure_ascii=False)
 
 

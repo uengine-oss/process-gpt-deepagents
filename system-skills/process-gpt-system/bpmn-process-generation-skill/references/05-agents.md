@@ -30,6 +30,11 @@
 
 - `id` 는 파일명과 반드시 같게 한다(`agents/leave-reviewer.json` → `"id": "leave-reviewer"`).
 - 외부 도구 목록은 지어내지 않는다(`tools` 필드를 임의로 채우지 말 것).
+- **한 응답에 에이전트 파일 하나씩** 쓴다: 파일마다 `write_file` 을 따로 부르고, 그 결과(`Updated file …`)를 받은 뒤
+  다음 파일을 쓴다. 여러 에이전트 파일을 — 또는 에이전트 파일과 다른 파일 쓰기·편집을 — 한 응답의 병렬 도구 호출로
+  묶지 마라. 묶어 쓰면 두 번째 파일 끝의 `}` 가 빠진 채 저장되는 일이 되풀이됐다.
+- `write_file` 이 "올바른 JSON 이 아니어서 파일을 쓰지 않았습니다" 를 돌려주면 그 파일은 저장되지 않은 것이다.
+  그 파일 하나만 내용 전체를 다시 쓴다.
 
 **설계 지침** (중요):
 - 너무 세분화된 "단일 태스크 전용" 에이전트로 만들지 말 것. 상세도 1~10 중 **6 정도** — 관련 업무를 묶어 포괄하는 형태.
@@ -51,14 +56,29 @@
    "agent": "<agent_id>"
    ```
    - 후보의 `activity_ids` 에 든 모든 Activity 에 반영.
-2. **자동화 정책 필드** 를 Activity 상태에 맞춰 설정한다:
+2. **자동화 정책 필드** 를 Activity 상태에 맞춰 설정한다. **`agentMode` 는 먼저 그 역할을 누가 맡는지로 정한다:**
+   - **역할을 에이전트만 맡는 Activity**(그 role 의 `endpoint` 가 에이전트 id 뿐 — 3번): 스킬 유무와 상관없이
+     `"agentMode": "complete"`. 초안(`draft`)은 담당자가 확인하고 제출해야 다음 단계로 넘어가는데, 그 역할엔 사람이
+     없어 단계가 초안 확인 대기로 멈춘다.
+   - 사람도 그 역할을 맡거나(endpoint 에 사람·사람 역할도 있음) 사용자가 **사람 검토를 명시적으로 요청**했으면 `"draft"`.
+     사람 검토 요청은 그 Activity 에 `"humanReview": true` 로 남기고, 확인할 사람을 그 역할에 함께 둔다.
+   - 그 밖에는 아래를 따른다(아래의 `draft` 는 사람이 맡는 역할에 에이전트를 도우미로 붙인 경우다).
+
    - 스킬이 배정된 Activity (`skills` 비어있지 않음): `"agentMode": "complete"`, `"orchestration": "deepagents"`
-   - 에이전트만 배정(스킬 없음): `"agentMode": "draft"`, `"orchestration": "crewai-action"`
+   - 에이전트만 배정(스킬 없음): `"agentMode": "draft"`, `"orchestration": "deepagents"`
    - 둘 다 없음: `"agentMode": "none"`, `"orchestration": null`
+   - `orchestration` 은 실행 때 이 단계를 집어 갈 실행기 이름이다. 이 설치에서 todolist 를 폴링하는 것은
+     딥 에이전트(`deepagents`)뿐이라, 에이전트·스킬 단계에는 늘 `"deepagents"` 를 쓴다
+     (`crewai-action`·`crewai-deep-research` 는 소비자가 없어 단계가 시작되지 않는다 — 마무리 단계가 바꿔 둔다).
 3. **`roles[].endpoint` 갱신**: 그 역할에 에이전트가 배치되면 해당 role 의 `endpoint` 를 그 agent id 로, `origin` 을 `"used"` 로 바꾼다.
 4. `manifest.json` 의 `agents[]` 에 `{"id": "<agent_id>", "activity_ids": [...]}` 를 기록한다.
 
 > `external_customer` 엔드포인트를 가진 외부 고객 역할에는 에이전트를 배정하지 않는다(사람/외부 참여자이므로).
+
+> **실행 엔진의 규칙과 같다.** 엔진(completion `determine_agent_mode`)은 정의의 `agentMode` 를 먼저 따르고, 없을 때만
+> 실제 담당자로 정한다 — 에이전트만 → COMPLETE, 사람과 에이전트 → DRAFT, 사람만 → 사람 업무. 정의에 `draft` 를 적으면
+> 담당자가 에이전트뿐이어도 DRAFT 가 되어 아무도 제출하지 못한다. 마무리 단계도 역할을 에이전트만 맡는 단계를
+> `complete` 로 맞춘다(`humanReview: true` 인 단계는 제외).
 
 ---
 

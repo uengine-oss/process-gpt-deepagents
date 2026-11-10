@@ -454,11 +454,19 @@ _DOC_ROLE_DESC = {
 }
 
 
+def _is_docx_template(card) -> bool:
+    """워드(.docx) 자료 — generate_docx 의 양식으로 넘길 수 있는지(file_id 가 있어야 한다).
+    한글(.hwpx) 의 generate_hwpx 는 file_id 가 아니라 URL 을 받으므로 여기 넣지 않는다."""
+    name = (card.file_name or "").lower()
+    return bool(getattr(card, "file_id", "")) and name.endswith(".docx")
+
+
 def _format_doc_card_md(card) -> str:
     role = (getattr(card, "doc_role", None) or "content")
     fm_lines = [
         "---",
         f"file_name: {card.file_name}",
+        f"file_id: {getattr(card, 'file_id', '') or ''}",
         f"n_pages: {card.n_pages if card.n_pages is not None else ''}",
         f"folder_path: {card.folder_path or ''}",
         f"mime_type: {card.mime_type or ''}",
@@ -537,6 +545,7 @@ async def list_documents(
 
     files_update: dict = {}
     summary_lines: list[str] = []
+    template_lines: list[str] = []
     for card in cards:
         if not card.file_name:
             continue
@@ -548,6 +557,8 @@ async def list_documents(
         role = (getattr(card, "doc_role", None) or "content")
         role_tag = "" if role == "content" else f" [{role}]"
         summary_lines.append(f"- {card.file_name}{n_pg}{role_tag}: {abstract_brief}")
+        if _is_docx_template(card):
+            template_lines.append(f"- {card.file_name} → file_id: {card.file_id}")
 
     if not files_update:
         return _err_msg("카탈로그를 만들 수 있는 자료가 없습니다.", tool_call_id)
@@ -556,6 +567,13 @@ async def list_documents(
         f"카탈로그 {len(files_update)}개 항목을 /catalog/ 에 저장했습니다.\n\n"
         + "\n".join(summary_lines)
     )
+    if template_lines:
+        # 선택한 워드 문서는 문서 양식으로 쓸 수 있다 — office-mcp generate_docx 는 template_file_id 로
+        # 이 file_id(=스토리지 경로)를 받는다. 이것이 없으면 모델이 「양식에 접근할 수 없다」며 멈췄다.
+        out += (
+            "\n\n문서 양식으로 쓸 수 있는 자료(office 도구 generate_docx 의 template_file_id 에 file_id 를 그대로 넘긴다):\n"
+            + "\n".join(template_lines)
+        )
     return Command(update={
         "files": files_update,
         "messages": [ToolMessage(content=out, tool_call_id=tool_call_id)],
