@@ -88,8 +88,10 @@ from core.skills.local_system_skills import seed_local_system_skills
 from core.skills.skills import add_skill_reload_inputs, resolve_slash_skill
 from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
+from core.chat.result_summary import split_result_summary
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
+from core.agents.team import choose_team, team_card_text, team_message_hint
 from core.chat.stream_scope import is_subagent_namespace
 from core.deterministic import MODE_UNDO_PENDING, try_deterministic_execution
 from core.rag.process_knowledge import (
@@ -1982,10 +1984,56 @@ class DeepAgentExecutor(AgentExecutor):
                         proc_def_id, activity_id, act_tools, act_skills,
                     )
                 elif not is_chat:
-                    logger.warning(
-                        "서브에이전트 미설정 (activity tools/skills 없음) | proc_def_id=%s activity_id=%s",
-                        proc_def_id, activity_id,
+                    # 팀 구성: 설계자가 정한 팀 · 도구가 없는 업무(사람이 「에이전트에 맡기기」로 넘긴 업무 등)는
+                    # 테넌트의 에이전트 프로필 중 꼭 필요한 것만 골라 서브에이전트로 붙인다(core/agents/team.py).
+                    team = await choose_team(
+                        tenant_id=tenant_id,
+                        activity_name=str(activity_name or ""),
+                        instruction=str(context.get_user_input() or ""),
+                        form_fields=extras.get("form_fields"),
                     )
+                    if team.candidates:
+                        team_job_id = str(uuid.uuid4())
+                        await _enqueue_status(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            state=TaskState.TASK_STATE_WORKING,
+                            text=json.dumps(
+                                {
+                                    "name": "팀 구성",
+                                    "role": "팀 구성",
+                                    "goal": "이 업무에 필요한 전문 에이전트를 찾습니다.",
+                                    "agent_profile": "/images/chat-icon.png",
+                                },
+                                ensure_ascii=False,
+                            ),
+                            event_type="task_started",
+                            job_id=team_job_id,
+                        )
+                        await _enqueue_status(
+                            event_queue,
+                            task_id=task_id,
+                            context_id=context_id,
+                            state=TaskState.TASK_STATE_WORKING,
+                            text=json.dumps(
+                                {
+                                    "result": team_card_text(team),
+                                    "team_agent_ids": [str(a.get("id")) for a in team.agents],
+                                },
+                                ensure_ascii=False,
+                            ),
+                            event_type="task_completed",
+                            job_id=team_job_id,
+                        )
+                    if team.agents:
+                        agents = team.agents
+                        user_message = team_message_hint(team) + user_message
+                    else:
+                        logger.warning(
+                            "서브에이전트 미설정 (activity tools/skills 없음, 팀 구성도 없음) | proc_def_id=%s activity_id=%s",
+                            proc_def_id, activity_id,
+                        )
 
         _root_tools_by_server: dict[str, list[str]] = {}
         for _tool_name, _srv in _root_tool_servers.items():
@@ -2697,12 +2745,19 @@ class DeepAgentExecutor(AgentExecutor):
                     else "요청을 처리하지 못했어요. 다시 말씀해 주세요."
                 )
 
+            # 폼 결과의 사람용 요약(_summary)은 폼 값이 아니다 — 떼어 내 이 이벤트로만 화면에 보낸다(결과 폼 위 안내 상자).
+            agent_summary = ""
+            if form_id and not is_chat:
+                raw_text, agent_summary = split_result_summary(raw_text)
+            _agent_result = {"result": raw_text}
+            if agent_summary:
+                _agent_result["agent_summary"] = agent_summary
             await _enqueue_status(
                 event_queue,
                 task_id=task_id,
                 context_id=context_id,
                 state=TaskState.TASK_STATE_COMPLETED,
-                text=json.dumps({"result": raw_text}, ensure_ascii=False),
+                text=json.dumps(_agent_result, ensure_ascii=False),
                 event_type="task_completed",
                 job_id=job_id,
             )

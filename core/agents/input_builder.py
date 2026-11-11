@@ -7,6 +7,8 @@ from typing import Any
 
 from langgraph.types import Command
 
+from core.chat.result_summary import SUMMARY_KEY
+
 logger = logging.getLogger(__name__)
 
 # [user][이름]: 또는 [assistant][이름][agentId=...]: 형식 파싱
@@ -92,7 +94,10 @@ def build_user_message(
     if form_id and form_fields:
         field_schema = json.dumps(form_fields, ensure_ascii=False)
         example_output = json.dumps(
-            {form_id: {f["key"]: _field_example_value(f) for f in form_fields if "key" in f}},
+            {
+                form_id: {f["key"]: _field_example_value(f) for f in form_fields if "key" in f},
+                SUMMARY_KEY: "<이 결과를 사람이 확인할 수 있게 2~3문장 요약>",
+            },
             ensure_ascii=False,
             indent=2,
         )
@@ -116,8 +121,10 @@ def build_user_message(
             f"필드 정의:\n{field_schema}\n"
             f"출력 예시:\n{example_output}\n"
             f"{multidata_note}"
-            f"주의: 출력 JSON의 최상위 키는 반드시 \"{form_id}\" 이어야 합니다."
-            f" 이전 단계 입력 데이터([입력: ...])의 폼 ID를 출력 키로 사용하지 마세요.\n\n"
+            f"주의: 폼 값은 반드시 최상위 키 \"{form_id}\" 아래에 넣어야 합니다."
+            f" 이전 단계 입력 데이터([입력: ...])의 폼 ID를 출력 키로 사용하지 마세요.\n"
+            f"최상위에 \"{SUMMARY_KEY}\" 키도 함께 넣으세요: 결과를 받은 사람이 폼을 보기 전에 읽을 2~3문장 요약입니다"
+            f"(무엇을 근거로 어떤 값을 정했는지, 확인이 필요한 점). 폼 값이 아니므로 폼에는 들어가지 않습니다.\n\n"
         )
     else:
         message = f"{prev_message}{message}"
