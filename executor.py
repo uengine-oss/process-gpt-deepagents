@@ -1100,10 +1100,11 @@ def _offload_input_data(text: str, instance_id: str) -> str:
         else:
             container_base = "/workspace/inputs"
 
-        lines: list[str] = [
-            "[이전 단계 입력 데이터]",
-            "이전 단계 결과가 파일로 저장되었습니다. 필요한 항목을 read_file로 읽어 사용하세요.",
-        ]
+        lines: list[str] = ["[이전 단계 입력 데이터]", ""]
+        # 실제로 파일로 옮긴 항목이 있을 때만 read_file 을 안내한다. 모두 짧아 그대로 실렸는데도
+        # "파일로 저장되었습니다"라고 쓰면, 모델이 폼 id 로 없는 경로를 지어 읽다 실패하고 일을 멈춘다
+        # (2026-11-11 설치본: 「제안서 작성 및 발송」을 에이전트에 맡기자 결과 없이 끝남).
+        offloaded = False
         for form_id, fields in data.items():
             lines.append(f"\n[입력: {form_id}]")
             if not isinstance(fields, dict):
@@ -1112,6 +1113,7 @@ def _offload_input_data(text: str, instance_id: str) -> str:
                     fname = _sanitize_ws_name(str(form_id)) + ".md"
                     try:
                         (dir_inputs / fname).write_text(raw, encoding="utf-8")
+                        offloaded = True
                         lines.append(f"- ({len(raw.encode()) / 1024:.1f} KB) → {container_base}/{fname}")
                     except Exception:
                         logger.warning("step input 파일 저장 실패 | form_id=%s", form_id, exc_info=True)
@@ -1127,6 +1129,7 @@ def _offload_input_data(text: str, instance_id: str) -> str:
                     try:
                         content = value if isinstance(value, str) else raw
                         (dir_inputs / fname).write_text(content, encoding="utf-8")
+                        offloaded = True
                         lines.append(f"- {field_name} ({size / 1024:.1f} KB) → {container_base}/{fname}")
                     except Exception:
                         logger.warning("step input 파일 저장 실패 | field=%s", field_name, exc_info=True)
@@ -1134,6 +1137,11 @@ def _offload_input_data(text: str, instance_id: str) -> str:
                 else:
                     lines.append(f"- {field_name}: {raw}")
 
+        lines[1] = (
+            "큰 항목은 파일로 저장했습니다. 「→ 경로」로 표시된 항목만 read_file 로 읽고, 나머지는 아래 값을 그대로 쓰세요."
+            if offloaded
+            else "이전 단계에서 입력한 값입니다. 파일이 아니므로 read_file 로 읽지 말고 아래 값을 그대로 쓰세요."
+        )
         replacement = "\n".join(lines)
         return text[: m.start()] + replacement + text[m.end():]
     except Exception:

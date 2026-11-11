@@ -159,3 +159,28 @@ def test_choose_team_failure_falls_back_to_alone(monkeypatch):
 def test_off_values(monkeypatch, value):
     monkeypatch.setenv("DEEPAGENTS_AUTO_TEAM", value)
     assert team_mod.auto_team_enabled() is False
+
+
+# ── 이전 단계 입력 안내: 파일로 옮긴 항목이 있을 때만 read_file 을 안내한다 ──────────────
+
+def _offload(monkeypatch, tmp_path, data):
+    import executor
+
+    monkeypatch.setattr(executor, "_instance_ws_dir", lambda instance_id, subdir: tmp_path / subdir)
+    text = "제안서를 작성하세요\n[InputData]\n" + json.dumps(data, ensure_ascii=False)
+    return executor._offload_input_data(text, "inst-1")
+
+
+def test_small_inputs_are_inline_and_not_called_files(monkeypatch, tmp_path):
+    out = _offload(monkeypatch, tmp_path, {"req_form": {"customer": "한빛물산", "detail": "회의실 가구"}})
+    assert "read_file 로 읽지 말고" in out
+    assert "파일로 저장했습니다" not in out
+    assert '- customer: "한빛물산"' in out
+    assert not (tmp_path / "inputs").exists() or not any((tmp_path / "inputs").iterdir())
+
+
+def test_large_inputs_point_to_files_and_say_so(monkeypatch, tmp_path):
+    out = _offload(monkeypatch, tmp_path, {"req_form": {"customer": "한빛물산", "body": "가" * 400}})
+    assert "「→ 경로」로 표시된 항목만 read_file" in out
+    assert "→ /workspace/inst-1/inputs/req_form_body.md" in out
+    assert (tmp_path / "inputs" / "req_form_body.md").read_text(encoding="utf-8") == "가" * 400
