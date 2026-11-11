@@ -42,7 +42,7 @@ uv run python server.py
 ```
 
 포트는 `HOST`/`PORT` 로 바꾼다(기본 `0.0.0.0:8888`). 살아 있는지는 `/health` 로 본다 —
-응답의 `busy` 는 세션 라우터가 유휴 Pod 를 회수해도 되는지 판정하는 근거다.
+응답의 `busy` 는 지금 턴이 도는 중인지를 알린다(배포 도구가 파드를 내릴 때 참고한다).
 
 ```bash
 curl -s localhost:8888/health
@@ -126,20 +126,32 @@ uv run pytest -q
 미들웨어는 루트에만 붙는다. 하위 에이전트가 도는 동안 접수된 지시는 제어가 루트로
 돌아온 뒤 반영된다 — 늦어질 뿐 유실되지 않는다.
 
-## 운영 전제: 한 대화 = 한 파드
+## 운영 전제: 여러 파드가 대화를 나눠 받는다
 
-진행 중인 turn 의 상태(SSE 구독자, 실행 중인 task, 워크스페이스)는 프로세스
+진행 중인 turn 의 상태(SSE 구독자, 실행 중인 task, 수정 지시 접수함)는 프로세스
 메모리에 있다. `asyncio.Task.cancel()` 은 그 task 를 만든 프로세스 안에서만
-가능하므로, **같은 `conversation_id` 의 요청은 항상 같은 파드로 가야 한다.**
+가능하므로, **진행 중인 turn 이 있는 대화의 요청은 그 turn 을 돌리는 파드에 닿아야 한다.**
 
-`process-gpt-session-router` 가 그 전제를 만든다 — `conversation_id` 로 세션 Pod 를
-찾거나 만들고, 유휴 TTL 이 지나면 회수한다. 회수 후 다시 찾아온 대화는 새 Pod 에서
-Supabase(대화 이력)와 Supabase Storage(워크스페이스)로부터 복원된다.
+SDK 의 넘겨주기(`process-gpt-agent-sdk` 0.12.0 `chat_owner`)가 그 전제를 만든다. 턴을
+시작한 파드가 Redis 에 `chat:owner:{대화}` = 자기 주소를 적어 두고, 다른 파드에 떨어진
+재접속 · 중지 · 수정 지시 · 같은 방의 새 질문을 그 파드로 그대로 넘긴다. 진행 중인 turn 이
+없으면 어느 파드든 처리한다 — 대화 맥락은 Postgres 체크포인터와 채팅 이력에 있다.
 
-> 라우터 없이 여러 레플리카로 띄우면 재접속과 중지가 조용히 깨진다 — 요청이 그 turn 을
-> 들고 있지 않은 파드에 떨어지면 "활성 스트림 없음"으로 응답한다. 예전에는 이를 위해
-> Redis 소유권 키와 pub/sub 취소 신호, Redis Streams 팬아웃을 뒀지만, 라우팅이 그
-> 계층을 대신한다.
+```bash
+CHAT_OWNER_FORWARDING=redis
+REDIS_URL=redis://process-gpt-deepagents-redis:6379/0   # 또는 CHAT_OWNER_REDIS_URL
+CHAT_OWNER_ADDRESS=http://$(POD_IP):8888                # 없으면 http://$POD_IP:$PORT
+```
+
+> 2026-09 ~ 2026-11 에는 대화마다 런너 Pod 를 띄우는 `process-gpt-session-router` 가 이
+> 전제를 만들었다. 새 대화와 30분 쉰 대화마다 Pod 기동(16~40초)을 기다려야 했고, 그
+> 동안 화면에 아무것도 오지 않았다. 서버형 에이전트는 한 프로세스가 여러 대화를 처리하도록
+> 만들어져 있으므로(샌드박스는 테넌트당 하나, 맥락은 체크포인터) 다시 공유 파드로 돌렸다
+> (process-gpt `docs/decisions/2026-11.md` D-1111-10). CLI 에이전트(codex, cliagents)는
+> 여전히 대화별 Pod 를 쓴다.
+>
+> 넘겨주기를 켜지 않고 여러 레플리카로 띄우면 재접속 · 중지 · 수정 지시가 조용히 깨진다 —
+> 요청이 그 turn 을 들고 있지 않은 파드에 떨어지면 "활성 스트림 없음" 으로 답한다.
 
 ### 채팅이 아닌 경로
 
