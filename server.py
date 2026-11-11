@@ -79,8 +79,12 @@ async def main() -> None:
     # 유휴 SSE 하트비트와 테넌트 가드 미들웨어도 여기 포함된다. 이 저장소에 남은
     # 채팅 코드는 에이전트 로직(HITL 판단, 채팅방 컨텍스트 저장)뿐이다.
     #
-    # /health 의 busy 필드는 세션 라우터가 유휴 Pod 를 회수해도 되는지 판정하는
-    # 근거다 — 턴이 도는 중인 Pod 를 죽이면 대화가 그대로 끊긴다.
+    # 여러 파드가 대화를 나눠 받을 때는 CHAT_OWNER_FORWARDING=redis 로 SDK 의 넘겨주기를
+    # 켠다 — 진행 중인 턴이 있는 대화의 재접속 · 중지 · 수정 지시 · 새 질문이 그 턴을
+    # 돌리는 파드로 간다(README 「운영 전제」).
+    #
+    # /health 의 busy 필드는 지금 턴이 도는 중인지를 알린다 — 턴이 도는 파드를 내리면
+    # 대화가 그대로 끊긴다.
     server.mount_chat_routes(
         app,
         health_path="/health",
