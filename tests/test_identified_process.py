@@ -160,3 +160,20 @@ def test_decision_field_lists_options_in_items_attribute(tmp_path):
     items = _re.search(r"items='([^']*)'", html).group(1)
     assert json.loads(_h.unescape(items)) == [{"견적서 수정 필요": "견적서 수정 필요"}, {"완료": "완료"}]
     assert "is_dynamic_load='fixed'" in html
+
+
+def test_conversion_keeps_the_identified_definition_id(tmp_path, monkeypatch):
+    """한 업무는 정식 정의 하나 — 전환 방에서 만든 정의는 도출 정의의 id(mined_<업무 키>)로 저장된다(2026-11-16)."""
+    original = _mined()
+    monkeypatch.setattr(identified, "load_identified_definition", lambda room: original if room == "room-1" else None)
+    token = tools._current_conversation_id.set("room-1")
+    try:
+        work = tmp_path / "p"
+        work.mkdir()
+        (work / "process-definition.json").write_text(json.dumps(identified.to_elements(original), ensure_ascii=False), encoding="utf-8")
+        out = tools._complete_one_process(work, persist=False)
+        assert out["processDefinition"]["processDefinitionId"] == "mined_quote"
+    finally:
+        tools._current_conversation_id.reset(token)
+    # 전환 방이 아니면 예전처럼 새 id
+    assert identified.identified_definition_id("other-room") is None

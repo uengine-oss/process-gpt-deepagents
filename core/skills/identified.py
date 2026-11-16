@@ -58,6 +58,13 @@ def load_identified_definition(room_id: str) -> dict | None:
     return copy.deepcopy(definition)
 
 
+def identified_definition_id(room_id: str) -> str | None:
+    """전환 방이면 도출 정의의 id(식별 화면이 정한 업무의 정식 정의 id, mined_<업무 키>). 아니면 None."""
+    original = load_identified_definition(room_id)
+    pid = str((original or {}).get("processDefinitionId") or "").strip()
+    return pid or None
+
+
 def to_elements(definition: dict) -> dict:
     """도출 정의(flattened)를 생성 작업 파일 형식(elements[])으로. 이미 elements[] 면 그대로 정규화."""
     from .tools import _normalize_to_processgpt_schema

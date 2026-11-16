@@ -2905,9 +2905,12 @@ def _complete_one_process(work, *, persist: bool = True) -> dict | None:
     if not isinstance(elements, list) or len(elements) == 0:
         return None
 
-    # processDefinitionId 항상 랜덤 UUID
+    # processDefinitionId 항상 랜덤 UUID — 식별 화면에서 전환한 방만 도출 정의의 id(업무의 정식 정의 id)를 쓴다.
+    # 한 업무는 정식 프로세스 정의 하나로 관리하므로, 다시 전환하면 같은 정의의 새 버전으로 저장된다.
     import uuid as _uuid
-    proc_id = str(_uuid.uuid4())
+    from .identified import identified_definition_id
+
+    proc_id = identified_definition_id(_current_conversation_id.get()) or str(_uuid.uuid4())
     pd["processDefinitionId"] = proc_id
 
     # manifest 를 먼저 읽어 '사용자가 선택한' 스킬/에이전트/DMN 을 파악한다.
