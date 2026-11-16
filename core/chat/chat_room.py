@@ -398,12 +398,28 @@ def set_chat_room_context(
     room_id: str,
     context: dict[str, Any],
 ) -> None:
-    """Overwrite the chat_room context with the given dict — no read, no merge."""
+    """Write the keys the agent accumulated in this turn over the room's stored context.
+
+    Only the keys in ``context`` are replaced. Keys the agent does not own stay as they are —
+    e.g. ``identification`` (the process-identification screen puts the mined definition and
+    its process key there when it opens a conversion room) or ``draftProcDefIds`` (the chat
+    screen). Overwriting the whole object here erased them at the end of every turn: a process
+    saved from a conversion room could no longer be tied to the identified process.
+    """
     tid = (tenant_id or "").strip()
     rid = (room_id or "").strip()
     if not tid or not rid:
         return
-    get_supabase().table("chat_rooms").update({"context": context}).eq("id", rid).execute()
+    sb = get_supabase()
+    prev: dict[str, Any] = {}
+    try:
+        rows = getattr(sb.table("chat_rooms").select("id,context").eq("id", rid).execute(), "data", None) or []
+        if rows and isinstance(rows[0], dict) and isinstance(rows[0].get("context"), dict):
+            prev = rows[0]["context"]
+    except Exception:
+        prev = {}
+    merged = {**prev, **(context if isinstance(context, dict) else {})}
+    sb.table("chat_rooms").update({"context": json_normalize(merged)}).eq("id", rid).execute()
 
 
 # 방 목록 미리보기 길이(프론트와 같다)

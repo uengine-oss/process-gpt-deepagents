@@ -93,3 +93,29 @@ def test_update_chat_room_context_persists_each_event_before_the_next_one_arrive
         )
         persisted_after_event_2 = fake_db.rooms["room-1"]["context"]
         assert persisted_after_event_2["tools"][0]["status"] == "done"
+
+
+def test_turn_end_write_keeps_keys_the_agent_does_not_own():
+    """턴 종료 저장은 에이전트가 모으는 키만 바꾼다. 식별 화면이 실어 둔 identification 은 남는다.
+
+    통째로 덮어쓰던 때는 실행 전환 대화방에서 에이전트 턴이 한 번 돌면 identification 이 지워져,
+    그 방에서 저장한 프로세스를 식별한 업무와 이을 수 없었다(2026-11-12).
+    """
+    from core.chat.chat_room import set_chat_room_context
+
+    fake = _FakeSupabase()
+    fake.rooms["r1"] = {
+        "id": "r1",
+        "context": {
+            "identification": {"process_key": "k1", "process_definition_id": "mined_k1"},
+            "draftProcDefIds": ["d1"],
+            "tools": [{"name": "old"}],
+        },
+    }
+    with patch("core.chat.chat_room.get_supabase", return_value=fake):
+        set_chat_room_context(tenant_id="t", room_id="r1", context={"tools": [{"name": "write_file"}], "todos": []})
+    ctx = fake.rooms["r1"]["context"]
+    assert ctx["identification"] == {"process_key": "k1", "process_definition_id": "mined_k1"}
+    assert ctx["draftProcDefIds"] == ["d1"]
+    assert ctx["tools"] == [{"name": "write_file"}]
+    assert ctx["todos"] == []
