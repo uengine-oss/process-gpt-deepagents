@@ -7,6 +7,7 @@ from typing import Any
 
 from langgraph.types import Command
 
+from core.chat.input_images import user_content
 from core.chat.result_summary import SUMMARY_KEY
 
 logger = logging.getLogger(__name__)
@@ -229,6 +230,7 @@ def build_graph_inputs(
     has_checkpoint: bool = False,
     has_pending_interrupt: bool = False,
     pinned_skills: list[str] | None = None,
+    images: list[str] | None = None,
 ) -> tuple[Any, bool]:
     """그래프 실행 입력과 use_graph_resume 플래그를 반환한다.
 
@@ -243,6 +245,8 @@ def build_graph_inputs(
             목록에 없는 이름은 조용히 고정되지 않는데, 대화 도중 추가한 스킬도 스킬이 바뀐
             턴에 SkillsMiddleware 가 목록을 다시 읽으므로(ToolBindingSkillsMiddleware) 여기서
             `skills_metadata` 를 따로 비우지 않는다. 재개(Command) 입력에는 싣지 않는다.
+        images: 이번 사용자 메시지에 붙일 이미지(data URL). 새 사용자 메시지에만
+            `image_url` 블록으로 싣는다. HITL 답변·재개 입력에는 싣지 않는다.
         has_checkpoint: 이 thread_id 에 이미 누적된 체크포인트 상태가 있으면 True.
             지속 체크포인터(공유 메모리/Postgres) 사용 시, 이미 누적된 대화에 또 history 를
             주입하면 메시지가 중복되므로, 이 경우 새 사용자 메시지만 넘긴다.
@@ -280,8 +284,9 @@ def build_graph_inputs(
         return _with_pins({"messages": [{"role": "user", "content": augmented}]}), False
 
     # 이미 체크포인트에 대화가 누적돼 있으면 history 재주입 없이 새 메시지만 추가한다(중복 방지).
+    new_user_msg = {"role": "user", "content": user_content(user_message, images)}
     if has_checkpoint:
-        return _with_pins({"messages": [{"role": "user", "content": user_message}]}), False
+        return _with_pins({"messages": [new_user_msg]}), False
 
     history = list(recent_messages or [])
     if (
@@ -289,9 +294,9 @@ def build_graph_inputs(
         and history[-1].get("role") == "user"
         and history[-1].get("content", "").strip() == user_message.strip()
     ):
-        state_msgs = history
+        state_msgs = [*history[:-1], new_user_msg] if images else history
     else:
-        state_msgs = [*history, {"role": "user", "content": user_message}]
+        state_msgs = [*history, new_user_msg]
 
     return _with_pins({"messages": state_msgs}), False
 

@@ -159,6 +159,10 @@ def _user_opted_out(messages: list[Any]) -> bool:
         if not isinstance(msg, HumanMessage):
             continue
         content = msg.content if isinstance(msg.content, str) else ""
+        if isinstance(msg.content, list):  # 이미지를 첨부한 턴은 글 블록 + 이미지 블록이다
+            content = " ".join(
+                b.get("text", "") for b in msg.content if isinstance(b, dict) and b.get("type") == "text"
+            )
         if content.startswith(_NUDGE_MARKER):
             continue
         lowered = content.lower()

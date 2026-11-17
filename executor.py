@@ -88,6 +88,7 @@ from core.skills.local_system_skills import seed_local_system_skills
 from core.skills.skills import add_skill_reload_inputs, resolve_slash_skill
 from core.skills.tools import _skills_from_tool_args, _current_tenant_id as _skill_tenant_id, _current_user_id as _skill_user_id
 from core.utils.output_utils import extract_final_text, extract_json_text
+from core.chat.input_images import images_note, resolve_images, split_input_images
 from core.chat.result_summary import split_result_summary
 from core.llm.token_hygiene import ToolResultTruncationMiddleware
 from core.agents.skill_creator_subagents import build_skill_creator_subagents
@@ -1611,6 +1612,7 @@ class DeepAgentExecutor(AgentExecutor):
         # 호출부터 SKILL.md 본문이 대화에 실려 스킬을 찾아 읽는 호출이 없어진다. 스킬 목록을
         # 그 하나로 덮어쓰지는 않는다: 목록은 thread 에 남아, 덮어쓰면 다음 턴에도 그 스킬만 보인다.
         _forced_skill_name = ""
+        input_images: list[str] = []
         if _latest_feedback_content:
             _original_query = str(context.get_user_input() or "").strip()
             user_message = (
@@ -1618,7 +1620,19 @@ class DeepAgentExecutor(AgentExecutor):
                 + (f"\n\n[원본 작업 지시]\n{_original_query}" if _original_query else "")
             )
         else:
-            _base_message = _offload_input_data(str(context.get_user_input() or ""), instance_id)
+            _raw_message = str(context.get_user_input() or "")
+            if is_chat:
+                # 첨부 이미지는 글([InputData])로 두면 모델이 보지 못한다 — 떼어 내 이미지 입력으로 싣는다.
+                _raw_message, _image_refs = split_input_images(_raw_message)
+                if _image_refs:
+                    input_images, _failed_images = await resolve_images(_image_refs)
+                    _note = images_note(len(input_images), _failed_images)
+                    _raw_message = f"{_raw_message}\n\n{_note}" if _raw_message.strip() else _note
+                    logger.info(
+                        "채팅 첨부 이미지 | task_id=%s 실음=%d 실패=%d",
+                        task_id, len(input_images), _failed_images,
+                    )
+            _base_message = _offload_input_data(_raw_message, instance_id)
             if is_chat:
                 _slash_skill, _stripped_message = extract_skill_command(_base_message)
                 if _slash_skill:
@@ -1890,6 +1904,7 @@ class DeepAgentExecutor(AgentExecutor):
             has_checkpoint=has_checkpoint,
             has_pending_interrupt=has_pending_interrupt,
             pinned_skills=pinned_skills,
+            images=input_images,
         )
 
         if use_graph_resume:
