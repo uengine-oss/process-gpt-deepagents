@@ -555,6 +555,20 @@ async def _emit_chat_hwpx_artifacts(streamer, tenant_id: str, texts: list[str], 
             logger.warning("채팅 hwpx 실체화 실패 | path=%s", cp, exc_info=True)
 
 
+def _rewrites_history(messages_update) -> bool:
+    """`[RemoveMessage(REMOVE_ALL), *지난 메시지]` 꼴의 갱신이면 True.
+
+    deepagents 의 PatchToolCallsMiddleware 는 지난 턴이 답 없는 도구 호출(예: HITL 질문)로
+    끝나면, 다음 턴 시작에 대화 기록 전체를 이 꼴로 다시 쓴다. 그 안의 지난 write_file 호출을
+    이번 턴 것으로 처리하면 지난 파일이 이번 턴 산출물(file_artifact)로 다시 나간다.
+    """
+    from langchain_core.messages import RemoveMessage
+    from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+    first = messages_update[0] if isinstance(messages_update, list) and messages_update else None
+    return isinstance(first, RemoveMessage) and first.id == REMOVE_ALL_MESSAGES
+
+
 def _file_artifact_payload(path: str, content: str | None, op: str) -> dict:
     name, ext = _ws_file_meta(path)
     text = content if isinstance(content, str) else ""
@@ -886,7 +900,9 @@ async def _reemit_room_artifacts(streamer, chat_room_id: str) -> None:
                 seen.add(key)
                 rel = hp.relative_to(room_host).as_posix()
                 cpath = f"{base_container}/{rel}"
-                await streamer.send_json(_file_artifact_payload(cpath, hp.read_text(encoding="utf-8"), "edit"))
+                # replay: 이번 턴에 고친 것이 아니라 패널 표시·저장을 위해 다시 보내는 것이다.
+                # 화면(Lite)은 이 표시로 방에 있던 메모(.md)를 이번 턴의 산출물 카드로 착각하지 않는다.
+                await streamer.send_json({**_file_artifact_payload(cpath, hp.read_text(encoding="utf-8"), "edit"), "replay": True})
             except Exception:
                 continue
 
@@ -2318,6 +2334,9 @@ class DeepAgentExecutor(AgentExecutor):
                         messages_update = update.get("messages", [])
                         if isinstance(messages_update, Overwrite):
                             messages_update = messages_update.value or []
+                        if _rewrites_history(messages_update):
+                            # 지난 기록을 다시 쓴 갱신이다 — 이번 턴에 한 일이 아니다.
+                            continue
                         for msg in messages_update:
                             if getattr(msg, "tool_calls", None):
                                 for tc in msg.tool_calls:
