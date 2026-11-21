@@ -1,0 +1,559 @@
+{
+ "_about": "평가 채점기가 모델에 함께 보여 주는 Process GPT Lite 테넌트의 MCP 도구(이름·설명은 Lite server/mcp/connectors/*.js, office-mcp mcp_server.py 에서 옮김, 인자는 요약). ArtCraft·이음오피스 live 도구는 설계 4.2(skill_only_tools)대로 스킬을 읽기 전에는 보이지 않으므로 넣지 않는다.",
+ "source_commit": "process-gpt-lite 84bd318",
+ "tools": [
+  {
+   "name": "calendar_find_events",
+   "description": "Find events in the user's Google Calendar between timeMin and timeMax (ISO dates or datetimes), optionally matching text q. Use before creating events to avoid duplicates.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "timeMin": {
+      "type": "string"
+     },
+     "timeMax": {
+      "type": "string"
+     },
+     "q": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "timeMin",
+     "timeMax"
+    ]
+   },
+   "server": "pgpt-google"
+  },
+  {
+   "name": "calendar_create_event",
+   "description": "Create a Google Calendar event. start is YYYY-MM-DD for all-day, or an ISO datetime with offset (e.g. 2026-11-10T22:30:00+09:00).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "summary": {
+      "type": "string"
+     },
+     "start": {
+      "type": "string"
+     },
+     "durationMin": {
+      "type": "integer"
+     },
+     "description": {
+      "type": "string"
+     },
+     "location": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "summary",
+     "start"
+    ]
+   },
+   "server": "pgpt-google"
+  },
+  {
+   "name": "calendar_update_event",
+   "description": "Update fields of an existing calendar event by id.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "eventId": {
+      "type": "string"
+     },
+     "summary": {
+      "type": "string"
+     },
+     "start": {
+      "type": "string"
+     },
+     "durationMin": {
+      "type": "integer"
+     },
+     "description": {
+      "type": "string"
+     },
+     "location": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "eventId"
+    ]
+   },
+   "server": "pgpt-google"
+  },
+  {
+   "name": "gmail_search",
+   "description": "Search the user's Gmail with Gmail query syntax (e.g. \"from:x newer_than:7d\"). Returns sender, subject, date, snippet.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     },
+     "max": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   },
+   "server": "pgpt-google"
+  },
+  {
+   "name": "gmail_read",
+   "description": "Read one Gmail message by id (plain text body).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ]
+   },
+   "server": "pgpt-google"
+  },
+  {
+   "name": "gmail_draft",
+   "description": "Create a Gmail draft (never sends). The user reviews and sends it.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "to": {
+      "type": "string"
+     },
+     "subject": {
+      "type": "string"
+     },
+     "body": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "to",
+     "subject",
+     "body"
+    ]
+   },
+   "server": "pgpt-google"
+  },
+  {
+   "name": "drive_search",
+   "description": "Full-text search in the user's Google Drive.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     },
+     "max": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   },
+   "server": "pgpt-google"
+  },
+  {
+   "name": "drive_read",
+   "description": "Read a Drive file as text (Docs → text, Sheets → CSV).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "fileId": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "fileId"
+    ]
+   },
+   "server": "pgpt-google"
+  },
+  {
+   "name": "slack_list_channels",
+   "description": "List Slack channels the user can see.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "limit": {
+      "type": "integer"
+     }
+    },
+    "required": []
+   },
+   "server": "pgpt-slack"
+  },
+  {
+   "name": "slack_read_channel",
+   "description": "Read recent messages of a channel (id or #name). oldest = unix seconds to only get newer messages.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "channel": {
+      "type": "string"
+     },
+     "oldest": {
+      "type": "string"
+     },
+     "limit": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "channel"
+    ]
+   },
+   "server": "pgpt-slack"
+  },
+  {
+   "name": "slack_post_message",
+   "description": "Post a message to a Slack channel as the user. Confirm with the user before posting to shared channels.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "channel": {
+      "type": "string"
+     },
+     "text": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "channel",
+     "text"
+    ]
+   },
+   "server": "pgpt-slack"
+  },
+  {
+   "name": "github_search_issues",
+   "description": "Search GitHub issues and pull requests (GitHub search syntax, e.g. \"repo:owner/name is:open label:bug\").",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     },
+     "max": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   },
+   "server": "pgpt-github"
+  },
+  {
+   "name": "github_list_prs",
+   "description": "Open pull requests that involve the user (authored, assigned or review requested).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "max": {
+      "type": "integer"
+     }
+    },
+    "required": []
+   },
+   "server": "pgpt-github"
+  },
+  {
+   "name": "github_create_issue",
+   "description": "Create an issue in a repository (owner/name).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "repo": {
+      "type": "string"
+     },
+     "title": {
+      "type": "string"
+     },
+     "body": {
+      "type": "string"
+     },
+     "labels": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "required": [
+     "repo",
+     "title",
+     "labels"
+    ]
+   },
+   "server": "pgpt-github"
+  },
+  {
+   "name": "notion_search",
+   "description": "Search Notion pages shared with the integration.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   },
+   "server": "pgpt-notion"
+  },
+  {
+   "name": "notion_read_page",
+   "description": "Read the text of a Notion page.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "pageId": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "pageId"
+    ]
+   },
+   "server": "pgpt-notion"
+  },
+  {
+   "name": "notion_create_page",
+   "description": "Create a page under a parent page id with a title and markdown-like content.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "parentPageId": {
+      "type": "string"
+     },
+     "title": {
+      "type": "string"
+     },
+     "markdown": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "parentPageId",
+     "title"
+    ]
+   },
+   "server": "pgpt-notion"
+  },
+  {
+   "name": "notion_append_to_page",
+   "description": "Append markdown-like content to the end of a page.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "pageId": {
+      "type": "string"
+     },
+     "markdown": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "pageId",
+     "markdown"
+    ]
+   },
+   "server": "pgpt-notion"
+  },
+  {
+   "name": "youtube_trending",
+   "description": "Most popular YouTube videos right now in a region (YouTube Data API chart=mostPopular). region is a 2-letter code (default KR); category is optional, one of these ids: 1 film, 10 music, 17 sports, 20 gaming, 24 entertainment, 25 news …. Returns rank, title, channel, views, likes, published time, url, thumbnail. Without an API key or Google account it returns the closest public approximation (exact_chart: false) together with what is missing and where to connect it — tell the user both; there is nothing more to find in the browser.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "region": {
+      "type": "string"
+     },
+     "category": {
+      "type": "string"
+     },
+     "max": {
+      "type": "integer"
+     }
+    },
+    "required": []
+   },
+   "server": "pgpt-youtube"
+  },
+  {
+   "name": "youtube_search",
+   "description": "Search YouTube videos. order: viewCount (most viewed first, default), date (newest first), relevance. publishedAfter: hours or days back (\"24h\", \"7d\"), a Seoul day (YYYY-MM-DD — for \"today\" give the date of today) or an ISO time. Uses the YouTube Data API; without a key it reads the public results page (views as shown there, no likes) and says what is missing for the API.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     },
+     "order": {
+      "type": "string",
+      "enum": [
+       "viewCount",
+       "date",
+       "relevance"
+      ]
+     },
+     "publishedAfter": {
+      "type": "string"
+     },
+     "region": {
+      "type": "string"
+     },
+     "max": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   },
+   "server": "pgpt-youtube"
+  },
+  {
+   "name": "youtube_channel_videos",
+   "description": "List the most recent uploads of a YouTube channel (handle like @name, channel id, or URL). Returns id, title, url, published time, views and likes when known. Works without an API key (channel RSS feed).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "channel": {
+      "type": "string"
+     },
+     "limit": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "channel"
+    ]
+   },
+   "server": "pgpt-youtube"
+  },
+  {
+   "name": "youtube_video_info",
+   "description": "Title, upload date, duration, views and description of one video.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "videoId": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "videoId"
+    ]
+   },
+   "server": "pgpt-youtube"
+  },
+  {
+   "name": "youtube_transcript",
+   "description": "Transcript text of a video from its captions (manual or auto-generated). lang defaults to ko, falls back to en.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "videoId": {
+      "type": "string"
+     },
+     "lang": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "videoId"
+    ]
+   },
+   "server": "pgpt-youtube"
+  },
+  {
+   "name": "browser_task",
+   "description": "Read a web page in the built-in browser as the user — also pages behind a login: saved logins are filled from the user's vault on the server. Read-only: it never posts, sends, deletes, buys, books or changes settings. Use it only after the connector/API tools and plain public fetches (RSS, public pages) did not work. Takes a few minutes; returns the result, notes and the last page's text.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "goal": {
+      "type": "string"
+     },
+     "start_url": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "goal"
+    ]
+   },
+   "server": "pgpt-browser"
+  },
+  {
+   "name": "generate_hwpx",
+   "server": "office-mcp",
+   "description": "HWPX 템플릿을 채워 스토리지 URL로 반환한다.\n\n사용자가 HWPX 작성을 요청하면 즉시 이 도구를 호출한다 (참고문서 선택 플로우 없음).\nreference_documents가 비어 있으면 memento 전체 검색으로 관련 자료를 자동 조회한다.\n사용자가 이미지 생성/참조 옵션을 선택한 경우 image_generation_enabled, image_reference_enabled에 전달한다.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "template_url": {
+      "type": "string",
+      "description": "HWPX 템플릿 URL"
+     },
+     "report_topic": {
+      "type": "string",
+      "description": "보고서 주제"
+     },
+     "report_description": {
+      "type": "string",
+      "description": "보고서 상세 설명"
+     },
+     "reference_text": {
+      "type": "string",
+      "description": "참고할 텍스트"
+     }
+    },
+    "required": [
+     "template_url",
+     "report_topic"
+    ]
+   }
+  },
+  {
+   "name": "generate_docx",
+   "server": "office-mcp",
+   "description": "DOCX 템플릿을 LLM으로 채워 스토리지 URL로 반환한다.\n템플릿 입력은 둘 중 하나:\n- template_file_id: supabase storage path (= knowledge_files.source_ref). bucket=files 에서 직접 다운로드.\n- template_url: 외부 http(s) URL (Google Drive 공유 링크 등). file_id 가 없을 때만 사용.\n참고문서 선택 플로우 없음 — reference_documents가 비어 있으면 memento 검색으로 자동 조회한다.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string",
+      "description": "사용자 요청 / 리서치 주제"
+     },
+     "template_url": {
+      "type": "string"
+     },
+     "template_file_id": {
+      "type": "string"
+     },
+     "output_name": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  }
+ ]
+}

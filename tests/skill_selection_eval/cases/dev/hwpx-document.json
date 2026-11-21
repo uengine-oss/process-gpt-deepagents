@@ -1,0 +1,258 @@
+{
+  "skill": "hwpx-document",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "hwp-d-p01",
+      "label": "pos",
+      "text": "협력사에 보낼 단가 조정 협조 공문을 한글 파일로 만들어 주세요. 시행일은 12월 1일이에요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-p02",
+      "label": "pos",
+      "text": "연말 송년회 안내문 hwp로 하나 만들러줘 장소는 강남 더리버 3층",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-p03",
+      "label": "pos",
+      "text": "첨부한 회사 표준 보고서 양식(표준보고서.hwpx)에 3분기 품질 실적 내용을 채워 한글 파일로 작성해 주십시오.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-p04",
+      "label": "pos",
+      "text": "Create a Hangul word-processor (.hwp) file for an official notice to tenants about elevator maintenance on Dec 3, in standard Korean public-document format.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-p05",
+      "label": "pos",
+      "text": "韓国の取引先に出す公文書を、ハングル(.hwp)形式で作ってもらえますか？件名は「納期変更のお知らせ」です。",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-p06",
+      "label": "pos",
+      "text": "구청에제출할사업계획요약서를한글파일로뽑아야하는데 구청양식이아래아한글이라서",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-p07",
+      "label": "pos",
+      "text": "신입사원 OJT 안내문을 HWP 포맷으로 받고 싶어요, 일정은 표 하나로 정리해서요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 공공기관은 꼭 한글 파일로만 받는대요, 워드로 만든 건 소용없다고. 입찰 참가 확약서를 hwp 파일로 새로 하나 만들어 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-p09",
+      "label": "pos",
+      "text": "보도자료는 한글 양식으로 내야 한다면서요? 그럼 우리 보도자료 양식에 맞춰 신제품 출시 건으로 한글 파일 하나 써 주실래요?",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-p10",
+      "label": "pos",
+      "text": "请用韩国HWP格式生成一份会议通知文件，会议时间是12月10日下午2点，地点是本社5楼。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-d-n01",
+      "label": "neg",
+      "text": "공문 양식 그대로 워드(.docx) 파일로 만들어줘 수신은 각 지점쟝",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "boundary",
+        "no-open"
+      ],
+      "right": "docx",
+      "open": null
+    },
+    {
+      "id": "hwp-d-n02",
+      "label": "neg",
+      "text": "이 영어 문장 한글로 번역해 줘: 'Please confirm the delivery date.'",
+      "axes": [
+        "banmal",
+        "mixed",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "hwp-d-n03",
+      "label": "neg",
+      "text": "안내문에서 날짜를 11월 28일로 바꾸고 문의 전화번호도 02-555-0142로 고쳐 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "ieumoffice-live-edit",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "hwp",
+        "file": "주민설명회_안내문.hwpx"
+      }
+    },
+    {
+      "id": "hwp-d-n04",
+      "label": "neg",
+      "text": "한글 프로그램에서 쪽 번호는 어떻게 넣어요?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "hwp-d-n05",
+      "label": "neg",
+      "text": "Make a PowerPoint deck in Korean (한글) for our investor briefing, about 8 slides.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pptx",
+      "open": null
+    },
+    {
+      "id": "hwp-d-n06",
+      "label": "neg",
+      "text": "직원한글이름 가나다순으로정렬된 엑셀명단파일 만들어주세요",
+      "axes": [
+        "haeyo",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "hwp-d-n07",
+      "label": "neg",
+      "text": "请把这句话翻译成韩文：我们下周一开始放假。",
+      "axes": [
+        "command",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "hwp-d-n08",
+      "label": "neg",
+      "text": "添付したハングルの契約書PDF3つを、1つのPDFにまとめてください。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pdf",
+      "open": null
+    },
+    {
+      "id": "hwp-d-n09",
+      "label": "neg",
+      "text": "나눔고딕 같은 한글 글꼴을 회사 PC에 설치하는 방법 알려 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "hwp-d-n10",
+      "label": "neg",
+      "text": "한글 자음 'ㅎ'을 모티브로 한 회사 로고를 벡터로 만들어 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    }
+  ]
+}

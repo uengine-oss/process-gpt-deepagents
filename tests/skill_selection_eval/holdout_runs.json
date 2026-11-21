@@ -1,0 +1,18 @@
+{
+ "runs": [
+  {
+   "at": "20261121-150346",
+   "model": "frentis-ai-model",
+   "pos_rate": 0.96875,
+   "neg_rate": 0.05,
+   "tag": "final"
+  },
+  {
+   "at": "20261121-151249",
+   "model": "frentis-ai-model",
+   "pos_rate": 1.0,
+   "neg_rate": 0.025,
+   "tag": "final-fill"
+  }
+ ]
+}

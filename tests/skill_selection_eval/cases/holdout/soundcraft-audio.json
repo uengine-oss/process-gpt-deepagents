@@ -1,0 +1,261 @@
+{
+  "skill": "soundcraft-audio",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "snd-h-p01",
+      "label": "pos",
+      "text": "회사 ARS 첫 안내 앞에 들어갈 2초짜리 짧은 로고 사운드 만들어 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-h-p02",
+      "label": "pos",
+      "text": "ad_v1.wav랑 ad_v2.wav 사이에 0.5초 무음 넣고 이어붙여서 하나로 뽑아쥬",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-h-p03",
+      "label": "pos",
+      "text": "강의 녹음 파일 lec1.wav, lec2.wav, lec3.wav를 순서대로 트랙에 배치하고 음량을 고르게 맞춘 뒤 WAV로 출력해 주십시오.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-h-p04",
+      "label": "pos",
+      "text": "In the open session, duck the music under the host's voice and add a 2-second fade-in at the start.",
+      "axes": [
+        "command",
+        "en",
+        "open-doc"
+      ],
+      "open": {
+        "app": "soundcraft",
+        "file": "podcast_ep7"
+      }
+    },
+    {
+      "id": "snd-h-p05",
+      "label": "pos",
+      "text": "エレベーター到着の「ポーン」という音を作れますか？短めでお願いします。",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-h-p06",
+      "label": "pos",
+      "text": "loop_a.wav를 전시장배경음으로 5분짜리로늘려서 끊김없이이어지게 만들어야되는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-h-p07",
+      "label": "pos",
+      "text": "Notification 소리를 지금 것보다 덜 날카롭게, 0.4초 안쪽으로 새로 받고 싶어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-h-p08",
+      "label": "pos",
+      "text": "음 그 지금 열려 있는 거요, 박수 소리가 왼쪽에서만 나서 이상하대요. 가운데로 팬 좀 맞춰 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "open-doc"
+      ],
+      "open": {
+        "app": "soundcraft",
+        "file": "행사_오프닝"
+      }
+    },
+    {
+      "id": "snd-h-p09",
+      "label": "pos",
+      "text": "MP3 말고 WAV로도 뽑을 수 있죠? 그럼 bgm_draft.mp3 마지막 15초 잘라 내고 WAV로 저장해 주세요.",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-h-p10",
+      "label": "pos",
+      "text": "把 rain.wav 和 piano.wav 混在一起，雨声小一点，导出成一个WAV文件。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-h-n01",
+      "label": "neg",
+      "text": "제품 소개 영상 intro_cut.mp4에 효과음 몇 개 넣고 자막까지 달아서 MP4로 만들어 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    },
+    {
+      "id": "snd-h-n02",
+      "label": "neg",
+      "text": "고객 상담 통화 녹음 call_0317.wav 들어 보고 고객이 뭘 불만인지 요약해 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "snd-h-n03",
+      "label": "neg",
+      "text": "Convert our onboarding script into spoken audio with a friendly male voice.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "snd-h-n04",
+      "label": "neg",
+      "text": "코드 진행에서 투파이브원이 뭐예요?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "snd-h-n05",
+      "label": "neg",
+      "text": "유튜브에 최근 올라온 사무실 소음 ASMR 영상 중에 인기 있는 거 찾아 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "youtube-public-data",
+      "open": null
+    },
+    {
+      "id": "snd-h-n06",
+      "label": "neg",
+      "text": "음 그 슬랙 #design 채널에 누가 효과음 파일 올렸다던데, 어, 목록 좀 보여 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "dictation",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    },
+    {
+      "id": "snd-h-n07",
+      "label": "neg",
+      "text": "音楽ライブの写真（live.jpg）を明るくして、ポスター用にトリミングして。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    },
+    {
+      "id": "snd-h-n08",
+      "label": "neg",
+      "text": "매장에서틀음악 저작권료를 어디에내야하는지 알고싶어요",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "snd-h-n09",
+      "label": "neg",
+      "text": "회사 보유 음원 목록을 곡명, 길이, 라이선스 만료일 열로 엑셀에 정리해 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "snd-h-n10",
+      "label": "neg",
+      "text": "设计一个耳机形状的矢量图标，用在我们的音频App里。",
+      "axes": [
+        "command",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    }
+  ]
+}

@@ -1,0 +1,262 @@
+{
+  "skill": "cadcraft-drawing",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "cad-h-p01",
+      "label": "pos",
+      "text": "주차장 120면 배치도를 그려 주세요. 주차 칸은 2.5m×5.0m, 차로 폭은 6m로요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-h-p02",
+      "label": "pos",
+      "text": "회의실 벽 단면도 하나 그려줘 석고보드 12.5mm 두겹에 스터드 간격 450으로 해죠",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-h-p03",
+      "label": "pos",
+      "text": "기존 도면 office_B1.dxf에서 탕비실 벽체를 삭제하고 개방형 휴게 공간으로 수정하여 저장해 주십시오.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-h-p04",
+      "label": "pos",
+      "text": "In the open drawing, add a 1.2 m wide stair on the north side and dimension it.",
+      "axes": [
+        "command",
+        "en",
+        "open-doc"
+      ],
+      "open": {
+        "app": "cadcraft",
+        "file": "warehouse_mezz.dxf"
+      }
+    },
+    {
+      "id": "cad-h-p05",
+      "label": "pos",
+      "text": "クリーンルームの装置レイアウト図を寸法付きで描いてもらえますか？装置は6台、間隔は1.5mです。",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-h-p06",
+      "label": "pos",
+      "text": "매장진열대배치를 도면으로정리해서 시공팀에넘겨야하는데 치수까지",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-h-p07",
+      "label": "pos",
+      "text": "Lobby 입면도를 치수 포함해서 DXF로 받았으면 좋겠어요, 높이 4.2m, 폭 9m.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-h-p08",
+      "label": "pos",
+      "text": "음 그 열려 있는 도면 말인데요, 싱크대가 문이랑 겹쳐 있어서 계속 지적받아요. 싱크대를 오른쪽으로 800 옮겨 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "open-doc"
+      ],
+      "open": {
+        "app": "cadcraft",
+        "file": "실험실_배치.dxf"
+      }
+    },
+    {
+      "id": "cad-h-p09",
+      "label": "pos",
+      "text": "DXF 파일도 열 수 있다던데 맞죠? site_plan.dxf 열어서 건물 외곽 치수만 뽑아 주세요.",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-h-p10",
+      "label": "pos",
+      "text": "把 office_3F.dxf 里会议室的隔墙往西移动1米，然后重新标注尺寸。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-h-n01",
+      "label": "neg",
+      "text": "도면 모양 아이콘 하나 SVG로 만들어 주세요. 사내 앱 메뉴에 쓸 거예요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "cad-h-n02",
+      "label": "neg",
+      "text": "신규 입사자 온보딩 업무 흐름도를 그려 줘. 인사팀, IT팀, 현업 부서 레인으로 나눠서.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "bpmn-process-generation-skill",
+      "open": null
+    },
+    {
+      "id": "cad-h-n03",
+      "label": "neg",
+      "text": "Here's a scanned blueprint image, scan_07.png — straighten it, crop the margins and boost the contrast.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    },
+    {
+      "id": "cad-h-n04",
+      "label": "neg",
+      "text": "건폐율이랑 용적률 차이가 뭐예요?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cad-h-n05",
+      "label": "neg",
+      "text": "모델하우스3D렌더링 이미지를 실사처럼 만들수있어요?",
+      "axes": [
+        "question",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cad-h-n06",
+      "label": "neg",
+      "text": "공장 이전 계획 발표 자료를 PPT로 작성해 주십시오. 각 장은 사진을 왼쪽에, 글을 오른쪽에 배치해 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pptx",
+      "open": null
+    },
+    {
+      "id": "cad-h-n07",
+      "label": "neg",
+      "text": "設備ごとの設置面積をまとめたExcelのグラフを作って。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "cad-h-n08",
+      "label": "neg",
+      "text": "인테리어 업체 고를 때 뭘 봐야 하는지 알고 싶어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cad-h-n09",
+      "label": "neg",
+      "text": "도면 검토 장면을 담은 클립 review1.mp4, review2.mp4를 이어 붙이고 자막 넣어서 MP4로 뽑아 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "filmcraft-video",
+      "open": {
+        "app": "cadcraft",
+        "file": "검토용_1층.dxf"
+      }
+    },
+    {
+      "id": "cad-h-n10",
+      "label": "neg",
+      "text": "用代码生成一张像建筑蓝图一样的抽象生成艺术图。",
+      "axes": [
+        "command",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "algorithmic-art",
+      "open": null
+    }
+  ]
+}

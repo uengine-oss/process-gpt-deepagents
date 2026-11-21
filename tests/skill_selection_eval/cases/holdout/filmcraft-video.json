@@ -1,0 +1,261 @@
+{
+  "skill": "filmcraft-video",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "flm-h-p01",
+      "label": "pos",
+      "text": "현장 스케치 영상 site_sketch.mp4에 잔잔한 배경음 넣고 1분으로 줄여 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-h-p02",
+      "label": "pos",
+      "text": "졸업식 영상 클립들 grad_01부터 grad_06까지 이어서 하나로 만들고 장면마다 날짜 자막 넣어쥬",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-h-p03",
+      "label": "pos",
+      "text": "신입사원 환영 영상 welcome_raw.mp4에 오프닝 타이틀과 엔딩 크레딧을 추가하여 MP4 형식으로 제작해 주십시오.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-h-p04",
+      "label": "pos",
+      "text": "In the open project, swap the order of clips 2 and 3 and put a fade between every clip.",
+      "axes": [
+        "command",
+        "en",
+        "open-doc"
+      ],
+      "open": {
+        "app": "filmcraft",
+        "file": "q4_recap"
+      }
+    },
+    {
+      "id": "flm-h-p05",
+      "label": "pos",
+      "text": "工場見学の動画（tour.mp4）に日本語字幕を入れて、MP4で書き出せますか？",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-h-p06",
+      "label": "pos",
+      "text": "고객사례영상 case_story.mp4 중간에회사로고자막띄우고 마지막에연락처화면붙여야되는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-h-p07",
+      "label": "pos",
+      "text": "데모용 풍경 footage로 20초짜리 brand teaser 하나 있었으면 좋겠어요, 끝에 'See you soon' 문구도요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-h-p08",
+      "label": "pos",
+      "text": "음 열려 있는 이 편집본요, 배경음이 말소리를 다 덮어서 아무것도 안 들려요. 음악 좀 줄이고 MP4로 다시 뽑아 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "open-doc"
+      ],
+      "open": {
+        "app": "filmcraft",
+        "file": "세미나_하이라이트"
+      }
+    },
+    {
+      "id": "flm-h-p09",
+      "label": "pos",
+      "text": "세로 영상도 만들 수 있죠? 그럼 promo_wide.mp4를 9:16으로 잘라서 쇼츠용 MP4로 뽑아 줄래요?",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-h-p10",
+      "label": "pos",
+      "text": "给 product_demo.mp4 加上片头标题“新品发布”和片尾的公司标志，导出MP4。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-h-n01",
+      "label": "neg",
+      "text": "'전기 자전거 리뷰' 주제로 이번 달 유튜브에 올라온 영상 목록 좀 뽑아 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "youtube-public-data",
+      "open": null
+    },
+    {
+      "id": "flm-h-n02",
+      "label": "neg",
+      "text": "다음 주 촬영할 제품 영상 콘티랑 장면별 대사 써 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "flm-h-n03",
+      "label": "neg",
+      "text": "Design a vectr channel logo for our video seires 'Factory Talks'.",
+      "axes": [
+        "command",
+        "en",
+        "typo",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "flm-h-n04",
+      "label": "neg",
+      "text": "영상 편집자 채용할 때 포트폴리오에서 뭘 봐야 해요?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "flm-h-n05",
+      "label": "neg",
+      "text": "광고 영상에 들어갈 '슉' 하는 전환 효과음만 따로 만들어 주세요. WAV로요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "soundcraft-audio",
+      "open": null
+    },
+    {
+      "id": "flm-h-n06",
+      "label": "neg",
+      "text": "세미나영상 seminar_qna.mp4에서 질의응답때 무슨질문들이나왔는지 알고싶어요",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "flm-h-n07",
+      "label": "neg",
+      "text": "動画のサムネイル用に、cover.jpg の背景を消して人物だけ切り抜いて。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    },
+    {
+      "id": "flm-h-n08",
+      "label": "neg",
+      "text": "완성한 홍보 영상 promo_final.mp4를 Slack #all-hands 채널에 올리고 다들 보라고 한마디 남겨 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    },
+    {
+      "id": "flm-h-n09",
+      "label": "neg",
+      "text": "영상 대신 발표 슬라이드 파일로 제품 소개 자료 만들어 주세요, 8장 정도요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pptx",
+      "open": null
+    },
+    {
+      "id": "flm-h-n10",
+      "label": "neg",
+      "text": "企业宣传视频一般多长比较合适？",
+      "axes": [
+        "question",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    }
+  ]
+}

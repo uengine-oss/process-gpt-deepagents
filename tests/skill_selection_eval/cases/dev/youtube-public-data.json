@@ -1,0 +1,254 @@
+{
+  "skill": "youtube-public-data",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "ytp-d-p01",
+      "label": "pos",
+      "text": "'슈카월드' 채널이 최근에 올린 영상 다섯 개 제목이랑 올린 날짜 알려 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-p02",
+      "label": "pos",
+      "text": "요즘 '전기차 배터리' 관련해서 유튜브에 올라온 영상 중에 조회수 젤 많은거 몇개 찾아바",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-p03",
+      "label": "pos",
+      "text": "다음 유튜브 영상의 제목, 조회수, 게시일을 확인해 주시기 바랍니다: https://www.youtube.com/watch?v=Qx7bL2mZpRk",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-p04",
+      "label": "pos",
+      "text": "List the ten most recent uploads from the Kurzgesagt YouTube channel with their view counts.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-p05",
+      "label": "pos",
+      "text": "「生成AI 業務効率化」で検索すると、最近アップされたYouTube動画にはどんなものがありますか？",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-p06",
+      "label": "pos",
+      "text": "@hyundaimotorgroup채널이 이번달에영상을몇개올렸는지세어봐야하는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-p07",
+      "label": "pos",
+      "text": "B2B SaaS 마케팅 주제로 지난 한 달 사이 view 많이 나온 유튜브 영상 리스트가 있으면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 유튜브 연동이 자꾸 실패했다고만 떠요. 연결 안 해도 되니까 그냥 공개된 걸로 '스마트팩토리' 최신 영상 몇 개만 좀 뽑아 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-p09",
+      "label": "pos",
+      "text": "그 신제품 리뷰 영상 조회수가 벌써 100만 넘었다던데 진짜예요? 링크는 youtu.be/R4kT9wEhn2c 예요.",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-p10",
+      "label": "pos",
+      "text": "帮我看看 YouTube 上关于“跨境电商”最近上传的热门视频，列出标题和播放量。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-d-n01",
+      "label": "neg",
+      "text": "유튜브에 올릴 인터뷰 영상(interview_ceo.mp4)에 한글 자막 입히고 MP4로 뽑아 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    },
+    {
+      "id": "ytp-d-n02",
+      "label": "neg",
+      "text": "드라이브에 있는 '신제품_소개.mp4'를 우리 회사 유튜브 채널에 비공개로 업로드해 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    },
+    {
+      "id": "ytp-d-n03",
+      "label": "neg",
+      "text": "Put big bold yellow text '3 TIPS' over team_offsite.jpg for a YouTube thumbnail and save it at 1280x720.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    },
+    {
+      "id": "ytp-d-n04",
+      "label": "neg",
+      "text": "유튜브 채널 구독자를 어떻게 하면 빨리 늘릴 수 있을까, 운영 요령을 좀 알아봐야 하는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "ytp-d-n05",
+      "label": "neg",
+      "text": "다음 달 신제품 홍보용 유튜브 쇼츠 대본을 30초 분량으로 써 줬으면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "ytp-d-n06",
+      "label": "neg",
+      "text": "YouTubeのオープニング用に、2秒くらいの明るいジングル音を作ってWAVで書き出して。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "soundcraft-audio",
+      "open": null
+    },
+    {
+      "id": "ytp-d-n07",
+      "label": "neg",
+      "text": "유튜브채널프로필에쓸 동그란 로고 svg로 만들어줘 이름은 공장일기",
+      "axes": [
+        "banmal",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "ytp-d-n08",
+      "label": "neg",
+      "text": "유튜브 쇼츠 덕에 올랐다는 하이브, 오늘 주가 몇 원인지 확인 좀 해 줄래요?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "stock-price-lookup",
+      "open": null
+    },
+    {
+      "id": "ytp-d-n09",
+      "label": "neg",
+      "text": "What's the ideal length for a YouTube product demo video?",
+      "axes": [
+        "question",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "ytp-d-n10",
+      "label": "neg",
+      "text": "우리 채널 최신 영상에 달린 댓글 중 배송 불만 글에 사과 답글 달아 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    }
+  ]
+}

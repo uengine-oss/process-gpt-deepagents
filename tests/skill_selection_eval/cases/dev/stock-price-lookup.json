@@ -1,0 +1,252 @@
+{
+  "skill": "stock-price-lookup",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "spl-d-p01",
+      "label": "pos",
+      "text": "SK하이닉스 지금 얼마에 거래되고 있어요? 몇 시 기준 가격인지도 같이 알려 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-p02",
+      "label": "pos",
+      "text": "엔비디아 어제 종가 몇 달러였는지 봐줘 그리고 그저께보다 몇 퍼 올랏는지도",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-p03",
+      "label": "pos",
+      "text": "현대자동차 보통주의 지난주 금요일 종가와 이번 주 금요일 종가를 비교하여 등락률을 산출해 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-p04",
+      "label": "pos",
+      "text": "Pull Apple's closing price for each trading day last week and give me the weekly percent change.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-p05",
+      "label": "pos",
+      "text": "日経平均は今日いくらで引けましたか？前日比も教えてください。",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-p06",
+      "label": "pos",
+      "text": "하닉이랑삼전 이번달들어서 얼마나빠졌는지 확인해봐야하는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-p07",
+      "label": "pos",
+      "text": "QQQ랑 SPY 최근 3주 수익률을 나란히 놓고 보고 싶어요, 기준은 어제 close로요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 에코프로 말이야, 다들 많이 빠졌다고만 하고 정확한 숫자는 아무도 안 알려 주네. 이번 주 등락률 좀 봐 줘.",
+      "axes": [
+        "banmal",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-p09",
+      "label": "pos",
+      "text": "도요타 주가가 1년 만에 최고라던데 진짜예요? 오늘 가격이랑 최근 52주 범위 좀 확인해 주실래요?",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-p10",
+      "label": "pos",
+      "text": "请帮我查一下腾讯控股今天的股价，以及最近五个交易日的涨跌幅。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-d-n01",
+      "label": "neg",
+      "text": "창고 재고(stock) 수량을 품목별로 정리한 엑셀 파일 만들어 줘. 안전재고 밑으로 떨어진 건 빨간색으로.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "spl-d-n02",
+      "label": "neg",
+      "text": "I bought a stock photo of a handshake (handshake.jpg) — crop it to 16:9 and warm up the colors a little.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    },
+    {
+      "id": "spl-d-n03",
+      "label": "neg",
+      "text": "주주총회 소집 통지서를 한글(hwpx) 파일로 작성해 주시기 바랍니다. 일시는 12월 18일 오전 10시, 장소는 본사 3층 대회의실입니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "hwpx-document",
+      "open": null
+    },
+    {
+      "id": "spl-d-n04",
+      "label": "neg",
+      "text": "PER이랑 PBR이 각각 뭘 뜻하는지 신입도 알아듣게 설명해 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "spl-d-n05",
+      "label": "neg",
+      "text": "달러환율오늘1400원넘었어?",
+      "axes": [
+        "question",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "spl-d-n06",
+      "label": "neg",
+      "text": "증권사에서 이번 달에 온 거래 확인서 메일 찾아서 첨부 파일만 구글 드라이브 '증권' 폴더에 올려 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    },
+    {
+      "id": "spl-d-n07",
+      "label": "neg",
+      "text": "「米国株」で最近再生回数が多いYouTube動画を探して、タイトルと再生回数を一覧にしてください。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "youtube-public-data",
+      "open": null
+    },
+    {
+      "id": "spl-d-n08",
+      "label": "neg",
+      "text": "카카오 주식 지금 사도 괜찮을지 의견 좀 듣고 싶어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "spl-d-n09",
+      "label": "neg",
+      "text": "스톡 영상 사이트에서 받은 도시 야경 클립 세 개(night1~3.mp4) 이어 붙여서 15초짜리 MP4로 만들어 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    },
+    {
+      "id": "spl-d-n10",
+      "label": "neg",
+      "text": "比特币现在多少钱？",
+      "axes": [
+        "question",
+        "zh",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    }
+  ]
+}

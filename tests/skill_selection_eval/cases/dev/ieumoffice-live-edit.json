@@ -1,0 +1,304 @@
+{
+  "skill": "ieumoffice-live-edit",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "iol-d-p01",
+      "label": "pos",
+      "text": "C열 금액 합계가 안 맞는 것 같아요. 다시 계산해서 합계 칸에 넣어 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "sheets",
+        "file": "영업실적_11월.xlsx"
+      }
+    },
+    {
+      "id": "iol-d-p02",
+      "label": "pos",
+      "text": "2장 제목 '추진 배경'을 '도입 배경'으로 바꿔조",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "docs",
+        "file": "제안서_한빛물산.docx"
+      }
+    },
+    {
+      "id": "iol-d-p03",
+      "label": "pos",
+      "text": "안내문의 '○○○' 자리 표시 문구를 모두 '품질관리팀'으로 바꾸어 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "hwp",
+        "file": "직원교육_안내문.hwpx"
+      }
+    },
+    {
+      "id": "iol-d-p04",
+      "label": "pos",
+      "text": "On slide 3, replace the bullet 'TBD' with 'Launch in January' and shorten the title.",
+      "axes": [
+        "command",
+        "en",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "slides",
+        "file": "Q4_kickoff.pptx"
+      }
+    },
+    {
+      "id": "iol-d-p05",
+      "label": "pos",
+      "text": "このPDFの2ページ目に書いてある納期はいつになっていますか？",
+      "axes": [
+        "question",
+        "ja",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "pdf",
+        "file": "見積依頼書.pdf"
+      }
+    },
+    {
+      "id": "iol-d-p06",
+      "label": "pos",
+      "text": "B12셀수량이틀렸는데고쳐야겠다 48이아니라84",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "sheets",
+        "file": "재고실사표.xlsx"
+      }
+    },
+    {
+      "id": "iol-d-p07",
+      "label": "pos",
+      "text": "Action item 표에 담당자 칸이 비어 있는데, 거기 다 '김도윤'으로 채워졌으면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "docs",
+        "file": "회의록_1120.docx"
+      }
+    },
+    {
+      "id": "iol-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 마지막 슬라이드 연락처가 또 작년 거예요, 이거 몇 번째인지... recruit@daehan.co.kr 로 바꿔 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "slides",
+        "file": "채용설명회.pptx"
+      }
+    },
+    {
+      "id": "iol-d-p09",
+      "label": "pos",
+      "text": "表格里的总额真的是1250万韩元吗？我觉得各项加起来不对，请核对一下，有错就直接改。",
+      "axes": [
+        "question",
+        "counter-question",
+        "zh",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "hwp",
+        "file": "예산신청서.hwp"
+      }
+    },
+    {
+      "id": "iol-d-p10",
+      "label": "pos",
+      "text": "채팅 옆 편집기에 띄워 둔 엑셀에서 '단가' 열을 전부 10% 올려 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "iol-d-n01",
+      "label": "neg",
+      "text": "신규 거래처 등록 안내문을 워드 문서로 새로 하나 만들어 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "docx",
+      "open": null
+    },
+    {
+      "id": "iol-d-n02",
+      "label": "neg",
+      "text": "비품 구매 내역을 매번 메모장에 적으니 엉망이에요. 부서별로 정리할 새 엑셀 파일 하나 만들어 줘요, 합계 행도 넣고.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "iol-d-n03",
+      "label": "neg",
+      "text": "오늘 서울 날씨 어때요? 오후에 외근 나가야 해서요.",
+      "axes": [
+        "question",
+        "ko",
+        "open-doc"
+      ],
+      "right": "general",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "sheets",
+        "file": "월별매출.xlsx"
+      }
+    },
+    {
+      "id": "iol-d-n04",
+      "label": "neg",
+      "text": "보고서에 넣을 현장 사진 site_0412.jpg가 너무 어두워요, 그 사진 파일 밝기만 올려 줘.",
+      "axes": [
+        "banmal",
+        "complaint",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "photocraft-editing",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "docs",
+        "file": "출장보고서.docx"
+      }
+    },
+    {
+      "id": "iol-d-n05",
+      "label": "neg",
+      "text": "Create a new 6-slide deck for the partner workshop agenda.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pptx",
+      "open": null
+    },
+    {
+      "id": "iol-d-n06",
+      "label": "neg",
+      "text": "첨부한 한글 양식(휴직신청서.hwp)에 내용 채워서 새 한글 파일로 주세요. 성명 이서윤, 기간 3개월.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "hwpx-document",
+      "open": null
+    },
+    {
+      "id": "iol-d-n07",
+      "label": "neg",
+      "text": "この資料とは別件ですが、明日10時の打ち合わせをGoogleカレンダーに入れてください。",
+      "axes": [
+        "command",
+        "ja",
+        "open-doc"
+      ],
+      "right": "connected-services",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "slides",
+        "file": "제품소개.pptx"
+      }
+    },
+    {
+      "id": "iol-d-n08",
+      "label": "neg",
+      "text": "첨부한 거래명세서 PDF 두 개랑 사업자등록증 PDF를 하나로 합쳐서 새 파일로 저장해 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pdf",
+      "open": null
+    },
+    {
+      "id": "iol-d-n09",
+      "label": "neg",
+      "text": "근데 NDA랑 MOU 차이가 뭐예요? 그냥 궁금해서요.",
+      "axes": [
+        "question",
+        "mixed",
+        "open-doc"
+      ],
+      "right": "general",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "pdf",
+        "file": "계약서_초안.pdf"
+      }
+    },
+    {
+      "id": "iol-d-n10",
+      "label": "neg",
+      "text": "첨부한엑셀 거래처목록.xlsx에서 중복행 지우고 새파일로 저장해줘요",
+      "axes": [
+        "haeyo",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    }
+  ]
+}
