@@ -77,6 +77,25 @@ uv run pytest -q
 `GITHUB_TOKEN` 이 없으면 스킬 저장소 API 테스트(`tests/test_github_skill_repo_api.py`
 등)는 실패한다 — 그 밖의 실패는 진짜 실패다.
 
+### 번들 시스템 스킬
+
+`system-skills/process-gpt-system/` 의 스킬은 기동 때 `{SKILLS_DIRS}/process-gpt-system/` 로 복사돼
+(`core/skills/local_system_skills.py`) **모든 테넌트**의 스킬 목록에 실린다. 에이전트는 description 을 보고
+고른 스킬의 SKILL.md 를 `read_file` 로 읽는다(`metadata.include_tools` 의 도구는 관리자가 스킬 전용으로 지정했을 때 그 뒤에 보인다).
+
+| 스킬 | 언제 |
+|---|---|
+| `bpmn-process-generation-skill` · `process-execution` · `bsc-strategy-interview` | 프로세스 설계 · 만들어 둔 프로세스 실행 · BSC 전략 인터뷰 |
+| `stock-price-lookup` · `youtube-public-data` | 주가·지수 시세, 유튜브 공개 정보(키·연결 없이) |
+| `connected-services` | 메일·캘린더·드라이브·Slack·GitHub·Notion 같은 바깥 서비스(연결 도구 → 공개 자료 → 내장 브라우저, 못 하면 빠진 연결 안내) |
+| `hwpx-document` | 한글(.hwpx) 파일 만들기·양식 채우기 |
+| `ieumoffice-live-edit` | 채팅 옆 이음오피스 편집기에 열린 문서를 그 화면에서 고치기 |
+| `cadcraft-drawing` · `vectorcraft-graphics` · `photocraft-editing` · `soundcraft-audio` · `filmcraft-video` | ArtCraft 앱 도구로 도면·벡터·이미지·오디오·영상 |
+
+이음오피스·ArtCraft 스킬은 Process GPT Lite 의 MCP 도구에 기댄다. 본문 첫 줄이 「이 도구들이 목록에 없으면 이 스킬을 쓰지 않는다」라
+그 도구가 없는 테넌트에서는 쓰이지 않는다. 형식은 `tests/test_lite_knowledge_skills.py` 가, 고르는 정확도는
+`tests/skill_selection_eval/`(개발·보류 문항 + LLM 채점기, 맨 위 주석에 쓰는 법)가 본다.
+
 ### 자주 막히는 자리
 
 | 증상 | 원인 |

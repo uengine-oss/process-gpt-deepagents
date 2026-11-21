@@ -1,0 +1,264 @@
+{
+  "skill": "filmcraft-video",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "flm-d-p01",
+      "label": "pos",
+      "text": "워크숍 클립 세 개(ws1.mp4, ws2.mp4, ws3.mp4)를 순서대로 이어 붙여서 MP4로 내보내 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-d-p02",
+      "label": "pos",
+      "text": "제품 시연 영상 demo_final.mp4 중간에 멈춰 있는 구간 빼고 끝에 회사이름 자막 넣어죠",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-d-p03",
+      "label": "pos",
+      "text": "교육 영상 training_v2.mp4의 장면 전환마다 디졸브 효과를 넣고, 하단에 한글 자막을 삽입하여 MP4로 출력해 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-d-p04",
+      "label": "pos",
+      "text": "Add a lower-third title 'Plant Tour 2026' to factory_walk.mp4, lay soft background music under it, and export MP4.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-d-p05",
+      "label": "pos",
+      "text": "風景の素材映像を使って、15秒くらいの会社紹介の短い動画を作ってもらえますか？",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-d-p06",
+      "label": "pos",
+      "text": "인터뷰영상 int_a.mp4랑 int_b.mp4 사이에전환효과넣고 배경음깔아야하는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-d-p07",
+      "label": "pos",
+      "text": "열려 있는 프로젝트에서 두 번째 clip이 조금 짧아지고 transition이 더 부드러워졌으면 해요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "open-doc"
+      ],
+      "open": {
+        "app": "filmcraft",
+        "file": "launch_teaser"
+      }
+    },
+    {
+      "id": "flm-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 행사 영상에 연사 이름이 하나도 안 나와서 누가 누군지 모르겠대요. event_day.mp4에 연사 나올 때마다 이름 자막 좀 넣어 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-d-p09",
+      "label": "pos",
+      "text": "이 영상 끝부분이 너무 길지 않아요? 마지막 장면을 10초 줄이고 MP4로 다시 내보내 줘요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "open-doc"
+      ],
+      "open": {
+        "app": "filmcraft",
+        "file": "사내홍보_편집본"
+      }
+    },
+    {
+      "id": "flm-d-p10",
+      "label": "pos",
+      "text": "把 city_day.mp4 和 city_night.mp4 拼接起来，中间加一个淡入淡出转场，导出MP4。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "flm-d-n01",
+      "label": "neg",
+      "text": "유튜브에서 '수제 맥주 양조' 관련 최근 영상 중 조회수 높은 거 찾아 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "youtube-public-data",
+      "open": null
+    },
+    {
+      "id": "flm-d-n02",
+      "label": "neg",
+      "text": "신제품 홍보 영상 기획안이랑 내레이션 대본 써 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "flm-d-n03",
+      "label": "neg",
+      "text": "Make a YouTube thumbnail from frame_120.png: add big text 'NEW' and brighten it.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    },
+    {
+      "id": "flm-d-n04",
+      "label": "neg",
+      "text": "내 PC 화면을 녹화하면서 설명하는 영상은 어떻게 찍어요?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "flm-d-n05",
+      "label": "neg",
+      "text": "영상 말고 소리만요. 인터뷰 음성 int_audio.wav 볼륨 맞추고 잡음 구간 잘라서 WAV로 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "soundcraft-audio",
+      "open": {
+        "app": "filmcraft",
+        "file": "interview_cut"
+      }
+    },
+    {
+      "id": "flm-d-n06",
+      "label": "neg",
+      "text": "safety_edu.mp4에서 강사가 한 말을 글로 받아 적어 줬으면 해요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "flm-d-n07",
+      "label": "neg",
+      "text": "Slackのスタンプ用に、ジャンプする犬の短いアニメーションGIFを作って。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "slack-gif-creator",
+      "open": null
+    },
+    {
+      "id": "flm-d-n08",
+      "label": "neg",
+      "text": "편집끝난영상 final_cut.mp4 팀구글드라이브 홍보물폴더에 올려줘",
+      "axes": [
+        "banmal",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    },
+    {
+      "id": "flm-d-n09",
+      "label": "neg",
+      "text": "영상 오프닝에 쓸 회사 로고 SVG로 새로 만들어 주세여",
+      "axes": [
+        "haeyo",
+        "ko",
+        "typo",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "flm-d-n10",
+      "label": "neg",
+      "text": "拍企业宣传片一般需要多少预算？",
+      "axes": [
+        "question",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    }
+  ]
+}

@@ -1,0 +1,260 @@
+{
+  "skill": "photocraft-editing",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "pho-d-p01",
+      "label": "pos",
+      "text": "회사 단체 사진(team_2026.jpg)이 너무 어두워요. 밝기랑 대비 좀 올려 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-d-p02",
+      "label": "pos",
+      "text": "프로필 사진 profile.jpg 정사각형으로 잘라서 400x400으로 줄여줘 배경은 회색으로 바꿔조",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-d-p03",
+      "label": "pos",
+      "text": "제품 사진 세 장(p1.jpg, p2.jpg, p3.jpg)을 한 장으로 합성하여 상세 페이지용 이미지로 만들어 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-d-p04",
+      "label": "pos",
+      "text": "Replace the background of headshot_kim.png with a soft office blur and keep the edges clean.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-d-p05",
+      "label": "pos",
+      "text": "この商品写真（shoes.jpg）の色味を、カタログの青系トーンに合わせてもらえますか？",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-d-p06",
+      "label": "pos",
+      "text": "전단지사진 flyer.jpg위에 오픈기념30%할인 글자얹어야되는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-d-p07",
+      "label": "pos",
+      "text": "열린 이미지에서 사람 얼굴 쪽만 살짝 brighter 했으면 좋겠고, 레이어는 그대로 두면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "open-doc"
+      ],
+      "open": {
+        "app": "photocraft",
+        "file": "banner_photo.psd"
+      }
+    },
+    {
+      "id": "pho-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 현장 사진들이 다 누렇게 나와서 보고서에 못 쓰겠어요. site_a.jpg, site_b.jpg 화이트밸런스 좀 맞춰 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-d-p09",
+      "label": "pos",
+      "text": "이거 채도 너무 높지 않아요? 좀 낮추고 오른쪽 아래에 회사 이름 워터마크도 넣어 줘요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "open-doc"
+      ],
+      "open": {
+        "app": "photocraft",
+        "file": "행사사진_보정.png"
+      }
+    },
+    {
+      "id": "pho-d-p10",
+      "label": "pos",
+      "text": "把 shop_front.jpg 裁成16:9，调亮一点，然后保存成带图层的PSD。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-d-n01",
+      "label": "neg",
+      "text": "사진 말고 벡터로 우리 팀 마스코트 아이콘을 새로 디자인해 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "pho-d-n02",
+      "label": "neg",
+      "text": "현장 사진 보고 기계실 배치를 치수 넣은 도면으로 새로 그려 주세요. 사진은 mech_room.jpg.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "cadcraft-drawing",
+      "open": null
+    },
+    {
+      "id": "pho-d-n03",
+      "label": "neg",
+      "text": "Turn the 20 event photos I attached into a slideshow video with music and export it as MP4.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    },
+    {
+      "id": "pho-d-n04",
+      "label": "neg",
+      "text": "이 영수증 사진 receipt_1118.jpg에 적힌 금액이랑 날짜 읽어 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "pho-d-n05",
+      "label": "neg",
+      "text": "제품사진 잘찍으려면 조명을 어떻게두는게 좋아요?",
+      "axes": [
+        "question",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "pho-d-n06",
+      "label": "neg",
+      "text": "제품 사진들 넣어서 신제품 소개 슬라이드 파일 만들어야 하는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pptx",
+      "open": null
+    },
+    {
+      "id": "pho-d-n07",
+      "label": "neg",
+      "text": "Slackで使う、拍手するペンギンの動くGIFスタンプを作って。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "slack-gif-creator",
+      "open": null
+    },
+    {
+      "id": "pho-d-n08",
+      "label": "neg",
+      "text": "몇천 장 되는 행사 사진을 날짜별, 사람별로 폴더 정리해 줬으면 해요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "pho-d-n09",
+      "label": "neg",
+      "text": "스캔한 사진 다섯 장을 PDF 하나로 묶어 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pdf",
+      "open": null
+    },
+    {
+      "id": "pho-d-n10",
+      "label": "neg",
+      "text": "这张照片 trip_0921.jpg 里拍的是什么地方？",
+      "axes": [
+        "question",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    }
+  ]
+}

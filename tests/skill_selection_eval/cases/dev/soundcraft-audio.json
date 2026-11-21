@@ -1,0 +1,264 @@
+{
+  "skill": "soundcraft-audio",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "snd-d-p01",
+      "label": "pos",
+      "text": "인트로 음악 intro.wav랑 내레이션 voice.wav를 섞어서 WAV 하나로 내보내 주세요. 음악은 좀 작게요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-d-p02",
+      "label": "pos",
+      "text": "앱 결제 완료 알림음 짧게 하나 만들어줘 0.5초 정도 밝은 느낌으로 부탁햐",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-d-p03",
+      "label": "pos",
+      "text": "사내 방송용 배경음 파일(bgm_morning.mp3)의 앞부분 10초를 잘라내고 끝에 3초 페이드아웃을 적용해 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-d-p04",
+      "label": "pos",
+      "text": "Pan guitar.wav hard left and keys.wav hard right, then mix them with drums.wav down to a 48 kHz WAV.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-d-p05",
+      "label": "pos",
+      "text": "電話の保留音を30秒くらいで作ってもらえますか？落ち着いた感じで、WAVでお願いします。",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-d-p06",
+      "label": "pos",
+      "text": "ep12팟캐스트 오프닝효과음이랑멘트트랙볼륨이안맞아서 다시맞춰야하는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-d-p07",
+      "label": "pos",
+      "text": "열린 세션에서 bass track만 3dB 낮아지고 마지막 fade out이 좀 더 길어졌으면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "open-doc"
+      ],
+      "open": {
+        "app": "soundcraft",
+        "file": "jingle_mix"
+      }
+    },
+    {
+      "id": "snd-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 녹음한 안내 멘트 앞에 잡음이 2초쯤 계속 들어가 있어서 거슬려요. notice.wav 앞쪽 그 부분만 잘라 주실래요?",
+      "axes": [
+        "question",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-d-p09",
+      "label": "pos",
+      "text": "드럼이 너무 크지 않아요? 드럼 볼륨 좀 내리고 전체를 WAV로 다시 뽑아 주세요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "open-doc"
+      ],
+      "open": {
+        "app": "soundcraft",
+        "file": "광고음악_믹스"
+      }
+    },
+    {
+      "id": "snd-d-p10",
+      "label": "pos",
+      "text": "做一个游戏里捡金币的音效，大约0.3秒，导出WAV。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "snd-d-n01",
+      "label": "neg",
+      "text": "홍보 영상 promo.mp4에 배경음악 깔고 끝부분 페이드아웃해서 MP4로 뽑아 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "filmcraft-video",
+      "open": {
+        "app": "soundcraft",
+        "file": "promo_bgm"
+      }
+    },
+    {
+      "id": "snd-d-n02",
+      "label": "neg",
+      "text": "어제 녹음한 주간 미팅 음성 파일 받아써서 핵심만 뽑아 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "snd-d-n03",
+      "label": "neg",
+      "text": "Read this paragraph aloud as an MP3 in a calm female voice: 'Welcome to our quarterly update.'",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "snd-d-n04",
+      "label": "neg",
+      "text": "업무집중할때 듣기좋은 음악 추천해줄래요?",
+      "axes": [
+        "question",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "snd-d-n05",
+      "label": "neg",
+      "text": "유튜브에서 '로파이 작업 음악'으로 최근 많이 본 영상 몇 개 찾아 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "youtube-public-data",
+      "open": null
+    },
+    {
+      "id": "snd-d-n06",
+      "label": "neg",
+      "text": "음 그 녹음 파일 있잖아요, interview_03.wav, 그거 구글 드라이브 '인터뷰' 폴더에 좀 올려 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "dictation",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    },
+    {
+      "id": "snd-d-n07",
+      "label": "neg",
+      "text": "ポッドキャストのカバー用に、音の波形をモチーフにしたロゴをベクターで作って。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "snd-d-n08",
+      "label": "neg",
+      "text": "광고에 유명 가요 30초 써도 저작권 문제가 없는지 알고 싶어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "snd-d-n09",
+      "label": "neg",
+      "text": "세미나실 스피커 배치를 치수 들어간 도면으로 그려 주세요. 방 크기는 10m×14m예요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "cadcraft-drawing",
+      "open": null
+    },
+    {
+      "id": "snd-d-n10",
+      "label": "neg",
+      "text": "给 interview.mp4 加上背景音乐和中文字幕，导出MP4。",
+      "axes": [
+        "command",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    }
+  ]
+}

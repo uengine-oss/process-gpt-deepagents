@@ -1,0 +1,260 @@
+{
+  "skill": "vectorcraft-graphics",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "vec-h-p01",
+      "label": "pos",
+      "text": "주말 플리마켓 홍보 포스터를 벡터로 만들어 주세요. A3 크기, 날짜는 11월 30일이에요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-h-p02",
+      "label": "pos",
+      "text": "등산 동호회 엠블럼 하나 그려줘 산이랑 해 모양 들어가게 단색으로 심플하게 부탁햬",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-h-p03",
+      "label": "pos",
+      "text": "안전보건 표지 스티커용 경고 아이콘 세 종(감전, 미끄럼, 낙하물)을 SVG 형식으로 제작해 주십시오.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-h-p04",
+      "label": "pos",
+      "text": "Round the corners of the open icon more and switch the gradient to teal-to-green.",
+      "axes": [
+        "command",
+        "en",
+        "open-doc"
+      ],
+      "open": {
+        "app": "vectorcraft",
+        "file": "app_icon.svg"
+      }
+    },
+    {
+      "id": "vec-h-p05",
+      "label": "pos",
+      "text": "名刺のデザインをベクターで作れますか？名前は田中美咲、肩書きは営業マネージャーです。",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-h-p06",
+      "label": "pos",
+      "text": "신규서비스아이콘을 svg로새로만들어야하는데 구름이랑자물쇠조합으로",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-h-p07",
+      "label": "pos",
+      "text": "Product launch 배너를 벡터로, 가로형 1920×600 사이즈로 받고 싶어요. 메인 카피는 'Meet Orbit'.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-h-p08",
+      "label": "pos",
+      "text": "음 그 열어 둔 캐릭터 그림이요, 눈이 너무 몰려 있어서 다들 무섭대요. 눈 간격 좀 벌리고 웃는 입으로 바꿔 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "open-doc"
+      ],
+      "open": {
+        "app": "vectorcraft",
+        "file": "mascot.svg"
+      }
+    },
+    {
+      "id": "vec-h-p09",
+      "label": "pos",
+      "text": "SVG 일러스트도 만들 수 있다면서요? 그럼 택배 상자 들고 뛰는 사람 일러스트 하나 단순하게 그려 줄래요?",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-h-p10",
+      "label": "pos",
+      "text": "给我们的物流公司做一个矢量Logo，公司名叫“迅达”，以蓝色为主。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-h-n01",
+      "label": "neg",
+      "text": "포스터에 쓸 모델 사진 model_03.jpg 피부 톤 보정하고 배경을 바다로 합성해 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    },
+    {
+      "id": "vec-h-n02",
+      "label": "neg",
+      "text": "간판 설치 위치를 매장 입면도에 치수로 표시해서 DXF로 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "cadcraft-drawing",
+      "open": null
+    },
+    {
+      "id": "vec-h-n03",
+      "label": "neg",
+      "text": "Our new logo needs a sound logo too — make a 2-second jingle and export it as WAV.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "soundcraft-audio",
+      "open": null
+    },
+    {
+      "id": "vec-h-n04",
+      "label": "neg",
+      "text": "슬라이드에 우리 회사 색 테마 입히는 것도 되죠? 이미 만든 annual_review.pptx 전체에 적용해 줘요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "theme-factory",
+      "open": null
+    },
+    {
+      "id": "vec-h-n05",
+      "label": "neg",
+      "text": "좋은로고의 조건이 뭔지 설명해줄래?",
+      "axes": [
+        "question",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "vec-h-n06",
+      "label": "neg",
+      "text": "아이콘이랑 배너가 들어간 관리자 대시보드 화면 UI를 디자인해 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "frontend-design",
+      "open": null
+    },
+    {
+      "id": "vec-h-n07",
+      "label": "neg",
+      "text": "添付のWord資料（report.docx）に、Anthropicのブランドカラーとフォントを適用して。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "brand-guidelines",
+      "open": null
+    },
+    {
+      "id": "vec-h-n08",
+      "label": "neg",
+      "text": "로고가 나오는 홍보 영상 promo_logo.mp4 끝에 3초짜리 검은 화면 붙여 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    },
+    {
+      "id": "vec-h-n09",
+      "label": "neg",
+      "text": "디자이너 채용 공고 문구를 써 줬으면 해요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "vec-h-n10",
+      "label": "neg",
+      "text": "我们的品牌应该走高端路线还是大众路线？",
+      "axes": [
+        "question",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    }
+  ]
+}

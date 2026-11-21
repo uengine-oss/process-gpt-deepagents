@@ -1,0 +1,263 @@
+{
+  "skill": "vectorcraft-graphics",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "vec-d-p01",
+      "label": "pos",
+      "text": "우리 빵집 '밀밭' 로고를 만들어 주세요. 밀 이삭 모양에 갈색 계열로요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-d-p02",
+      "label": "pos",
+      "text": "사내 앱 메뉴에 쓸 아이콘 6개 svg로 만들어줘 결재 일정 공지 메일 설정 도움말 이렇게 선 굵기 통일해서 해져",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-d-p03",
+      "label": "pos",
+      "text": "영업본부장 명함을 앞뒤 양면으로 디자인해 주시기 바랍니다. 성명 최민호, 연락처 010-2481-7730.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-d-p04",
+      "label": "pos",
+      "text": "Create an SVG web banner, 1200×300, announcing our spring hiring with a simple mountain illustration.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-d-p05",
+      "label": "pos",
+      "text": "社内イベント用に、シンプルなベクターのポスターを作ってもらえますか？テーマは「秋の運動会」です。",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-d-p06",
+      "label": "pos",
+      "text": "고객센터안내에넣을 간단한상담원일러스트하나필요한데 벡터로",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-d-p07",
+      "label": "pos",
+      "text": "지금 열린 badge에서 텍스트 color만 navy로 바뀌고 테두리가 조금 더 두꺼워지면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "open-doc"
+      ],
+      "open": {
+        "app": "vectorcraft",
+        "file": "badge_v2.svg"
+      }
+    },
+    {
+      "id": "vec-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 기존 로고가 확대만 하면 다 깨져서 매번 창피해요. 첨부한 logo_old.png 보고 같은 모양으로 벡터 로고 다시 만들어 주실래요?",
+      "axes": [
+        "question",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-d-p09",
+      "label": "pos",
+      "text": "이 포스터 제목 글자 너무 작지 않아요? 두 배로 키우고 날짜를 12월 6일로 고쳐 주세요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "open-doc"
+      ],
+      "open": {
+        "app": "vectorcraft",
+        "file": "행사포스터.svg"
+      }
+    },
+    {
+      "id": "vec-d-p10",
+      "label": "pos",
+      "text": "设计一套简单的矢量图标：仓库、卡车、箱子、扫码枪，统一线条风格，输出SVG。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "vec-d-n01",
+      "label": "neg",
+      "text": "제품 사진 bottle_white.jpg 배경 지우고 그림자 자연스럽게 넣어 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    },
+    {
+      "id": "vec-d-n02",
+      "label": "neg",
+      "text": "전시 부스 3m×6m 배치를 치수 들어간 도면으로 그려 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "cadcraft-drawing",
+      "open": {
+        "app": "vectorcraft",
+        "file": "booth_banner.svg"
+      }
+    },
+    {
+      "id": "vec-d-n03",
+      "label": "neg",
+      "text": "Generate a generative art piece with p5.js — flowing particle lines in blue tones.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "algorithmic-art",
+      "open": null
+    },
+    {
+      "id": "vec-d-n04",
+      "label": "neg",
+      "text": "로고 들어간 회사 소개 발표 슬라이드도 되죠? 10장짜리 PPT로 만들어 줘요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pptx",
+      "open": null
+    },
+    {
+      "id": "vec-d-n05",
+      "label": "neg",
+      "text": "우리 브랜드 포지셔닝을 어떻게 잡아야 할지 전략 조언 좀 해 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "vec-d-n06",
+      "label": "neg",
+      "text": "배너랑 아이콘 들어간 이벤트 랜딩 웹페이지를 HTML로 만들어주세요",
+      "axes": [
+        "haeyo",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "web-artifacts-builder",
+      "open": null
+    },
+    {
+      "id": "vec-d-n07",
+      "label": "neg",
+      "text": "撮影した社内イベントのクリップ3本をつないで、ロゴ入りのタイトルを入れてMP4にして。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    },
+    {
+      "id": "vec-d-n08",
+      "label": "neg",
+      "text": "Slack에 올릴 움직이는 축하 이모지 GIF 만들어 줘. 박수 치는 손 모양으로.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "slack-gif-creator",
+      "open": null
+    },
+    {
+      "id": "vec-d-n09",
+      "label": "neg",
+      "text": "Figma랑 Illustrator 중에 우리 팀에 뭐가 나을지 의견 듣고 싶어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "vec-d-n10",
+      "label": "neg",
+      "text": "这个Logo图片 logo_scan.png 里写的公司名是什么？",
+      "axes": [
+        "question",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    }
+  ]
+}
