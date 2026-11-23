@@ -1,0 +1,264 @@
+{
+  "skill": "photocraft-editing",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "pho-h-p01",
+      "label": "pos",
+      "text": "신제품 사진 lamp_new.jpg 배경을 하얗게 바꾸고 1000×1000으로 맞춰 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-h-p02",
+      "label": "pos",
+      "text": "a팀.jpg랑 b팀.jpg 두 사진 합쳐서 한장짜리 단체사진처럼 만들어줘 자연스럽게 해죠",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-h-p03",
+      "label": "pos",
+      "text": "보고서 표지 색조와 어울리도록 공장 전경 사진(factory.jpg)의 색감을 남색 계열로 보정해 주십시오.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-h-p04",
+      "label": "pos",
+      "text": "In the open image, remove the street sign on the left and add the text 'Grand Opening' across the top.",
+      "axes": [
+        "command",
+        "en",
+        "open-doc"
+      ],
+      "open": {
+        "app": "photocraft",
+        "file": "storefront.psd"
+      }
+    },
+    {
+      "id": "pho-h-p05",
+      "label": "pos",
+      "text": "集合写真（group.jpg）の端の暗い部分を明るくして、少しトリミングしてもらえますか？",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-h-p06",
+      "label": "pos",
+      "text": "메뉴판에쓸음식사진들 크기가제각각이라 다800x600으로맞춰야겠네",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-h-p07",
+      "label": "pos",
+      "text": "Hero 이미지 hero_bg.jpg가 웹사이트 브랜드 컬러랑 톤이 맞았으면 좋겠어요, 살짝 cool tone으로요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-h-p08",
+      "label": "pos",
+      "text": "음 이 사진 말인데요, 그림자가 얼굴 반쪽을 덮어서 사원증에 못 쓰겠대요. 그림자 좀 걷어 주실래요?",
+      "axes": [
+        "question",
+        "complaint",
+        "ko",
+        "dictation",
+        "open-doc"
+      ],
+      "open": {
+        "app": "photocraft",
+        "file": "사원증사진.png"
+      }
+    },
+    {
+      "id": "pho-h-p09",
+      "label": "pos",
+      "text": "PSD로 레이어 나눠서 저장도 된다고요? 그럼 poster_bg.jpg에 제목 글자 얹고 레이어 살려서 PSD로 주세요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-h-p10",
+      "label": "pos",
+      "text": "把产品照片 cup_red.jpg 里杯子的颜色换成蓝色，背景保持不变。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "pho-h-n01",
+      "label": "neg",
+      "text": "사진 느낌 말고 납작한 벡터 아이콘으로 카메라 모양 하나 SVG로 그려 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "pho-h-n02",
+      "label": "neg",
+      "text": "촬영해 온 제품 영상 unbox.mp4가 앞뒤로 쓸데없이 길어서 못 쓰겠어요. 군더더기 자르고 자막 넣어 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    },
+    {
+      "id": "pho-h-n03",
+      "label": "neg",
+      "text": "Draw a dimensioned layout for the new photo studio: 10 m × 7 m, backdrop wall on the north side, as DXF.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "cadcraft-drawing",
+      "open": null
+    },
+    {
+      "id": "pho-h-n04",
+      "label": "neg",
+      "text": "이 사진 product_label.jpg에 뭐라고 쓰여 있는지 텍스트로 옮겨 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "pho-h-n05",
+      "label": "neg",
+      "text": "DSLR이랑 미러리스 중에 제품 촬영엔 뭐가 나아요?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "pho-h-n06",
+      "label": "neg",
+      "text": "현장 사진 넣은 점검 결과 보고서를 한글(hwpx) 파일로 만들어야 하는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "hwpx-document",
+      "open": null
+    },
+    {
+      "id": "pho-h-n07",
+      "label": "neg",
+      "text": "写真ギャラリーを表示するHTMLページを作ってください。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "web-artifacts-builder",
+      "open": null
+    },
+    {
+      "id": "pho-h-n08",
+      "label": "neg",
+      "text": "사진파일 이름을 촬영날짜 순서로 일괄정리했으면 좋겠어요",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "pho-h-n09",
+      "label": "neg",
+      "text": "사진 찍을 때 나는 '찰칵' 셔터 효과음을 만들어서 WAV로 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "soundcraft-audio",
+      "open": {
+        "app": "photocraft",
+        "file": "camera_ad.psd"
+      }
+    },
+    {
+      "id": "pho-h-n10",
+      "label": "neg",
+      "text": "把产品照片的文件名和拍摄日期整理成一个Excel表格。",
+      "axes": [
+        "command",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    }
+  ]
+}

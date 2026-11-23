@@ -1,0 +1,263 @@
+{
+  "skill": "hwpx-document",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "hwp-h-p01",
+      "label": "pos",
+      "text": "주민센터에 낼 행사 장소 사용 신청서를 한글(.hwp)로 만들어 주세요. 행사명은 '동네 플리마켓'이에요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-p02",
+      "label": "pos",
+      "text": "회사 공문 양식에 이번주 정전 안내 내용 채워서 한글파일로 저장해쥬",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-p03",
+      "label": "pos",
+      "text": "감사 결과 보고서를 공공기관 표준 서식에 맞추어 아래아한글 파일로 작성하여 주시기 바랍니다. 대상 기간은 2026년 상반기입니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-p04",
+      "label": "pos",
+      "text": "Fill our company's HWP letterhead template with the attached meeting minutes and send me back the .hwp file.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-p05",
+      "label": "pos",
+      "text": "社内規定の改定案を、韓国の官公庁向けの.hwpxファイルで作成できますか？",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-p06",
+      "label": "pos",
+      "text": "교육청에보낼협조요청공문 한글파일로만들어놔야되는데내일까지",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-p07",
+      "label": "pos",
+      "text": "Safety 점검 결과 안내문을 우리 HWP 양식 그대로 받았으면 해요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-p08",
+      "label": "pos",
+      "text": "음 아 그게 매번 한글 양식에 손으로 옮겨 적느라 시간이 너무 걸려요. 이번 달 출장 결과 보고를 양식 파일에 채워서 한글 파일로 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-p09",
+      "label": "pos",
+      "text": "한글 파일은 못 만든다고 누가 그러던데 진짜예요? 되면 시설 점검 일정 안내문을 한글 파일로 하나 만들어 줘요.",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-p10",
+      "label": "pos",
+      "text": "按照公司的HWP公文模板，填写关于年底盘点的通知，并输出.hwpx文件。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "hwp-h-n01",
+      "label": "neg",
+      "text": "보고서는 한글 말고 워드로 주세여. 3분기 영업 실적 보고서요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "typo",
+        "boundary",
+        "no-open"
+      ],
+      "right": "docx",
+      "open": null
+    },
+    {
+      "id": "hwp-h-n02",
+      "label": "neg",
+      "text": "공문 본문 셋째 문단을 좀 더 정중하게 바꿔 주고 시행일자도 12월 5일로 고쳐 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "ieumoffice-live-edit",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "hwp",
+        "file": "협조공문_초안.hwp"
+      }
+    },
+    {
+      "id": "hwp-h-n03",
+      "label": "neg",
+      "text": "여기 표 맨 아래에 '안전교육, 2시간' 행 하나만 추가해 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "ieumoffice-live-edit",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "hwp",
+        "file": "교육계획서.hwpx"
+      }
+    },
+    {
+      "id": "hwp-h-n04",
+      "label": "neg",
+      "text": "외국인 직원에게 한글 자모 읽는 법을 쉽게 가르치고 싶은데 순서 좀 정리해 줘.",
+      "axes": [
+        "banmal",
+        "wish",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "hwp-h-n05",
+      "label": "neg",
+      "text": "Make an Excel sheet listing our overseas staff with Korean (Hangul) and romanized names side by side.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "hwp-h-n06",
+      "label": "neg",
+      "text": "한컴오피스한글에서 표테두리 없애는메뉴가 어디있어요?",
+      "axes": [
+        "question",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "hwp-h-n07",
+      "label": "neg",
+      "text": "첨부한 한글로 된 계약서 PDF에서 서명 페이지만 따로 뽑아 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pdf",
+      "open": null
+    },
+    {
+      "id": "hwp-h-n08",
+      "label": "neg",
+      "text": "做一份韩文的PPT，介绍我们公司的新产品，大约10页。",
+      "axes": [
+        "command",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pptx",
+      "open": null
+    },
+    {
+      "id": "hwp-h-n09",
+      "label": "neg",
+      "text": "この文章を自然な韓国語(ハングル)に直してください：「来週の会議は延期になりました」",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "hwp-h-n10",
+      "label": "neg",
+      "text": "포스터 사진 위에 한글 문구 '가을맞이 특가'를 큼직하게 얹어 줘. 파일은 autumn_sale.jpg.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    }
+  ]
+}

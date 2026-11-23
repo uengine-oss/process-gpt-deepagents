@@ -1,0 +1,263 @@
+{
+  "skill": "cadcraft-drawing",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "cad-d-p01",
+      "label": "pos",
+      "text": "가로 12m, 세로 8m 사무실에 책상 16개랑 회의실 하나가 들어가는 배치도를 치수 넣어서 그려 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-d-p02",
+      "label": "pos",
+      "text": "창고 랙 배치 도면 dxf로 하나 뽑아줘 랙 폭 1.2m 통로는 3m 이상으로 해져",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-d-p03",
+      "label": "pos",
+      "text": "첨부한 1층 평면 DXF 파일(plant_1F.dxf)을 읽어 출입문 개수와 각 문의 폭을 정리해 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-d-p04",
+      "label": "pos",
+      "text": "Draw a dimensioned 2D elevation of a 2.4 m tall storage wall with three shelving bays and export it as DXF.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-d-p05",
+      "label": "pos",
+      "text": "幅6m×奥行き4mの会議室に机と椅子を配置した、寸法入りの図面を作れますか？DXFでほしいです。",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-d-p06",
+      "label": "pos",
+      "text": "생산라인컨베이어배치도에치수넣어서DWG로줘야하는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-d-p07",
+      "label": "pos",
+      "text": "지금 열린 도면에서 fume hood 위치를 동쪽 벽으로 옮기고 치수선도 다시 맞춰졌으면 해요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "open-doc"
+      ],
+      "open": {
+        "app": "cadcraft",
+        "file": "lab_layout.dxf"
+      }
+    },
+    {
+      "id": "cad-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 설비 업체가 준 도면이 인치 단위라서 우리 쪽이랑 안 맞아요. equip_A.dxf 열어서 mm로 바꿔 다시 저장해 줄래요?",
+      "axes": [
+        "question",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-d-p09",
+      "label": "pos",
+      "text": "이 도면 복도 폭이 1.5m 맞아요? 1.8m로 넓히고 치수도 고쳐 주세요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "open-doc"
+      ],
+      "open": {
+        "app": "cadcraft",
+        "file": "점포_2층.dxf"
+      }
+    },
+    {
+      "id": "cad-d-p10",
+      "label": "pos",
+      "text": "画一张带尺寸的机房设备布置图，机柜8台，每台600×1000mm，导出DXF。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cad-d-n01",
+      "label": "neg",
+      "text": "건축사무소 개업 기념 포스터 만들어 주세요. 도면 느낌 나는 선 스타일로, SVG로요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "cad-d-n02",
+      "label": "neg",
+      "text": "구매 승인 흐름을 순서도로 그려 줘. 요청→팀장 승인→재무 검토→발주.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "bpmn-process-generation-skill",
+      "open": null
+    },
+    {
+      "id": "cad-d-n03",
+      "label": "neg",
+      "text": "Make this living room interior photo (lr_01.jpg) look warmer and brighter for the brochure.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "photocraft-editing",
+      "open": {
+        "app": "photocraft",
+        "file": "lr_01.jpg"
+      }
+    },
+    {
+      "id": "cad-d-n04",
+      "label": "neg",
+      "text": "사무실 3D 모델 만들어서 렌더링 이미지 몇 장 뽑아 줄 수 있어?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cad-d-n05",
+      "label": "neg",
+      "text": "근린생활시설복도 최소폭이 법적으로 몇m예요?",
+      "axes": [
+        "question",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cad-d-n06",
+      "label": "neg",
+      "text": "도면 번호, 리비전, 작성자 항목으로 구성된 도면 대장 엑셀 파일을 작성해 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "cad-d-n07",
+      "label": "neg",
+      "text": "添付の図面PDFを5枚まとめて1つのPDFにしてください。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pdf",
+      "open": null
+    },
+    {
+      "id": "cad-d-n08",
+      "label": "neg",
+      "text": "영업팀 조직도를 그림으로 깔끔하게 보고 싶어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cad-d-n09",
+      "label": "neg",
+      "text": "층별 면적 데이터로 엑셀 막대 차트 만들어 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "cad-d-n10",
+      "label": "neg",
+      "text": "做一份介绍新工厂布局的PPT，五页左右，不需要图纸。",
+      "axes": [
+        "command",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pptx",
+      "open": null
+    }
+  ]
+}

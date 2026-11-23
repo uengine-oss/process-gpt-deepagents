@@ -1,0 +1,255 @@
+{
+  "skill": "youtube-public-data",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "ytp-h-p01",
+      "label": "pos",
+      "text": "'EBS 다큐' 채널에서 이번 주에 올라온 영상 목록 좀 보여 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-p02",
+      "label": "pos",
+      "text": "'물류 자동화' 키워드로 최근 일주일 안에 올라온 유튜브 영상 있나 차자봐",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-p03",
+      "label": "pos",
+      "text": "youtube.com/watch?v=Lm3pW8cTz0A 영상이 언제 게시되었고 현재 조회수가 얼마인지 확인 부탁드립니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-p04",
+      "label": "pos",
+      "text": "Find the most-viewed YouTube videos about heat pump installation from the last 30 days.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-p05",
+      "label": "pos",
+      "text": "@NHKWORLDJAPAN のチャンネルで最近公開された動画を5本、タイトルと公開日で教えてもらえますか？",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-p06",
+      "label": "pos",
+      "text": "요즘사람들이캠핑용품영상중에뭘많이보는지궁금하네 유튜브에서조회수순으로좀보고싶은데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-p07",
+      "label": "pos",
+      "text": "MKBHD 채널 latest uploads 중에서 이번 달 것만 views랑 같이 정리되면 좋겠다.",
+      "axes": [
+        "banmal",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-p08",
+      "label": "pos",
+      "text": "아 그 왜 유튜브 인기 급상승 한국 차트 보려고 했는데 계속 안 열리더라고요, 음, 지금 한국에서 뜨는 영상 볼 방법 없을까요?",
+      "axes": [
+        "question",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-p09",
+      "label": "pos",
+      "text": "이 영상 올라온 지 1년 됐다고요? 제가 보기엔 최근 같은데, youtu.be/Vb9sK2rLq7E 업로드 날짜 확인해 주세요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-p10",
+      "label": "pos",
+      "text": "请列出 YouTube 频道 @TED 最近发布的十个视频和各自的观看次数。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "ytp-h-n01",
+      "label": "neg",
+      "text": "유튜브용 브이로그 클립 네 개(vlog1~4.mp4) 이어 붙이고 사이사이에 페이드 전환 넣어 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    },
+    {
+      "id": "ytp-h-n02",
+      "label": "neg",
+      "text": "유튜브 신제품 영상 링크 youtu.be/Hn4qT2xWm8s 를 Slack #marketing 채널에 공지로 올려 주세요.",
+      "axes": [
+        "haeyo",
+        "mixed",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    },
+    {
+      "id": "ytp-h-n03",
+      "label": "neg",
+      "text": "Make a vector YouTube channel banner, 2560x1440, with our slogan 'Built to Last' in navy.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "ytp-h-n04",
+      "label": "neg",
+      "text": "유튜브 프리미엄 가족 요금제가 만 원도 안 한다던데 맞아요? 한 달에 얼마예요?",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "ytp-h-n05",
+      "label": "neg",
+      "text": "유튜브알고리즘은 어떤기준으로 영상을 추천해요?",
+      "axes": [
+        "question",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "ytp-h-n06",
+      "label": "neg",
+      "text": "유튜브 배경음으로 깔 잔잔한 피아노 루프 30초짜리 만들고 끝에 페이드아웃 넣어 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "soundcraft-audio",
+      "open": null
+    },
+    {
+      "id": "ytp-h-n07",
+      "label": "neg",
+      "text": "把 demo1.mp4、demo2.mp4、demo3.mp4 剪成一个60秒的宣传片，加上中文字幕，导出MP4，准备发到YouTube。",
+      "axes": [
+        "command",
+        "zh",
+        "boundary",
+        "no-open"
+      ],
+      "right": "filmcraft-video",
+      "open": null
+    },
+    {
+      "id": "ytp-h-n08",
+      "label": "neg",
+      "text": "유튜브 채널 콘셉트를 어떻게 잡아야 할지 아이디어가 좀 필요한데",
+      "axes": [
+        "monologue",
+        "wish",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "ytp-h-n09",
+      "label": "neg",
+      "text": "うちのYouTubeチャンネルのアナリティクスで、先月の総再生時間を確認して。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    },
+    {
+      "id": "ytp-h-n10",
+      "label": "neg",
+      "text": "유튜브 썸네일로 쓰게 product_main.png 배경을 흰색으로 바꾸고 1280×720으로 맞춰 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "photocraft-editing",
+      "open": null
+    }
+  ]
+}

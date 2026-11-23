@@ -1,0 +1,259 @@
+{
+  "skill": "connected-services",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "cns-h-p01",
+      "label": "pos",
+      "text": "드롭박스 '계약서' 폴더에 어떤 파일들 있는지 보여 주세요. 연결이 안 돼 있으면 어디서 연결하는지도 알려 주시고요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-p02",
+      "label": "pos",
+      "text": "지난주에 인사팀한테서 온 메일 첨부파일 내 구글드라이브 '인사' 폴더에 저장해놔져",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-p03",
+      "label": "pos",
+      "text": "Outlook 일정에서 이번 달 외부 고객 미팅이 몇 건인지 집계해 주시겠습니까?",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-p04",
+      "label": "pos",
+      "text": "Open a GitHub issue in northwind/web-portal titled 'Login button misaligned on Safari' with the bug label.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-p05",
+      "label": "pos",
+      "text": "Slackの#営業チャンネルで、昨日いちばん反応が多かった投稿はどれですか？",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-p06",
+      "label": "pos",
+      "text": "트렐로보드에서 완료안된카드들만 추려봐야겠는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-p07",
+      "label": "pos",
+      "text": "HubSpot에 있는 이번 분기 신규 deal 금액 합계만 딱 알면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-p08",
+      "label": "pos",
+      "text": "음 그 메일함이 너무 꽉 차서 중요한 게 안 보여요, 어 그 뭐냐, 안 읽은 것 중에 대표님이 보낸 메일만 좀 뽑아 줄래요?",
+      "axes": [
+        "question",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-p09",
+      "label": "pos",
+      "text": "acme/mobile-app 저장소 PR #482가 아직 리뷰 대기라고요? 머지된 줄 알았는데 상태 한번 확인해 줄래요?",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-p10",
+      "label": "pos",
+      "text": "把我 Google 日历里下周三下午两点的“供应商评审”会议改到周四同一时间。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-h-n01",
+      "label": "neg",
+      "text": "어 그 캘린더 말고요, 우리 시스템에 있는 '외근 보고' 프로세스 있잖아요, 그거 하나 시작해 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "dictation",
+        "boundary",
+        "no-open"
+      ],
+      "right": "process-execution",
+      "open": null
+    },
+    {
+      "id": "cns-h-n02",
+      "label": "neg",
+      "text": "GitHub 이슈 접수부터 배포 승인까지의 흐름을 업무 프로세스 모델로 그려 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "bpmn-process-generation-skill",
+      "open": null
+    },
+    {
+      "id": "cns-h-n03",
+      "label": "neg",
+      "text": "Draft a company-wide Slack announcement about the new parking policy — just the text, I'll post it myself.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "internal-comms",
+      "open": null
+    },
+    {
+      "id": "cns-h-n04",
+      "label": "neg",
+      "text": "구글 드라이브에 올리기 전에 거래처 연락처 목록을 엑셀 파일로 만들어 줘. 열은 회사명, 담당자, 전화번호.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "cns-h-n05",
+      "label": "neg",
+      "text": "Slack에서 메시지 예약 전송은 어떻게 설정해요?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cns-h-n06",
+      "label": "neg",
+      "text": "요즘 생성형 AI 규제 동향을 웹에서 찾아서 정리해 줬으면 해요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cns-h-n07",
+      "label": "neg",
+      "text": "Notion페이지를주간보고형식으로바꿔주는스킬을새로하나만들고싶어요",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "skill-creator",
+      "open": null
+    },
+    {
+      "id": "cns-h-n08",
+      "label": "neg",
+      "text": "Googleカレンダーみたいな社内会議室予約アプリの画面デザインを作って。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "frontend-design",
+      "open": null
+    },
+    {
+      "id": "cns-h-n09",
+      "label": "neg",
+      "text": "Is Dropbox Business cheaper than Google Workspace for a 20-person team?",
+      "axes": [
+        "question",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cns-h-n10",
+      "label": "neg",
+      "text": "메일로 보내기 전에 이 문서 두 번째 표의 '진행률' 칸을 80%로 고쳐 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "ieumoffice-live-edit",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "docs",
+        "file": "주간보고_47주차.docx"
+      }
+    }
+  ]
+}

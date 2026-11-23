@@ -1,0 +1,255 @@
+{
+  "skill": "connected-services",
+  "split": "dev",
+  "cases": [
+    {
+      "id": "cns-d-p01",
+      "label": "pos",
+      "text": "오늘 받은 메일 중에 '계약'이 들어간 것만 골라서 보낸 사람이랑 제목 알려 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-p02",
+      "label": "pos",
+      "text": "내일 오후 3시에 구매팀이랑 미팅 캘린더에 잡아저 참석자는 박서준 김하늘 두명",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-p03",
+      "label": "pos",
+      "text": "GitHub 저장소 acme/billing-api 에 현재 열려 있는 이슈 목록을 담당자별로 정리해 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-p04",
+      "label": "pos",
+      "text": "Post a message in the #release Slack channel saying the v2.3 deploy is done, with a link to the changelog.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-p05",
+      "label": "pos",
+      "text": "Googleドライブの「2026年度予算」フォルダに最近追加されたファイルは何がありますか？",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-p06",
+      "label": "pos",
+      "text": "노션회의록데이터베이스에 이번주항목하나 새로만들어둬야하는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-p07",
+      "label": "pos",
+      "text": "Jira에서 나한테 assign된 티켓 중에 due date가 이번 주인 것만 한눈에 봤으면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-p08",
+      "label": "pos",
+      "text": "어 그 뭐냐 슬랙에서 누가 저를 멘션했는데 어디였는지 못 찾겠어요, 어제부터 온 멘션 좀 모아서 보여 주세요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-p09",
+      "label": "pos",
+      "text": "다음 주 목요일 오전에 제 일정 비어 있는 거 맞아요? 캘린더 한번 확인해 주세요.",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-p10",
+      "label": "pos",
+      "text": "在 Notion 的「客户反馈」数据库里新增一条记录：客户是华星电子，问题是发票延迟。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "cns-d-n01",
+      "label": "neg",
+      "text": "어 그 뭐냐 고객 클레임 메일 들어오면 처리하는 거, 우리 시스템에 있는 '클레임 접수' 프로세스요, 그거 지금 하나 시작해 줘요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "dictation",
+        "boundary",
+        "no-open"
+      ],
+      "right": "process-execution",
+      "open": null
+    },
+    {
+      "id": "cns-d-n02",
+      "label": "neg",
+      "text": "Slack 문의가 들어오면 담당자 배정, 답변, 종결까지 가는 업무 프로세스를 BPMN으로 설계해 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "bpmn-process-generation-skill",
+      "open": null
+    },
+    {
+      "id": "cns-d-n03",
+      "label": "neg",
+      "text": "Make an animated GIF of a dancing cat with 'Ship it!' text for our Slack celebration emoji.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "slack-gif-creator",
+      "open": null
+    },
+    {
+      "id": "cns-d-n04",
+      "label": "neg",
+      "text": "전 직원 메일로 나갈 연말 휴무 안내 공지 문안 써 주세요. 보내지는 말고 글만요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "internal-comms",
+      "open": null
+    },
+    {
+      "id": "cns-d-n05",
+      "label": "neg",
+      "text": "Notion 무료 요금제랑 Plus 요금제 차이가 뭐예요?",
+      "axes": [
+        "question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cns-d-n06",
+      "label": "neg",
+      "text": "요즘반도체수출관련뉴스좀찾아서정리해줄래",
+      "axes": [
+        "question",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "cns-d-n07",
+      "label": "neg",
+      "text": "증권 계좌 연결 없이도 되죠? 마이크론 어제 종가만 확인해 주세요.",
+      "axes": [
+        "haeyo",
+        "counter-question",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "stock-price-lookup",
+      "open": null
+    },
+    {
+      "id": "cns-d-n08",
+      "label": "neg",
+      "text": "Slackで共有する前に、プロジェクト週報をWordファイルで作ってください。進捗3件、課題2件の構成で。",
+      "axes": [
+        "command",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "docx",
+      "open": null
+    },
+    {
+      "id": "cns-d-n09",
+      "label": "neg",
+      "text": "우리 회사 Jira에 붙는 MCP 서버를 직접 개발하고 싶어요. 코드 뼈대부터 잡아 주세요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "mcp-builder",
+      "open": null
+    },
+    {
+      "id": "cns-d-n10",
+      "label": "neg",
+      "text": "Polish this sentence for a client email: 'we are sorry for late reply, we will check it soon'.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    }
+  ]
+}

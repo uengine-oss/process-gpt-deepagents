@@ -1,0 +1,307 @@
+{
+  "skill": "ieumoffice-live-edit",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "iol-h-p01",
+      "label": "pos",
+      "text": "목차 다음 첫 문단이 너무 길어요. 세 문장으로 줄여 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "docs",
+        "file": "사업계획서_v3.docx"
+      }
+    },
+    {
+      "id": "iol-h-p02",
+      "label": "pos",
+      "text": "D열에 지각 표시된 사람 몇 명인지 세서 맨 위에 적어 놔조",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "sheets",
+        "file": "출근부_11월.xlsx"
+      }
+    },
+    {
+      "id": "iol-h-p03",
+      "label": "pos",
+      "text": "5번 슬라이드 차트 아래 설명 문구를 '전년 대비 12% 증가'로 수정해 주십시오.",
+      "axes": [
+        "formal",
+        "ko",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "slides",
+        "file": "이사회보고.pptx"
+      }
+    },
+    {
+      "id": "iol-h-p04",
+      "label": "pos",
+      "text": "Recalculate the totals row and fix any cell in column F that isn't a number.",
+      "axes": [
+        "command",
+        "en",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "sheets",
+        "file": "budget_2027.xlsx"
+      }
+    },
+    {
+      "id": "iol-h-p05",
+      "label": "pos",
+      "text": "この文書の宛先は誰になっていますか？担当者名も見てください。",
+      "axes": [
+        "question",
+        "ja",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "hwp",
+        "file": "協力要請文.hwpx"
+      }
+    },
+    {
+      "id": "iol-h-p06",
+      "label": "pos",
+      "text": "회사명이영문으로잘못들어간데가있는거같은데 다찾아서한글로바꿔야겠다",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "docs",
+        "file": "보도자료_초안.docx"
+      }
+    },
+    {
+      "id": "iol-h-p07",
+      "label": "pos",
+      "text": "표지 subtitle이 'Draft'로 돼 있는데 'Final'로 바뀌어 있으면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "slides",
+        "file": "Sales_Review.pptx"
+      }
+    },
+    {
+      "id": "iol-h-p08",
+      "label": "pos",
+      "text": "아 그 이거 점검자 이름이 어디 써 있는지 아무리 봐도 못 찾겠어요, 음, 문서에서 좀 찾아 주실래요?",
+      "axes": [
+        "question",
+        "complaint",
+        "ko",
+        "dictation",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "pdf",
+        "file": "점검결과서.pdf"
+      }
+    },
+    {
+      "id": "iol-h-p09",
+      "label": "pos",
+      "text": "第三行的增长率真的是负数吗？请在这张表里核对一下，算错了就改过来。",
+      "axes": [
+        "question",
+        "counter-question",
+        "zh",
+        "open-doc"
+      ],
+      "open": {
+        "app": "ieumoffice",
+        "editor": "sheets",
+        "file": "季度销售.xlsx"
+      }
+    },
+    {
+      "id": "iol-h-p10",
+      "label": "pos",
+      "text": "지금 이음오피스에 열어 둔 한글 문서에서 '담당자: 미정'을 '담당자: 한지민'으로 고쳐.",
+      "axes": [
+        "command",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "iol-h-n01",
+      "label": "neg",
+      "text": "새 한글 문서로 사내 체육대회 안내문 만들어 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "hwpx-document",
+      "open": null
+    },
+    {
+      "id": "iol-h-n02",
+      "label": "neg",
+      "text": "발표 자료가 하나도 없어서 큰일이에요. 분기 실적 발표용 슬라이드 새로 열 장 만들어 줘요.",
+      "axes": [
+        "haeyo",
+        "complaint",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pptx",
+      "open": null
+    },
+    {
+      "id": "iol-h-n03",
+      "label": "neg",
+      "text": "근처에 회식하기 좋은 고깃집 있으면 추천해 줄래요?",
+      "axes": [
+        "question",
+        "ko",
+        "open-doc"
+      ],
+      "right": "general",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "docs",
+        "file": "인사평가표.docx"
+      }
+    },
+    {
+      "id": "iol-h-n04",
+      "label": "neg",
+      "text": "행사 포스터 사진 poster_v2.png 배경을 하늘색으로 바꿔 주세요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "photocraft-editing",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "sheets",
+        "file": "행사예산.xlsx"
+      }
+    },
+    {
+      "id": "iol-h-n05",
+      "label": "neg",
+      "text": "Write a new Word document with an onboarding checklist for new hires.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "docx",
+      "open": null
+    },
+    {
+      "id": "iol-h-n06",
+      "label": "neg",
+      "text": "메일로 받은 첨부 엑셀 단가표.xlsx 단가에 부가세 붙여서 새 파일로 저장해 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "iol-h-n07",
+      "label": "neg",
+      "text": "문서랑 상관없는데 AMD 지금 price 얼마예요?",
+      "axes": [
+        "question",
+        "mixed",
+        "open-doc"
+      ],
+      "right": "stock-price-lookup",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "hwp",
+        "file": "공문_1121.hwpx"
+      }
+    },
+    {
+      "id": "iol-h-n08",
+      "label": "neg",
+      "text": "회의자료 PDF에서 3~5쪽만 잘라 새 PDF로 만들어주세요",
+      "axes": [
+        "haeyo",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "pdf",
+      "open": null
+    },
+    {
+      "id": "iol-h-n09",
+      "label": "neg",
+      "text": "顺便问一下，下周韩国有公共假期吗？",
+      "axes": [
+        "question",
+        "zh",
+        "open-doc"
+      ],
+      "right": "general",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "slides",
+        "file": "신제품런칭.pptx"
+      }
+    },
+    {
+      "id": "iol-h-n10",
+      "label": "neg",
+      "text": "이 카탈로그에 쓸 새 아이콘 다섯 개를 SVG로 그려 주세요. 배송, 교환, 환불, 문의, 할인.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "pdf",
+        "file": "카탈로그.pdf"
+      }
+    }
+  ]
+}

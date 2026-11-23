@@ -1,0 +1,256 @@
+{
+  "skill": "stock-price-lookup",
+  "split": "holdout",
+  "cases": [
+    {
+      "id": "spl-h-p01",
+      "label": "pos",
+      "text": "네이버(NAVER) 오늘 종가 확인 부탁해요. 어느 날짜 기준 자료인지도요.",
+      "axes": [
+        "haeyo",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-p02",
+      "label": "pos",
+      "text": "마소 주가 요즘 어때 지금 가격이랑 한달 전 가격 비교해죠",
+      "axes": [
+        "banmal",
+        "ko",
+        "typo",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-p03",
+      "label": "pos",
+      "text": "S&P 500 지수의 최근 10거래일 종가를 날짜별로 정리해 주십시오.",
+      "axes": [
+        "formal",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-p04",
+      "label": "pos",
+      "text": "Check where the Nasdaq Composite closed yesterday and how much it has moved over the past two weeks.",
+      "axes": [
+        "command",
+        "en",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-p05",
+      "label": "pos",
+      "text": "ソニーグループの株価は今いくらですか？先月末と比べて何％動いたかも知りたいです。",
+      "axes": [
+        "question",
+        "ja",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-p06",
+      "label": "pos",
+      "text": "셀트리온어제종가가얼마였더라 보고서에넣어야되는데",
+      "axes": [
+        "monologue",
+        "ko",
+        "nospace",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-p07",
+      "label": "pos",
+      "text": "LG엔솔 last close랑 한 달 전 close 차이가 몇 퍼센트인지 알았으면 좋겠어요.",
+      "axes": [
+        "haeyo",
+        "wish",
+        "mixed",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-p08",
+      "label": "pos",
+      "text": "음 그 뭐냐 구글 모회사 주식 있잖아, 기사마다 숫자가 제각각이라 짜증 나. 어제 종가 하나만 딱 어디 자료인지랑 같이 줘.",
+      "axes": [
+        "banmal",
+        "complaint",
+        "ko",
+        "dictation",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-p09",
+      "label": "pos",
+      "text": "코스닥 지수가 오늘 2% 넘게 빠졌다는 게 사실이에요? 실제 수치로 확인해 주세요.",
+      "axes": [
+        "question",
+        "counter-question",
+        "ko",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-p10",
+      "label": "pos",
+      "text": "请查一下阿里巴巴美股最近一个月的涨跌幅和最新收盘价。",
+      "axes": [
+        "command",
+        "zh",
+        "no-open"
+      ],
+      "open": null
+    },
+    {
+      "id": "spl-h-n01",
+      "label": "neg",
+      "text": "이번 분기 원자재 stock 소진율 표를 엑셀로 만들어 주세요. 품목은 강판, 볼트, 도료예요.",
+      "axes": [
+        "haeyo",
+        "mixed",
+        "boundary",
+        "no-open"
+      ],
+      "right": "xlsx",
+      "open": null
+    },
+    {
+      "id": "spl-h-n02",
+      "label": "neg",
+      "text": "Design a simple SVG icon of a rising stock-chart arrow for our finance team's intranet tile.",
+      "axes": [
+        "command",
+        "en",
+        "boundary",
+        "no-open"
+      ],
+      "right": "vectorcraft-graphics",
+      "open": null
+    },
+    {
+      "id": "spl-h-n03",
+      "label": "neg",
+      "text": "주식회사 설립 시 필요한 정관 초안을 워드 파일로 작성해 주시기 바랍니다.",
+      "axes": [
+        "formal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "docx",
+      "open": null
+    },
+    {
+      "id": "spl-h-n04",
+      "label": "neg",
+      "text": "금 한 돈 시세 오늘 얼마예요?",
+      "axes": [
+        "question",
+        "ko",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "spl-h-n05",
+      "label": "neg",
+      "text": "요즘 강남 아파트 매매 시세 어떻게 돼요?",
+      "axes": [
+        "question",
+        "ko",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "spl-h-n06",
+      "label": "neg",
+      "text": "주식 방송 오프닝에 쓸 3초짜리 '띠링' 알림음 하나 만들어서 WAV로 줘.",
+      "axes": [
+        "banmal",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "soundcraft-audio",
+      "open": null
+    },
+    {
+      "id": "spl-h-n07",
+      "label": "neg",
+      "text": "여기 stock 열 합계가 틀린 것 같아요, 다시 계산해서 맨 아래 칸에 넣어 주세요.",
+      "axes": [
+        "haeyo",
+        "mixed",
+        "boundary",
+        "open-doc"
+      ],
+      "right": "ieumoffice-live-edit",
+      "open": {
+        "app": "ieumoffice",
+        "editor": "sheets",
+        "file": "재고현황_11월.xlsx"
+      }
+    },
+    {
+      "id": "spl-h-n08",
+      "label": "neg",
+      "text": "株の配当金にかかる税金について教えて。",
+      "axes": [
+        "question",
+        "ja",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "spl-h-n09",
+      "label": "neg",
+      "text": "삼성바이오로직스재무제표보고 고평가인지 판단해줬으면",
+      "axes": [
+        "banmal",
+        "wish",
+        "ko",
+        "nospace",
+        "boundary",
+        "no-open"
+      ],
+      "right": "general",
+      "open": null
+    },
+    {
+      "id": "spl-h-n10",
+      "label": "neg",
+      "text": "구글 캘린더에 매주 월요일 9시 '주간 증시 점검' 회의 일정 만들어 줘.",
+      "axes": [
+        "command",
+        "ko",
+        "boundary",
+        "no-open"
+      ],
+      "right": "connected-services",
+      "open": null
+    }
+  ]
+}
