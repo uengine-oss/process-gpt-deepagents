@@ -22,6 +22,7 @@ from starlette.applications import Starlette
 
 from processgpt_agent_sdk import ProcessGPTAgentServer
 
+from core.api.mcp_router import routes as mcp_routes
 from core.api.skills_router import routes as skills_routes
 from core.api.skill_tools_router import routes as skill_tools_routes
 from core.api.workspace_file import routes as workspace_file_routes
@@ -74,6 +75,8 @@ async def main() -> None:
         *skills_routes,
     *skill_tools_routes,
         *workspace_file_routes,
+        # GET /mcp/common — 켜진 공통 MCP 서버 이름만(주소·헤더 없음). /health 처럼 인증 없이 연다.
+        *mcp_routes,
     ])
     # 채팅 인프라 한 벌(/chat/stream · 재접속 · 중지 · /health)을 SDK 가 통째로 건다.
     # 유휴 SSE 하트비트와 테넌트 가드 미들웨어도 여기 포함된다. 이 저장소에 남은

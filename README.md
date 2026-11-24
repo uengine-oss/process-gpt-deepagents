@@ -162,3 +162,53 @@ CHAT_OWNER_ADDRESS=http://$(POD_IP):8888                # 없으면 http://$POD_
 규약을 타고 비공개 버킷에 보관되며, 주소는 한 시간짜리 서명 주소다
 (`core/chat/artifacts.py`). 예전에는 파일 내용을 이 서버(또는 Redis)에 담고 토큰 주소를
 내줬는데, 그 시간이 지나거나 파드가 바뀌면 파일을 영영 받을 수 없었다.
+
+## 공통 MCP 서버
+
+Process GPT Lite 의 기본 도구(공유 폴더 · 패널 앱 · 프로세스 개선 · ArtCraft 앱 다섯 · 이음오피스 편집기)처럼
+**모든 테넌트의 에이전트가 써야 하는 MCP 서버**는 테넌트마다 `tenants.mcp` 에 넣지 않고 이 서버의 환경
+설정으로 한 번 준다. `fetch_tenant_mcp` 가 테넌트 설정에 합치므로 채팅 실행 · 업무(액티비티) 실행 ·
+스킬 도구 카탈로그가 모두 같은 목록을 본다(`core/llm/mcp.py`).
+
+| 변수 | 값 |
+|---|---|
+| `COMMON_MCP_SERVERS` | `mcpServers` 와 같은 모양의 JSON — `{이름: {url, type, headers, enabled, …}}`. `{"mcpServers": {...}}` 로 감싸도 된다 |
+| `COMMON_MCP_SERVERS_FILE` | 그 JSON 을 담은 파일 경로(ConfigMap 을 마운트한 자리) |
+
+- 둘 다 주면 합치고, 이름이 겹치면 `COMMON_MCP_SERVERS` 가 이긴다.
+- 한 번만 파싱한다. 파일은 수정 시각 · 크기가 바뀌면 다음 요청에서 다시 읽는다 — ConfigMap 을
+  디렉터리로 마운트하면(`subPath` 없이) 고친 값이 파드 재시작 없이 들어온다. 환경 변수는 파드를 다시 띄워야 바뀐다.
+- JSON 이 잘못되면 내용은 남기지 않고 경고 한 줄만 남긴 뒤 무시한다(헤더에 비밀이 들어 있을 수 있다).
+- **테넌트 항목이 이긴다.** 같은 이름이 `tenants.mcp` 에 있으면 그 항목을 쓴다. `url` · `command` 가 없는
+  항목은 공통 항목 위에 덮어쓰므로, 한 테넌트만 끄려면 `"pgpt-photocraft": {"enabled": false}` 한 줄이면 된다.
+- 헤더 · env 의 `{{user_jwt}}` · `{{user_email}}` 은 테넌트 항목처럼 요청한 사용자 값으로 바뀐다. 값이 없는
+  요청(예: 사용자 토큰 없이 도는 업무)에서는 그 서버를 부르지 않고 뺀다(`[MCP] skip … but the request has none`).
+- `process-gpt-mcp` 기본 주입은 그대로다. 공통 목록에 같은 이름이 있으면 그 항목이 쓰인다.
+- `GET /mcp/common` 은 켜진 공통 서버의 **이름만** 돌려준다 — `{"servers": ["pgpt-folders", …]}`. 주소 · 헤더 ·
+  env 는 내보내지 않으며 `/health` 처럼 인증 없이 열려 있다(클러스터 안에서만 닿는다). Lite 서버가 자기
+  `/api/config` 에 "도구가 에이전트에 연결돼 있는지"를 알리려고 부른다.
+
+Process GPT Lite 서버(클러스터 안)의 도구를 모두 붙이는 예 — `type` 은 Lite 가 `tenants.mcp` 에 넣던 항목과 같은
+`streamable-http` 다.
+
+```json
+{
+  "pgpt-folders":   {"url": "http://process-gpt-lite-server.default.svc.cluster.local:8787/mcp/folders",   "type": "streamable-http", "headers": {"Authorization": "Bearer {{user_jwt}}"}},
+  "pgpt-panelapps": {"url": "http://process-gpt-lite-server.default.svc.cluster.local:8787/mcp/panelapps", "type": "streamable-http", "headers": {"Authorization": "Bearer {{user_jwt}}"}},
+  "pgpt-improve":   {"url": "http://process-gpt-lite-server.default.svc.cluster.local:8787/mcp/improve",   "type": "streamable-http", "headers": {"Authorization": "Bearer {{user_jwt}}"}},
+  "pgpt-cadcraft":    {"url": "http://process-gpt-lite-server.default.svc.cluster.local:8787/mcp/cadcraft",    "type": "streamable-http", "headers": {"Authorization": "Bearer {{user_jwt}}"}},
+  "pgpt-vectorcraft": {"url": "http://process-gpt-lite-server.default.svc.cluster.local:8787/mcp/vectorcraft", "type": "streamable-http", "headers": {"Authorization": "Bearer {{user_jwt}}"}},
+  "pgpt-photocraft":  {"url": "http://process-gpt-lite-server.default.svc.cluster.local:8787/mcp/photocraft",  "type": "streamable-http", "headers": {"Authorization": "Bearer {{user_jwt}}"}},
+  "pgpt-soundcraft":  {"url": "http://process-gpt-lite-server.default.svc.cluster.local:8787/mcp/soundcraft",  "type": "streamable-http", "headers": {"Authorization": "Bearer {{user_jwt}}"}},
+  "pgpt-filmcraft":   {"url": "http://process-gpt-lite-server.default.svc.cluster.local:8787/mcp/filmcraft",   "type": "streamable-http", "headers": {"Authorization": "Bearer {{user_jwt}}"}},
+  "pgpt-ieumoffice-live-editor": {"url": "http://process-gpt-lite-server.default.svc.cluster.local:8787/mcp/ieumoffice-live-editor", "type": "streamable-http", "headers": {"Authorization": "Bearer {{user_jwt}}"}}
+}
+```
+
+Kubernetes 에서는 이 JSON 을 `process-gpt-deepagents-config` ConfigMap 의 `COMMON_MCP_SERVERS` 키로 넣으면
+(Deployment 가 `envFrom` 으로 읽는다) 다음 롤아웃부터 붙는다. 재시작 없이 바꾸고 싶으면 별도 ConfigMap 을
+디렉터리로 마운트하고 `COMMON_MCP_SERVERS_FILE` 로 그 파일을 가리킨다.
+
+```bash
+curl -s localhost:8888/mcp/common   # {"servers": ["pgpt-cadcraft", "pgpt-filmcraft", …]}
+```
