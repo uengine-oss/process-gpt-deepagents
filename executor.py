@@ -1582,7 +1582,8 @@ class DeepAgentExecutor(AgentExecutor):
             streamer = EventTapStreamer(streamer, on_event=_on_context_event)
 
         tenant_mcp: dict[str, Any] = await asyncio.to_thread(fetch_tenant_mcp, tenant_id) if tenant_id else {}
-        # 사용자별 자격증명 MCP 서버(예: Process GPT Lite 의 커넥터)의 {{user_jwt}}·{{user_email}} 을 요청 사용자 값으로 치환
+        # 사용자별 자격증명 MCP 서버(예: Process GPT Lite 의 커넥터)의 {{user_jwt}}·{{user_email}} 을 요청 사용자 값으로 치환.
+        # fetch_tenant_mcp 가 더한 공통 MCP 서버(COMMON_MCP_SERVERS)도 여기를 거친다 — 값이 없으면 그 서버는 빠진다.
         tenant_mcp = resolve_user_placeholders(tenant_mcp, user_jwt, user_email) if tenant_mcp else tenant_mcp
         chat_root_tools, _root_tool_servers = (
             await load_chat_root_tools(tenant_mcp) if is_chat else ([], {})

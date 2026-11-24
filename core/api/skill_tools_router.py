@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from processgpt_agent_sdk import tenant_auth
 from processgpt_agent_sdk.tenant_auth import request_tenant_id, request_user_id, tenant_guard
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -43,14 +44,30 @@ def _is_tenant_admin(user_id: str, tenant_id: str) -> bool:
     return bool(rows) and (bool(rows[0].get("is_admin")) or _is_admin_role(rows[0].get("role")))
 
 
+async def _request_user(request: Request) -> dict:
+    """MCP 설정의 {{user_jwt}}·{{user_email}} 에 넣을 요청 사용자 값 — 채팅 실행처럼 그 사용자로 서버에 붙는다.
+
+    가드가 이미 토큰을 검증했다(다시 검증해도 SDK 캐시에 걸린다). 값을 못 얻으면 비워 두고, 그 값이
+    필요한 서버는 카탈로그가 부르지 않고 뺀다.
+    """
+    auth = request.headers.get("authorization") or ""
+    user_jwt = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    user_email = ""
+    try:
+        user_email = (await tenant_auth.resolve_identity(request)).email or ""
+    except Exception:
+        pass
+    return {"user_jwt": user_jwt or None, "user_email": user_email or None}
+
+
 @tenant_guard
 async def get_catalog(request: Request) -> JSONResponse:
-    return JSONResponse(await tool_catalog.build_catalog(request_tenant_id(request)))
+    return JSONResponse(await tool_catalog.build_catalog(request_tenant_id(request), **await _request_user(request)))
 
 
 @tenant_guard
 async def get_bindings(request: Request) -> JSONResponse:
-    return JSONResponse(await tool_catalog.build_bindings(request_tenant_id(request)))
+    return JSONResponse(await tool_catalog.build_bindings(request_tenant_id(request), **await _request_user(request)))
 
 
 @tenant_guard

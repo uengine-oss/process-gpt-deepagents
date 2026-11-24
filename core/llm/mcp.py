@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -248,11 +250,138 @@ async def load_chat_root_tools(
         return [], {}
 
 
+# ---------------------------------------------------------------------------
+# 공통 MCP 서버 — 테넌트마다 등록하지 않아도 모든 테넌트의 에이전트에 붙는 서버
+# ---------------------------------------------------------------------------
+# 운영자가 환경 변수로 준다. 모양은 tenants.mcp 의 mcpServers 와 같다(이름 → {url, type, headers, enabled, …}).
+#   COMMON_MCP_SERVERS       JSON 문자열
+#   COMMON_MCP_SERVERS_FILE  그 JSON 을 담은 파일 경로(ConfigMap 을 마운트한 자리)
+# 둘 다 있으면 합치고, 이름이 겹치면 COMMON_MCP_SERVERS 쪽이 이긴다. {"mcpServers": {...}} 로 감싸도 된다.
+# 한 번만 파싱한다 — 문자열은 값이 바뀔 때만, 파일은 수정 시각·크기가 바뀔 때만 다시 읽는다.
+# 잘못된 JSON 은 내용 없이 경고 한 줄만 남기고 무시한다(헤더에 비밀이 들어 있을 수 있다).
+
+COMMON_MCP_ENV = "COMMON_MCP_SERVERS"
+COMMON_MCP_FILE_ENV = "COMMON_MCP_SERVERS_FILE"
+
+_common_lock = threading.Lock()
+_common_env_cache: tuple[str, dict[str, dict]] | None = None
+_common_file_cache: tuple[tuple, dict[str, dict]] | None = None
+
+# 이 키가 없는 테넌트 항목은 연결을 새로 정하지 않는다 — 같은 이름의 공통 항목 위에 덮어쓴다.
+_CONNECTION_KEYS = ("url", "command")
+
+
+def _parse_common_servers(raw: str, source: str) -> dict[str, dict]:
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        logger.warning("[MCP] %s is not valid JSON; common MCP servers from it are ignored", source)
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("mcpServers"), dict):
+        data = data["mcpServers"]
+    if not isinstance(data, dict):
+        logger.warning("[MCP] %s must be a JSON object (server name -> config); ignored", source)
+        return {}
+    servers: dict[str, dict] = {}
+    for name, cfg in data.items():
+        if isinstance(cfg, dict) and str(name).strip():
+            servers[str(name)] = cfg
+        else:
+            logger.warning("[MCP] %s: entry %r is not an object; ignored", source, name)
+    return servers
+
+
+def _common_from_env() -> dict[str, dict]:
+    global _common_env_cache
+    raw = os.environ.get(COMMON_MCP_ENV, "").strip()
+    if not raw:
+        return {}
+    cached = _common_env_cache
+    if cached is not None and cached[0] == raw:
+        return cached[1]
+    servers = _parse_common_servers(raw, COMMON_MCP_ENV)
+    _common_env_cache = (raw, servers)
+    return servers
+
+
+def _common_from_file() -> dict[str, dict]:
+    global _common_file_cache
+    path = os.environ.get(COMMON_MCP_FILE_ENV, "").strip()
+    if not path:
+        return {}
+    try:
+        st = os.stat(path)  # ConfigMap 은 심볼릭 링크를 바꿔 갱신한다 — stat 은 링크를 따라간다.
+        key: tuple = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (path, None, None)
+    cached = _common_file_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    servers: dict[str, dict] = {}
+    if key[1] is None:
+        logger.warning("[MCP] %s=%s: file not found; common MCP servers from it are ignored", COMMON_MCP_FILE_ENV, path)
+    else:
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = f.read()
+        except OSError:
+            logger.warning("[MCP] %s=%s: file unreadable; common MCP servers from it are ignored", COMMON_MCP_FILE_ENV, path)
+        else:
+            if raw.strip():
+                servers = _parse_common_servers(raw, f"{COMMON_MCP_FILE_ENV} ({path})")
+    _common_file_cache = (key, servers)
+    return servers
+
+
+def common_mcp_servers() -> dict[str, dict]:
+    """운영자가 정한 공통 MCP 서버 `{이름: 설정}`. 캐시를 그대로 주므로 고치지 말 것."""
+    with _common_lock:
+        from_file = _common_from_file()
+        from_env = _common_from_env()
+    if not from_file:
+        return from_env
+    if not from_env:
+        return from_file
+    return {**from_file, **from_env}
+
+
+def enabled_common_mcp_server_names() -> list[str]:
+    """켜져 있는 공통 MCP 서버 이름(`GET /mcp/common`). 주소·헤더·환경 변수는 담지 않는다."""
+    return sorted(name for name, cfg in common_mcp_servers().items() if is_mcp_server_enabled(cfg))
+
+
+def merge_common_mcp_servers(tenant_mcp: dict) -> dict:
+    """공통 MCP 서버를 테넌트 설정의 mcpServers 에 더한 새 설정을 돌려준다.
+
+    - 같은 이름의 테넌트 항목이 이긴다. url·command 가 있는 항목은 공통 항목을 통째로 바꾼다.
+    - url·command 가 없는 테넌트 항목은 공통 항목 위에 덮어쓴다. 그래서 `{"enabled": false}` 한 줄로
+      그 테넌트만 공통 서버를 끈다(`is_mcp_server_enabled` 가 거른다).
+    - 공통 항목은 사본으로 넣는다 — 뒤에서 설정을 고쳐도 캐시는 그대로다.
+    - 공통 서버가 앞, 테넌트 항목이 뒤에 온다(도구 이름이 겹치면 뒤의 것이 남는다).
+    """
+    common = common_mcp_servers()
+    if not common:
+        return tenant_mcp
+    if not isinstance(tenant_mcp, dict):
+        tenant_mcp = {}
+    own = tenant_mcp.get("mcpServers")
+    own = own if isinstance(own, dict) else {}
+    merged: dict[str, Any] = {name: copy.deepcopy(cfg) for name, cfg in common.items() if name not in own}
+    for name, cfg in own.items():
+        base = common.get(name)
+        if base is not None and isinstance(cfg, dict) and not any(k in cfg for k in _CONNECTION_KEYS):
+            merged[name] = {**copy.deepcopy(base), **cfg}
+        else:
+            merged[name] = cfg
+    return {**tenant_mcp, "mcpServers": merged}
+
+
 def fetch_tenant_mcp(tenant_id: str) -> dict:
-    """테넌트의 MCP 설정(`tenants.mcp`)에 process-gpt-mcp 기본 주입까지 더한 값을 돌려준다.
+    """테넌트의 MCP 설정(`tenants.mcp`)에 공통 MCP 서버와 process-gpt-mcp 기본 주입까지 더한 값을 돌려준다.
 
     채팅 실행(executor)과 스킬 도구 카탈로그가 같은 설정으로 도구를 불러오게 한곳에 둔다.
-    조회에 실패하면 기본 주입만 한 빈 설정을 돌려준다.
+    조회에 실패하면 공통 서버·기본 주입만 한 설정을 돌려준다.
+    `{{user_jwt}}`·`{{user_email}}` 은 아직 그대로다 — 부르는 쪽이 `resolve_user_placeholders` 로 바꾼다.
     """
     tenant_mcp: dict = {}
     if tenant_id:
@@ -265,4 +394,4 @@ def fetch_tenant_mcp(tenant_id: str) -> dict:
                 tenant_mcp = fetched
         except Exception:
             logger.warning("tenant_mcp DB 조회 실패 | tenant_id=%s", tenant_id, exc_info=True)
-    return ensure_process_gpt_mcp(tenant_mcp, tenant_id)
+    return ensure_process_gpt_mcp(merge_common_mcp_servers(tenant_mcp), tenant_id)

@@ -178,21 +178,29 @@ async def _build_raw_catalog(tenant_mcp: dict) -> dict:
 
 
 async def build_catalog(tenant_id: str, *, tenant_mcp: dict | None = None,
-                        skill_only: frozenset[str] | None = None) -> dict:
-    """`GET /skill-tools/catalog` 응답. MCP 설정 해시로 캐시하고, 스킬 전용 표시는 매번 현재 지정으로 계산한다."""
-    from core.llm.mcp import fetch_tenant_mcp
+                        skill_only: frozenset[str] | None = None,
+                        user_jwt: str | None = None, user_email: str | None = None) -> dict:
+    """`GET /skill-tools/catalog` 응답. MCP 설정 해시로 캐시하고, 스킬 전용 표시는 매번 현재 지정으로 계산한다.
+
+    `{{user_jwt}}`·`{{user_email}}` 을 쓰는 서버(공통 MCP 서버 포함)는 채팅 실행처럼 부른 사용자 값으로
+    바꿔 연결하고, 값이 없으면 부르지 않고 뺀다. 캐시 키는 바꾸기 전 설정과 남은 서버 이름으로 정한다 —
+    토큰마다 캐시가 갈리지 않고, 값이 없어 서버를 뺀 목록이 값이 있는 호출에 쓰이지도 않는다.
+    """
+    from core.llm.mcp import fetch_tenant_mcp, resolve_user_placeholders
 
     if tenant_mcp is None:
         tenant_mcp = await asyncio.to_thread(fetch_tenant_mcp, tenant_id)
     if skill_only is None:
         skill_only = await asyncio.to_thread(load_skill_only_tools, tenant_id, use_cache=False)
-    key = (tenant_id, _config_hash(tenant_mcp))
+    resolved = resolve_user_placeholders(tenant_mcp, user_jwt, user_email) if tenant_mcp else tenant_mcp
+    kept = (resolved or {}).get("mcpServers")
+    key = (tenant_id, _config_hash({"config": tenant_mcp, "servers": sorted(kept) if isinstance(kept, dict) else []}))
     now = time.time()
     cached = _catalog_cache.get(key)
     if cached and now < cached[0]:
         raw = cached[1]
     else:
-        raw = await _build_raw_catalog(tenant_mcp)
+        raw = await _build_raw_catalog(resolved)
         raw["generated_at"] = now
         ttl = _CATALOG_TTL_PARTIAL if raw["unavailable_servers"] else _CATALOG_TTL_OK
         # 같은 테넌트의 이전 설정 캐시는 버린다.
@@ -272,7 +280,8 @@ def direct_server_assignments(tenant_id: str) -> dict[str, list[dict]]:
     return result
 
 
-async def build_bindings(tenant_id: str, *, catalog: dict | None = None) -> dict:
+async def build_bindings(tenant_id: str, *, catalog: dict | None = None,
+                         user_jwt: str | None = None, user_email: str | None = None) -> dict:
     """`GET /skill-tools/bindings` 응답 — 도구마다 그 도구를 `include_tools` 에 적은 스킬.
 
     - `bindings[도구]`: `skills`(적은 스킬), `skill_only`(관리자 지정 여부), `server`, `direct_assignments`.
@@ -282,7 +291,7 @@ async def build_bindings(tenant_id: str, *, catalog: dict | None = None) -> dict
     """
     skills = await asyncio.to_thread(tenant_skill_includes, tenant_id)
     if catalog is None:
-        catalog = await build_catalog(tenant_id)
+        catalog = await build_catalog(tenant_id, user_jwt=user_jwt, user_email=user_email)
     by_name = {t["name"]: t for t in catalog["tools"]}
     assignments = await asyncio.to_thread(direct_server_assignments, tenant_id)
     bindings: dict[str, dict] = {}
