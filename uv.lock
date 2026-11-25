@@ -1867,7 +1867,7 @@ wheels = [
 [[package]]
 name = "process-gpt-agent-sdk"
 version = "0.12.0"
-source = { url = "https://github.com/uengine-oss/process-gpt-agent-sdk/archive/d78eeea9adf6cafb77261aebbc18011413e3435d.tar.gz" }
+source = { url = "https://github.com/uengine-oss/process-gpt-agent-sdk/archive/e67aba3785f8cb110517041bfc77fa59f63c068b.tar.gz" }
 dependencies = [
     { name = "a2a-sdk" },
     { name = "httpx" },
@@ -1878,7 +1878,7 @@ dependencies = [
     { name = "supabase" },
     { name = "typing-extensions" },
 ]
-sdist = { hash = "sha256:ca99fa54b6fb0ba62c92904bd3794b9e058d740d890921b49be52a5997665550" }
+sdist = { hash = "sha256:960617c8780d3629316de521a797f5a39f9f8ccc777389015fe8bfa7d5fce968" }
 
 [package.optional-dependencies]
 auth = [
@@ -1963,7 +1963,7 @@ requires-dist = [
     { name = "langgraph-checkpoint", specifier = "==4.1.1" },
     { name = "langgraph-checkpoint-postgres", specifier = ">=2.0" },
     { name = "mcp", specifier = "==1.27.2" },
-    { name = "process-gpt-agent-sdk", extras = ["sse", "auth", "redis"], url = "https://github.com/uengine-oss/process-gpt-agent-sdk/archive/d78eeea9adf6cafb77261aebbc18011413e3435d.tar.gz" },
+    { name = "process-gpt-agent-sdk", extras = ["sse", "auth", "redis"], url = "https://github.com/uengine-oss/process-gpt-agent-sdk/archive/e67aba3785f8cb110517041bfc77fa59f63c068b.tar.gz" },
     { name = "protobuf", specifier = "==6.33.6" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
     { name = "psycopg-pool", specifier = ">=3.2" },

@@ -18,7 +18,7 @@ dependencies = [
     "langgraph-checkpoint==4.1.1",
     "langgraph-checkpoint-postgres>=2.0",
     "mcp==1.27.2",
-    "process-gpt-agent-sdk[sse,auth,redis] @ https://github.com/uengine-oss/process-gpt-agent-sdk/archive/d78eeea9adf6cafb77261aebbc18011413e3435d.tar.gz",
+    "process-gpt-agent-sdk[sse,auth,redis] @ https://github.com/uengine-oss/process-gpt-agent-sdk/archive/e67aba3785f8cb110517041bfc77fa59f63c068b.tar.gz",
     "protobuf==6.33.6",
     "psycopg-pool>=3.2",
     "psycopg[binary]>=3.1",
