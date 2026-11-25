@@ -16,7 +16,7 @@ uvicorn==0.49.0
 python-dotenv==1.2.2
 starlette==1.2.1
 # 0.12.0(넘겨주기) — PyPI 배포 전이라 병합된 커밋을 직접 받는다. PyPI 에 올라가면 ==0.12.0 으로 되돌린다.
-process-gpt-agent-sdk[sse,auth,redis] @ https://github.com/uengine-oss/process-gpt-agent-sdk/archive/d78eeea9adf6cafb77261aebbc18011413e3435d.tar.gz
+process-gpt-agent-sdk[sse,auth,redis] @ https://github.com/uengine-oss/process-gpt-agent-sdk/archive/e67aba3785f8cb110517041bfc77fa59f63c068b.tar.gz
 psycopg[binary]>=3.1
 psycopg-pool>=3.2
 pyjwt>=2.8
