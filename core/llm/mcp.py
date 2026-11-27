@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import json
 import logging
@@ -17,6 +18,40 @@ _DISABLED_MCP_TOOLS: set[str] = {
     "create_consulting_process_workitem",
     "create_pdf2bpmn_workitem",
 }
+
+
+# 요청마다 숨길 MCP 도구 이름(요청 metadata.hidden_tools). 클라이언트가 그 대화에서 쓰지 않을 도구를 이름으로 준다 —
+# Process GPT Lite 는 회사 공용 발송 계정으로 메일을 보내는 도구(send_email)를 숨기고, 사람의 메일은 그 사람이 연결한
+# 메일함에서 「보낼 메일」 카드의 보내기로만 나가게 한다(Lite mcp/mail.js send_mail_as_me). 채팅 루트·업무 지정·에이전트
+# 프로필·서브에이전트의 MCP 도구가 모두 `_load_mcp_tools_grouped` 를 거치므로 여기서 한 번 거른다. 요청이 주지 않으면 빈 집합
+# (본판 채팅 · 업무 실행은 그대로).
+_HIDDEN_MCP_TOOLS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar("hidden_mcp_tools", default=frozenset())
+_HIDDEN_MAX = 50
+
+
+def hidden_tool_names(metadata: Any) -> frozenset[str]:
+    """요청 metadata 의 `hidden_tools`(도구 이름 목록) → 이름 집합. 목록이 아니거나 이름이 아닌 값은 버린다."""
+    raw = metadata.get("hidden_tools") if isinstance(metadata, dict) else None
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(str(n).strip() for n in raw[:_HIDDEN_MAX] if isinstance(n, str) and str(n).strip())
+
+
+def set_hidden_tools(names: frozenset[str] | set[str] | list[str] | None) -> contextvars.Token:
+    """이 요청(현재 async 컨텍스트)에서 숨길 MCP 도구 이름을 정한다. 돌려받은 토큰으로 되돌린다."""
+    return _HIDDEN_MCP_TOOLS.set(frozenset(names or ()))
+
+
+def reset_hidden_tools(token: contextvars.Token) -> None:
+    _HIDDEN_MCP_TOOLS.reset(token)
+
+
+def hide_tools(tools: list, hidden: frozenset[str] | None = None) -> list:
+    """도구 목록에서 숨길 이름을 뺀다(hidden 을 주지 않으면 이 요청에서 정한 이름)."""
+    names = _HIDDEN_MCP_TOOLS.get() if hidden is None else hidden
+    if not names:
+        return tools
+    return [t for t in tools if getattr(t, "name", "") not in names]
 
 
 def is_mcp_server_enabled(server_config: Any) -> bool:
@@ -142,6 +177,12 @@ async def _load_mcp_tools_grouped(
                 removed = before - len(tools)
                 if removed:
                     logger.info("MCP 도구 임시 제거: %d개 %s (server=%s)", removed, sorted(_DISABLED_MCP_TOOLS), name)
+            hidden = _HIDDEN_MCP_TOOLS.get()
+            if hidden:
+                before = len(tools)
+                tools = hide_tools(tools, hidden)
+                if len(tools) != before:
+                    logger.info("MCP 도구 요청이 숨김: %d개 %s (server=%s)", before - len(tools), sorted(hidden), name)
             allowed = (tool_filters or {}).get(name)
             if allowed:
                 before = len(tools)

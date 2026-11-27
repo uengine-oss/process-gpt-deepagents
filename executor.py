@@ -82,7 +82,7 @@ from core.chat.chat_room import (
 )
 from core.chat.event_tap import EventTapStreamer
 from core.chat.tool_arg_stream import ToolArgTextStreamer
-from core.llm.mcp import fetch_tenant_mcp, load_chat_root_tools, resolve_user_placeholders
+from core.llm.mcp import fetch_tenant_mcp, hidden_tool_names, load_chat_root_tools, resolve_user_placeholders, set_hidden_tools
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
 from core.skills.skills import add_skill_reload_inputs, resolve_slash_skill
@@ -1581,6 +1581,12 @@ class DeepAgentExecutor(AgentExecutor):
 
             streamer = EventTapStreamer(streamer, on_event=_on_context_event)
 
+        # 클라이언트가 이 요청에서 쓰지 않을 MCP 도구(metadata.hidden_tools — Lite: 회사 공용 계정 메일 도구). 아래 모든 MCP 도구
+        # 로드(채팅 루트 · 업무 지정 · 프로필 · 서브에이전트)가 이 요청 동안 거른다(core/llm/mcp.py).
+        _hidden_tools = hidden_tool_names(metadata)
+        set_hidden_tools(_hidden_tools)
+        if _hidden_tools:
+            logger.info("이 요청에서 숨길 MCP 도구: %s | room=%s", sorted(_hidden_tools), context_id)
         tenant_mcp: dict[str, Any] = await asyncio.to_thread(fetch_tenant_mcp, tenant_id) if tenant_id else {}
         # 사용자별 자격증명 MCP 서버(예: Process GPT Lite 의 커넥터)의 {{user_jwt}}·{{user_email}} 을 요청 사용자 값으로 치환.
         # fetch_tenant_mcp 가 더한 공통 MCP 서버(COMMON_MCP_SERVERS)도 여기를 거친다 — 값이 없으면 그 서버는 빠진다.
