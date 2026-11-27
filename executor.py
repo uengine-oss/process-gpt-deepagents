@@ -82,7 +82,19 @@ from core.chat.chat_room import (
 )
 from core.chat.event_tap import EventTapStreamer
 from core.chat.tool_arg_stream import ToolArgTextStreamer
-from core.llm.mcp import fetch_tenant_mcp, load_chat_root_tools, resolve_user_placeholders
+from core.llm.mcp import (
+    fetch_tenant_mcp,
+    hidden_server_names,
+    hidden_tool_names,
+    load_chat_root_tools,
+    reset_hidden_servers,
+    reset_hidden_tools,
+    reset_request_user_jwt,
+    resolve_user_placeholders,
+    set_hidden_servers,
+    set_hidden_tools,
+    set_request_user_jwt,
+)
 from core.skills.git_skill_fetcher import prefetch_git_skills
 from core.skills.local_system_skills import seed_local_system_skills
 from core.skills.skills import add_skill_reload_inputs, resolve_slash_skill
@@ -1372,6 +1384,16 @@ class DeepAgentExecutor(AgentExecutor):
 
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> dict | None:
+        # 요청마다 정하는 값(숨길 MCP 도구 · 서버, 도구에 채울 사용자 토큰)은 이 요청이 끝나면 되돌린다
+        tokens = (set_hidden_tools(frozenset()), set_hidden_servers(frozenset()), set_request_user_jwt(""))
+        try:
+            return await self._execute(context, event_queue)
+        finally:
+            reset_request_user_jwt(tokens[2])
+            reset_hidden_servers(tokens[1])
+            reset_hidden_tools(tokens[0])
+
+    async def _execute(self, context: RequestContext, event_queue: EventQueue) -> dict | None:
         try:
             await asyncio.to_thread(seed_local_system_skills)
         except Exception:
@@ -1581,10 +1603,21 @@ class DeepAgentExecutor(AgentExecutor):
 
             streamer = EventTapStreamer(streamer, on_event=_on_context_event)
 
+        # 클라이언트가 이 요청에서 쓰지 않을 MCP 도구(metadata.hidden_tools — Lite: 회사 공용 계정 메일 도구). 아래 모든 MCP 도구
+        # 로드(채팅 루트 · 업무 지정 · 프로필 · 서브에이전트)가 이 요청 동안 거른다(core/llm/mcp.py).
+        _hidden_tools = hidden_tool_names(metadata)
+        _hidden_servers = hidden_server_names(metadata)
+        set_hidden_tools(_hidden_tools)
+        set_hidden_servers(_hidden_servers)
+        if _hidden_tools or _hidden_servers:
+            logger.info("이 요청에서 숨길 MCP 도구: %s · 서버: %s | room=%s", sorted(_hidden_tools), sorted(_hidden_servers), context_id)
+        # 사용자 토큰은 프롬프트에 싣지 않는다 — `user_jwt` 를 인자로 받는 MCP 도구에만 서버가 채운다(core/llm/mcp.py)
+        set_request_user_jwt(user_jwt or "")
         tenant_mcp: dict[str, Any] = await asyncio.to_thread(fetch_tenant_mcp, tenant_id) if tenant_id else {}
-        # 사용자별 자격증명 MCP 서버(예: Process GPT Lite 의 커넥터)의 {{user_jwt}}·{{user_email}} 을 요청 사용자 값으로 치환.
-        # fetch_tenant_mcp 가 더한 공통 MCP 서버(COMMON_MCP_SERVERS)도 여기를 거친다 — 값이 없으면 그 서버는 빠진다.
-        tenant_mcp = resolve_user_placeholders(tenant_mcp, user_jwt, user_email) if tenant_mcp else tenant_mcp
+        # 사용자별 자격증명 MCP 서버(예: Process GPT Lite 의 커넥터)의 {{user_jwt}}·{{user_email}} 을 요청 사용자 값으로,
+        # {{conversation_id}} 를 이 대화 id 로 치환. fetch_tenant_mcp 가 더한 공통 MCP 서버(COMMON_MCP_SERVERS)도 여기를 거친다 —
+        # 사용자 값이 없으면 그 서버는 빠진다.
+        tenant_mcp = resolve_user_placeholders(tenant_mcp, user_jwt, user_email, conversation_id=context_id) if tenant_mcp else tenant_mcp
         chat_root_tools, _root_tool_servers = (
             await load_chat_root_tools(tenant_mcp) if is_chat else ([], {})
         )

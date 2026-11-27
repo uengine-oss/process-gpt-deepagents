@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import json
 import logging
@@ -19,25 +20,136 @@ _DISABLED_MCP_TOOLS: set[str] = {
 }
 
 
+# 요청마다 숨길 MCP 도구 이름(요청 metadata.hidden_tools). 클라이언트가 그 대화에서 쓰지 않을 도구를 이름으로 준다 —
+# Process GPT Lite 는 회사 공용 발송 계정으로 메일을 보내는 도구(send_email)를 숨기고, 사람의 메일은 그 사람이 연결한
+# 메일함에서 「보낼 메일」 카드의 보내기로만 나가게 한다(Lite mcp/mail.js send_mail_as_me). 채팅 루트·업무 지정·에이전트
+# 프로필·서브에이전트의 MCP 도구가 모두 `_load_mcp_tools_grouped` 를 거치므로 여기서 한 번 거른다. 요청이 주지 않으면 빈 집합
+# (본판 채팅 · 업무 실행은 그대로).
+_HIDDEN_MCP_TOOLS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar("hidden_mcp_tools", default=frozenset())
+# 요청마다 통째로 숨길 MCP 서버 이름(요청 metadata.hidden_tool_servers) — 도구 이름을 다 알 수 없는 서버(회사 공용 메일함의
+# gmail-mcp 등)는 서버째로 뺀다.
+_HIDDEN_MCP_SERVERS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar("hidden_mcp_servers", default=frozenset())
+# 이 요청 사용자의 토큰 — 프롬프트에 싣지 않고, 도구가 인자(`user_jwt`)로 받는 MCP 도구에만 서버가 채워 넣는다.
+_REQUEST_USER_JWT: contextvars.ContextVar[str] = contextvars.ContextVar("request_user_jwt", default="")
+_HIDDEN_MAX = 50
+# 도구 이름 앞에 서버 이름이 붙는 꼴(`<server>_<tool>`, `<server>__<tool>`, `<server>.<tool>` …)도 같은 도구로 본다
+_PREFIX_SEPARATORS = ("_", ".", "-", "/", ":")
+
+
+def _names(metadata: Any, key: str) -> frozenset[str]:
+    raw = metadata.get(key) if isinstance(metadata, dict) else None
+    if not isinstance(raw, list):
+        return frozenset()
+    return frozenset(str(n).strip() for n in raw[:_HIDDEN_MAX] if isinstance(n, str) and str(n).strip())
+
+
+def hidden_tool_names(metadata: Any) -> frozenset[str]:
+    """요청 metadata 의 `hidden_tools`(도구 이름 목록) → 이름 집합. 목록이 아니거나 이름이 아닌 값은 버린다."""
+    return _names(metadata, "hidden_tools")
+
+
+def hidden_server_names(metadata: Any) -> frozenset[str]:
+    """요청 metadata 의 `hidden_tool_servers`(MCP 서버 이름 목록) → 이름 집합."""
+    return _names(metadata, "hidden_tool_servers")
+
+
+def set_hidden_tools(names: frozenset[str] | set[str] | list[str] | None) -> contextvars.Token:
+    """이 요청(현재 async 컨텍스트)에서 숨길 MCP 도구 이름을 정한다. 돌려받은 토큰으로 되돌린다."""
+    return _HIDDEN_MCP_TOOLS.set(frozenset(names or ()))
+
+
+def reset_hidden_tools(token: contextvars.Token) -> None:
+    _HIDDEN_MCP_TOOLS.reset(token)
+
+
+def set_hidden_servers(names: frozenset[str] | set[str] | list[str] | None) -> contextvars.Token:
+    return _HIDDEN_MCP_SERVERS.set(frozenset(names or ()))
+
+
+def reset_hidden_servers(token: contextvars.Token) -> None:
+    _HIDDEN_MCP_SERVERS.reset(token)
+
+
+def set_request_user_jwt(jwt: str | None) -> contextvars.Token:
+    return _REQUEST_USER_JWT.set(str(jwt or ""))
+
+
+def reset_request_user_jwt(token: contextvars.Token) -> None:
+    _REQUEST_USER_JWT.reset(token)
+
+
+def is_hidden_name(name: str, hidden: frozenset[str]) -> bool:
+    """숨길 이름 그대로이거나, 앞에 서버 이름이 붙은 꼴(`gmail-mcp_send_email`)이면 참."""
+    if not name or not hidden:
+        return False
+    if name in hidden:
+        return True
+    return any(name.endswith(sep + h) for h in hidden for sep in _PREFIX_SEPARATORS)
+
+
+def hide_tools(tools: list, hidden: frozenset[str] | None = None) -> list:
+    """도구 목록에서 숨길 이름을 뺀다(hidden 을 주지 않으면 이 요청에서 정한 이름)."""
+    names = _HIDDEN_MCP_TOOLS.get() if hidden is None else hidden
+    if not names:
+        return tools
+    return [t for t in tools if not is_hidden_name(getattr(t, "name", ""), names)]
+
+
+# 도구가 인자로 받는 사용자 자격증명. 모델이 값을 알 필요가 없도록 모델에 보이는 스키마에서 빼고, 부를 때 서버가 이 요청의
+# 값을 넣는다(예: process-gpt-mcp 의 execute_process(user_jwt=…)). 자격증명은 프롬프트에 싣지 않는다.
+_CREDENTIAL_ARGS = ("user_jwt",)
+
+
+def inject_user_credentials(tool: Any, jwt: str) -> Any:
+    """`user_jwt` 인자를 받는 MCP 도구를, 그 인자를 모델에게서 숨기고 서버가 채우는 도구로 바꾼다. 해당 없으면 그대로."""
+    schema = getattr(tool, "args_schema", None)
+    coroutine = getattr(tool, "coroutine", None)
+    if not isinstance(schema, dict) or coroutine is None:
+        return tool
+    props = schema.get("properties") or {}
+    keys = [k for k in _CREDENTIAL_ARGS if k in props]
+    if not keys:
+        return tool
+    from typing import Annotated
+
+    from langchain_core.tools import InjectedToolArg, StructuredTool
+
+    shown = {**schema, "properties": {k: v for k, v in props.items() if k not in keys}}
+    if isinstance(schema.get("required"), list):
+        shown["required"] = [r for r in schema["required"] if r not in keys]
+
+    async def call(runtime: Annotated[object | None, InjectedToolArg()] = None, **arguments: Any):
+        return await coroutine(runtime=runtime, **{**arguments, **{k: jwt for k in keys}})
+
+    return StructuredTool(
+        name=tool.name, description=tool.description or "", args_schema=shown, coroutine=call,
+        response_format=getattr(tool, "response_format", "content_and_artifact"), metadata=getattr(tool, "metadata", None),
+    )
+
+
 def is_mcp_server_enabled(server_config: Any) -> bool:
     """설정 화면의 켜기/끄기. 값이 없으면 켜진 것으로 본다(화면과 같은 기본값)."""
     return isinstance(server_config, dict) and server_config.get("enabled", True) is not False
 
 
 _USER_PLACEHOLDERS = ("{{user_jwt}}", "{{user_email}}")
+# 이 요청의 대화 id — 도구 서버가 결과를 어느 대화에 놓을지 정할 때 쓴다(Lite 의 「보낼 메일」 카드: X-Conversation-Id).
+# 값이 없어도(스킬 도구 카탈로그처럼 대화가 없는 호출) 서버를 빼지 않고 빈 값으로 둔다.
+_OPTIONAL_PLACEHOLDERS = ("{{conversation_id}}",)
 
 
-def resolve_user_placeholders(tenant_mcp: dict, user_jwt: str | None, user_email: str | None) -> dict:
-    """mcpServers 의 headers·env 에 있는 {{user_jwt}}·{{user_email}} 을 요청 사용자 값으로 바꾼다.
+def resolve_user_placeholders(tenant_mcp: dict, user_jwt: str | None, user_email: str | None, conversation_id: str | None = None) -> dict:
+    """mcpServers 의 headers·env 에 있는 {{user_jwt}}·{{user_email}} 을 요청 사용자 값으로, {{conversation_id}} 를 이 요청의
+    대화 id 로 바꾼다.
 
     사용자별 자격증명을 쓰는 MCP 서버(예: 사용자 OAuth 토큰을 쥔 게이트웨이)를 테넌트 설정 하나로
     등록할 수 있게 한다. 값이 없어 치환하지 못한 서버는 잘못된 인증으로 호출하지 않도록 뺀다.
-    자리표시자가 없는 서버는 그대로 둔다.
+    자리표시자가 없는 서버는 그대로 둔다. {{conversation_id}} 는 값이 없으면 빈 값으로 바꾸고 서버를 빼지 않는다.
     """
     servers = (tenant_mcp or {}).get("mcpServers")
     if not isinstance(servers, dict):
         return tenant_mcp
-    values = {"{{user_jwt}}": user_jwt or "", "{{user_email}}": user_email or ""}
+    values = {"{{user_jwt}}": user_jwt or "", "{{user_email}}": user_email or "", "{{conversation_id}}": conversation_id or ""}
 
     def sub(v):
         if not isinstance(v, str):
@@ -53,7 +165,8 @@ def resolve_user_placeholders(tenant_mcp: dict, user_jwt: str | None, user_email
             continue
         blob = json.dumps({k: cfg.get(k) for k in ("headers", "env")}, ensure_ascii=False)
         used = [k for k in _USER_PLACEHOLDERS if k in blob]
-        if not used:
+        optional = [k for k in _OPTIONAL_PLACEHOLDERS if k in blob]
+        if not used and not optional:
             out[name] = cfg
             continue
         if any(not values[k] for k in used):
@@ -117,8 +230,11 @@ async def _load_mcp_tools_grouped(
     """
     mcp_servers = tenant_mcp.get("mcpServers", {})
     connections = {}
+    hidden_servers = _HIDDEN_MCP_SERVERS.get()
     for name in server_names:
-        if name in mcp_servers and not is_mcp_server_enabled(mcp_servers[name]):
+        if name in hidden_servers:
+            logger.info("MCP 서버 요청이 숨김, 건너뜀: %s", name)
+        elif name in mcp_servers and not is_mcp_server_enabled(mcp_servers[name]):
             logger.info("MCP 서버 꺼짐, 건너뜀: %s", name)
         elif name in mcp_servers:
             connections[name] = _mcp_connection_config(mcp_servers[name])
@@ -142,6 +258,15 @@ async def _load_mcp_tools_grouped(
                 removed = before - len(tools)
                 if removed:
                     logger.info("MCP 도구 임시 제거: %d개 %s (server=%s)", removed, sorted(_DISABLED_MCP_TOOLS), name)
+            hidden = _HIDDEN_MCP_TOOLS.get()
+            if hidden:
+                before = len(tools)
+                tools = hide_tools(tools, hidden)
+                if len(tools) != before:
+                    logger.info("MCP 도구 요청이 숨김: %d개 %s (server=%s)", before - len(tools), sorted(hidden), name)
+            jwt = _REQUEST_USER_JWT.get()
+            if jwt:
+                tools = [inject_user_credentials(t, jwt) for t in tools]
             allowed = (tool_filters or {}).get(name)
             if allowed:
                 before = len(tools)

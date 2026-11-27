@@ -201,7 +201,7 @@ def test_executor_is_wired_to_the_resume_decisions():
 
     import executor
 
-    src = inspect.getsource(executor.DeepAgentExecutor.execute)
+    src = inspect.getsource(executor.DeepAgentExecutor._execute)
     assert "choose_reclaim_inputs(" in src
     assert "resume_kind=resume_kind_of(extras)" in src
     assert "get_workitem_checkpointer()" in src
