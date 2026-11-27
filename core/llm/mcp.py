@@ -110,7 +110,7 @@ def inject_user_credentials(tool: Any, jwt: str) -> Any:
     keys = [k for k in _CREDENTIAL_ARGS if k in props]
     if not keys:
         return tool
-    from typing import Annotated
+    from typing import Annotated, Optional
 
     from langchain_core.tools import InjectedToolArg, StructuredTool
 
@@ -118,8 +118,13 @@ def inject_user_credentials(tool: Any, jwt: str) -> Any:
     if isinstance(schema.get("required"), list):
         shown["required"] = [r for r in schema["required"] if r not in keys]
 
-    async def call(runtime: Annotated[object | None, InjectedToolArg()] = None, **arguments: Any):
+    async def call(runtime=None, **arguments):
         return await coroutine(runtime=runtime, **{**arguments, **{k: jwt for k in keys}})
+
+    # Real objects, not strings: this module has `from __future__ import annotations`, so a written annotation would be the
+    # string "Annotated[…]", and LangGraph's ToolNode resolves it against this module's globals (get_type_hints) — where
+    # Annotated and InjectedToolArg are not (they are imported here, inside the function) → NameError on every agent build.
+    call.__annotations__ = {"runtime": Annotated[Optional[object], InjectedToolArg()], "arguments": Any}
 
     return StructuredTool(
         name=tool.name, description=tool.description or "", args_schema=shown, coroutine=call,

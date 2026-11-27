@@ -170,6 +170,32 @@ async def test_the_user_token_is_filled_by_the_server_never_shown_to_the_model()
     assert inject_user_credentials(plain, "jwt") is plain
 
 
+async def test_a_credential_wrapped_tool_can_be_given_to_the_agent():
+    # 2026-11-27 운영: 모든 채팅이 「NameError: name 'Annotated' is not defined」 — 에이전트를 만들 때(ToolNode) 감싼 도구의
+    # 인자 형식을 이 모듈의 전역에서 풀다 실패했다. 에이전트에 넘길 수 있고 runtime 은 모델에게 보이지 않아야 한다.
+    from langchain_core.tools import StructuredTool
+    from langgraph.prebuilt import ToolNode
+
+    from core.llm.mcp import inject_user_credentials
+
+    seen = {}
+
+    async def call_tool(runtime=None, **arguments):
+        seen.update(arguments)
+        return "ok", None
+
+    schema = {"type": "object", "properties": {"process": {"type": "string"}, "user_jwt": {"type": "string"}},
+              "required": ["process", "user_jwt"]}
+    tool = StructuredTool(name="execute_process", description="run", args_schema=schema, coroutine=call_tool,
+                          response_format="content_and_artifact")
+    wrapped = inject_user_credentials(tool, "jwt-of-the-request")
+    node = ToolNode([wrapped])
+    assert "execute_process" in node.tools_by_name
+    assert set(wrapped.args) == {"process"}
+    assert await wrapped.ainvoke({"process": "p1"}) == "ok"
+    assert seen == {"process": "p1", "user_jwt": "jwt-of-the-request"}
+
+
 def test_the_system_prompt_carries_no_user_token():
     src = open(mcp_mod.__file__.replace("core/llm/mcp.py", "core/agents/agent.py"), encoding="utf-8").read()
     assert "- JWT:" not in src and "user_ctx['user_jwt']" not in src
