@@ -371,8 +371,7 @@ async def build_agent(
         _info_parts.append(f"- 이름: {_user_ctx['user_name']}")
     if _user_ctx.get("user_email"):
         _info_parts.append(f"- 이메일: {_user_ctx['user_email']}")
-    if _user_ctx.get("user_jwt"):
-        _info_parts.append(f"- JWT: {_user_ctx['user_jwt']}")
+    # (자격증명은 싣지 않는다 — 그것이 필요한 도구는 서버가 채운다: core/llm/mcp.py inject_user_credentials, core/bpm/tools.py)
     if _info_parts:
         system_prompt = system_prompt + "\n\n## 현재 사용자 정보\n" + "\n".join(_info_parts)
 

@@ -28,5 +28,5 @@ def test_the_executor_hands_the_chat_context_id_over():
 
     import executor
 
-    src = inspect.getsource(executor.DeepAgentExecutor.execute)
+    src = inspect.getsource(executor.DeepAgentExecutor._execute)
     assert "new_conversation_id=context_id if is_chat" in src

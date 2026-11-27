@@ -441,7 +441,7 @@ def test_executor_is_wired_to_add_skill_reload_inputs():
 
     import executor
 
-    src = inspect.getsource(executor.DeepAgentExecutor.execute)
+    src = inspect.getsource(executor.DeepAgentExecutor._execute)
     assert "skill_sources = await resolve_skill_sources(tenant_id)" in src
     assert "skill_sources=skill_sources" in src
     assert "await add_skill_reload_inputs(inputs, graph, config, checkpoint_values, *skill_sources)" in src

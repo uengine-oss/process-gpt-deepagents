@@ -117,3 +117,92 @@ def test_the_executor_sets_the_requests_hidden_tools_before_any_mcp_load():
     assert set_at < src.index("fetch_tenant_mcp, tenant_id) if tenant_id else {}")
     assert set_at < src.index("await load_chat_root_tools(tenant_mcp)")
     assert set_at < src.index("graph, _, _sub_mcp_tools_meta = await build_agent(")
+
+
+# ---------------------------------------------------------------------------
+# 서버째 숨기기 · 서버 이름이 붙은 도구 이름 · 프롬프트에 없는 사용자 토큰 · 대화 id 자리표시자 · 요청이 끝나면 되돌림
+# ---------------------------------------------------------------------------
+
+def test_a_server_prefixed_name_is_the_same_tool():
+    from core.llm.mcp import is_hidden_name
+
+    hidden = frozenset({"send_email"})
+    for name in ("send_email", "gmail-mcp_send_email", "gmail_mcp__send_email", "gmail.send_email", "srv:send_email"):
+        assert is_hidden_name(name, hidden), name
+    for name in ("send_emails_report", "send_mail_as_me", "email_send", ""):
+        assert not is_hidden_name(name, hidden), name
+
+
+async def test_a_request_can_hide_a_whole_server(fake_client):
+    from core.llm.mcp import hidden_server_names, reset_hidden_servers, set_hidden_servers
+
+    assert hidden_server_names({"hidden_tool_servers": ["company-mail", 7]}) == frozenset({"company-mail"})
+    token = set_hidden_servers(frozenset({"company-mail"}))
+    try:
+        grouped = await _load_mcp_tools_grouped(["company-mail", "pgpt-mail"], CFG)
+    finally:
+        reset_hidden_servers(token)
+    assert _names(grouped) == {"pgpt-mail": ["send_mail_as_me"]}
+
+
+async def test_the_user_token_is_filled_by_the_server_never_shown_to_the_model():
+    from langchain_core.tools import StructuredTool
+
+    from core.llm.mcp import inject_user_credentials
+
+    seen = {}
+
+    async def call_tool(runtime=None, **arguments):
+        seen.update(arguments)
+        return "ok", None
+
+    schema = {"type": "object", "properties": {"process": {"type": "string"}, "user_jwt": {"type": "string"}},
+              "required": ["process", "user_jwt"]}
+    tool = StructuredTool(name="execute_process", description="run", args_schema=schema, coroutine=call_tool,
+                          response_format="content_and_artifact")
+    wrapped = inject_user_credentials(tool, "jwt-of-the-request")
+    assert "user_jwt" not in wrapped.args
+    assert wrapped.args_schema["required"] == ["process"]
+    assert await wrapped.ainvoke({"process": "p1"}) == "ok"
+    assert seen == {"process": "p1", "user_jwt": "jwt-of-the-request"}
+    # a tool without that argument is left as it is
+    plain = StructuredTool(name="x", description="", args_schema={"type": "object", "properties": {}}, coroutine=call_tool)
+    assert inject_user_credentials(plain, "jwt") is plain
+
+
+def test_the_system_prompt_carries_no_user_token():
+    src = open(mcp_mod.__file__.replace("core/llm/mcp.py", "core/agents/agent.py"), encoding="utf-8").read()
+    assert "- JWT:" not in src and "user_ctx['user_jwt']" not in src
+
+
+def test_conversation_id_placeholder_is_filled_and_never_drops_the_server():
+    from core.llm.mcp import resolve_user_placeholders
+
+    cfg = {"mcpServers": {"pgpt-mail": {"url": "http://lite/mcp/mail", "headers": {
+        "Authorization": "Bearer {{user_jwt}}", "X-Conversation-Id": "{{conversation_id}}"}}}}
+    out = resolve_user_placeholders(cfg, "jwt-1", "u@x.io", conversation_id="conv-1")
+    assert out["mcpServers"]["pgpt-mail"]["headers"] == {"Authorization": "Bearer jwt-1", "X-Conversation-Id": "conv-1"}
+    no_conv = resolve_user_placeholders(cfg, "jwt-1", "u@x.io")
+    assert no_conv["mcpServers"]["pgpt-mail"]["headers"]["X-Conversation-Id"] == ""
+    only_conv = {"mcpServers": {"s": {"url": "http://s", "headers": {"X-Conversation-Id": "{{conversation_id}}"}}}}
+    assert "s" in resolve_user_placeholders(only_conv, None, None)["mcpServers"]
+
+
+async def test_execute_resets_the_requests_values_when_it_ends():
+    import executor
+    from core.llm import mcp as m
+
+    async def body(self, context, event_queue):
+        m.set_hidden_tools(frozenset({"send_email"}))
+        m.set_hidden_servers(frozenset({"gmail-mcp"}))
+        m.set_request_user_jwt("jwt")
+        raise RuntimeError("boom")
+
+    class Runner:
+        _execute = body
+
+    with pytest.raises(RuntimeError):
+        await executor.DeepAgentExecutor.execute(Runner(), None, None)
+    assert m._HIDDEN_MCP_TOOLS.get() == frozenset()
+    assert m._HIDDEN_MCP_SERVERS.get() == frozenset()
+    assert m._REQUEST_USER_JWT.get() == ""
